@@ -48,6 +48,7 @@ class TestAPI(RedisTest):
     pool = (await self.bus.run(run_id))["pool"]
     if pool not in self.trainers:
       self.trainers[pool] = Trainer(self.bus, pool, Model(tiny))
+      await self.trainers[pool].own()
     while await self.trainers[pool].step(block_ms=10):
       pass
 

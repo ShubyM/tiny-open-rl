@@ -10,6 +10,9 @@ streams through one consumer group, so Redis itself knows:
 
 A reply is a stream with a single entry, tinyrl:f:<request_id>. XREAD from id 0 blocks until it is written and never
 consumes it, so a client can retry retrieve_future, or many clients can wait on one, and every one gets the same answer.
+
+A pool has one owner, the trainer holding its lease, tinyrl:owner:<pool>. Replies are written by a script that checks
+the lease first, so a trainer that lost its pool, say after a long pause, can't answer for it.
 """
 
 from __future__ import annotations
@@ -29,6 +32,24 @@ GROUP = "trainer"  # the consumer group every pool's trainer reads through
 LIVE_SECONDS = 120  # a session is live this long after its last heartbeat
 REPLY_TTL = getenv("REPLY_TTL", 3600)
 SESSION_TTL = getenv("SESSION_TTL", 7 * 24 * 3600)
+LEASE_MS = getenv("LEASE_MS", 10000)  # a trainer owns its pool this long after its last renewal
+
+# the reply, the acknowledgement and the count land together, and only if ARGV[1] still owns the pool
+FINISH = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call('XADD', KEYS[2], 'MAXLEN', '=', 1, '*', 'ok', ARGV[3], 'content_type', ARGV[4], 'body', ARGV[5])
+redis.call('EXPIRE', KEYS[2], ARGV[6])
+redis.call('XACK', KEYS[3], ARGV[8], ARGV[2])
+redis.call('XDEL', KEYS[3], ARGV[2])
+if ARGV[7] ~= '' then
+  redis.call('HINCRBY', KEYS[4], ARGV[7], 1)
+end
+return 1
+"""
+RENEW = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) end return 0"
+RELEASE = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0"
 
 
 def key(*parts: str) -> str:
@@ -85,6 +106,9 @@ def connect(url: str) -> redis.Redis:
 class Bus:
   def __init__(self, r: redis.Redis | None = None):
     self.r = r if r is not None else connect(getenv("REDIS_URL", "redis://localhost:6379"))
+    self.finish_script = self.r.register_script(FINISH)
+    self.renew_script = self.r.register_script(RENEW)
+    self.release_script = self.r.register_script(RELEASE)
 
   # ***** sessions *****
 
@@ -175,30 +199,40 @@ class Bus:
       cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
     return cmds
 
-  async def finish(self, cmd: Cmd, reply: Reply) -> None:
-    """Write a command's reply, acknowledge the command, and count it, all in one transaction."""
-    reply_key, stream = key("f", cmd.request_id), key("q", cmd.run)
-    p = self.r.pipeline(transaction=True)
-    fields = {"ok": int(reply.ok), "content_type": reply.content_type, "body": reply.body}
-    p.xadd(reply_key, fields, maxlen=1, approximate=False)
-    p.expire(reply_key, REPLY_TTL)
-    p.xack(stream, GROUP, cmd.entry_id)
-    p.xdel(stream, cmd.entry_id)
+  async def finish(self, cmd: Cmd, reply: Reply, pool: str, worker: str) -> bool:
+    """Write a command's reply, acknowledge the command, and count it, all at once, if `worker` still owns the pool.
+    Returns False, having written nothing, if it doesn't: another trainer took the pool over and fails the command."""
+    counter = ""
     if not reply.ok:
-      p.hincrby(key("run", cmd.run), "failed", 1)
+      counter = "failed"
     elif cmd.op == Op.OPTIM_STEP:
-      p.hincrby(key("run", cmd.run), "steps", 1)
-    await p.execute()
+      counter = "steps"
+    keys = [key("owner", pool), key("f", cmd.request_id), key("q", cmd.run), key("run", cmd.run)]
+    args = [worker, cmd.entry_id, int(reply.ok), reply.content_type, reply.body, REPLY_TTL, counter, GROUP]
+    return bool(await self.finish_script(keys=keys, args=args))
 
-  async def reclaim(self, pool: str, worker: str) -> list[Cmd]:
-    """Claim every command still in flight in a pool. A pool has one trainer, so when a trainer starts, any command in
-    flight was taken by one that died."""
+  async def reclaim(self, pool: str, worker: str, min_idle_ms: int = 0) -> list[Cmd]:
+    """Claim the pool's commands that have been in flight for at least min_idle_ms, on any trainer. Called by the pool's
+    owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the pool."""
     cmds = []
     for run_id in await self.runs(pool):
-      # a trainer has one take in flight at most, so a single claim gets everything
-      _, entries, _ = await self.r.xautoclaim(key("q", run_id), GROUP, worker, min_idle_time=0, count=10000)
+      stream = key("q", run_id)
+      _, entries, _ = await self.r.xautoclaim(stream, GROUP, worker, min_idle_time=min_idle_ms, count=10000)
       cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
     return cmds
+
+  # ***** pool leases *****
+
+  async def own(self, pool: str, worker: str) -> bool:
+    """Take the pool's lease if no trainer holds it."""
+    return bool(await self.r.set(key("owner", pool), worker, nx=True, px=LEASE_MS))
+
+  async def renew(self, pool: str, worker: str) -> bool:
+    """Hold the pool's lease for another LEASE_MS. False if `worker` doesn't hold it anymore."""
+    return bool(await self.renew_script(keys=[key("owner", pool)], args=[worker, LEASE_MS]))
+
+  async def release(self, pool: str, worker: str) -> None:
+    await self.release_script(keys=[key("owner", pool)], args=[worker])
 
   # ***** replies *****
 

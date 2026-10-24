@@ -175,6 +175,21 @@ class TestModel(unittest.TestCase):
       if rank:  # a LoRA run's base model is frozen, so it stays bf16
         self.assertEqual(model.lm.get_input_embeddings().weight.dtype, torch.bfloat16)
 
+  def test_a_run_restored_from_its_checkpoint_trains_on_exactly_as_before(self):
+    for rank in (0, 4):
+      model, run = Model(tiny), new_id()
+      model.create(run, "tiny", rank, LORA)
+      train(model, run, steps=3)
+      path = tempfile.mkdtemp()
+      model.save(run, path, optimizer=True)
+
+      restored = Model(tiny)  # a new trainer, say on another node
+      restored.create(run, "tiny", rank, LORA)
+      restored.load_weights(run, path, optimizer=True)
+
+      self.assertEqual(train(model, run, steps=3), train(restored, run, steps=3), f"rank {rank}")
+      self.assertTrue(same(model.params[run], restored.params[run]), f"rank {rank}")
+
   def test_save_and_load_bring_back_weights_and_optimizer(self):
     model, (a, b) = lora_runs(2)
     train(model, a, steps=3)
@@ -250,6 +265,7 @@ class TestTrainer(RedisTest):
     )
 
     t = Trainer(self.bus, "p", Model(tiny))
+    await t.own()
     while await t.step(block_ms=10):
       pass
 
