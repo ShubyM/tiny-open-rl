@@ -148,6 +148,7 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
 
 
 def load(name: str) -> PreTrainedModel:
+  # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create
   if torch.cuda.is_available():
     return AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="auto")
   return AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
@@ -181,6 +182,8 @@ class Model:
   def create(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
       self.lm, self.base, self.lora = self.load(base), base, rank > 0
+      if not self.lora:
+        self.lm.float()  # a full fine-tune updates fp32 master weights. Its forward pass runs in bf16, under autocast
       if GRAD_CKPT:
         self.lm.gradient_checkpointing_enable()
         if self.lora:
@@ -205,6 +208,8 @@ class Model:
     )
     self.lm.add_adapter(adapter, adapter_name=run)
     self.params[run] = [p for name, p in self.lm.named_parameters() if f".{run}." in name]
+    for p in self.params[run]:
+      p.data = p.data.float()  # PEFT gives an adapter its base model's dtype, but master weights are fp32
 
   def use(self, run: str) -> PreTrainedModel:
     """The model, with the run's adapter active."""
@@ -228,7 +233,8 @@ class Model:
     with torch.set_grad_enabled(not forward_only):
       for batch in batches(lengths, token_budget(lm)):
         x = batch_tensors([data[i] for i in batch], [lengths[i] for i in batch], lm.device)
-        lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
+        with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=lm.device.type == "cuda"):
+          lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
         loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
         if not forward_only:
           loss.backward()

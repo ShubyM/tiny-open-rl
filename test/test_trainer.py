@@ -9,7 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 from peft import PeftModel
-from transformers import LlamaConfig
+from transformers import LlamaConfig, LlamaForCausalLM
 
 from test.helpers import RedisTest, new_id, tiny
 from tinyrl import trainer, wire
@@ -159,6 +159,21 @@ class TestModel(unittest.TestCase):
       model.create(new_id(), "tiny", 0, {})
     with self.assertRaises(ValueError):
       model.create(new_id(), "tiny", 4, LORA)
+
+  def test_the_optimizer_updates_fp32_master_weights(self):
+    def bf16(name: str) -> LlamaForCausalLM:  # how a base model loads on the gpu
+      return tiny(name).to(torch.bfloat16)
+
+    for rank in (0, 4):
+      model, run = Model(bf16), new_id()
+      model.create(run, "tiny", rank, {"seed": 0})
+      model.forward_backward(run, [counting(12)], "cross_entropy", {}, False)
+      grads = [p.grad for p in model.params[run]]
+      model.optim_step(run, {"learning_rate": 1e-2})
+      moments = [m for state in model.optimizers[run].state.values() for m in (state["exp_avg"], state["exp_avg_sq"])]
+      self.assertEqual({t.dtype for t in model.params[run] + grads + moments}, {torch.float32}, f"rank {rank}")
+      if rank:  # a LoRA run's base model is frozen, so it stays bf16
+        self.assertEqual(model.lm.get_input_embeddings().weight.dtype, torch.bfloat16)
 
   def test_save_and_load_bring_back_weights_and_optimizer(self):
     model, (a, b) = lora_runs(2)

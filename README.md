@@ -51,7 +51,8 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
   Older SDKs' JSON is turned into the same protobuf at the gateway, and JSON clients get the output decoded back to JSON.
 * **One trainer.** A base model, with a PEFT adapter per run or the whole model for a single run, behind `create`, `forward_backward`,
   `optim_step`, `save`, `load_weights` and `delete`. Logprobs are computed `CHUNK` tokens at a time under checkpointing, so the
-  `[tokens, vocab]` logits never exist all at once.
+  `[tokens, vocab]` logits never exist all at once. The optimizer updates fp32 master weights and keeps fp32 AdamW state, while the
+  forward pass runs in bf16 under autocast. A LoRA run's frozen base model stays bf16.
 
 ## Reading the code
 
@@ -60,7 +61,7 @@ to see how each Tinker call becomes a command, and [trainer.py](tinyrl/trainer.p
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 266 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 271 | the losses, token budget batching, the model, and the trainer loop |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 154 | the Tinker HTTP API |
 | [tinyrl/bus.py](tinyrl/bus.py) | 158 | runs, sessions, commands and replies on Redis |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
