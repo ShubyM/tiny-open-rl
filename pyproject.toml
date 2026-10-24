@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-open-rl"
+version = "0.1.0"
+description = "Stream-first, Protobuf-native minimal redesign of Open-RL (~1,000 LOC)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "httpx",
+    "numpy",
+    "protobuf>=5",
+    "pydantic>=2",
+    "redis>=5.0.0",
+    "torch",
+    "uvicorn",
+]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 140
+indent-width = 2
+extend-exclude = ["src/tiny_open_rl/proto"]
