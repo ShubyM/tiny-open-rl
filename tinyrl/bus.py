@@ -77,9 +77,14 @@ def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
   return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"])
 
 
+def connect(url: str) -> redis.Redis:
+  # a reply is waited for with a blocking read of up to 30s, and redis-py gives up on a read after 5s by default
+  return redis.from_url(url, socket_timeout=None)
+
+
 class Bus:
   def __init__(self, r: redis.Redis | None = None):
-    self.r = r if r is not None else redis.from_url(getenv("REDIS_URL", "redis://localhost:6379"))
+    self.r = r if r is not None else connect(getenv("REDIS_URL", "redis://localhost:6379"))
 
   # ***** sessions *****
 

@@ -5,11 +5,10 @@ import time
 import unittest
 import uuid
 
-import redis.asyncio as redis
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from tinyrl.bus import Bus
+from tinyrl.bus import Bus, connect
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -61,7 +60,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
       cls.proc.terminate()
 
   async def asyncSetUp(self):
-    self.bus = Bus(redis.from_url(self.url))
+    self.bus = Bus(connect(self.url))
     await self.bus.r.flushall()
 
   async def asyncTearDown(self):

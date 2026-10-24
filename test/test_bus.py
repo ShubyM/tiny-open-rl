@@ -46,6 +46,19 @@ class TestBus(RedisTest):
     self.assertLess(time.perf_counter() - start, 0.5)
     self.assertEqual(await self.bus.result(request_id, 0), ok(n=1))
 
+  async def test_waiting_for_a_reply_outlasts_the_socket_timeout(self):
+    run_id = await self.new_run()
+    request_id = await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
+    [cmd] = await self.bus.take("p", "w0", block_ms=10)
+
+    async def answer_late():
+      await asyncio.sleep(5.5)  # past redis-py's default socket timeout, but well inside retrieve_future's 30s
+      await self.bus.finish(cmd, ok(n=1))
+
+    answering = asyncio.create_task(answer_late())
+    self.assertEqual(await self.bus.result(request_id, 10), ok(n=1))
+    await answering
+
   async def test_unknown_and_deleted_runs_take_no_work(self):
     self.assertIsNone(await self.bus.submit(new_id(), Op.OPTIM_STEP, b""))
 
