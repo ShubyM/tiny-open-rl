@@ -3,16 +3,18 @@ import copy
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import torch
 from peft import PeftModel
+from transformers import LlamaConfig
 
 from test.helpers import RedisTest, new_id, tiny
 from tinyrl import trainer, wire
 from tinyrl.bus import Op, Run
-from tinyrl.trainer import LOSSES, Model, Trainer, batches, target_logprobs
+from tinyrl.trainer import LOSSES, Model, Trainer, batches, target_logprobs, token_budget
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -55,6 +57,26 @@ class TestForwardPass(unittest.TestCase):
     passes = batches(lengths, 256)
     self.assertEqual(sorted(i for p in passes for i in p), list(range(200)))
     self.assertTrue(all(len(p) == 1 or max(lengths[i] for i in p) * len(p) <= 256 for p in passes))
+
+  def test_the_token_budget_fits_the_free_gpu_memory(self):
+    gpu = SimpleNamespace(
+      device=torch.device("cuda", 0), dtype=torch.bfloat16, config=LlamaConfig(num_hidden_layers=32, hidden_size=4096)
+    )
+    bytes_per_token = 6 * 32 * 4096 * 2
+
+    def budget(free_gib: int) -> int:
+      with (
+        patch.object(torch.cuda, "mem_get_info", return_value=(free_gib * 2**30, 0)),
+        patch.object(torch.cuda, "memory_reserved", return_value=2**30),  # 1 GiB cached by torch but unused
+        patch.object(torch.cuda, "memory_allocated", return_value=0),
+      ):
+        return token_budget(gpu)
+
+    self.assertEqual(budget(7), 8 * 2**30 // 2 // bytes_per_token)
+    self.assertEqual(budget(80), trainer.MAX_TOKEN_BUDGET)
+    self.assertEqual(token_budget(tiny()), trainer.MAX_TOKEN_BUDGET)  # on the cpu
+    with patch.object(trainer, "TOKEN_BUDGET", 512):
+      self.assertEqual(token_budget(gpu), 512)
 
   def test_chunked_logprobs_are_the_full_softmax(self):
     lm = tiny().eval()

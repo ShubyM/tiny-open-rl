@@ -60,14 +60,15 @@ to see how each Tinker call becomes a command, and [trainer.py](tinyrl/trainer.p
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 255 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 266 | the losses, token budget batching, the model, and the trainer loop |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 154 | the Tinker HTTP API |
 | [tinyrl/bus.py](tinyrl/bus.py) | 158 | runs, sessions, commands and replies on Redis |
-| [tinyrl/wire.py](tinyrl/wire.py) | 92 | the Tinker protobuf, to numpy and back |
+| [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
-checkpoint disk the trainers and samplers share), `TOKEN_BUDGET`, `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL` and `DEBUG=1`.
+checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL` and `DEBUG=1`.
 
 ## Test
 

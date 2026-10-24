@@ -26,7 +26,8 @@ from tinyrl import wire
 from tinyrl.bus import Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
 
-TOKEN_BUDGET = getenv("TOKEN_BUDGET", 16384)  # padded tokens per forward/backward pass
+TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
+MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
 CHUNK = getenv("CHUNK", 1024)  # positions per output head chunk when computing logprobs
 GRAD_CKPT = getenv("GRAD_CKPT", 1)  # gradient checkpointing
 
@@ -61,6 +62,25 @@ LOSSES = {"cross_entropy": cross_entropy, "importance_sampling": importance_samp
 
 
 # ***** forward pass *****
+
+
+def token_budget(lm: PreTrainedModel) -> int:
+  """How many padded tokens one forward/backward pass can hold: TOKEN_BUDGET if it's set, otherwise as many as fit in
+  half of the free GPU memory. It's measured on every call, since memory use changes as runs come and go, and an
+  optimizer allocates its state on its first step."""
+  if TOKEN_BUDGET:
+    return TOKEN_BUDGET
+  if lm.device.type != "cuda":
+    return MAX_TOKEN_BUDGET
+
+  free, _ = torch.cuda.mem_get_info(lm.device)
+  free += torch.cuda.memory_reserved(lm.device) - torch.cuda.memory_allocated(lm.device)  # cached by torch, but unused
+
+  # with gradient checkpointing, a token keeps about one hidden vector per layer. 6x that covers the layer being
+  # recomputed in the backward pass, and leaves a margin.
+  config = lm.config.get_text_config()
+  bytes_per_token = 6 * config.num_hidden_layers * config.hidden_size * lm.dtype.itemsize
+  return min(MAX_TOKEN_BUDGET, int(free / 2 / bytes_per_token))
 
 
 def batches(lengths: list[int], budget: int) -> list[list[int]]:
@@ -206,7 +226,7 @@ class Model:
     total = 0.0
 
     with torch.set_grad_enabled(not forward_only):
-      for batch in batches(lengths, TOKEN_BUDGET):
+      for batch in batches(lengths, token_budget(lm)):
         x = batch_tensors([data[i] for i in batch], [lengths[i] for i in batch], lm.device)
         lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
         loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
