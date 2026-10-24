@@ -26,8 +26,6 @@ NUMPY_DTYPES = {
 
 @dataclass(frozen=True)
 class Datum:
-  """One training sequence: its input tokens, and its per-token loss inputs (target_tokens, weights, ...)."""
-
   tokens: np.ndarray
   inputs: dict[str, np.ndarray]
 

@@ -62,8 +62,8 @@ to see how each Tinker call becomes a command, and [trainer.py](tinyrl/trainer.p
 |---|---:|---|
 | [tinyrl/trainer.py](tinyrl/trainer.py) | 255 | the losses, token budget batching, the model, and the trainer loop |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 154 | the Tinker HTTP API |
-| [tinyrl/bus.py](tinyrl/bus.py) | 148 | runs, sessions, commands and replies on Redis |
-| [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
+| [tinyrl/bus.py](tinyrl/bus.py) | 158 | runs, sessions, commands and replies on Redis |
+| [tinyrl/wire.py](tinyrl/wire.py) | 92 | the Tinker protobuf, to numpy and back |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the

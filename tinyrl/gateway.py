@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tinyrl import wire
-from tinyrl.bus import Bus, Run
+from tinyrl.bus import Bus, Op, Run
 from tinyrl.helpers import getenv
 
 CKPT = getenv("CKPT", "/tmp/tinyrl")  # the checkpoint disk the trainers and samplers share
@@ -87,7 +87,7 @@ def app(bus: Bus | None = None) -> FastAPI:
   api.add_exception_handler(ValueError, bad_request)
   api.add_exception_handler(KeyError, bad_request)
 
-  async def submit(run: str, op: str, body: bytes | dict) -> dict[str, str]:
+  async def submit(run: str, op: Op, body: bytes | dict) -> dict[str, str]:
     if isinstance(body, dict):
       body = json.dumps(body).encode()
     request_id = await bus.submit(run, op, body)
@@ -127,7 +127,7 @@ def app(bus: Bus | None = None) -> FastAPI:
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     run = str(uuid.uuid4())
     await bus.create(Run(run, pool_for(run, req.base_model, rank, metadata), req.base_model, rank, req.session_id))
-    return await submit(run, "create_model", {"base_model": req.base_model, "rank": rank, "lora": lora})
+    return await submit(run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora})
 
   @api.post("/api/v1/get_info")
   async def get_info(req: ModelRequest):
@@ -151,21 +151,21 @@ def app(bus: Bus | None = None) -> FastAPI:
   async def forward_backward(request: Request):
     body = await request.body()
     if request.headers.get("content-type", "").startswith(wire.PROTO):
-      return await submit(wire.parse(body).model_id, "forward_backward", body)  # forwarded as is
+      return await submit(wire.parse(body).model_id, Op.FORWARD_BACKWARD, body)  # forwarded as is
 
     data = json.loads(body)
-    return await submit(data["model_id"], "forward_backward", wire.from_json(data))
+    return await submit(data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data))
 
   @api.post("/api/v1/forward")  # SDKs before 0.25
   async def forward(request: Request):
     data = await request.json()
-    return await submit(data["model_id"], "forward_backward", wire.from_json(data, forward_only=True))
+    return await submit(data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data, forward_only=True))
 
   @api.post("/api/v1/optim_step")
   async def optim_step(req: OptimStepRequest):
-    return await submit(req.model_id, "optim_step", {"adam_params": req.adam_params})
+    return await submit(req.model_id, Op.OPTIM_STEP, {"adam_params": req.adam_params})
 
-  async def save(req: SaveRequest, op: str, kind: str):
+  async def save(req: SaveRequest, op: Op, kind: str):
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
     path, uri = checkpoint(req.model_id, kind, name)
@@ -173,20 +173,20 @@ def app(bus: Bus | None = None) -> FastAPI:
 
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
   async def save_weights(req: SaveRequest):
-    return await save(req, "save_weights", "weights")
+    return await save(req, Op.SAVE_WEIGHTS, "weights")
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveRequest):
-    return await save(req, "save_weights_for_sampler", "sampler_weights")
+    return await save(req, Op.SAVE_WEIGHTS_FOR_SAMPLER, "sampler_weights")
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):
     path, uri = checkpoint(req.model_id, "weights", req.path)
-    return await submit(req.model_id, "load_weights", {"path": path, "uri": uri, "optimizer": req.optimizer})
+    return await submit(req.model_id, Op.LOAD_WEIGHTS, {"path": path, "uri": uri, "optimizer": req.optimizer})
 
   @api.post("/api/v1/delete_model")
   async def delete_model(req: ModelRequest):
-    await submit(req.model_id, "delete_model", {})  # queued behind the run's work, which still finishes
+    await submit(req.model_id, Op.DELETE_MODEL, {})  # queued behind the run's work, which still finishes
     return {"status": "ok"}
 
   @api.post("/api/v1/retrieve_future")

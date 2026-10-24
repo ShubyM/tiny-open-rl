@@ -4,7 +4,7 @@ import time
 import unittest
 
 from test.helpers import RedisTest, new_id
-from tinyrl.bus import Cmd, Reply, Run, key
+from tinyrl.bus import Cmd, Op, Reply, Run, key
 
 
 def ok(**body) -> Reply:
@@ -19,10 +19,10 @@ class TestBus(RedisTest):
 
   async def test_a_command_goes_through_the_stream_and_its_reply_comes_back(self):
     run_id = await self.new_run()
-    request_id = await self.bus.submit(run_id, "optim_step", b'{"lr": 1}')
+    request_id = await self.bus.submit(run_id, Op.OPTIM_STEP, b'{"lr": 1}')
 
     [cmd] = await self.bus.take("p", "w0", block_ms=10)
-    self.assertEqual((cmd.run, cmd.op, cmd.body, cmd.request_id), (run_id, "optim_step", b'{"lr": 1}', request_id))
+    self.assertEqual((cmd.run, cmd.op, cmd.body, cmd.request_id), (run_id, Op.OPTIM_STEP, b'{"lr": 1}', request_id))
     self.assertIsNone(await self.bus.result(request_id, 0))
 
     await self.bus.finish(cmd, ok(type="optim_step"))
@@ -34,8 +34,8 @@ class TestBus(RedisTest):
 
   async def test_a_reply_wakes_every_waiter_and_reading_it_never_consumes_it(self):
     run_id = await self.new_run()
-    request_id = await self.bus.submit(run_id, "x", b"")
-    cmd = Cmd(run_id, request_id.split("/")[1], "x", b"")
+    request_id = await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
+    cmd = Cmd(run_id, request_id.split("/")[1], Op.OPTIM_STEP, b"")
 
     waiters = [asyncio.create_task(self.bus.result(request_id, 5)) for _ in range(3)]
     await asyncio.sleep(0.05)
@@ -47,18 +47,18 @@ class TestBus(RedisTest):
     self.assertEqual(await self.bus.result(request_id, 0), ok(n=1))
 
   async def test_unknown_and_deleted_runs_take_no_work(self):
-    self.assertIsNone(await self.bus.submit(new_id(), "x", b""))
+    self.assertIsNone(await self.bus.submit(new_id(), Op.OPTIM_STEP, b""))
 
     run_id = await self.new_run()
     await self.bus.drop(run_id, "p")
-    self.assertIsNone(await self.bus.submit(run_id, "x", b""))
+    self.assertIsNone(await self.bus.submit(run_id, Op.OPTIM_STEP, b""))
     self.assertEqual(await self.bus.runs("p"), [])
     self.assertEqual(await self.bus.queue(run_id), {"live": False})
     self.assertFalse(await self.bus.r.exists(key("q", run_id)))
 
   async def test_the_queue_is_read_from_the_stream_itself(self):
     run_id = await self.new_run()
-    request_ids = [await self.bus.submit(run_id, "x", b"") for _ in range(3)]
+    request_ids = [await self.bus.submit(run_id, Op.OPTIM_STEP, b"") for _ in range(3)]
     self.assertEqual(await self.bus.queue(run_id), {"live": True, "queued": 3, "in_flight": []})
 
     [cmd] = await self.bus.take("p", "w0", count=1, block_ms=10)
@@ -75,7 +75,7 @@ class TestBus(RedisTest):
   async def test_a_new_trainer_reclaims_what_a_dead_one_took(self):
     run_id = await self.new_run()
     for _ in range(2):
-      await self.bus.submit(run_id, "x", b"")
+      await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
 
     taken = await self.bus.take("p", "dead", block_ms=10)
     reclaimed = await self.bus.reclaim("p", "new")
@@ -86,7 +86,7 @@ class TestBus(RedisTest):
   async def test_every_run_in_a_pool_is_served_each_take(self):
     a, b, other = await self.new_run(), await self.new_run(), await self.new_run("other")
     for run_id in (a, a, a, b, other):
-      await self.bus.submit(run_id, "x", b"")
+      await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
 
     first = await self.bus.take("p", "w0", count=2, block_ms=10)
     self.assertEqual(sorted(cmd.run for cmd in first), sorted([a, a, b]))
@@ -95,7 +95,7 @@ class TestBus(RedisTest):
 
   async def test_a_failure_is_counted(self):
     run_id = await self.new_run()
-    await self.bus.submit(run_id, "optim_step", b"")
+    await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
     [cmd] = await self.bus.take("p", "w0", block_ms=10)
     await self.bus.finish(cmd, Reply(False, "application/json", b'{"error": "x"}'))
 

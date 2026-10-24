@@ -11,7 +11,7 @@ from peft import PeftModel
 
 from test.helpers import RedisTest, new_id, tiny
 from tinyrl import trainer, wire
-from tinyrl.bus import Run
+from tinyrl.bus import Op, Run
 from tinyrl.trainer import LOSSES, Model, Trainer, batches, target_logprobs
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
@@ -195,7 +195,7 @@ class TestModel(unittest.TestCase):
 
 
 class TestTrainer(RedisTest):
-  async def submit(self, run: str, *cmds: tuple[str, dict | bytes]) -> list[str]:
+  async def submit(self, run: str, *cmds: tuple[Op, dict | bytes]) -> list[str]:
     request_ids = []
     for op, body in cmds:
       request_ids.append(await self.bus.submit(run, op, body if isinstance(body, bytes) else json.dumps(body).encode()))
@@ -206,10 +206,10 @@ class TestTrainer(RedisTest):
     await self.bus.create(Run(run, "p", "tiny", 4))
     request_ids = await self.submit(
       run,
-      ("create_model", {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      ("forward_backward", b"not protobuf"),
-      ("optim_step", {"adam_params": {}}),
-      ("delete_model", {}),
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      (Op.FORWARD_BACKWARD, b"not protobuf"),
+      (Op.OPTIM_STEP, {"adam_params": {}}),
+      (Op.DELETE_MODEL, {}),
     )
 
     t = Trainer(self.bus, "p", Model(tiny))
@@ -223,13 +223,13 @@ class TestTrainer(RedisTest):
     self.assertEqual(bodies[1]["category"], "user")
 
     self.assertEqual((await self.bus.run(run))["steps"], 1)
-    self.assertIsNone(await self.bus.submit(run, "optim_step", b"{}"))  # deleted
+    self.assertIsNone(await self.bus.submit(run, Op.OPTIM_STEP, b"{}"))  # deleted
     self.assertFalse(t.done)  # a LoRA trainer keeps serving its pool
 
   async def test_a_new_trainer_fails_what_a_dead_one_left_in_flight(self):
     run = new_id()
     await self.bus.create(Run(run, "p", "tiny", 4))
-    [request_id] = await self.submit(run, ("optim_step", {"adam_params": {}}))
+    [request_id] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}}))
     await self.bus.take("p", "dead", block_ms=10)  # taken, and never answered
 
     t = Trainer(self.bus, "p", Model(tiny), worker="new")
@@ -244,7 +244,7 @@ class TestTrainer(RedisTest):
   async def test_a_full_fine_tune_trainer_exits_with_its_run(self):
     run = new_id()
     await self.bus.create(Run(run, run, "tiny", 0))
-    await self.submit(run, ("create_model", {"base_model": "tiny", "rank": 0, "lora": {}}), ("delete_model", {}))
+    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
 
     t = Trainer(self.bus, run, Model(tiny))
     await asyncio.wait_for(t.serve(), 60)

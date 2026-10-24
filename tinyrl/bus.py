@@ -19,6 +19,7 @@ import json
 import random
 import time
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 
 import redis.asyncio as redis
 
@@ -34,10 +35,18 @@ def key(*parts: str) -> str:
   return ":".join(("tinyrl", *parts))
 
 
+class Op(StrEnum):
+  CREATE_MODEL = "create_model"
+  FORWARD_BACKWARD = "forward_backward"
+  OPTIM_STEP = "optim_step"
+  SAVE_WEIGHTS = "save_weights"
+  SAVE_WEIGHTS_FOR_SAMPLER = "save_weights_for_sampler"
+  LOAD_WEIGHTS = "load_weights"
+  DELETE_MODEL = "delete_model"
+
+
 @dataclass(frozen=True)
 class Run:
-  """A model being trained. A rank of 0 means a full fine-tune."""
-
   id: str
   pool: str
   base: str
@@ -47,16 +56,14 @@ class Run:
 
 @dataclass(frozen=True)
 class Cmd:
-  """A command a trainer took from a run's stream."""
-
   run: str
-  id: str  # the stream entry id
-  op: str
+  entry_id: str
+  op: Op
   body: bytes
 
   @property
   def request_id(self) -> str:
-    return f"{self.run}/{self.id}"
+    return f"{self.run}/{self.entry_id}"
 
 
 @dataclass(frozen=True)
@@ -67,7 +74,7 @@ class Reply:
 
 
 def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
-  return Cmd(run, entry_id.decode(), fields[b"op"].decode(), fields[b"body"])
+  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"])
 
 
 class Bus:
@@ -138,7 +145,7 @@ class Bus:
 
   # ***** commands *****
 
-  async def submit(self, run_id: str, op: str, body: bytes) -> str | None:
+  async def submit(self, run_id: str, op: Op, body: bytes) -> str | None:
     """Queue a command on a run's stream. Returns its request id, or None if there is no such run."""
     # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
     entry_id = await self.r.xadd(key("q", run_id), {"op": op, "body": body}, nomkstream=True)
@@ -167,13 +174,14 @@ class Bus:
     """Write a command's reply, acknowledge the command, and count it, all in one transaction."""
     reply_key, stream = key("f", cmd.request_id), key("q", cmd.run)
     p = self.r.pipeline(transaction=True)
-    p.xadd(reply_key, {"ok": int(reply.ok), "content_type": reply.content_type, "body": reply.body}, maxlen=1)
+    fields = {"ok": int(reply.ok), "content_type": reply.content_type, "body": reply.body}
+    p.xadd(reply_key, fields, maxlen=1, approximate=False)
     p.expire(reply_key, REPLY_TTL)
-    p.xack(stream, GROUP, cmd.id)
-    p.xdel(stream, cmd.id)
+    p.xack(stream, GROUP, cmd.entry_id)
+    p.xdel(stream, cmd.entry_id)
     if not reply.ok:
       p.hincrby(key("run", cmd.run), "failed", 1)
-    elif cmd.op == "optim_step":
+    elif cmd.op == Op.OPTIM_STEP:
       p.hincrby(key("run", cmd.run), "steps", 1)
     await p.execute()
 

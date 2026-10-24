@@ -23,7 +23,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl import wire
-from tinyrl.bus import Bus, Cmd, Reply
+from tinyrl.bus import Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 16384)  # padded tokens per forward/backward pass
@@ -317,7 +317,7 @@ class Trainer:
       reply = await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
       await self.bus.finish(cmd, reply)
 
-      if cmd.op == "delete_model" and reply.ok:
+      if cmd.op == Op.DELETE_MODEL and reply.ok:
         await self.bus.drop(cmd.run, self.pool)
         self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
 
@@ -331,7 +331,7 @@ class Trainer:
     """Run one command on the model. A failure becomes the reply, never an exception."""
     model = self.model
     try:
-      if cmd.op == "forward_backward":
+      if cmd.op == Op.FORWARD_BACKWARD:
         req = wire.parse(cmd.body)
         data, loss_fn, config = wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req)
         logprobs, metrics = model.forward_backward(cmd.run, data, loss_fn, config, req.forward_only)
@@ -339,15 +339,15 @@ class Trainer:
 
       args = json.loads(cmd.body)
       match cmd.op:
-        case "create_model":
+        case Op.CREATE_MODEL:
           model.create(cmd.run, args["base_model"], args["rank"], args["lora"])
-        case "optim_step":
-          return ok({"type": "optim_step", "metrics": model.optim_step(cmd.run, args["adam_params"])})
-        case "save_weights" | "save_weights_for_sampler":
-          model.save(cmd.run, args["path"], optimizer=cmd.op == "save_weights")
-        case "load_weights":
+        case Op.OPTIM_STEP:
+          return ok({"type": cmd.op, "metrics": model.optim_step(cmd.run, args["adam_params"])})
+        case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
+          model.save(cmd.run, args["path"], optimizer=cmd.op == Op.SAVE_WEIGHTS)
+        case Op.LOAD_WEIGHTS:
           model.load_weights(cmd.run, args["path"], args["optimizer"])
-        case "delete_model":
+        case Op.DELETE_MODEL:
           model.delete(cmd.run)
         case _:
           raise ValueError(f"unknown op {cmd.op}")
