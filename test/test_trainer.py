@@ -1,159 +1,256 @@
-import asyncio, copy, json, tempfile, unittest
+import asyncio
+import copy
+import json
+import tempfile
+import unittest
 from unittest.mock import patch
-import numpy as np, torch
+
+import numpy as np
+import torch
 from peft import PeftModel
+
+from test.helpers import RedisTest, new_id, tiny
 from tinyrl import trainer, wire
 from tinyrl.bus import Run
-from tinyrl.trainer import LOSSES, Model, Trainer, batches, logprobs
-from test.helpers import RedisTest, rid, tiny
+from tinyrl.trainer import LOSSES, Model, Trainer, batches, target_logprobs
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
-def datum(n:int, shift:int=0, **inputs) -> wire.Datum:  # count up from shift: each token's target is the next one
-  t = np.arange(shift, shift+n+1) % 96
-  return wire.Datum(t[:-1].astype(np.int32), {"target_tokens": t[1:].astype(np.int64), **inputs})
 
-def train(m:Model, run:str, steps:int=8, lr:float=1e-2) -> list[float]:
+def counting(n: int, start: int = 0, **inputs) -> wire.Datum:
+  """A sequence that counts up from `start`: each token's target is the next one."""
+  tokens = np.arange(start, start + n + 1) % 96
+  return wire.Datum(tokens[:-1].astype(np.int32), {"target_tokens": tokens[1:].astype(np.int64), **inputs})
+
+
+def train(model: Model, run: str, steps: int = 8, lr: float = 1e-2) -> list[float]:
   losses = []
   for _ in range(steps):
-    losses.append(m.forward_backward(run, [datum(12), datum(9, 40)], "cross_entropy", {}, False)[1]["loss:sum"])
-    m.optim_step(run, {"learning_rate": lr})
+    _, metrics = model.forward_backward(run, [counting(12), counting(9, start=40)], "cross_entropy", {}, False)
+    model.optim_step(run, {"learning_rate": lr})
+    losses.append(metrics["loss:sum"])
   return losses
 
-def lora(n:int=1) -> tuple[Model, list[str]]:
-  m, runs = Model(tiny), [rid() for _ in range(n)]
-  for r in runs: m.create(r, "tiny", 4, LORA)
-  return m, runs
 
-class TestForward(unittest.TestCase):
+def lora_runs(n: int = 1) -> tuple[Model, list[str]]:
+  model, runs = Model(tiny), [new_id() for _ in range(n)]
+  for run in runs:
+    model.create(run, "tiny", 4, LORA)
+  return model, runs
+
+
+def same(a: list[torch.Tensor], b: list[torch.Tensor]) -> bool:
+  return all(torch.equal(x, y) for x, y in zip(a, b))
+
+
+class TestForwardPass(unittest.TestCase):
   def test_batches(self):
     self.assertEqual(batches([5, 5, 5], 100), [[0, 1, 2]])
     self.assertEqual(batches([5, 5, 5], 10), [[0, 1], [2]])
-    self.assertEqual(batches([10]*6+[50], 1000), [[0, 1, 2, 3, 4, 5], [6]])  # a long sequence gets its own pass instead of padding short ones
-    self.assertEqual(batches([3, 1, 2], 0), [[1], [2], [0]])  # no budget, one sequence per pass
-    every = batches(lens:=[int(x) for x in np.random.default_rng(0).integers(1, 64, 200)], 256)
-    self.assertEqual(sorted(i for b in every for i in b), list(range(200)))
-    self.assertTrue(all(len(b) == 1 or max(lens[i] for i in b)*len(b) <= 256 for b in every))
+    self.assertEqual(batches([3, 1, 2], 0), [[1], [2], [0]])  # no budget means one sequence per pass
+    # a long sequence gets a pass of its own instead of padding the short ones
+    self.assertEqual(batches([10] * 6 + [50], 1000), [[0, 1, 2, 3, 4, 5], [6]])
+
+    lengths = [int(n) for n in np.random.default_rng(0).integers(1, 64, 200)]
+    passes = batches(lengths, 256)
+    self.assertEqual(sorted(i for p in passes for i in p), list(range(200)))
+    self.assertTrue(all(len(p) == 1 or max(lengths[i] for i in p) * len(p) <= 256 for p in passes))
 
   def test_chunked_logprobs_are_the_full_softmax(self):
-    lm, ids, tgt = tiny().eval(), torch.randint(0, 96, (3, 11)), torch.randint(0, 96, (3, 11))
+    lm = tiny().eval()
+    ids, targets = torch.randint(0, 96, (3, 11)), torch.randint(0, 96, (3, 11))
     mask = torch.ones_like(ids)
     mask[2, 7:] = 0
-    with patch.object(trainer, "CHUNK", 4), torch.no_grad(): got = logprobs(lm, ids, mask, tgt)
-    with torch.no_grad(): want = lm(ids, attention_mask=mask).logits.log_softmax(-1).gather(-1, tgt[..., None])[..., 0]
+
+    with patch.object(trainer, "CHUNK", 4), torch.no_grad():
+      got = target_logprobs(lm, ids, mask, targets)
+    with torch.no_grad():
+      want = lm(ids, attention_mask=mask).logits.log_softmax(-1).gather(-1, targets[..., None])[..., 0]
     torch.testing.assert_close(got[mask.bool()], want[mask.bool()])
 
   def test_losses_are_their_definitions(self):
     g = torch.Generator().manual_seed(0)
-    lp, old, adv, w = -torch.rand(4, 9, generator=g), -torch.rand(4, 9, generator=g), torch.randn(4, 9, generator=g), torch.rand(4, 9, generator=g)
-    r = torch.exp(lp-old)
-    torch.testing.assert_close(LOSSES["cross_entropy"](lp, w, old, adv, {}), -lp*w)
-    torch.testing.assert_close(LOSSES["importance_sampling"](lp, w, old, adv, {}), -r*adv*w)
-    torch.testing.assert_close(LOSSES["ppo"](lp, w, old, adv, {"clip_range": 0.1}), -torch.min(r*adv, r.clamp(0.9, 1.1)*adv)*w)
-    torch.testing.assert_close(LOSSES["ppo"](lp, w, old, adv, {"kl_coeff": 0.5}) - LOSSES["ppo"](lp, w, old, adv, {}), 0.5*((r-1)-(lp-old))*w)
+    logprobs, sampler_logprobs = -torch.rand(4, 9, generator=g), -torch.rand(4, 9, generator=g)
+    advantages, weights = torch.randn(4, 9, generator=g), torch.rand(4, 9, generator=g)
+    ratio = torch.exp(logprobs - sampler_logprobs)
+
+    def loss(name: str, **config) -> torch.Tensor:
+      return LOSSES[name](logprobs, weights, sampler_logprobs, advantages, config)
+
+    torch.testing.assert_close(loss("cross_entropy"), -logprobs * weights)
+    torch.testing.assert_close(loss("importance_sampling"), -ratio * advantages * weights)
+    clipped = torch.min(ratio * advantages, ratio.clamp(0.9, 1.1) * advantages)
+    torch.testing.assert_close(loss("ppo", clip_range=0.1), -clipped * weights)
+    kl = (ratio - 1) - (logprobs - sampler_logprobs)
+    torch.testing.assert_close(loss("ppo", kl_coeff=0.5) - loss("ppo"), 0.5 * kl * weights)
+
 
 class TestModel(unittest.TestCase):
   def test_lora_runs_share_a_frozen_base_and_train_apart(self):
-    m, (a, b) = lora(2)
-    base, before = {n:p.detach().clone() for n,p in m.lm.named_parameters() if "lora" not in n}, [p.detach().clone() for p in m.params[b]]
-    self.assertLess((losses:=train(m, a))[-1], losses[0]*0.7)
-    self.assertTrue(all(torch.equal(x, p) for x,p in zip(before, m.params[b])))
-    self.assertTrue(all(torch.equal(base[n], p) for n,p in m.lm.named_parameters() if "lora" not in n))
+    model, (a, b) = lora_runs(2)
+    base = {name: p.detach().clone() for name, p in model.lm.named_parameters() if "lora" not in name}
+    b_before = [p.detach().clone() for p in model.params[b]]
+
+    losses = train(model, a)
+    self.assertLess(losses[-1], losses[0] * 0.7)
+    self.assertTrue(same(b_before, model.params[b]))
+    self.assertTrue(all(torch.equal(base[name], p) for name, p in model.lm.named_parameters() if "lora" not in name))
 
   def test_interleaved_runs_keep_their_own_gradients(self):
-    m, (a, b) = lora(2)
-    m.forward_backward(a, [datum(8)], "cross_entropy", {}, False)
-    m.forward_backward(b, [datum(8, 5)], "cross_entropy", {}, False)
-    grads = [p.grad.clone() for p in m.params[b]]
-    m.optim_step(a, {"learning_rate": 1e-2})
-    self.assertTrue(all(p.grad is None for p in m.params[a]))
-    self.assertTrue(all(torch.equal(g, p.grad) for g,p in zip(grads, m.params[b])))
+    model, (a, b) = lora_runs(2)
+    model.forward_backward(a, [counting(8)], "cross_entropy", {}, False)
+    model.forward_backward(b, [counting(8, start=5)], "cross_entropy", {}, False)
+    b_grads = [p.grad.clone() for p in model.params[b]]
+
+    model.optim_step(a, {"learning_rate": 1e-2})
+    self.assertTrue(all(p.grad is None for p in model.params[a]))
+    self.assertTrue(same(b_grads, [p.grad for p in model.params[b]]))
 
   def test_forward_only_leaves_no_gradient(self):
-    m, (a,) = lora()
-    lps, metrics = m.forward_backward(a, [datum(8), datum(5)], "cross_entropy", {}, True)
-    self.assertTrue(all(p.grad is None for p in m.params[a]))
-    self.assertEqual([x.shape for x in lps], [(8,), (5,)])
-    self.assertAlmostEqual(metrics["loss:sum"], -sum(float(x.sum()) for x in lps), places=4)
+    model, (a,) = lora_runs()
+    logprobs, metrics = model.forward_backward(a, [counting(8), counting(5)], "cross_entropy", {}, True)
+    self.assertTrue(all(p.grad is None for p in model.params[a]))
+    self.assertEqual([lp.shape for lp in logprobs], [(8,), (5,)])
+    self.assertAlmostEqual(metrics["loss:sum"], -sum(float(lp.sum()) for lp in logprobs), places=4)
 
   def test_rl_losses_move_logprobs_with_the_advantage(self):
     for loss in ("importance_sampling", "ppo"):
-      m, (a,) = lora()
-      d = datum(10)
-      old = m.forward_backward(a, [d], "cross_entropy", {}, True)[0][0]
+      model, (a,) = lora_runs()
+      datum = counting(10)
+      before = model.forward_backward(a, [datum], "cross_entropy", {}, True)[0][0]
+
+      inputs = {**datum.inputs, "logprobs": before, "advantages": np.ones(10, np.float32)}
       for _ in range(5):
-        m.forward_backward(a, [wire.Datum(d.tokens, {**d.inputs, "logprobs": old, "advantages": np.ones(10, np.float32)})], loss, {}, False)
-        m.optim_step(a, {"learning_rate": 1e-2})
-      self.assertGreater(m.forward_backward(a, [d], "cross_entropy", {}, True)[0][0].sum(), old.sum(), loss)
+        model.forward_backward(a, [wire.Datum(datum.tokens, inputs)], loss, {}, False)
+        model.optim_step(a, {"learning_rate": 1e-2})
+
+      after = model.forward_backward(a, [datum], "cross_entropy", {}, True)[0][0]
+      self.assertGreater(after.sum(), before.sum(), loss)
 
   def test_full_fine_tune(self):
-    m = Model(tiny)
-    m.create(r:=rid(), "tiny", 0, {})
-    self.assertLess((losses:=train(m, r))[-1], losses[0]*0.7)
-    with self.assertRaises(ValueError): m.create(rid(), "tiny", 0, {})
-    with self.assertRaises(ValueError): m.create(rid(), "tiny", 4, LORA)
+    model, run = Model(tiny), new_id()
+    model.create(run, "tiny", 0, {})
+    losses = train(model, run)
+    self.assertLess(losses[-1], losses[0] * 0.7)
+
+    with self.assertRaises(ValueError):  # a full fine-tune has its trainer to itself
+      model.create(new_id(), "tiny", 0, {})
+    with self.assertRaises(ValueError):
+      model.create(new_id(), "tiny", 4, LORA)
 
   def test_save_and_load_bring_back_weights_and_optimizer(self):
-    m, (a, b) = lora(2)
-    train(m, a, steps=3)
-    m.save(a, d:=tempfile.mkdtemp(), optimizer=True)
-    saved, opt = [p.detach().clone() for p in m.params[a]], copy.deepcopy(m.opts[a].state_dict())
-    train(m, a, steps=3)
-    m.load_weights(a, d, optimizer=True)
-    self.assertTrue(all(torch.equal(x, p) for x,p in zip(saved, m.params[a])))
-    torch.testing.assert_close(m.opts[a].state_dict()["state"], opt["state"])
-    m.load_weights(b, d, optimizer=False)  # a run can start from another run's checkpoint
-    self.assertTrue(all(torch.equal(x, p) for x,p in zip(saved, m.params[b])))
-    m.create(c:=rid(), "tiny", 4, {**LORA, "train_mlp": False})
-    with self.assertRaises(ValueError): m.load_weights(c, d, optimizer=False)
-    with self.assertRaises(ValueError): m.load_weights(a, tempfile.mkdtemp(), optimizer=False)
+    model, (a, b) = lora_runs(2)
+    train(model, a, steps=3)
+    path = tempfile.mkdtemp()
+    model.save(a, path, optimizer=True)
+    saved_weights = [p.detach().clone() for p in model.params[a]]
+    saved_optimizer = copy.deepcopy(model.optimizers[a].state_dict())
+
+    train(model, a, steps=3)
+    model.load_weights(a, path, optimizer=True)
+    self.assertTrue(same(saved_weights, model.params[a]))
+    torch.testing.assert_close(model.optimizers[a].state_dict()["state"], saved_optimizer["state"])
+
+    model.load_weights(b, path, optimizer=False)  # a run can start from another run's checkpoint
+    self.assertTrue(same(saved_weights, model.params[b]))
+
+  def test_loading_a_checkpoint_that_does_not_fit_fails(self):
+    model, (a,) = lora_runs()
+    path = tempfile.mkdtemp()
+    model.save(a, path, optimizer=False)
+
+    no_mlp = new_id()
+    model.create(no_mlp, "tiny", 4, {**LORA, "train_mlp": False})
+    with self.assertRaises(ValueError):
+      model.load_weights(no_mlp, path, optimizer=False)
+    with self.assertRaises(ValueError):
+      model.load_weights(a, path, optimizer=True)  # it was saved without the optimizer
+    with self.assertRaises(ValueError):
+      model.load_weights(a, tempfile.mkdtemp(), optimizer=False)
 
   def test_sampler_weights_are_a_peft_adapter(self):
-    m, (a,) = lora()
-    train(m, a, steps=3)
-    m.save(a, d:=tempfile.mkdtemp(), optimizer=False)
+    model, (a,) = lora_runs()
+    train(model, a, steps=3)
+    path = tempfile.mkdtemp()
+    model.save(a, path, optimizer=False)
+
     ids = torch.randint(0, 96, (2, 8))
-    with torch.no_grad(): torch.testing.assert_close(PeftModel.from_pretrained(tiny(), d).eval()(ids).logits, m.use(a).eval()(ids).logits)
+    with torch.no_grad():
+      want = model.use(a).eval()(ids).logits
+      got = PeftModel.from_pretrained(tiny(), path).eval()(ids).logits
+    torch.testing.assert_close(got, want)
 
   def test_mistakes_are_the_users(self):
-    m, (a,) = lora()
-    with self.assertRaises(KeyError): m.forward_backward(rid(), [datum(4)], "cross_entropy", {}, False)
-    with self.assertRaises(ValueError): m.forward_backward(a, [datum(4)], "dpo", {}, False)
-    with self.assertRaises(ValueError): m.create(rid(), "other", 4, LORA)
-    m.delete(a)
-    with self.assertRaises(KeyError): m.optim_step(a, {})
+    model, (a,) = lora_runs()
+    with self.assertRaises(KeyError):
+      model.forward_backward(new_id(), [counting(4)], "cross_entropy", {}, False)
+    with self.assertRaises(ValueError):
+      model.forward_backward(a, [counting(4)], "dpo", {}, False)
+    with self.assertRaises(ValueError):
+      model.create(new_id(), "other", 4, LORA)
+
+    model.delete(a)
+    with self.assertRaises(KeyError):
+      model.optim_step(a, {})
+
 
 class TestTrainer(RedisTest):
-  async def submit(self, run:str, *ops:tuple[str, dict|bytes]) -> list[str]:
-    return [await self.bus.submit(run, op, b if isinstance(b, bytes) else json.dumps(b).encode()) for op,b in ops]
+  async def submit(self, run: str, *cmds: tuple[str, dict | bytes]) -> list[str]:
+    request_ids = []
+    for op, body in cmds:
+      request_ids.append(await self.bus.submit(run, op, body if isinstance(body, bytes) else json.dumps(body).encode()))
+    return request_ids
 
   async def test_commands_flow_through_and_delete_drops_the_run(self):
-    await self.bus.create(Run(r:=rid(), "p", "tiny", 4))
-    rids = await self.submit(r, ("create_model", {"base_model": "tiny", "rank": 4, "lora": LORA}), ("forward_backward", b"junk"),
-                             ("optim_step", {"adam_params": {}}), ("delete_model", {}))
+    run = new_id()
+    await self.bus.create(Run(run, "p", "tiny", 4))
+    request_ids = await self.submit(
+      run,
+      ("create_model", {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      ("forward_backward", b"not protobuf"),
+      ("optim_step", {"adam_params": {}}),
+      ("delete_model", {}),
+    )
+
     t = Trainer(self.bus, "p", Model(tiny))
-    while await t.step(block=10): pass
-    reps = [await self.bus.result(x, 0) for x in rids]
-    self.assertEqual([x.ok for x in reps], [True, False, True, True])
-    self.assertEqual([json.loads(x.body).get("type") for x in reps], ["create_model", None, "optim_step", "delete_model"])
-    self.assertEqual(json.loads(reps[1].body)["category"], "user")
-    self.assertEqual(((await self.bus.run(r))["steps"], await self.bus.submit(r, "optim_step", b"{}"), t.done), (1, None, False))
+    while await t.step(block_ms=10):
+      pass
+
+    replies = [await self.bus.result(request_id, 0) for request_id in request_ids]
+    bodies = [json.loads(reply.body) for reply in replies]
+    self.assertEqual([reply.ok for reply in replies], [True, False, True, True])
+    self.assertEqual([body.get("type") for body in bodies], ["create_model", None, "optim_step", "delete_model"])
+    self.assertEqual(bodies[1]["category"], "user")
+
+    self.assertEqual((await self.bus.run(run))["steps"], 1)
+    self.assertIsNone(await self.bus.submit(run, "optim_step", b"{}"))  # deleted
+    self.assertFalse(t.done)  # a LoRA trainer keeps serving its pool
 
   async def test_a_new_trainer_fails_what_a_dead_one_left_in_flight(self):
-    await self.bus.create(Run(r:=rid(), "p", "tiny", 4))
-    [rq] = await self.submit(r, ("optim_step", {"adam_params": {}}))
-    await self.bus.take("p", "dead", block=10)
+    run = new_id()
+    await self.bus.create(Run(run, "p", "tiny", 4))
+    [request_id] = await self.submit(run, ("optim_step", {"adam_params": {}}))
+    await self.bus.take("p", "dead", block_ms=10)  # taken, and never answered
+
     t = Trainer(self.bus, "p", Model(tiny), worker="new")
-    t.done = True  # serve reclaims, then returns
+    t.done = True  # so serve() stops right after reclaiming
     await t.serve()
-    rep = await self.bus.result(rq, 1)
-    self.assertEqual((rep.ok, json.loads(rep.body)["category"], (await self.bus.queue(r))["in_flight"]), (False, "server", []))
+
+    reply = await self.bus.result(request_id, 1)
+    self.assertFalse(reply.ok)
+    self.assertEqual(json.loads(reply.body)["category"], "server")
+    self.assertEqual((await self.bus.queue(run))["in_flight"], [])
 
   async def test_a_full_fine_tune_trainer_exits_with_its_run(self):
-    await self.bus.create(Run(r:=rid(), r, "tiny", 0))
-    await self.submit(r, ("create_model", {"base_model": "tiny", "rank": 0, "lora": {}}), ("delete_model", {}))
-    await asyncio.wait_for((t:=Trainer(self.bus, r, Model(tiny))).serve(), 60)
-    self.assertEqual((t.done, await self.bus.runs(r)), (True, []))
+    run = new_id()
+    await self.bus.create(Run(run, run, "tiny", 0))
+    await self.submit(run, ("create_model", {"base_model": "tiny", "rank": 0, "lora": {}}), ("delete_model", {}))
+
+    t = Trainer(self.bus, run, Model(tiny))
+    await asyncio.wait_for(t.serve(), 60)
+    self.assertTrue(t.done)
+    self.assertEqual(await self.bus.runs(run), [])
+
 
 if __name__ == "__main__":
   unittest.main()

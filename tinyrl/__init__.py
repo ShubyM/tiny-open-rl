@@ -1,1 +1,1 @@
-from tinyrl.bus import Bus, Run, Cmd, Reply  # noqa: F401
+from tinyrl.bus import Bus, Cmd, Reply, Run  # noqa: F401
