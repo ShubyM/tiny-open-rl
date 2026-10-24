@@ -286,6 +286,7 @@ class TestTrainer(RedisTest):
     )
 
     t = Trainer(self.bus, "p", Model(tiny))
+    await self.own(t)
     while await t.step(block_ms=10):
       pass
 
@@ -334,6 +335,7 @@ class TestTrainer(RedisTest):
       tc = Trainer(self.bus, f"ctrl-{rank}", Model(tiny), store=store)
       t1 = Trainer(self.bus, f"p1-{rank}", Model(tiny), store=store)
       t2 = Trainer(self.bus, f"p2-{rank}", Model(tiny), store=store)
+      await asyncio.gather(self.own(tc), self.own(t1), self.own(t2))
 
       for r in (ctrl, r1):
         await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))

@@ -21,7 +21,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl import wire
-from tinyrl.bus import Bus, Cmd, Op, Reply
+from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.store import Store
 
@@ -29,6 +29,7 @@ TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward p
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
 CHUNK = getenv("CHUNK", 1024)  # positions per output head chunk when computing logprobs
 GRAD_CKPT = getenv("GRAD_CKPT", 1)  # gradient checkpointing
+STRANDED_MS = 5000  # a command in flight this long while its pool's owner has nothing in flight was stranded
 
 # ***** losses *****
 #
@@ -346,24 +347,50 @@ class Trainer:
     self.pool = pool
     self.model = model if model is not None else Model()
     self.store = store if store is not None else Store()
-    self.worker = worker or f"{socket.gethostname()}-{os.getpid()}"
+    self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.done = False
 
   async def serve(self) -> None:
-    # anything still in flight in the pool was taken by a trainer that died
-    for cmd in await self.bus.reclaim(self.pool, self.worker):
-      await self.bus.finish(cmd, fail(RuntimeError(f"its trainer died during {cmd.op}")))
+    await self.own()
+    renewing = asyncio.create_task(self.keep())
+    try:
+      await self.fail_stranded(0)  # anything in flight now was taken by a trainer that died or lost the pool
+      while not self.done:
+        await self.step()
+        await self.fail_stranded(STRANDED_MS)
+    finally:
+      renewing.cancel()
+      await self.bus.release(self.pool, self.worker)
 
+  async def own(self) -> None:
+    """Wait until this trainer owns its pool. Only the owner's replies land, see Bus.finish."""
+    while not await self.bus.own(self.pool, self.worker):
+      await asyncio.sleep(LEASE_MS / 4000)
+
+  async def keep(self) -> None:
+    """Renew the pool's lease until another trainer has it."""
     while not self.done:
-      await self.step()
+      await asyncio.sleep(LEASE_MS / 4000)
+      if not await self.bus.renew(self.pool, self.worker):
+        self.done = True
+        return
+
+  async def fail_stranded(self, min_idle_ms: int) -> None:
+    for cmd in await self.bus.reclaim(self.pool, self.worker, min_idle_ms):
+      reply = fail(RuntimeError(f"its trainer died, or lost the pool, during {cmd.op}"))
+      await self.bus.finish(cmd, reply, self.pool, self.worker)
 
   async def step(self, count: int = 16, block_ms: int = 1000) -> int:
     """Take the next commands from the pool and run them. Returns how many there were."""
+    if self.done:
+      return 0
     cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
     for cmd in cmds:
       start = time.perf_counter()
       reply = await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
-      await self.bus.finish(cmd, reply)
+      if not await self.bus.finish(cmd, reply, self.pool, self.worker):
+        self.done = True  # another trainer owns the pool now
+        break
 
       if cmd.op == Op.DELETE_MODEL and reply.ok:
         await self.bus.drop(cmd.run, self.pool)

@@ -19,7 +19,7 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path  # a P
 
 ```sh
 pip install -e .
-redis-server &                                  # Redis 7 or newer
+redis-server &                                  # Redis 8.4 or newer
 python -m tinyrl.gateway &                      # the Tinker HTTP API, on :8000
 python -m tinyrl.trainer lora:Qwen/Qwen3-0.6B   # trains every LoRA on Qwen3-0.6B
 ```
@@ -56,6 +56,7 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 * **Portable checkpoints.** Training checkpoints (`save_weights`) and sampler weights (`save_weights_for_sampler`) go through
   [store.py](tinyrl/store.py) behind `put(uri)` and `get(uri)` as pure `safetensors` (no `torch.save` pickle), so any trainer can
   resume a run with its exact fp32 weights and AdamW state.
+* **One owner per pool.** A trainer serves a pool only while it holds the pool's lease. A WATCH/MULTI/EXEC transaction on the lease key checks the lease before any reply lands.
 
 ## Reading the code
 
@@ -65,8 +66,8 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 294 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 160 | runs, sessions, commands and replies on Redis |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 318 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/bus.py](tinyrl/bus.py) | 181 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 152 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
 | [tinyrl/store.py](tinyrl/store.py) | 38 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
@@ -74,7 +75,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL` and `DEBUG=1`.
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS` and `DEBUG=1`.
 
 ## Throughput simulator
 
@@ -96,4 +97,4 @@ Every test runs against a real `redis-server` and a real (tiny, random) Llama. N
 * `create_training_client_from_state`.
 * Multi-GPU trainers (FSDP, context parallelism).
 * Running on Kubernetes: a scheduler that starts trainers for new pools, GPU time-slicing, and parking idle runs. The design is
-  in [docs/kubernetes.md](docs/kubernetes.md), and its first piece, one owner per pool, is on the `k8s-prototype` branch.
+  in [docs/kubernetes.md](docs/kubernetes.md).
