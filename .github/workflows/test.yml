@@ -1,0 +1,23 @@
+name: Tests
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install redis and dependencies
+      run: |
+        sudo apt-get update && sudo apt-get install -y redis-server
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[testing]" tinker
+    - name: Lint
+      run: ruff check .
+    - name: Line count
+      run: MAX_LINE_COUNT=400 python sz.py
+    - name: Test
+      run: TINKER_PYTHON=$(which python) python -m unittest discover -s test -t . -v
