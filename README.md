@@ -84,4 +84,6 @@ Every test runs against a real `redis-server` and a real (tiny, random) Llama. N
 
 * Sampling (`create_sampling_session`, `asample`). vLLM can already serve the adapters `save_weights_for_sampler` writes.
 * `create_training_client_from_state`.
-* Multi-GPU trainers (FSDP, context parallelism), GPU time-slicing, and a scheduler that starts trainers for new pools.
+* Multi-GPU trainers (FSDP, context parallelism).
+* Running on Kubernetes: a scheduler that starts trainers for new pools, GPU time-slicing, and parking idle runs. The design is
+  in [docs/kubernetes.md](docs/kubernetes.md), and its first piece, one owner per pool, is on the `k8s-prototype` branch.
