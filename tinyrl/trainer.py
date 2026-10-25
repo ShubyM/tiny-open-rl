@@ -6,7 +6,6 @@ It takes commands from its pool's streams on the bus, runs each one on the model
 from __future__ import annotations
 
 import asyncio
-import glob
 import json
 import math
 import os
@@ -16,20 +15,21 @@ import time
 from collections.abc import Callable
 
 import numpy as np
-import safetensors.torch
 import torch
-from peft import LoraConfig, set_peft_model_state_dict
+from peft import LoraConfig
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl import wire
 from tinyrl.bus import Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
+from tinyrl.store import Store
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
 CHUNK = getenv("CHUNK", 1024)  # positions per output head chunk when computing logprobs
 GRAD_CKPT = getenv("GRAD_CKPT", 1)  # gradient checkpointing
+MOMENTS = (".exp_avg", ".exp_avg_sq", ".step")
 
 # ***** losses *****
 #
@@ -171,8 +171,9 @@ def lora_targets(lm: PreTrainedModel, config: dict) -> list[str]:
 class Model:
   """A base model and the runs training on it: a LoRA adapter per run, or the whole model for one full fine-tune."""
 
-  def __init__(self, load: Callable[[str], PreTrainedModel] = load):
+  def __init__(self, load: Callable[[str], PreTrainedModel] = load, store: Store | None = None):
     self.load = load
+    self.store = store if store is not None else Store()
     self.lm: PreTrainedModel | None = None
     self.base = ""
     self.lora = True
@@ -269,33 +270,57 @@ class Model:
     optimizer.zero_grad()
     return {"grad_norm:mean": grad_norm}
 
-  def save(self, run: str, path: str, optimizer: bool) -> None:
-    # a LoRA run saves its adapter in PEFT format and a full fine-tune the whole model, either way what vLLM loads
-    self.use(run).save_pretrained(path)
-    if optimizer:
-      torch.save(self.optimizer(run).state_dict(), f"{path}/optimizer.pt")
+  def named_params(self, run: str) -> dict[str, torch.nn.Parameter]:
+    self.use(run)
+    if not self.lora:
+      return dict(self.lm.named_parameters())
+    return {
+      f"base_model.model.{n.replace(f'.{run}.', '.')}": p for n, p in self.lm.named_parameters() if f".{run}." in n
+    }
+
+  def weights(self, run: str) -> dict[str, torch.Tensor]:
+    """The run's weights in the dtype a sampler serves: bf16 on a GPU, fp32 on the CPU."""
+    params = self.named_params(run)
+    dtype = torch.bfloat16 if self.lm.device.type == "cuda" else torch.float32
+    return {name: p.detach().to(dtype) for name, p in params.items()}
+
+  def state(self, run: str) -> dict[str, torch.Tensor]:
+    """Everything a trainer needs to resume the run anywhere: fp32 master weights and AdamW moments."""
+    params, opt = self.named_params(run), self.optimizers.get(run)
+    tensors = {name: p.detach() for name, p in params.items()}
+    if opt and opt.state:
+      for name, p in params.items():
+        for k in MOMENTS:
+          tensors[name + k] = opt.state[p][k[1:]].detach()
+    return tensors
+
+  def save(self, run: str, path: str, optimizer: bool, *, durable: bool = True) -> None:
+    tensors = self.state(run) if optimizer else self.weights(run)
+    if durable:
+      (self.lm.peft_config[run] if self.lora else self.lm.config).save_pretrained(path)
+    disk = f"{path}/{'adapter_model' if self.lora else 'model'}.safetensors" if durable else ""
+    self.store.put(path, tensors, {"optimizer": "1"} if optimizer else {}, disk)
 
   def load_weights(self, run: str, path: str, optimizer: bool) -> None:
-    lm = self.use(run)
-    state = {}
-    for file in glob.glob(f"{path}/*.safetensors"):
-      for name, tensor in safetensors.torch.load_file(file).items():
-        state[name.removeprefix("base_model.model.")] = tensor  # PEFT saves adapter weights under this prefix
-    if not state:
+    params = self.named_params(run)
+    tensors, meta = self.store.get(path)
+    weights = {k: v for k, v in tensors.items() if not k.endswith(MOMENTS)}
+    if not weights:
       raise ValueError(f"no weights at {path}")
-    if optimizer and not os.path.exists(f"{path}/optimizer.pt"):
+    if {k: v.shape for k, v in weights.items()} != {k: p.shape for k, p in params.items()}:
+      raise ValueError(f"{path} does not fit this model")
+    if optimizer and meta.get("optimizer") != "1":
       raise ValueError(f"no optimizer state at {path}")
 
-    if self.lora:
-      result = set_peft_model_state_dict(lm, state, adapter_name=run)
-    else:
-      result = lm.load_state_dict(state, strict=False)  # not strict: a tied output head isn't saved
-    if result.unexpected_keys:
-      raise ValueError(f"{path} does not fit this model: {', '.join(result.unexpected_keys[:3])}")
-
+    with torch.no_grad():
+      for name, p in params.items():
+        p.copy_(weights[name])
     self.optimizers.pop(run, None)
     if optimizer:
-      self.optimizer(run).load_state_dict(torch.load(f"{path}/optimizer.pt", map_location="cpu"))
+      opt = self.optimizer(run)
+      for name, p in params.items():
+        if f"{name}.step" in tensors:
+          opt.state[p] = {k[1:]: tensors[name + k].to(p.device if k != ".step" else "cpu", p.dtype) for k in MOMENTS}
 
   def delete(self, run: str) -> None:
     lm = self.use(run)
