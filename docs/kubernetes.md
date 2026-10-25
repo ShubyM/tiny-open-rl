@@ -1,6 +1,6 @@
 # tinyrl on Kubernetes
 
-**Status: design.** The first piece, one owner per pool, is built and tested on the
+**Status.** Portable checkpoints are built. One owner per pool is prototyped on the
 [`k8s-prototype`](https://github.com/ShubyM/tiny-open-rl/tree/k8s-prototype) branch. Nothing else here exists yet.
 
 Today you start a trainer for each pool by hand: `python -m tinyrl.trainer <pool>`. Nothing starts trainers for new pools,

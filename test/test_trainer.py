@@ -12,8 +12,10 @@ from peft import PeftModel
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from test.helpers import RedisTest, new_id, tiny
+from test.test_api import proto_body
 from tinyrl import trainer, wire
 from tinyrl.bus import Op, Run
+from tinyrl.store import Store
 from tinyrl.trainer import LOSSES, Model, Trainer, batches, target_logprobs, token_budget
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
@@ -41,8 +43,10 @@ def lora_runs(n: int = 1) -> tuple[Model, list[str]]:
   return model, runs
 
 
-def same(a: list[torch.Tensor], b: list[torch.Tensor]) -> bool:
-  return all(torch.equal(x, y) for x, y in zip(a, b))
+def same(a, b) -> bool:
+  av = a.values() if isinstance(a, dict) else a
+  bv = b.values() if isinstance(b, dict) else b
+  return all(torch.equal(x, y) for x, y in zip(av, bv))
 
 
 class TestForwardPass(unittest.TestCase):
@@ -111,7 +115,7 @@ class TestModel(unittest.TestCase):
   def test_lora_runs_share_a_frozen_base_and_train_apart(self):
     model, (a, b) = lora_runs(2)
     base = {name: p.detach().clone() for name, p in model.lm.named_parameters() if "lora" not in name}
-    b_before = [p.detach().clone() for p in model.params[b]]
+    b_before = [p.detach().clone() for p in model.params[b].values()]
 
     losses = train(model, a)
     self.assertLess(losses[-1], losses[0] * 0.7)
@@ -122,16 +126,16 @@ class TestModel(unittest.TestCase):
     model, (a, b) = lora_runs(2)
     model.forward_backward(a, [counting(8)], "cross_entropy", {}, False)
     model.forward_backward(b, [counting(8, start=5)], "cross_entropy", {}, False)
-    b_grads = [p.grad.clone() for p in model.params[b]]
+    b_grads = [p.grad.clone() for p in model.params[b].values()]
 
     model.optim_step(a, {"learning_rate": 1e-2})
-    self.assertTrue(all(p.grad is None for p in model.params[a]))
-    self.assertTrue(same(b_grads, [p.grad for p in model.params[b]]))
+    self.assertTrue(all(p.grad is None for p in model.params[a].values()))
+    self.assertTrue(same(b_grads, [p.grad for p in model.params[b].values()]))
 
   def test_forward_only_leaves_no_gradient(self):
     model, (a,) = lora_runs()
     logprobs, metrics = model.forward_backward(a, [counting(8), counting(5)], "cross_entropy", {}, True)
-    self.assertTrue(all(p.grad is None for p in model.params[a]))
+    self.assertTrue(all(p.grad is None for p in model.params[a].values()))
     self.assertEqual([lp.shape for lp in logprobs], [(8,), (5,)])
     self.assertAlmostEqual(metrics["loss:sum"], -sum(float(lp.sum()) for lp in logprobs), places=4)
 
@@ -160,7 +164,7 @@ class TestModel(unittest.TestCase):
     with self.assertRaises(ValueError):
       model.create(new_id(), "tiny", 4, LORA)
 
-  def test_the_optimizer_updates_fp32_master_weights(self):
+  def test_the_optimizer_updates_fp32_master_weights_and_casts_sampler_weights_to_bf16(self):
     def bf16(name: str) -> LlamaForCausalLM:  # how a base model loads on the gpu
       return tiny(name).to(torch.bfloat16)
 
@@ -168,54 +172,86 @@ class TestModel(unittest.TestCase):
       model, run = Model(bf16), new_id()
       model.create(run, "tiny", rank, {"seed": 0})
       model.forward_backward(run, [counting(12)], "cross_entropy", {}, False)
-      grads = [p.grad for p in model.params[run]]
+      grads = [p.grad for p in model.params[run].values()]
       model.optim_step(run, {"learning_rate": 1e-2})
       moments = [m for state in model.optimizers[run].state.values() for m in (state["exp_avg"], state["exp_avg_sq"])]
-      self.assertEqual({t.dtype for t in model.params[run] + grads + moments}, {torch.float32}, f"rank {rank}")
+      self.assertEqual(
+        {t.dtype for t in [*model.params[run].values(), *grads, *moments]}, {torch.float32}, f"rank {rank}"
+      )
+      self.assertEqual({t.dtype for t in model.weights(run)[0].values()}, {torch.bfloat16}, f"rank {rank}")
       if rank:  # a LoRA run's base model is frozen, so it stays bf16
         self.assertEqual(model.lm.get_input_embeddings().weight.dtype, torch.bfloat16)
 
+  def test_a_run_restored_from_its_checkpoint_trains_on_exactly_as_before(self):
+    store = Store(root=tempfile.mkdtemp())
+    for rank in (0, 4):
+      model, run = Model(tiny), new_id()
+      model.create(run, "tiny", rank, LORA)
+      train(model, run, steps=3)
+      uri = f"tinker://{run}/weights/step-3"
+      store.put(uri, *model.state(run))
+
+      restored = Model(tiny)  # a new trainer, say on another node
+      restored.create(run, "tiny", rank, LORA)
+      restored.restore(run, *store.get(uri), optimizer=True)
+
+      self.assertEqual(train(model, run, steps=3), train(restored, run, steps=3), f"rank {rank}")
+      self.assertTrue(same(model.params[run].values(), restored.params[run].values()), f"rank {rank}")
+
   def test_save_and_load_bring_back_weights_and_optimizer(self):
+    store = Store(root=tempfile.mkdtemp())
     model, (a, b) = lora_runs(2)
     train(model, a, steps=3)
-    path = tempfile.mkdtemp()
-    model.save(a, path, optimizer=True)
-    saved_weights = [p.detach().clone() for p in model.params[a]]
+    uri = f"tinker://{a}/weights/step-3"
+    store.put(uri, *model.state(a))
+    saved_weights = [p.detach().clone() for p in model.params[a].values()]
     saved_optimizer = copy.deepcopy(model.optimizers[a].state_dict())
 
     train(model, a, steps=3)
-    model.load_weights(a, path, optimizer=True)
+    model.restore(a, *store.get(uri), optimizer=True)
     self.assertTrue(same(saved_weights, model.params[a]))
     torch.testing.assert_close(model.optimizers[a].state_dict()["state"], saved_optimizer["state"])
 
-    model.load_weights(b, path, optimizer=False)  # a run can start from another run's checkpoint
+    model.restore(b, *store.get(uri), optimizer=False)  # a run can start from another run's checkpoint
     self.assertTrue(same(saved_weights, model.params[b]))
 
   def test_loading_a_checkpoint_that_does_not_fit_fails(self):
+    store = Store(root=tempfile.mkdtemp())
     model, (a,) = lora_runs()
-    path = tempfile.mkdtemp()
-    model.save(a, path, optimizer=False)
+    uri = f"tinker://{a}/sampler_weights/step-0"
+    store.put(uri, *model.weights(a))
 
     no_mlp = new_id()
     model.create(no_mlp, "tiny", 4, {**LORA, "train_mlp": False})
     with self.assertRaises(ValueError):
-      model.load_weights(no_mlp, path, optimizer=False)
+      model.restore(no_mlp, *store.get(uri), optimizer=False)
     with self.assertRaises(ValueError):
-      model.load_weights(a, path, optimizer=True)  # it was saved without the optimizer
+      model.restore(a, *store.get(uri), optimizer=True)  # it was saved without the optimizer
     with self.assertRaises(ValueError):
-      model.load_weights(a, tempfile.mkdtemp(), optimizer=False)
+      store.get(f"tinker://{a}/weights/missing")
 
-  def test_sampler_weights_are_a_peft_adapter(self):
-    model, (a,) = lora_runs()
-    train(model, a, steps=3)
-    path = tempfile.mkdtemp()
-    model.save(a, path, optimizer=False)
-
+  def test_sampler_weights_load_in_peft_and_transformers(self):
+    store = Store(root=tempfile.mkdtemp())
     ids = torch.randint(0, 96, (2, 8))
+
+    model, (lora_run,) = lora_runs()
+    train(model, lora_run, steps=3)
+    lora_dir = store.put(f"tinker://{lora_run}/sampler_weights/final", *model.weights(lora_run))
     with torch.no_grad():
-      want = model.use(a).eval()(ids).logits
-      got = PeftModel.from_pretrained(tiny(), path).eval()(ids).logits
-    torch.testing.assert_close(got, want)
+      torch.testing.assert_close(
+        PeftModel.from_pretrained(tiny(), lora_dir).eval()(ids).logits,
+        model.use(lora_run).eval()(ids).logits,
+      )
+
+    fft, fft_run = Model(tiny), new_id()
+    fft.create(fft_run, "tiny", 0, {})
+    train(fft, fft_run, steps=3)
+    fft_dir = store.put(f"tinker://{fft_run}/sampler_weights/final", *fft.weights(fft_run))
+    with torch.no_grad():
+      torch.testing.assert_close(
+        LlamaForCausalLM.from_pretrained(fft_dir).eval()(ids).logits,
+        fft.use(fft_run).eval()(ids).logits,
+      )
 
   def test_mistakes_are_the_users(self):
     model, (a,) = lora_runs()
@@ -287,6 +323,51 @@ class TestTrainer(RedisTest):
     await asyncio.wait_for(t.serve(), 60)
     self.assertTrue(t.done)
     self.assertEqual(await self.bus.runs(run), [])
+
+  async def test_a_run_moves_between_trainers_through_the_store(self):
+    store = Store(root=tempfile.mkdtemp())
+    for rank, lora in ((4, LORA), (0, {})):
+      ctrl, r1, r2 = new_id(), new_id(), new_id()
+      for r, pool in ((ctrl, f"ctrl-{rank}"), (r1, f"p1-{rank}"), (r2, f"p2-{rank}")):
+        await self.bus.create(Run(r, pool, "tiny", rank))
+
+      tc = Trainer(self.bus, f"ctrl-{rank}", Model(tiny), store=store)
+      t1 = Trainer(self.bus, f"p1-{rank}", Model(tiny), store=store)
+      t2 = Trainer(self.bus, f"p2-{rank}", Model(tiny), store=store)
+
+      for r in (ctrl, r1):
+        await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))
+
+      async def step_run(tr: Trainer, r: str) -> float:
+        fb, _ = await self.submit(
+          r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})
+        )
+        while await tr.step(block_ms=10):
+          pass
+        return wire.output_json((await self.bus.result(fb, 1)).body)["metrics"]["loss:sum"]
+
+      losses_ctrl = [await step_run(tc, ctrl) for _ in range(2)]
+      losses_moved = [await step_run(t1, r1) for _ in range(2)]
+
+      # save + delete on trainer 1, then create + load(optimizer=True) on trainer 2
+      uri = f"tinker://{r1}/weights/handoff"
+      await self.submit(r1, (Op.SAVE_WEIGHTS, {"uri": uri}), (Op.DELETE_MODEL, {}))
+      while await t1.step(block_ms=10):
+        pass
+      await self.submit(
+        r2,
+        (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}),
+        (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": True}),
+      )
+      while await t2.step(block_ms=10):
+        pass
+
+      for _ in range(3):
+        losses_ctrl.append(await step_run(tc, ctrl))
+        losses_moved.append(await step_run(t2, r2))
+
+      self.assertEqual(losses_moved, losses_ctrl, f"rank {rank}")
+      self.assertTrue(same(tc.model.params[ctrl], t2.model.params[r2]), f"rank {rank}")
 
 
 if __name__ == "__main__":
