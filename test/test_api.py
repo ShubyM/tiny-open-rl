@@ -53,6 +53,7 @@ class TestAPI(RedisTest):
     pool = (await self.bus.run(run_id))["pool"]
     if pool not in self.trainers:
       self.trainers[pool] = Trainer(self.bus, pool, Model(tiny), store=self.store)
+      await self.own(self.trainers[pool])
     while await self.trainers[pool].step(block_ms=10):
       pass
 
@@ -208,6 +209,7 @@ class TestAPI(RedisTest):
           return tiny(name).to(torch.bfloat16)
 
         self.trainers[pool] = Trainer(self.bus, pool, Model(bf16), store=self.store)
+        await self.own(self.trainers[pool])
       while await self.trainers[pool].step(block_ms=10):
         pass
 

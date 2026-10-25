@@ -1,3 +1,4 @@
+import asyncio
 import os
 import subprocess
 import tempfile
@@ -60,8 +61,16 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
       cls.proc.terminate()
 
   async def asyncSetUp(self):
+    self.renewal_tasks = []
     self.bus = Bus(connect(self.url))
     await self.bus.r.flushall()
 
+  async def own(self, trainer):
+    """Renew the lease as Trainer.serve does."""
+    await trainer.own()
+    self.renewal_tasks.append(asyncio.create_task(trainer.keep()))
+
   async def asyncTearDown(self):
+    for task in self.renewal_tasks:
+      task.cancel()
     await self.bus.r.aclose()

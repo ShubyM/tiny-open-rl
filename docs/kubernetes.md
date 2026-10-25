@@ -1,7 +1,6 @@
 # tinyrl on Kubernetes
 
-**Status.** Portable checkpoints are built. One owner per pool is prototyped on the
-[`k8s-prototype`](https://github.com/ShubyM/tiny-open-rl/tree/k8s-prototype) branch. Nothing else here exists yet.
+**Status.** Portable checkpoints and one owner per pool are built. Nothing else here exists yet.
 
 Today you start a trainer for each pool by hand: `python -m tinyrl.trainer <pool>`. Nothing starts trainers for new pools,
 sizes them, puts them on GPUs, shares a GPU between them, grows them when they're busy, moves them off a dying Spot node,
@@ -47,7 +46,7 @@ flowchart LR
   `nvidia.com/gpu` requests, sized to the pools that need them (1, 2, 4 or 8 GPUs). An agent starts a process for each
   pool or sampler placed on it and decides which of them are resident on its GPUs.
 - **A pool has one owner.** A trainer serves a pool only while it holds the pool's lease in Redis. Every reply, checkpoint
-  `ref` pointer, and run handoff is committed by a Lua script that checks the lease first.
+  `ref` pointer, and run handoff is committed in a WATCH/MULTI/EXEC transaction on the lease key.
 
 ## What runs where
 
@@ -83,7 +82,7 @@ Everything [bus.py](../tinyrl/bus.py) has today stays. What's new, and who write
 | `tinyrl:load:<pool>` | hash `{gpu_bytes, host_bytes, busy, wait}`: measured | the pool's trainer | scheduler, agent |
 
 A run's membership has one writer at a time, and the writer changes hands with the run. The scheduler can only put a run
-into a pool while it's in none (checked in the same script that writes it), and only the trainer holding a run can take
+into a pool while it's in none (checked in the same WATCH/MULTI/EXEC transaction that writes it), and only the trainer holding a run can take
 it out, under that pool's lease. So two parties never both think they own a run.
 
 ## A run's life
@@ -160,7 +159,7 @@ class Store:
 ```
 
 Because `ref` is write-once, readers never see torn or overwritten files, and a paused trainer whose lease expired can call
-`put` without harming anything—its `Bus.finish` Lua check rejects publishing `ref` to `tinyrl:ckpt:<run>`. Every `put` and
+`put` without harming anything—its `Bus.finish` transaction rejects publishing `ref` to `tinyrl:ckpt:<run>`. Every `put` and
 `get` moves through up to three tiers behind that interface:
 
 1. **Tier 1 — GPU ↔ `/dev/shm` on the agent (~50 GB/s pinned D2H/H2D per GPU on PCIe Gen5).**
@@ -233,7 +232,7 @@ waits for every other's `forward_backward`. Ten GPUs serving one run each is the
 
 **Releasing a run** is one operation across growing, shrinking, migrating, idling and draining. Between batches, so nothing
 of the run is in flight, the trainer calls `ref = store.put(state(run), durable=True)`, frees the run from GPU memory, and
-in one Lua script—checked against its pool's lease—moves the run from its pool to the target (or to `""`), sets
+in one WATCH/MULTI/EXEC transaction on the lease key moves the run from its pool to the target (or to `""`), sets
 `parked = ref`, and clears `release_to`. Commands that arrive meanwhile wait in the run's stream. The target pool's trainer
 sees the run in its pool, pulls `ref` via `store.get`, restores the tensors, clears `parked`, and calls `store.drop(ref)`.
 
@@ -343,32 +342,24 @@ from then on.
 
 ## One owner per pool
 
-Two trainers serving one pool would split its runs' commands between two copies of the model, and a paused trainer waking
-up late must neither answer a client nor overwrite a checkpoint or `parked` pointer. Three pieces on `k8s-prototype` (57
-lines in `bus.py` and `trainer.py`) plus immutable `Store` `ref`s enforce that:
+Two trainers serving one pool would split its runs' commands between two copies of the model, and a paused trainer
+waking up late must neither answer a client nor overwrite a checkpoint or `parked` pointer. Three pieces in `bus.py`
+and `trainer.py` plus immutable `Store` `ref`s enforce that:
 
 1. **The lease.** A trainer serves a pool only after `SET tinyrl:owner:<pool> <worker> NX PX 10000` succeeds. It renews
-   every 2.5 s from the event loop while commands run in a thread. If renewal fails—or more than half a lease (5 s) passes
-   on the monotonic clock since the last renewal—the trainer stops before reading or running another command.
+   every 2.5 s with `SET ... IFEQ <worker>` from the event loop while commands run in a thread. If a renewal fails, the
+   trainer stops before reading or running another command.
 2. **The fenced finish and handoff.** `Bus.finish` writes the reply, acknowledges the command, updates counters, and (for
-   `save_weights*`) publishes `ref` into `tinyrl:ckpt:<run>` in one Lua script that first checks the lease is still the
-   caller's. Releasing a run (`parked = ref`) goes through the same lease check.
+   `save_weights*`) publishes `ref` into `tinyrl:ckpt:<run>` in one WATCH/MULTI/EXEC transaction on the lease key.
+   Releasing a run (`parked = ref`) goes through the same lease check.
 
-   ```lua
-   if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-     return 0
-   end
-   redis.call('XADD', KEYS[2], 'MAXLEN', '=', 1, '*', 'ok', ARGV[3], 'content_type', ARGV[4], 'body', ARGV[5])
-   redis.call('EXPIRE', KEYS[2], ARGV[6])
-   redis.call('XACK', KEYS[3], ARGV[8], ARGV[2])
-   redis.call('XDEL', KEYS[3], ARGV[2])
-   if ARGV[7] ~= '' then
-     redis.call('HINCRBY', KEYS[4], ARGV[7], 1)
-   end
-   if ARGV[9] ~= '' then
-     redis.call('HSET', KEYS[5], ARGV[9], ARGV[10])
-   end
-   return 1
+   ```python
+   async with self.r.pipeline(transaction=True) as p:
+     await p.watch(lease_key)
+     if await p.get(lease_key) == worker.encode():
+       p.multi()
+       # write reply, ack, update counters
+       await p.execute()
    ```
 
 3. **The stranded sweep.** Between batches, when the owner has nothing in flight itself, it `XAUTOCLAIM`s anything in its
@@ -383,7 +374,7 @@ over subsequent steps.
 | Failure | What happens | What's lost |
 |---|---|---|
 | a trainer dies mid-`optim_step` | lease expires within 10 s; agent starts a new trainer, which claims and fails the command | uncheckpointed in-memory steps of active runs in that pool; runs parked in `Store` (`durable=True`) lose nothing |
-| a trainer dies while releasing a run | before the release script: run stays in the old pool as above (orphan `ref` is swept); after: `parked = ref` is set and the new pool loads it | as above, or nothing |
+| a trainer dies while releasing a run | before the release transaction: run stays in the old pool as above (orphan `ref` is swept); after: `parked = ref` is set and the new pool loads it | as above, or nothing |
 | source agent dies while a peer pulls `<ref>` from `/dev/shm` | `store.get` catches the connection error and falls back to durable storage (`CKPT` / GCS) | nothing once flushed; if the source node died before a background flush completed, same as sudden node death |
 | a Spot VM gets a 30 s preemption notice | agent marks `draining=1`; trainers dump active runs (`durable=True`) after their current batch and release them | nothing when current batch + flush completes within 30 s |
 | a node dies suddenly | agent heartbeat expires in 30 s; scheduler places its pools elsewhere | same as a trainer dying |
@@ -449,7 +440,7 @@ Kubernetes only for GPU pods.
 | Sharing a GPU | host-network time-slicer DaemonSet; pods `ACQUIRE`/`RELEASE` around batches, one resident per claim | the agent, over stdin; placements stay co-resident when they fit, least recently served when they don't |
 | Getting state off GPU | two ways: privileged host-PID `cuda-checkpoint` DaemonSet + custom FFT sleep/wake | one: `store.put` and `store.get`, used for time-slicing, sampler sync, resizing, Spot drain and checkpoints |
 | LoRA workers | exclusive: always resident, never share a GPU | park and migrate through `Store` like any other pool |
-| One owner & fencing | cooperative agreement across CRD status, ledger seat, assignment ID and env vars; NFS writes unfenced | Redis lease per pool; Lua script fences every reply, checkpoint `ref` publish, and run handoff |
+| One owner & fencing | cooperative agreement across CRD status, ledger seat, assignment ID and env vars; NFS writes unfenced | Redis lease per pool; WATCH transaction fences every reply, checkpoint `ref` publish, and run handoff |
 | Queues | Redis lists (`LPOP`), separate in-flight tracking | Redis streams (`XPENDING` + `XAUTOCLAIM`) |
 | Sizing | hardcoded parameter/KV tables per model name (unknown → Qwen3-8B) | exact `meta`-device parameter count from `AutoConfig`, then live measurement |
 | Privileges | 2 CRDs, ClusterRole, DRA driver, host-network + privileged host-PID DaemonSets | 1 namespaced Role over Pods |

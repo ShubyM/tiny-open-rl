@@ -12,6 +12,10 @@ def ok(**body) -> Reply:
 
 
 class TestBus(RedisTest):
+  async def asyncSetUp(self):
+    await super().asyncSetUp()
+    await self.bus.own("p", "w0")  # only a pool's owner can answer for it
+
   async def new_run(self, pool: str = "p", session: str = "") -> str:
     run_id = new_id()
     await self.bus.create(Run(run_id, pool, "base", 8, session))
@@ -25,7 +29,7 @@ class TestBus(RedisTest):
     self.assertEqual((cmd.run, cmd.op, cmd.body, cmd.request_id), (run_id, Op.OPTIM_STEP, b'{"lr": 1}', request_id))
     self.assertIsNone(await self.bus.result(request_id, 0))
 
-    await self.bus.finish(cmd, ok(type="optim_step"))
+    await self.bus.finish(cmd, ok(type="optim_step"), "p", "w0")
     self.assertEqual(await self.bus.result(request_id, 0), ok(type="optim_step"))
     self.assertEqual(await self.bus.take("p", "w0", block_ms=10), [])
 
@@ -40,7 +44,7 @@ class TestBus(RedisTest):
     waiters = [asyncio.create_task(self.bus.result(request_id, 5)) for _ in range(3)]
     await asyncio.sleep(0.05)
     start = time.perf_counter()
-    await self.bus.finish(cmd, ok(n=1))
+    await self.bus.finish(cmd, ok(n=1), "p", "w0")
 
     self.assertEqual(await asyncio.gather(*waiters), [ok(n=1)] * 3)
     self.assertLess(time.perf_counter() - start, 0.5)
@@ -53,7 +57,7 @@ class TestBus(RedisTest):
 
     async def answer_late():
       await asyncio.sleep(5.5)  # past redis-py's default socket timeout, but well inside retrieve_future's 30s
-      await self.bus.finish(cmd, ok(n=1))
+      await self.bus.finish(cmd, ok(n=1), "p", "w0")
 
     answering = asyncio.create_task(answer_late())
     self.assertEqual(await self.bus.result(request_id, 10), ok(n=1))
@@ -82,7 +86,7 @@ class TestBus(RedisTest):
       (in_flight["request_id"], in_flight["trainer"], in_flight["deliveries"]), (request_ids[0], "w0", 1)
     )
 
-    await self.bus.finish(cmd, ok())
+    await self.bus.finish(cmd, ok(), "p", "w0")
     self.assertEqual(await self.bus.queue(run_id), {"live": True, "queued": 2, "in_flight": []})
 
   async def test_a_new_trainer_reclaims_what_a_dead_one_took(self):
@@ -110,10 +114,28 @@ class TestBus(RedisTest):
     run_id = await self.new_run()
     await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
     [cmd] = await self.bus.take("p", "w0", block_ms=10)
-    await self.bus.finish(cmd, Reply(False, "application/json", b'{"error": "x"}'))
+    await self.bus.finish(cmd, Reply(False, "application/json", b'{"error": "x"}'), "p", "w0")
 
     run = await self.bus.run(run_id)
     self.assertEqual((run["steps"], run["failed"]), (0, 1))
+
+  async def test_only_the_pools_owner_can_answer_for_it(self):
+    run_id = await self.new_run()
+    request_id = await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
+    [cmd] = await self.bus.take("p", "w0", block_ms=10)
+
+    self.assertFalse(await self.bus.own("p", "zombie"))  # w0 holds the lease
+    self.assertFalse(await self.bus.renew("p", "zombie"))
+    self.assertFalse(await self.bus.finish(cmd, ok(by="zombie"), "p", "zombie"))
+    self.assertIsNone(await self.bus.result(request_id, 0))
+
+    self.assertTrue(await self.bus.finish(cmd, ok(by="w0"), "p", "w0"))
+    self.assertEqual(await self.bus.result(request_id, 0), ok(by="w0"))
+
+    await self.bus.release("p", "zombie")  # not its lease, so this does nothing
+    self.assertTrue(await self.bus.renew("p", "w0"))
+    await self.bus.release("p", "w0")
+    self.assertTrue(await self.bus.own("p", "next"))
 
   async def test_sessions(self):
     await self.bus.session("s")
