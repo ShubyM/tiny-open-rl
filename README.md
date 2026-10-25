@@ -71,6 +71,11 @@ to see how each Tinker call becomes a command, and [trainer.py](tinyrl/trainer.p
 checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL` and `DEBUG=1`.
 
+## Throughput simulator
+
+The [interactive simulator](simulator/README.md) explores GPU switching, arrival rates, queue growth, and data-transfer bottlenecks.
+Open `simulator/index.html` in a browser; it runs locally without installing dependencies.
+
 ## Test
 
 ```sh
