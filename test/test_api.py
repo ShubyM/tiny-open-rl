@@ -228,6 +228,74 @@ class TestAPI(RedisTest):
         tensor_count += 1
     self.assertGreater(tensor_count, 0, "No tensors found in sampler safetensors")
 
+  async def test_a_retried_call_runs_once_and_returns_the_first_reply(self):
+    run_id = await self.create_model()
+    pb1 = pb.ForwardBackwardRequest.FromString(proto_body(run_id))
+    pb1.seq_id = 1
+    req1 = pb1.SerializeToString()
+
+    r1 = await self.post("forward_backward", content=req1, headers=PROTO)
+    r2 = await self.post("forward_backward", content=req1, headers=PROTO)
+
+    r3 = await self.post("optim_step", json={"model_id": run_id, "adam_params": {}, "seq_id": 2})
+    r4 = await self.post("optim_step", json={"model_id": run_id, "adam_params": {}, "seq_id": 2})
+
+    await self.drain(run_id)
+
+    out1 = await self.result(r1)
+    out2 = await self.result(r2)
+    self.assertEqual(out1.content, out2.content)
+
+    out3 = await self.result(r3)
+    out4 = await self.result(r4)
+    self.assertEqual(out3.content, out4.content)
+
+    run = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
+    self.assertEqual(run["steps"], 1)
+
+  async def test_a_save_never_takes_another_calls_reply(self):
+    run_id = await self.create_model()
+    pb1 = pb.ForwardBackwardRequest.FromString(proto_body(run_id))
+    pb1.seq_id = 1
+    r1 = await self.post("forward_backward", content=pb1.SerializeToString(), headers=PROTO)
+
+    save = {"model_id": run_id, "sampling_session_seq_id": 1, "seq_id": 2}
+    r2 = await self.post("save_weights_for_sampler", json=save)
+
+    await self.drain(run_id)
+
+    out1 = (await self.result(r1)).json()
+    out2 = (await self.result(r2)).json()
+    self.assertEqual(out1["type"], "forward_backward")
+    self.assertEqual(out2["type"], "save_weights_for_sampler")
+    self.assertIn("path", out2)
+
+  async def test_chunks_of_one_call_run_even_out_of_order(self):
+    run_id = await self.create_model()
+    pb1 = pb.ForwardBackwardRequest.FromString(proto_body(run_id))
+    pb1.seq_id = 2
+    res2 = await self.post("forward_backward", content=pb1.SerializeToString(), headers=PROTO)
+    r2 = res2.json()
+
+    pb1.seq_id = 1
+    res1 = await self.post("forward_backward", content=pb1.SerializeToString(), headers=PROTO)
+    r1 = res1.json()
+    self.assertNotEqual(r1["request_id"], r2["request_id"])
+
+    out1 = (await self.result(res1)).json()
+    out2 = (await self.result(res2)).json()
+    self.assertEqual(out1["type"], "forward_backward")
+    self.assertEqual(out2["type"], "forward_backward")
+
+  async def test_a_call_on_a_deleted_run_is_a_404_with_or_without_a_seq_id(self):
+    run_id = await self.create_model()
+    await self.post("delete_model", json={"model_id": run_id, "seq_id": 1})
+    await self.drain(run_id)
+
+    res = await self.post("optim_step", json={"model_id": run_id, "seq_id": 2})
+    self.assertEqual(res.status_code, 404)
+    self.assertEqual((await self.post("optim_step", json={"model_id": run_id})).status_code, 404)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -64,6 +64,7 @@ class Cmd:
   entry_id: str
   op: Op
   body: bytes
+  seq: int | None = None
 
   @property
   def request_id(self) -> str:
@@ -78,7 +79,8 @@ class Reply:
 
 
 def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
-  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"])
+  seq = int(fields[b"seq"]) if b"seq" in fields else None
+  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"], seq=seq)
 
 
 def connect(url: str) -> redis.Redis:
@@ -154,10 +156,13 @@ class Bus:
 
   # ***** commands *****
 
-  async def submit(self, run_id: str, op: Op, body: bytes) -> str | None:
+  async def submit(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
     """Queue a command on a run's stream. Returns its request id, or None if there is no such run."""
     # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
-    entry_id = await self.r.xadd(key("q", run_id), {"op": op, "body": body}, nomkstream=True)
+    fields = {"op": op, "body": body}
+    if seq_id is not None:
+      fields["seq"] = str(seq_id)
+    entry_id = await self.r.xadd(key("q", run_id), fields, nomkstream=True)
     if entry_id is None:
       return None
     return f"{run_id}/{entry_id.decode()}"
@@ -179,14 +184,15 @@ class Bus:
       cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
     return cmds
 
-  async def finish(self, cmd: Cmd, reply: Reply, pool: str, worker: str) -> bool:
+  async def finish(self, cmd: Cmd, reply: Reply, pool: str, worker: str, repeat: bool = False) -> bool:
     """Write a command's reply, acknowledge the command, and count it, all at once, if `worker` still owns the pool.
     Returns False, having written nothing, if it doesn't: another trainer took the pool over and fails the command."""
     counter = ""
-    if not reply.ok:
-      counter = "failed"
-    elif cmd.op == Op.OPTIM_STEP:
-      counter = "steps"
+    if not repeat:
+      if not reply.ok:
+        counter = "failed"
+      elif cmd.op == Op.OPTIM_STEP:
+        counter = "steps"
 
     k = key("owner", pool)
     while True:
@@ -204,10 +210,24 @@ class Bus:
           p.xdel(key("q", cmd.run), cmd.entry_id)
           if counter:
             p.hincrby(key("run", cmd.run), counter, 1)
+          if not repeat and cmd.seq is not None:
+            p.set(key("seq", cmd.run, str(cmd.seq)), cmd.request_id, ex=REPLY_TTL)
           await p.execute()
           return True
       except redis.WatchError:
         continue
+
+  async def first_reply(self, cmd: Cmd) -> Reply | None:
+    if cmd.seq is None:
+      return None
+    request_id = await self.r.get(key("seq", cmd.run, str(cmd.seq)))
+    if not request_id:
+      return None
+    got = await self.r.xrange(key("f", request_id.decode()), "-", "+")
+    if not got:
+      return None
+    fields = got[0][1]
+    return Reply(fields[b"ok"] == b"1", fields[b"content_type"].decode(), fields[b"body"])
 
   async def reclaim(self, pool: str, worker: str, min_idle_ms: int = 0) -> list[Cmd]:
     """Claim the pool's commands that have been in flight for at least min_idle_ms, on any trainer. Called by the pool's
