@@ -19,7 +19,6 @@ from tinyrl import wire
 from tinyrl.bus import Bus, Op, Run
 from tinyrl.helpers import getenv
 
-CKPT = getenv("CKPT", "/tmp/tinyrl")  # the checkpoint disk the trainers and samplers share
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
 
 
@@ -60,13 +59,13 @@ class FutureRequest(BaseModel):
   request_id: str
 
 
-def checkpoint(run: str, kind: str, name: str) -> tuple[str, str]:
-  """Where a checkpoint lives, and its tinker:// path. tinker://<run>/<kind>/<name> is CKPT/<run>/<kind>/<name>."""
-  if name.startswith("tinker://"):  # a checkpoint by path, maybe another run's to resume from
+def checkpoint_uri(run: str, kind: str, name: str) -> str:
+  """The logical tinker://<run>/<kind>/<name> URI for a checkpoint."""
+  if name.startswith("tinker://"):  # a checkpoint by URI, maybe another run's to resume from
     run, kind, name = name.removeprefix("tinker://").split("/", 2)
-  if name.startswith("/") or ".." in f"{run}/{kind}/{name}".split("/"):
+  if not name or name.startswith("/") or ".." in f"{run}/{kind}/{name}".split("/"):
     raise ValueError(f"bad checkpoint name {name}")
-  return f"{CKPT}/{run}/{kind}/{name}", f"tinker://{run}/{kind}/{name}"
+  return f"tinker://{run}/{kind}/{name}"
 
 
 def pool_for(run: str, base_model: str, rank: int, metadata: dict) -> str:
@@ -168,8 +167,7 @@ def app(bus: Bus | None = None) -> FastAPI:
   async def save(req: SaveRequest, op: Op, kind: str):
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-    path, uri = checkpoint(req.model_id, kind, name)
-    return await submit(req.model_id, op, {"path": path, "uri": uri})
+    return await submit(req.model_id, op, {"uri": checkpoint_uri(req.model_id, kind, name)})
 
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
   async def save_weights(req: SaveRequest):
@@ -181,8 +179,8 @@ def app(bus: Bus | None = None) -> FastAPI:
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):
-    path, uri = checkpoint(req.model_id, "weights", req.path)
-    return await submit(req.model_id, Op.LOAD_WEIGHTS, {"path": path, "uri": uri, "optimizer": req.optimizer})
+    uri = checkpoint_uri(req.model_id, "weights", req.path)
+    return await submit(req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer})
 
   @api.post("/api/v1/delete_model")
   async def delete_model(req: ModelRequest):
