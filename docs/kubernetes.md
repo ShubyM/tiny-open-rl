@@ -33,9 +33,10 @@ flowchart LR
 - **What gets placed is a pool's trainer process**, onto an agent pod that holds GPUs. The scheduler creates agent pods
   with plain `nvidia.com/gpu` requests, sized to the pools that need them (1, 2, 4 or 8 GPUs). An agent starts a trainer
   for each pool placed on it and decides which of them are on its GPUs.
-- **Runs move between pools**, so pools can be resized. A run's state moves the way it's checkpointed: its pool's trainer
-  parks it to disk in the format `save_weights` already writes, and the next pool's trainer loads it. For a LoRA run that's
-  an adapter and its AdamW state, about a second, so splitting a busy LoRA pool or merging two quiet ones is cheap.
+- **Every workload scales with demand**, each the way its state allows. LoRA pools grow and shrink by moving runs between
+  them: a run moves the way it's checkpointed, parked to disk in the format `save_weights` already writes and loaded by
+  the next pool's trainer, about a second for a LoRA run. A full fine-tune holds a GPU only while it trains. Samplers, when
+  tinyrl has them, scale by replicas.
 - **Parking** covers time-slicing and checkpointing. A trainer parks its pool's tensors to host RAM when its agent needs
   the GPU for another pool, and parks a run to disk when the run goes idle or moves.
 - **A pool has one owner.** A trainer serves a pool only while it holds the pool's lease in Redis, and every reply is
@@ -99,16 +100,26 @@ sequenceDiagram
   S->>R: a pool with no runs for 10 min: DEL place:pool, and its trainer stops
 ```
 
-## Runs into pools: resizing
+## Scaling every workload
 
-Pools are where accelerator efficiency is won or lost. One GPU serving every LoRA run on a base is a queue that grows with
-the number of runs. Say a run's RL step spends 10 s training and 50 s sampling and scoring: one GPU keeps up with about six
-such runs, and from the seventh on, every run waits for every other's `forward_backward`. Ten GPUs serving one run each
-is the opposite mistake. The scheduler sizes pools to load:
+Every workload scales up and down with demand, but not in the same way, because what each one holds is different:
 
-- **Load.** Each trainer writes, once a minute, how busy it was (`busy`: the fraction of the minute spent running commands)
-  and how long commands waited (`wait`: the mean time from a command's `XADD` to its start, read from its stream entry ID,
-  which is a timestamp).
+| Workload | What it holds | How it scales | Signal | What a change costs |
+|---|---|---|---|---|
+| LoRA trainer pool | a base model, plus a small adapter and its AdamW state per run | more or fewer pools per base; runs move between them | `busy`, `wait` | about a second per run moved |
+| full fine-tune trainer | a whole model at 12 to 16 B/param | in time, not width: it holds a GPU only while it trains, and its GPU count is set by what fits | the agent's resident set | a host RAM park, 0.4 to 2 s |
+| sampler (coming) | weights it can reload, and a KV cache it can drop | replicas | its sampling queue | loading the weights; nothing to save when it scales down |
+
+Both kinds of trainer report the same two numbers once a minute: how busy they were (`busy`, the fraction of the minute
+spent running commands) and how long commands waited (`wait`, the mean time from a command's `XADD` to its start, read from
+its stream entry ID, which is a timestamp). The scheduler uses them for every decision below.
+
+### LoRA trainer pools: more pools per base
+
+One GPU serving every LoRA run on a base is a queue that grows with the number of runs. Say a run's RL step spends 10 s
+training and 50 s sampling and scoring: one GPU keeps up with about six such runs, and from the seventh on, every run
+waits for every other's `forward_backward`. Ten GPUs serving one run each is the opposite mistake. So:
+
 - **Assigning.** A run with queued work and no pool (a new run, or one coming back from idle) goes into the pool on its
   base with the most room: memory for its adapter, and `busy` below the grow threshold. If none has room, the scheduler
   makes a pool. A full fine-tune, or a run marked `openrl.exclusive`, always gets a pool of its own.
@@ -132,12 +143,39 @@ run's next command it recreates the adapter from the run's recorded config, load
 |---|---|---|
 | 0.5B LoRA, rank 32 on every linear layer | 17.6M adapter parameters × 12 B = 0.21 GB | 0.2 s on Filestore (2 GB/s) |
 | 8B LoRA (Qwen3-8B), rank 32, output head included | 92M × 12 B = 1.1 GB | 1.1 s on Filestore, 0.2 s on Lustre (10 GB/s) |
-| 1.5B full fine-tune | 1.54B × 12 B = 18.5 GB | 18 s on Filestore, 3.7 s on Lustre |
 
-LoRA runs are cheap to move, so LoRA pools resize horizontally and freely. A full fine-tune is its own pool; resizing it
-means more GPUs for that one pool (FSDP, which tinyrl doesn't have yet), done rarely, by releasing the run and placing its
-next pool on a bigger agent. A new pool on a base costs one base model load from the shared Hugging Face cache, about 8 s
-for an 8B model on Filestore, plus an agent pod if no agent has room.
+A new pool on a base costs one base model load from the shared Hugging Face cache, about 8 s for an 8B model on Filestore,
+plus an agent pod if no agent has room.
+
+### Full fine-tunes: elastic in time, not in width
+
+A full fine-tune is one run, so it can't be split across pools, and making its trainer wider (more GPUs, data parallel)
+buys little:
+
+- **Training isn't where an RL step goes.** In open-rl's own two-job full fine-tune benchmark (`docs/fft/fft.md` §9), a
+  steady-state step was about 25 s sampling, 25 s training and 74 to 88 s writing weights for the sampler to the shared
+  disk, 124 to 138 s in all. Doubling the trainer's GPUs would save at most about 12 s of that.
+- **Changing width means moving everything.** Going from one GPU to two reshards the weights, gradients and AdamW moments,
+  12 to 16 bytes per parameter, and changes the order of the gradient reductions, so the run's numbers shift.
+
+So a full fine-tune scales in time instead. It gets the fewest GPUs its state fits on, chosen at placement. Between its
+training steps, while its client samples and scores, it holds no GPU memory if another pool wants it: the agent parks it
+to host RAM, 0.4 s for a 1.5B model, and that GPU serves other runs. Packing several full fine-tunes onto the GPUs they
+take turns on is how they use accelerators well. Its width changes only when it's next placed, after a release or an idle
+park, and only when it has to (an 8B full fine-tune with fp32 master weights needs more than one 80 GB GPU), once tinyrl
+has FSDP.
+
+The bigger win for full fine-tunes is the 74 to 88 s of weight sync, not the trainer: put the run's sampler on the trainer's
+agent, so new weights go through host memory instead of the shared disk.
+
+### Samplers: replicas
+
+Generating rollouts splits cleanly across prompts and samples, and a sampler holds nothing it can't rebuild: weights it
+can reload and a KV cache it can drop. So samplers scale the simple way, with replicas: more when the sampling queue
+grows, fewer when it drains, and scaling down saves nothing because there's nothing to save. A LoRA sampler serves every
+adapter on its base, so its replicas serve every run on that base. A full fine-tune's sampler serves one run, and each of
+its replicas reloads the weights after every training step, so its replicas are worth adding only while sampling takes
+much longer than that reload.
 
 ## Pools onto agents
 
@@ -287,9 +325,10 @@ weights as the run that never stopped, which is what moving a run between pools 
 
 When tinyrl has a sampler (vLLM serving what `save_weights_for_sampler` writes), it's a second kind of process on an agent.
 It parks with vLLM's `sleep(level=1)` and resumes with `wake_up()`, and the agent treats it like a trainer, with its
-sampling queue as its demand. Samplers get pools too, resized the same way, and the scheduler places a sampler pool on the
-agent that has its trainers, so they take turns on one GPU and weight sync can go through the node's `/dev/shm` instead of
-the shared disk. For small models both stay resident and only their kernels interleave.
+sampling queue as its demand. Its replicas scale with that queue (see Scaling every workload), and the scheduler places
+them on the agents that have their runs' trainers, so a run's sampler and trainer take turns on one GPU and weight sync can
+go through the node's `/dev/shm` instead of the shared disk. For small models both stay resident and only their kernels
+interleave.
 
 A full fine-tune's sampler checkpoint is fp32, because the master weights are. vLLM's `dtype="auto"` would serve an fp32
 checkpoint in fp16, so the sampler should run with `--dtype bfloat16`, or the save should write a bf16 copy.
@@ -359,6 +398,8 @@ past the lease is still a design.
   trainer nothing, and three that train back to back can saturate it. Memory is the hard cap; load sets the rest.
 - **Spreading one LoRA pool across GPUs** (one process, data parallel). It speeds up one big batch, not many runs, and adds
   collectives between GPUs to every step.
+- **Widening a full fine-tune's trainer while it runs.** Training was about a fifth of a step in open-rl's benchmark, and
+  every change of width reshards 12 to 16 bytes per parameter and shifts the run's numbers.
 - **Autoscaling on queue lag** (HPA or KEDA). An RL run's queue is empty while it samples, and a Deployment scale-down kills
   whichever pod it picks, parked state and all.
 - **One process per GPU that hosts every pool.** Residency needs no messages, but one crash takes down every pool on the
