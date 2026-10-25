@@ -387,8 +387,9 @@ class Trainer:
     cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
     for cmd in cmds:
       start = time.perf_counter()
-      reply = await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
-      if not await self.bus.finish(cmd, reply, self.pool, self.worker):
+      first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
+      reply = first or await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
+      if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None):
         self.done = True  # another trainer owns the pool now
         break
 

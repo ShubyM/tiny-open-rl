@@ -43,8 +43,9 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
   and `XPENDING` says what's in flight, on which trainer, and for how long. `GET /api/v1/runs/<id>` just asks.
 * **A dead trainer fails fast.** The commands it took stay in the pending list. The next trainer to start claims them with `XAUTOCLAIM`
   and fails them, so no client waits on work that died with its process.
-* **Retries are free.** `XREAD` from id `0` blocks until the reply is written and never consumes it, so `retrieve_future` can be retried,
-  or waited on by many clients, and every one of them gets the same answer.
+* **Retries are free.** `XREAD` from id `0` blocks until the reply is written and never consumes it, so
+  `retrieve_future` can be retried, or waited on by many clients, and every one of them gets the same answer.
+  A call the SDK retries with the same `seq_id` runs once, and every attempt gets the first attempt's answer.
 * **Deleted runs take no work.** A run is live exactly while its stream exists, so `XADD NOMKSTREAM` turns a call on a deleted run into a 404.
 * **Replies land atomically.** The reply, the acknowledgement and the run's step counter are written in one transaction.
 * **One wire format.** `forward_backward` stays protobuf from the SDK to the trainer, which reads the tensors straight out of the bytes.
@@ -66,9 +67,9 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 318 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 181 | runs, sessions, commands and replies on Redis |
-| [tinyrl/gateway.py](tinyrl/gateway.py) | 152 | the Tinker HTTP API |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 319 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/bus.py](tinyrl/bus.py) | 200 | runs, sessions, commands and replies on Redis |
+| [tinyrl/gateway.py](tinyrl/gateway.py) | 154 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
 | [tinyrl/store.py](tinyrl/store.py) | 38 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |

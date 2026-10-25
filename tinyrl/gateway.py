@@ -38,6 +38,7 @@ class CreateModelRequest(BaseModel):
 
 class ModelRequest(BaseModel):
   model_id: str
+  seq_id: int | None = None
 
 
 class OptimStepRequest(ModelRequest):
@@ -46,7 +47,6 @@ class OptimStepRequest(ModelRequest):
 
 class SaveRequest(ModelRequest):
   path: str | None = None
-  seq_id: int | None = None
   sampling_session_seq_id: int | None = None
 
 
@@ -86,10 +86,10 @@ def app(bus: Bus | None = None) -> FastAPI:
   api.add_exception_handler(ValueError, bad_request)
   api.add_exception_handler(KeyError, bad_request)
 
-  async def submit(run: str, op: Op, body: bytes | dict) -> dict[str, str]:
+  async def submit(run: str, op: Op, body: bytes | dict, seq_id: int | None = None) -> dict[str, str]:
     if isinstance(body, dict):
       body = json.dumps(body).encode()
-    request_id = await bus.submit(run, op, body)
+    request_id = await bus.submit(run, op, body, seq_id)
     if request_id is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
@@ -150,24 +150,26 @@ def app(bus: Bus | None = None) -> FastAPI:
   async def forward_backward(request: Request):
     body = await request.body()
     if request.headers.get("content-type", "").startswith(wire.PROTO):
-      return await submit(wire.parse(body).model_id, Op.FORWARD_BACKWARD, body)  # forwarded as is
+      parsed = wire.parse(body)
+      return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None)
 
     data = json.loads(body)
-    return await submit(data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data))
+    return await submit(data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data), data.get("seq_id"))
 
   @api.post("/api/v1/forward")  # SDKs before 0.25
   async def forward(request: Request):
     data = await request.json()
-    return await submit(data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data, forward_only=True))
+    body = wire.from_json(data, forward_only=True)
+    return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"))
 
   @api.post("/api/v1/optim_step")
   async def optim_step(req: OptimStepRequest):
-    return await submit(req.model_id, Op.OPTIM_STEP, {"adam_params": req.adam_params})
+    return await submit(req.model_id, Op.OPTIM_STEP, {"adam_params": req.adam_params}, req.seq_id)
 
   async def save(req: SaveRequest, op: Op, kind: str):
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-    return await submit(req.model_id, op, {"uri": checkpoint_uri(req.model_id, kind, name)})
+    return await submit(req.model_id, op, {"uri": checkpoint_uri(req.model_id, kind, name)}, req.seq_id)
 
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
   async def save_weights(req: SaveRequest):
@@ -180,11 +182,11 @@ def app(bus: Bus | None = None) -> FastAPI:
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):
     uri = checkpoint_uri(req.model_id, "weights", req.path)
-    return await submit(req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer})
+    return await submit(req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer}, req.seq_id)
 
   @api.post("/api/v1/delete_model")
   async def delete_model(req: ModelRequest):
-    await submit(req.model_id, Op.DELETE_MODEL, {})  # queued behind the run's work, which still finishes
+    await submit(req.model_id, Op.DELETE_MODEL, {}, req.seq_id)  # queued behind the run's work, which still finishes
     return {"status": "ok"}
 
   @api.post("/api/v1/retrieve_future")
