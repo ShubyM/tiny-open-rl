@@ -1,5 +1,7 @@
 import functools
 import os
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar, overload
 
@@ -19,20 +21,38 @@ def getenv(key: str, default: Any = 0):
 DEBUG = getenv("DEBUG")
 
 
+def is_hex(value: str, length: int) -> bool:
+  return isinstance(value, str) and len(value) == length and all(c in "0123456789abcdef" for c in value)
+
+
 def sync_directory(path: str | os.PathLike) -> None:
   fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-  try:
-    os.fsync(fd)
-  finally:
-    os.close(fd)
+  try: os.fsync(fd)
+  finally: os.close(fd)
 
 
-def make_directory(path: str | os.PathLike) -> None:
+def make_directory(path: str | os.PathLike) -> Path:
   """Persist each new parent entry before acknowledging files beneath it."""
-  missing, current = [], Path(path).absolute()
-  while not current.exists():
-    missing.append(current)
-    current = current.parent
-  for directory in reversed(missing):
-    directory.mkdir(exist_ok=True)
-    sync_directory(directory.parent)
+  target = Path(path).absolute()
+  missing, cur = [], target
+  while not cur.exists():
+    missing.append(cur)
+    cur = cur.parent
+  for d in reversed(missing):
+    d.mkdir(exist_ok=True)
+    sync_directory(d.parent)
+  return target
+
+
+def atomic_link(target: str | os.PathLike, write: Callable[[str], None], prefix: str = ".tmp-") -> None:
+  """Write, fsync, and hard-link a new immutable file without ever overwriting `target`."""
+  dest = Path(target)
+  fd, tmp = tempfile.mkstemp(prefix=prefix, dir=dest.parent)
+  os.close(fd)
+  try:
+    write(tmp)
+    with open(tmp, "rb") as f: os.fsync(f.fileno())
+    os.link(tmp, dest)
+    os.unlink(tmp)
+    sync_directory(dest.parent)
+  finally: Path(tmp).unlink(missing_ok=True)

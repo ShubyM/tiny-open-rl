@@ -13,21 +13,17 @@ import uuid
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, Field
 from redis.exceptions import RedisError
 
 from tinyrl import wire
-from tinyrl.bus import MAX_COMMAND_BYTES, Bus, CoordinatorUnavailable, Op, Run
-from tinyrl.client import command, pack, reply
+from tinyrl.bus import MAX_COMMAND_BYTES, Bus, CoordinatorUnavailable, Op, Run, pack, unpack_cmd, unpack_reply
 from tinyrl.helpers import getenv
 from tinyrl.payloads import INLINE_BYTES, PayloadStore
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
-
-
-# ***** requests *****
 
 
 class SessionRequest(BaseModel):
@@ -69,19 +65,14 @@ class FutureRequest(BaseModel):
 
 
 def checkpoint_uri(run: str, kind: str, name: str) -> str:
-  """The logical tinker://<run>/<kind>/<name> URI for a checkpoint."""
-  if name.startswith("tinker://"):  # a checkpoint by URI, maybe another run's to resume from
-    run, kind, name = name.removeprefix("tinker://").split("/", 2)
+  if name.startswith("tinker://"): run, kind, name = name.removeprefix("tinker://").split("/", 2)
   if not name or name.startswith("/") or ".." in f"{run}/{kind}/{name}".split("/"):
     raise ValueError(f"bad checkpoint name {name}")
   return f"tinker://{run}/{kind}/{name}"
 
 
 def pool_for(run: str, base_model: str, rank: int, metadata: dict) -> str:
-  """LoRA runs on a base model share its trainer unless one asks for its own. A full fine-tune always gets its own."""
-  exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
-  if rank == 0 or exclusive:
-    return run
+  if rank == 0 or str(metadata.get("openrl.exclusive")).lower() == "true": return run
   return f"lora:{base_model}"
 
 
@@ -97,63 +88,36 @@ def app(bus: Bus | None = None, worker_token: str | None = None, payloads: Paylo
 
     async def reap():
       while True:
-        try:
-          await bus.expire_workers()
-        except (RedisError, CoordinatorUnavailable):
-          pass  # admission/dispatch also check authority; transient outages pause work
+        with contextlib.suppress(RedisError, CoordinatorUnavailable): await bus.expire_workers()
         await asyncio.sleep(1)
 
     task = asyncio.create_task(reap())
-    try:
-      yield
+    try: yield
     finally:
       task.cancel()
-      with contextlib.suppress(asyncio.CancelledError):
-        await task
-      if owns_bus:
-        await bus.close()
+      with contextlib.suppress(asyncio.CancelledError): await task
+      if owns_bus: await bus.close()
 
   api = FastAPI(title="tiny-open-rl", lifespan=lifespan)
+  for exc in (ValueError, KeyError):
+    api.add_exception_handler(exc, lambda _, e: JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400))
+  unavail = JSONResponse({"error": "coordinator unavailable; retry the same request"}, status_code=503)
+  for exc in (RedisError, CoordinatorUnavailable):
+    api.add_exception_handler(exc, lambda _, _e: unavail)
 
-  def bad_request(_: Request, e: Exception) -> JSONResponse:
-    return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400)
-
-  api.add_exception_handler(ValueError, bad_request)
-  api.add_exception_handler(KeyError, bad_request)
-
-  def unavailable(_: Request, e: Exception) -> JSONResponse:
-    return JSONResponse({"error": "coordinator unavailable; retry the same request"}, status_code=503)
-
-  api.add_exception_handler(RedisError, unavailable)
-  api.add_exception_handler(CoordinatorUnavailable, unavailable)
-
-  async def submit(
-    run: str, op: Op, body: bytes | dict, seq: int | None = None, key: str | None = None
-  ) -> dict[str, str]:
-    if isinstance(body, dict):
-      body = json.dumps(body, sort_keys=True).encode()
-    if seq is not None and (type(seq) is not int or seq < 1):
-      raise ValueError("seq_id must be a positive integer")
-    if len(body) > MAX_COMMAND_BYTES:
-      raise ValueError("command exceeds MAX_COMMAND_BYTES")
+  async def submit(run: str, op: Op, body: bytes | dict, seq: int | None = None,
+                   key: str | None = None) -> dict[str, str]:
+    if isinstance(body, dict): body = json.dumps(body, sort_keys=True).encode()
+    if seq is not None and (type(seq) is not int or seq < 1): raise ValueError("seq_id must be a positive integer")
+    if len(body) > MAX_COMMAND_BYTES: raise ValueError("command exceeds MAX_COMMAND_BYTES")
     size, ref = len(body), ""
     if size > INLINE_BYTES:
-      if op != Op.FORWARD_BACKWARD:
-        raise ValueError("command metadata exceeds the inline size limit")
-      ref = await asyncio.to_thread(payloads.put, body)
-      body = b""
-    request_id = await bus.submit(
-      run,
-      op,
-      body,
-      seq_id=None if seq is None else seq - 1,
-      idempotency_key=key,
-      body_ref=ref,
-      body_size=size,
-    )
-    if request_id is None:
-      raise HTTPException(404, f"no model {run}")
-    return {"request_id": request_id, "model_id": run}
+      if op != Op.FORWARD_BACKWARD: raise ValueError("command metadata exceeds the inline size limit")
+      ref, body = await asyncio.to_thread(payloads.put, body), b""
+    req_id = await bus.submit(run, op, body, seq_id=None if seq is None else seq - 1,
+                              idempotency_key=key, body_ref=ref, body_size=size)
+    if req_id is None: raise HTTPException(404, f"no model {run}")
+    return {"request_id": req_id, "model_id": run}
 
   # ***** service *****
 
@@ -164,12 +128,10 @@ def app(bus: Bus | None = None, worker_token: str | None = None, payloads: Paylo
 
   @api.post("/api/v1/client/config")
   @api.post("/api/v1/client/dynamic_config")
-  async def client_config():
-    return {}  # the SDK's defaults
+  async def client_config(): return {}
 
   @api.get("/api/v1/get_server_capabilities")
-  async def get_server_capabilities():
-    return {"supported_models": []}
+  async def get_server_capabilities(): return {"supported_models": []}
 
   @api.post("/api/v1/create_session")
   async def create_session():
@@ -188,36 +150,22 @@ def app(bus: Bus | None = None, worker_token: str | None = None, payloads: Paylo
       raise ValueError("only the adamw optimizer is supported")
     metadata, lora = req.user_metadata or {}, req.lora_config or {}
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
-    key = None
-    if req.model_seq_id is not None:
-      if not req.session_id:
-        raise ValueError("model_seq_id requires session_id")
-      key = json.dumps([req.session_id, req.model_seq_id])
-    elif idempotency_key:
-      key = json.dumps([req.session_id, idempotency_key])
+    if req.model_seq_id is not None and not req.session_id: raise ValueError("model_seq_id requires session_id")
+    token = req.model_seq_id if req.model_seq_id is not None else idempotency_key
+    key = json.dumps([req.session_id, token]) if token is not None else None
     run = str(uuid.uuid5(uuid.NAMESPACE_URL, f"tinyrl:create:{key}")) if key else str(uuid.uuid4())
     body = json.dumps({"base_model": req.base_model, "rank": rank, "lora": lora}, sort_keys=True).encode()
-    record = await bus.create(
-      Run(run, pool_for(run, req.base_model, rank, metadata), req.base_model, rank, req.session_id),
-      body=body,
-      idempotency_key=key,
-    )
-    return {"request_id": record["request_id"], "model_id": record["id"]}
+    pool = pool_for(run, req.base_model, rank, metadata)
+    rec = await bus.create(Run(run, pool, req.base_model, rank, req.session_id), body=body, idempotency_key=key)
+    return {"request_id": rec["request_id"], "model_id": rec["id"]}
 
   @api.post("/api/v1/get_info")
   async def get_info(req: ModelRequest):
     run = await bus.run(req.model_id)
-    if run is None:
-      raise HTTPException(404, f"no model {req.model_id}")
-
-    # the SDK reads LoRA shaped metadata, even for a full fine-tune
+    if run is None: raise HTTPException(404, f"no model {req.model_id}")
     return {
-      "type": "get_info",
-      "model_id": req.model_id,
-      "model_name": run["base"],
-      "is_lora": True,
-      "lora_rank": run["rank"] or 16,
-      "model_data": {"model_name": run["base"], "tokenizer_id": run["base"]},
+      "type": "get_info", "model_id": req.model_id, "model_name": run["base"], "is_lora": True,
+      "lora_rank": run["rank"] or 16, "model_data": {"model_name": run["base"], "tokenizer_id": run["base"]},
     }
 
   # ***** training *****
@@ -227,46 +175,29 @@ def app(bus: Bus | None = None, worker_token: str | None = None, payloads: Paylo
     body = await request.body()
     if request.headers.get("content-type", "").startswith(wire.PROTO):
       parsed = wire.parse(body)
-      # Protobuf's absent scalar defaults to zero; the SDK numbers calls from one.
       return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, idempotency_key)
-
     data = json.loads(body)
-    return await submit(
-      data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data), data.get("seq_id"), idempotency_key
-    )
+    return await submit(data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data),
+                        data.get("seq_id"), idempotency_key)
 
-  @api.post("/api/v1/forward")  # SDKs before 0.25
+  @api.post("/api/v1/forward")
   async def forward(request: Request, idempotency_key: str | None = Header(None)):
     data = await request.json()
-    return await submit(
-      data["model_id"],
-      Op.FORWARD_BACKWARD,
-      wire.from_json(data, forward_only=True),
-      data.get("seq_id"),
-      idempotency_key,
-    )
+    return await submit(data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data, forward_only=True),
+                        data.get("seq_id"), idempotency_key)
 
   @api.post("/api/v1/optim_step")
   async def optim_step(req: OptimStepRequest, idempotency_key: str | None = Header(None)):
-    if req.adam_params.get("type", "adamw") != "adamw":
-      raise ValueError("only the adamw optimizer is supported")
+    if req.adam_params.get("type", "adamw") != "adamw": raise ValueError("only the adamw optimizer is supported")
     return await submit(req.model_id, Op.OPTIM_STEP, {"adam_params": req.adam_params}, req.seq_id, idempotency_key)
 
-  async def save(req: SaveRequest, op: Op, kind: str, idempotency_key: str | None):
+  async def save(req: SaveRequest, op: Op, kind: str, idem: str | None):
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
-    suffix = (
-      seq
-      if seq is not None
-      else hashlib.sha256(idempotency_key.encode()).hexdigest()
-      if idempotency_key
-      else time.time_ns()
-    )
-    name = req.path or f"step-{suffix}"
-    return await submit(
-      req.model_id, op, {"uri": checkpoint_uri(req.model_id, kind, name)}, req.seq_id, idempotency_key
-    )
+    suffix = seq if seq is not None else hashlib.sha256(idem.encode()).hexdigest() if idem else time.time_ns()
+    uri = checkpoint_uri(req.model_id, kind, req.path or f"step-{suffix}")
+    return await submit(req.model_id, op, {"uri": uri}, req.seq_id, idem)
 
-  @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
+  @api.post("/api/v1/save_weights")
   async def save_weights(req: SaveRequest, idempotency_key: str | None = Header(None)):
     return await save(req, Op.SAVE_WEIGHTS, "weights", idempotency_key)
 
@@ -276,10 +207,8 @@ def app(bus: Bus | None = None, worker_token: str | None = None, payloads: Paylo
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest, idempotency_key: str | None = Header(None)):
-    uri = checkpoint_uri(req.model_id, "weights", req.path)
-    return await submit(
-      req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer}, req.seq_id, idempotency_key
-    )
+    body = {"uri": checkpoint_uri(req.model_id, "weights", req.path), "optimizer": req.optimizer}
+    return await submit(req.model_id, Op.LOAD_WEIGHTS, body, req.seq_id, idempotency_key)
 
   @api.post("/api/v1/delete_model")
   async def delete_model(req: ModelRequest, idempotency_key: str | None = Header(None)):
@@ -288,86 +217,79 @@ def app(bus: Bus | None = None, worker_token: str | None = None, payloads: Paylo
 
   @api.post("/api/v1/retrieve_future")
   async def retrieve_future(req: FutureRequest, accept: str = Header("")):
-    reply = await bus.result(req.request_id, WAIT)
-    if reply is None:
-      return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
-    body = reply.body
-    if reply.body_ref:
-      try:
-        body = await asyncio.to_thread(payloads.get, reply.body_ref, reply.body_size)
-      except (OSError, ValueError) as error:
-        raise HTTPException(503, "result payload unavailable; retry this future") from error
-    if reply.content_type == wire.PROTO and wire.PROTO not in accept:
-      return wire.output_json(body)  # an older client, which reads JSON
-    return Response(body, media_type=reply.content_type)
+    res = await bus.result(req.request_id, WAIT)
+    if res is None: return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
+    body = res.body
+    if res.body_ref:
+      try: body = await asyncio.to_thread(payloads.get, res.body_ref, res.body_size)
+      except (OSError, ValueError) as e:
+        raise HTTPException(503, "result payload unavailable; retry this future") from e
+    if res.content_type == wire.PROTO and wire.PROTO not in accept: return wire.output_json(body)
+    return Response(body, media_type=res.content_type)
 
-  # ***** inspection *****
+  # ***** inspection & worker protocol *****
 
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
     run = await bus.run(run_id)
-    if run is None:
-      raise HTTPException(404, f"no model {run_id}")
+    if run is None: raise HTTPException(404, f"no model {run_id}")
     return {**run, **await bus.queue(run_id)}
 
   @api.get("/api/v1/sessions/{session_id}")
   async def session_info(session_id: str):
     session = await bus.session_info(session_id)
-    if session is None:
-      raise HTTPException(404, f"no session {session_id}")
+    if session is None: raise HTTPException(404, f"no session {session_id}")
     return session
 
   @api.post("/api/v1/resolve_checkpoint")
   async def resolve_checkpoint(request: Request):
     uri = (await request.json())["path"]
     ref = await bus.ckpt(uri)
-    if ref is None:
-      raise HTTPException(404, f"no checkpoint {uri}")
+    if ref is None: raise HTTPException(404, f"no checkpoint {uri}")
     return {"ref": ref}
 
-  # Worker and placement control share one authenticated protocol.
   def authorized(authorization: str = Header("")):
     if not worker_token or not hmac.compare_digest(authorization, f"Bearer {worker_token}"):
       raise HTTPException(401, "coordinator worker token required")
 
-  @api.post("/internal/register", dependencies=[Depends(authorized)])
+  internal = APIRouter(prefix="/internal", dependencies=[Depends(authorized)])
+
+  @internal.post("/register")
   async def register(request: Request):
     args = await request.json()
     return await bus.register(args["worker"], args["pool"])
 
-  @api.post("/internal/heartbeat", dependencies=[Depends(authorized)])
+  @internal.post("/heartbeat")
   async def heartbeat(request: Request):
     return {"live": await bus.heartbeat((await request.json())["worker"])}
 
-  @api.post("/internal/take", dependencies=[Depends(authorized)])
+  @internal.post("/take")
   async def take(request: Request):
     args = await request.json()
     count, block = int(args.get("count", 16)), int(args.get("block_ms", 1000))
-    if not 1 <= count <= 256 or not 0 <= block <= 30000:
-      raise ValueError("invalid poll bounds")
-    commands = await bus.take(args["pool"], args["worker"], count=count, block_ms=block)
-    return {"commands": [pack(c) for c in commands]}
+    if not 1 <= count <= 256 or not 0 <= block <= 30000: raise ValueError("invalid poll bounds")
+    return {"commands": [pack(c) for c in await bus.take(args["pool"], args["worker"], count=count, block_ms=block)]}
 
-  @api.post("/internal/finish", dependencies=[Depends(authorized)])
+  @internal.post("/finish")
   async def finish(request: Request):
     args = await request.json()
-    return {"status": await bus.finish(command(args["command"]), reply(args["reply"]))}
+    return {"status": await bus.finish(unpack_cmd(args["command"]), unpack_reply(args["reply"]))}
 
-  @api.post("/internal/move", dependencies=[Depends(authorized)])
+  @internal.post("/move")
   async def move(request: Request):
     args = await request.json()
     return await bus.request_move(args["run_id"], args["target_pool"])
 
-  @api.post("/internal/recover", dependencies=[Depends(authorized)])
+  @internal.post("/recover")
   async def recover(request: Request):
     args = await request.json()
     if ("path" in args) == ("ref" in args):
       raise ValueError("provide either a checkpoint path or an immutable snapshot ref")
     ref = await bus.ckpt(args["path"]) if "path" in args else args["ref"]
-    if ref is None:
-      raise HTTPException(404, "no recovery checkpoint")
+    if ref is None: raise HTTPException(404, "no recovery checkpoint")
     return await bus.recover(args["run_id"], ref, args.get("target_pool"))
 
+  api.include_router(internal)
   return api
 
 
