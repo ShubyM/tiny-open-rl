@@ -6,7 +6,6 @@ It takes commands from its pool's streams on the bus, runs each one on the model
 from __future__ import annotations
 
 import asyncio
-import glob
 import json
 import math
 import os
@@ -16,15 +15,15 @@ import time
 from collections.abc import Callable
 
 import numpy as np
-import safetensors.torch
 import torch
-from peft import LoraConfig, set_peft_model_state_dict
+from peft import LoraConfig
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl import wire
 from tinyrl.bus import Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
+from tinyrl.store import Store
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
@@ -176,12 +175,14 @@ class Model:
     self.lm: PreTrainedModel | None = None
     self.base = ""
     self.lora = True
-    self.params: dict[str, list[torch.nn.Parameter]] = {}  # each run's trainable parameters
+    self.dtype = torch.float32
+    self.params: dict[str, dict[str, torch.nn.Parameter]] = {}  # canonical name -> trainable parameter
     self.optimizers: dict[str, torch.optim.AdamW] = {}
 
   def create(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
       self.lm, self.base, self.lora = self.load(base), base, rank > 0
+      self.dtype = self.lm.dtype
       if not self.lora:
         self.lm.float()  # a full fine-tune updates fp32 master weights. Its forward pass runs in bf16, under autocast
       if GRAD_CKPT:
@@ -197,7 +198,7 @@ class Model:
     if not self.lora:
       if self.params:
         raise ValueError(f"a full fine-tune has its trainer to itself, and {next(iter(self.params))} is on this one")
-      self.params[run] = [p.requires_grad_() for p in self.lm.parameters()]
+      self.params[run] = {name: p.requires_grad_() for name, p in self.lm.named_parameters()}
       return
 
     adapter = LoraConfig(
@@ -207,8 +208,9 @@ class Model:
       target_modules=lora_targets(self.lm, config),
     )
     self.lm.add_adapter(adapter, adapter_name=run)
-    self.params[run] = [p for name, p in self.lm.named_parameters() if f".{run}." in name]
-    for p in self.params[run]:
+    infix = f".{run}."
+    self.params[run] = {name.replace(infix, "."): p for name, p in self.lm.named_parameters() if infix in name}
+    for p in self.params[run].values():
       p.data = p.data.float()  # PEFT gives an adapter its base model's dtype, but master weights are fp32
 
   def use(self, run: str) -> PreTrainedModel:
@@ -249,7 +251,7 @@ class Model:
 
   def optimizer(self, run: str) -> torch.optim.AdamW:
     if run not in self.optimizers:
-      self.optimizers[run] = torch.optim.AdamW(self.params[run])
+      self.optimizers[run] = torch.optim.AdamW(self.params[run].values())
     return self.optimizers[run]
 
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
@@ -264,38 +266,57 @@ class Model:
       group["weight_decay"] = adam.get("weight_decay", 0.0)
 
     max_norm = adam.get("grad_clip_norm") or math.inf  # 0 means don't clip
-    grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run], max_norm).item()
+    grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run].values(), max_norm).item()
     optimizer.step()
     optimizer.zero_grad()
     return {"grad_norm:mean": grad_norm}
 
-  def save(self, run: str, path: str, optimizer: bool) -> None:
-    # a LoRA run saves its adapter in PEFT format and a full fine-tune the whole model, either way what vLLM loads
-    self.use(run).save_pretrained(path)
-    if optimizer:
-      torch.save(self.optimizer(run).state_dict(), f"{path}/optimizer.pt")
+  def state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
+    """A run's portable training checkpoint: fp32 master weights and named AdamW state, with no pickle."""
+    self.use(run)
+    tensors = {name: p.detach() for name, p in self.params[run].items()}
+    optim = self.optimizers.get(run)
+    for name, p in self.params[run].items():
+      if optim and p in optim.state:
+        s = optim.state[p]
+        tensors[f"{name}.exp_avg"] = s["exp_avg"].detach()
+        tensors[f"{name}.exp_avg_sq"] = s["exp_avg_sq"].detach()
+        tensors[f"{name}.step"] = s["step"].detach()
+    return tensors, {"optimizer": True}
 
-  def load_weights(self, run: str, path: str, optimizer: bool) -> None:
+  def weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
+    """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
     lm = self.use(run)
-    state = {}
-    for file in glob.glob(f"{path}/*.safetensors"):
-      for name, tensor in safetensors.torch.load_file(file).items():
-        state[name.removeprefix("base_model.model.")] = tensor  # PEFT saves adapter weights under this prefix
-    if not state:
-      raise ValueError(f"no weights at {path}")
-    if optimizer and not os.path.exists(f"{path}/optimizer.pt"):
-      raise ValueError(f"no optimizer state at {path}")
-
+    prefix = "base_model.model." if self.lora else ""
+    tensors = {f"{prefix}{name}": p.detach().to(self.dtype) for name, p in self.params[run].items()}
     if self.lora:
-      result = set_peft_model_state_dict(lm, state, adapter_name=run)
+      cfg = {k: sorted(v) if isinstance(v, set) else v for k, v in lm.peft_config[run].to_dict().items()}
     else:
-      result = lm.load_state_dict(state, strict=False)  # not strict: a tied output head isn't saved
-    if result.unexpected_keys:
-      raise ValueError(f"{path} does not fit this model: {', '.join(result.unexpected_keys[:3])}")
+      cfg = lm.config.to_dict()
+    return tensors, {"lora": self.lora, "optimizer": False, "config": cfg}
+
+  def restore(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
+    self.use(run)
+    if optimizer and not meta.get("optimizer"):
+      raise ValueError("checkpoint has no optimizer state")
+    suffixes = (".exp_avg", ".exp_avg_sq", ".step")
+    weights = {k.removeprefix("base_model.model."): v for k, v in tensors.items() if not k.endswith(suffixes)}
+    if not self.lora and "lm_head.weight" not in self.params[run]:
+      weights.pop("lm_head.weight", None)  # tied to embed_tokens
+    if weights.keys() != self.params[run].keys():
+      raise ValueError("checkpoint does not fit this model")
+    for name, p in self.params[run].items():
+      p.data.copy_(weights[name])
 
     self.optimizers.pop(run, None)
-    if optimizer:
-      self.optimizer(run).load_state_dict(torch.load(f"{path}/optimizer.pt", map_location="cpu"))
+    if optimizer and any(k.endswith(".step") for k in tensors):
+      opt = self.optimizer(run)
+      for name, p in self.params[run].items():
+        opt.state[p] = {
+          "exp_avg": tensors[f"{name}.exp_avg"].to(p.device, torch.float32),
+          "exp_avg_sq": tensors[f"{name}.exp_avg_sq"].to(p.device, torch.float32),
+          "step": tensors[f"{name}.step"].cpu().float(),
+        }
 
   def delete(self, run: str) -> None:
     lm = self.use(run)
@@ -320,10 +341,11 @@ def fail(error: Exception) -> Reply:
 
 
 class Trainer:
-  def __init__(self, bus: Bus, pool: str, model: Model | None = None, worker: str = ""):
+  def __init__(self, bus: Bus, pool: str, model: Model | None = None, worker: str = "", store: Store | None = None):
     self.bus = bus
     self.pool = pool
     self.model = model if model is not None else Model()
+    self.store = store if store is not None else Store()
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}"
     self.done = False
 
@@ -369,10 +391,12 @@ class Trainer:
           model.create(cmd.run, args["base_model"], args["rank"], args["lora"])
         case Op.OPTIM_STEP:
           return ok({"type": cmd.op, "metrics": model.optim_step(cmd.run, args["adam_params"])})
-        case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
-          model.save(cmd.run, args["path"], optimizer=cmd.op == Op.SAVE_WEIGHTS)
+        case Op.SAVE_WEIGHTS:
+          self.store.put(args["uri"], *model.state(cmd.run))
+        case Op.SAVE_WEIGHTS_FOR_SAMPLER:
+          self.store.put(args["uri"], *model.weights(cmd.run))
         case Op.LOAD_WEIGHTS:
-          model.load_weights(cmd.run, args["path"], args["optimizer"])
+          model.restore(cmd.run, *self.store.get(args["uri"]), args["optimizer"])
         case Op.DELETE_MODEL:
           model.delete(cmd.run)
         case _:

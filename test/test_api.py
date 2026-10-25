@@ -10,6 +10,7 @@ from test.helpers import RedisTest, tiny
 from test.test_wire import json_body
 from tinyrl import gateway, wire
 from tinyrl.proto import tinker_public_pb2 as pb
+from tinyrl.store import Store
 from tinyrl.trainer import Model, Trainer
 
 PROTO = {"content-type": wire.PROTO}
@@ -32,7 +33,7 @@ def proto_body(model_id: str, n: int = 12, loss_fn: str = "cross_entropy") -> by
 class TestAPI(RedisTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
-    self.enterContext(patch.object(gateway, "CKPT", tempfile.mkdtemp()))
+    self.store = Store(root=tempfile.mkdtemp())
     self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app(self.bus)), base_url="http://tinyrl")
     self.trainers: dict[str, Trainer] = {}
 
@@ -47,7 +48,7 @@ class TestAPI(RedisTest):
     """Let the trainer for the run's pool do all of the pool's queued work."""
     pool = (await self.bus.run(run_id))["pool"]
     if pool not in self.trainers:
-      self.trainers[pool] = Trainer(self.bus, pool, Model(tiny))
+      self.trainers[pool] = Trainer(self.bus, pool, Model(tiny), store=self.store)
     while await self.trainers[pool].step(block_ms=10):
       pass
 
@@ -119,7 +120,7 @@ class TestAPI(RedisTest):
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
     self.assertEqual(sampler["path"], f"tinker://{run_id}/sampler_weights/step-0")
-    with open(f"{gateway.CKPT}/{run_id}/sampler_weights/step-0/adapter_config.json") as f:
+    with open(f"{self.store.path(sampler['path'])}/adapter_config.json") as f:
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}

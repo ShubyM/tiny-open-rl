@@ -50,26 +50,31 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 * **One wire format.** `forward_backward` stays protobuf from the SDK to the trainer, which reads the tensors straight out of the bytes.
   Older SDKs' JSON is turned into the same protobuf at the gateway, and JSON clients get the output decoded back to JSON.
 * **One trainer.** A base model, with a PEFT adapter per run or the whole model for a single run, behind `create`, `forward_backward`,
-  `optim_step`, `save`, `load_weights` and `delete`. Logprobs are computed `CHUNK` tokens at a time under checkpointing, so the
+  `optim_step`, `state`, `weights`, `restore` and `delete`. Logprobs are computed `CHUNK` tokens at a time under checkpointing, so the
   `[tokens, vocab]` logits never exist all at once. The optimizer updates fp32 master weights and keeps fp32 AdamW state, while the
   forward pass runs in bf16 under autocast. A LoRA run's frozen base model stays bf16.
+* **Portable checkpoints.** Training checkpoints (`save_weights`) and sampler weights (`save_weights_for_sampler`) go through
+  [store.py](tinyrl/store.py) behind `put(uri)` and `get(uri)` as pure `safetensors` (no `torch.save` pickle), so any trainer can
+  resume a run with its exact fp32 weights and AdamW state.
 
 ## Reading the code
 
 Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains the streams. Then read [gateway.py](tinyrl/gateway.py)
-to see how each Tinker call becomes a command, and [trainer.py](tinyrl/trainer.py) to see how a command runs on the model.
+to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to see how checkpoints are stored, and
+[trainer.py](tinyrl/trainer.py) to see how a command runs on the model.
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 271 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/gateway.py](tinyrl/gateway.py) | 154 | the Tinker HTTP API |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 294 | the losses, token budget batching, the model, and the trainer loop |
 | [tinyrl/bus.py](tinyrl/bus.py) | 160 | runs, sessions, commands and replies on Redis |
+| [tinyrl/gateway.py](tinyrl/gateway.py) | 152 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
+| [tinyrl/store.py](tinyrl/store.py) | 68 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
-checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL` and `DEBUG=1`.
+checkpoint disk the trainers and samplers share), `SHM` (optional local `/dev/shm` cache), `TOKEN_BUDGET` (padded tokens per pass;
+unset, each call sizes its passes to the free GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL` and `DEBUG=1`.
 
 ## Test
 
