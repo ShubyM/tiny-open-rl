@@ -1,4 +1,4 @@
-"""Tinker API and the single journal-owning coordinator's worker endpoints."""
+"""Tinker API and the Redis coordinator's worker endpoints."""
 
 from __future__ import annotations
 
@@ -16,11 +16,13 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, Field
+from redis.exceptions import RedisError
 
 from tinyrl import wire
-from tinyrl.bus import Bus, Op, Run
+from tinyrl.bus import MAX_COMMAND_BYTES, Bus, CoordinatorUnavailable, Op, Run
 from tinyrl.client import command, pack, reply
 from tinyrl.helpers import getenv
+from tinyrl.payloads import INLINE_BYTES, PayloadStore
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
 
@@ -83,16 +85,22 @@ def pool_for(run: str, base_model: str, rank: int, metadata: dict) -> str:
   return f"lora:{base_model}"
 
 
-def app(bus: Bus | None = None, worker_token: str | None = None) -> FastAPI:
+def app(bus: Bus | None = None, worker_token: str | None = None, payloads: PayloadStore | None = None) -> FastAPI:
   owns_bus = bus is None
   bus = bus if bus is not None else Bus()
   worker_token = os.getenv("COORDINATOR_TOKEN", "") if worker_token is None else worker_token
+  payloads = payloads if payloads is not None else PayloadStore()
 
   @contextlib.asynccontextmanager
   async def lifespan(_: FastAPI):
+    await bus.start()
+
     async def reap():
       while True:
-        await bus.expire_workers()
+        try:
+          await bus.expire_workers()
+        except (RedisError, CoordinatorUnavailable):
+          pass  # admission/dispatch also check authority; transient outages pause work
         await asyncio.sleep(1)
 
     task = asyncio.create_task(reap())
@@ -113,6 +121,12 @@ def app(bus: Bus | None = None, worker_token: str | None = None) -> FastAPI:
   api.add_exception_handler(ValueError, bad_request)
   api.add_exception_handler(KeyError, bad_request)
 
+  def unavailable(_: Request, e: Exception) -> JSONResponse:
+    return JSONResponse({"error": "coordinator unavailable; retry the same request"}, status_code=503)
+
+  api.add_exception_handler(RedisError, unavailable)
+  api.add_exception_handler(CoordinatorUnavailable, unavailable)
+
   async def submit(
     run: str, op: Op, body: bytes | dict, seq: int | None = None, key: str | None = None
   ) -> dict[str, str]:
@@ -120,7 +134,23 @@ def app(bus: Bus | None = None, worker_token: str | None = None) -> FastAPI:
       body = json.dumps(body, sort_keys=True).encode()
     if seq is not None and (type(seq) is not int or seq < 1):
       raise ValueError("seq_id must be a positive integer")
-    request_id = await bus.submit(run, op, body, seq_id=None if seq is None else seq - 1, idempotency_key=key)
+    if len(body) > MAX_COMMAND_BYTES:
+      raise ValueError("command exceeds MAX_COMMAND_BYTES")
+    size, ref = len(body), ""
+    if size > INLINE_BYTES:
+      if op != Op.FORWARD_BACKWARD:
+        raise ValueError("command metadata exceeds the inline size limit")
+      ref = await asyncio.to_thread(payloads.put, body)
+      body = b""
+    request_id = await bus.submit(
+      run,
+      op,
+      body,
+      seq_id=None if seq is None else seq - 1,
+      idempotency_key=key,
+      body_ref=ref,
+      body_size=size,
+    )
     if request_id is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
@@ -129,6 +159,7 @@ def app(bus: Bus | None = None, worker_token: str | None = None) -> FastAPI:
 
   @api.get("/api/v1/healthz")
   async def healthz():
+    await bus.check_owner()
     return {"status": "ok"}
 
   @api.post("/api/v1/client/config")
@@ -260,9 +291,15 @@ def app(bus: Bus | None = None, worker_token: str | None = None) -> FastAPI:
     reply = await bus.result(req.request_id, WAIT)
     if reply is None:
       return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
+    body = reply.body
+    if reply.body_ref:
+      try:
+        body = await asyncio.to_thread(payloads.get, reply.body_ref, reply.body_size)
+      except (OSError, ValueError) as error:
+        raise HTTPException(503, "result payload unavailable; retry this future") from error
     if reply.content_type == wire.PROTO and wire.PROTO not in accept:
-      return wire.output_json(reply.body)  # an older client, which reads JSON
-    return Response(reply.body, media_type=reply.content_type)
+      return wire.output_json(body)  # an older client, which reads JSON
+    return Response(body, media_type=reply.content_type)
 
   # ***** inspection *****
 
@@ -288,7 +325,7 @@ def app(bus: Bus | None = None, worker_token: str | None = None) -> FastAPI:
       raise HTTPException(404, f"no checkpoint {uri}")
     return {"ref": ref}
 
-  # Worker and placement control share one authenticated protocol; no remote SQL.
+  # Worker and placement control share one authenticated protocol.
   def authorized(authorization: str = Header("")):
     if not worker_token or not hmac.compare_digest(authorization, f"Bearer {worker_token}"):
       raise HTTPException(401, "coordinator worker token required")

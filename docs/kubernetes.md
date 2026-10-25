@@ -1,7 +1,7 @@
 # tinyrl on Kubernetes
 
-**Status: architecture and deployment design.** The code contains a singleton coordinator with an embedded SQLite
-journal, authenticated HTTP workers, immutable tensor snapshots, and explicit run handoff/recovery commands.
+**Status: architecture and deployment design.** The code contains one active coordinator per Redis namespace,
+authenticated HTTP workers, shared immutable payload/tensor files, and explicit run handoff/recovery commands.
 The Kubernetes scheduler/agent, automatic placement/resizing, vLLM sampler, and multi-GPU trainer described below are
 not implemented. Tests exercise CPU models and real
 processes; they do not establish GPU memory-release or cluster-failover performance.
@@ -12,23 +12,18 @@ Kubernetes supplies GPU pods. The coordinator owns durable commands, worker assi
 results. Agents decide which of their local processes can use GPU memory. The tensor store moves immutable state.
 
 ```text
-clients → coordinator API → private SQLite journal on a persistent block volume
+clients → coordinator API → Redis command metadata, assignments, and results
                   ↕
            worker HTTP connections
                   ↕
-          GPU agents and trainers ↔ immutable tensor store
+          GPU agents and trainers ↔ shared payload files and tensor snapshots
 ```
 
 One logical authority does not mean one GPU or one trainer. Many trainers, agents, gateway connections, and runs can
 operate concurrently. The coordinator serializes short metadata transitions; tensors and training computation stay
-outside it. Workers never connect to SQLite directly. There is no Redis script layer or second authoritative queue.
-
-This ownership model does not depend on excluding Redis. Redis can supply disposable caches or notifications if
-independently scaled consumers need them; notification loss must be recoverable by reading the journal. It could also
-replace the metadata backend behind the coordinator with an explicit persistence and failover contract. The current
-singleton already has a durable command journal and local wakeups, so adding a second command queue would add
-coordination without removing any responsibility. Choose a backend for its operational requirements, while keeping
-one authority for command acceptance, ownership, and completion.
+outside it. Redis stores request-processing state using native primitives and transactions. Scheduling, assignment,
+and recovery decisions stay in coordinator code; there is no Lua policy layer. Workers use the authenticated
+coordinator API rather than making independent ownership decisions against Redis.
 
 A run is the stable unit of command order and training state. A worker is a process incarnation that can host multiple
 compatible LoRA runs sharing one frozen base. Pools describe this sharing. An agent is the local GPU-capacity manager.
@@ -37,7 +32,7 @@ provide liveness without requiring an independently renewed lease for every run.
 
 ## Durable commands
 
-Before returning an accepted request id, the coordinator commits its command and deduplication identity. The run's
+Before returning an accepted request id, the coordinator commits its command and deduplication identity to Redis. The run's
 sequence establishes execution order even when HTTP requests arrive out of order. Repeating an accepted command with
 the same identity returns its original request; reusing that identity for a different command is an error.
 
@@ -48,10 +43,20 @@ can upload an immutable blob, but cannot publish it as the result or checkpoint 
 Workers retain an in-flight command's result until completion is acknowledged. Following a coordinator restart they
 reconnect and reconcile that result; they must not blindly execute the command again. If a worker also loses its state,
 the coordinator reports the uncertain command as failed. Training updates cannot be made transactional merely by
-journaling their replies.
+persisting their replies.
 
 Deleting a run closes admission and terminates queued requests explicitly. Futures that no longer exist or have expired
 return terminal errors rather than leaving clients polling forever.
+
+Training payloads and results above 64 KiB are stored as immutable files addressed by SHA-256. Redis metadata and
+the worker HTTP protocol carry their references, and workers read payloads directly from the shared mount.
+`PAYLOAD_DIR` defaults to `CKPT/payloads`; coordinator and workers must see the same files. Small bodies stay inline. This keeps large batches
+and numerical outputs out of Redis transactions without introducing a second command queue. The current storage
+implementation uses shared filesystems; an object-storage/S3 backend is not implemented.
+
+Request and result bodies are capped at 64 MiB by default. If numerical execution produces an oversized result, the
+worker reports an explicit failure requiring recovery; it does not retry the training mutation to produce a smaller
+response. Workers fetch one command at a time to bound prefetched payload memory.
 
 ## Tensor state and residency
 
@@ -98,7 +103,7 @@ These are persisted phases so a restarted coordinator can continue or abort a tr
 snapshot exists cannot promise lossless migration. A target that dies before cutover leaves the source authoritative.
 Worker loss can put a run into explicit recovery even when a snapshot exists; the coordinator must not silently resume
 older state. Snapshot-based recovery after a committed cutover requires retaining that snapshot. Commands arriving
-during migration stay ordered in the run's journal.
+during migration stay ordered in the run's request records.
 
 The current `/internal/recover` endpoint accepts a `run_id`, exactly one checkpoint `path` or immutable snapshot `ref`,
 and an optional `target_pool`. Recovery is an explicit operation; automatic retry and checkpoint-selection policy are
@@ -115,44 +120,65 @@ Samplers are independently placed replicas using immutable weight references. A 
 weight version it requests; active batches and prefix/KV caches need an explicit version-switch protocol. Agent-driven
 vLLM sleep/wake is a future integration with the same local capacity manager.
 
-## Deploying the coordinator
+## Deploying Redis and the coordinator
 
-Use one coordinator StatefulSet replica on CPU nodes and a CSI `ReadWriteOncePod` persistent volume. Mount a block
-volume with a local filesystem and keep the SQLite database and its WAL together. Use WAL mode and `synchronous=FULL`
-for acknowledged metadata durability. Do not share a SQLite WAL database between machines over NFS.
-[SQLite documents this application-server usage](https://www.sqlite.org/whentouse.html),
-[WAL's host requirement](https://www.sqlite.org/wal.html), and
-[the durability setting](https://sqlite.org/pragma.html#pragma_synchronous).
+Use Redis 7 or newer on persistent storage, with `appendonly yes`, `appendfsync always`, and
+`maxmemory-policy noeviction` for the documented durability contract. Snapshot-only persistence or AOF `everysec`
+can lose accepted commands after a crash. Configure backups and capacity monitoring; a full metadata store must
+stop acceptance rather than evict command or deduplication state. These settings are deployment requirements,
+not something the coordinator silently changes on a shared Redis service.
+[Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
 
-Only the coordinator opens `JOURNAL`. Workers use `COORDINATOR_URL` and authenticate with `COORDINATOR_TOKEN`.
-The tensor store uses `CKPT`, separate from the metadata volume. Keep journal backups and tensor retention consistent;
-use the [SQLite backup API](https://sqlite.org/backup.html) or another WAL-aware backup method.
+The coordinator uses `REDIS_URL` and `REDIS_NAMESPACE`. Workers use `COORDINATOR_URL` and authenticate with
+`COORDINATOR_TOKEN`. Mount `CKPT` and `PAYLOAD_DIR` on shared persistent storage with the same view from every
+process that needs them. Keep Redis backups and blob retention consistent: a restored reference is useful only if
+its payload or checkpoint still exists. Garbage collection must preserve queued payloads, retained results,
+checkpoint aliases, and migration snapshots; automatic blob garbage collection is not implemented.
 
-During an ordinary update, stop admission/dispatch, flush metadata, stop the old process, and restart against the same
-journal. GPU workers can retain their model state during the control-plane pause. New commands and result publication
-wait until the coordinator has recovered. This deployment has restart availability, not uninterrupted HA.
+One coordinator holds a renewable namespace lease. Metadata transitions verify its ownership with
+`WATCH`/`MULTI`/`EXEC`, so a process whose lease expired cannot publish a new assignment or completion against the
+same Redis history. Losing the lease is terminal for that coordinator instance. Assignment generations and worker
+sessions separately reject late worker results. The lease does not stop already-running GPU computation.
+[Redis transaction semantics](https://redis.io/docs/latest/develop/using-commands/transactions/).
 
-`ReadWriteOncePod` restricts the PVC to one pod; ordinary `ReadWriteOnce` can allow several pods on one node.
-[Kubernetes access modes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes).
-The pod-count setting is not proof that a partitioned old process is dead. Force-deleting a StatefulSet pod can create
-another while the original is still running, and a Kubernetes leader-election lease does not provide fencing.
+The namespace is private to the coordinator; external writes can violate its key types and invariants. Redis does not
+roll back runtime errors inside `EXEC`. Such errors stop that coordinator and log an instruction to inspect and repair
+the namespace before restarting; they are not treated as ordinary connection retries.
+
+For a normal update, stop the old coordinator and release its lease, then start its replacement against the same
+Redis namespace. After a crash, wait for lease expiry (`COORDINATOR_TTL`, default 10 seconds). Workers retain their
+model and unacknowledged result while reconnecting. Dispatch and result publication pause during replacement;
+this is restart availability, not uninterrupted HA. The health endpoint checks and renews coordinator authority.
+
+A coordinator that has lost its lease returns HTTP 503 and never reacquires it in the same process. Readiness removes
+traffic but cannot repair this state: configure a liveness/restart policy that replaces a fenced instance. Allow startup
+and restart backoff enough time for the previous lease to expire, plus Redis connection and process-start time; a
+replacement started while another lease is still live can fail startup and needs retrying. Avoid a short probe budget
+that continually kills replacements during the expected failover pause. Probe and lease timings belong in the deployment
+configuration; the two-second lease in the SDK test is only for that controlled test.
+
+Deploy one active coordinator process, with Redis access restricted to the coordinator service. Kubernetes pod
+counts and leader-election leases alone do not fence a partitioned old process. Redis lease checks protect metadata
+only while all participants use the same authoritative Redis history. A replacement Redis primary must not coexist
+with an old writable primary or silently roll back accepted work.
 [StatefulSet warning](https://kubernetes.io/docs/tasks/run-application/force-delete-stateful-set-pod/),
 [client-go leader-election contract](https://pkg.go.dev/k8s.io/client-go/tools/leaderelection).
 
-For node failover, confirm the old process/node is stopped or use a proven infrastructure fence before promotion.
-Google regional Persistent Disk force-attach prevents the original VM from writing to the disk, but does not stop its
-network RPCs. Assignment generations, coordinator-only publication, and conditional resource operations still matter.
-[Google's disk-failover guarantee](https://docs.cloud.google.com/compute/docs/disks/repd-failover).
-Kubernetes also requires care around forced detach and out-of-service nodes:
-[node-shutdown procedures](https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/).
+Redis replication is asynchronous. Sentinel/Cluster promotion can lose acknowledged writes, and `WAIT` does not
+turn it into a strongly consistent store. Do not assume AOF on one primary makes replica promotion lossless.
+Automatic failover needs an explicit data-loss and fencing contract; after a rollback, stop admission and reconcile
+affected sessions and model state before resuming. The application does not implement that disaster-recovery policy.
+[Redis replication guarantees](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/).
 
 ## Failure contract
 
 | Failure | Recovery | Limit |
 |---|---|---|
-| Coordinator process exits | Recover journal and reconnect workers | Dispatch/publication pause; do not replay uncertain optimizer work |
-| Coordinator node partitions | Wait for confirmed termination or effective fencing before replacement | Safety may require waiting |
-| Metadata disk is lost | Restore a consistent backup and invalidate old sessions | Backup age bounds lost metadata |
+| Coordinator process exits | Reacquire expired/released lease and reconnect against the same Redis | Dispatch/publication pause; do not replay uncertain optimizer work |
+| Coordinator node partitions | Redis lease checks reject its later transitions; replacement waits for expiry | Requires a single authoritative Redis history; old computation may continue |
+| Redis process restarts on its intact AOF | Recover metadata, then reconcile coordinator and workers | Durability depends on the configured fsync policy and storage |
+| Redis disk loss or replica rollback | Stop admission; restore/reconcile metadata and invalidate affected sessions | Backup/replication lag bounds lost metadata; not automatic |
+| Shared payload/checkpoint storage is lost | Restore the referenced files before execution or recovery | Redis references cannot reconstruct missing tensors or request bodies |
 | Worker pauses or partitions | Advance affected assignments; reject late results | Old GPU computation may continue without publication authority |
 | Worker/node loses training state | Restore a known snapshot and report ambiguous/lost work | A durable reply is not a durable tensor update |
 | Migration source dies | Explicit recovery from a complete retained snapshot | Otherwise recover from the previous checkpoint and report lost work |
@@ -160,17 +186,17 @@ Kubernetes also requires care around forced detach and out-of-service nodes:
 | A distributed rank fails | Fence and restart the affected execution group | Requires distributed snapshot and collective recovery support |
 
 Lossless recovery of acknowledged training progress requires durable state or a defined replay protocol in addition
-to the command journal. That policy must be explicit; a metadata transaction does not manufacture missing gradients
+to durable request records. That policy must be explicit; a metadata transaction does not manufacture missing gradients
 or weights after GPU memory disappears.
 
-Zero-downtime HA is a separate availability requirement. Independent SQLite replicas plus leader election do not meet
-it. Automatic HA needs synchronously replicated authoritative state and enforced fencing using an established system;
-failover and network partitions still impose availability limits. No application-written consensus is needed for the
-single active coordinator deployment described here.
+Zero-downtime HA is a separate availability requirement. A second coordinator and asynchronous Redis failover do not
+by themselves provide it. Lossless failover needs a storage contract that preserves acknowledged state and enforces
+fencing; network partitions still impose availability limits. The current deployment relies on native Redis primitives
+and one coordinator authority rather than implementing application-level consensus.
 
 ## Validation
 
-The implementation should be validated against temporary real SQLite journals, real HTTP coordinator/worker processes,
+The implementation should be validated against isolated real Redis servers with AOF enabled, real HTTP coordinator/worker processes,
 and tiny CPU models: command ordering and retry identity, terminal future states, stale-worker rejection, coordinator
 restart, complete snapshot continuation, checkpoint publication, and migration phase interruptions.
 

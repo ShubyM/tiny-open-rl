@@ -7,9 +7,10 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 
-from test.helpers import tiny
+from test.helpers import RedisServer, tiny
 from tinyrl.store import Store
 
 EXAMPLE = pathlib.Path(__file__).parent.parent / "examples" / "tinker_sdk.py"
@@ -26,7 +27,9 @@ def wait_until_up(url: str) -> None:
     try:
       with urllib.request.urlopen(url, timeout=1):
         return
-    except OSError:
+    except OSError as error:
+      if isinstance(error, urllib.error.HTTPError):
+        error.close()
       time.sleep(0.1)
   raise TimeoutError(f"coordinator did not become ready: {url}")
 
@@ -36,15 +39,18 @@ class TestTinkerSDK(unittest.TestCase):
   """The real SDK and HTTP worker retain a training run across a coordinator restart."""
 
   def test_the_tinker_sdk_trains_across_a_coordinator_restart(self):
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, RedisServer() as redis_server:
       base = f"{tmp}/tiny"
       tiny().save_pretrained(base)
       url = f"http://127.0.0.1:{free_port()}"
       env = {
         **os.environ,
         "PORT": url.rsplit(":", 1)[1],
-        "JOURNAL": f"{tmp}/journal.sqlite3",
+        "REDIS_URL": redis_server.url,
+        "REDIS_NAMESPACE": "sdk-restart-test",
+        "COORDINATOR_TTL": "2",
         "CKPT": f"{tmp}/ckpt",
+        "PAYLOAD_DIR": f"{tmp}/payloads",
         "COORDINATOR_URL": url,
         "COORDINATOR_TOKEN": "integration-worker-token",
         "BASE_URL": url,
@@ -72,7 +78,11 @@ print('resumed_sampler ' + trainer.save_weights_for_sampler('after-restart').res
           def coordinator():
             proc = subprocess.Popen([sys.executable, "-m", "tinyrl.gateway"], env=env, stdout=logs, stderr=logs)
             procs.append(proc)
-            wait_until_up(f"{url}/api/v1/healthz")
+            try:
+              wait_until_up(f"{url}/api/v1/healthz")
+            except TimeoutError as error:
+              logs.seek(0)
+              raise RuntimeError(f"{error}\n{logs.read()[-6000:]}") from error
             return proc
 
           server = coordinator()
@@ -99,9 +109,10 @@ print('resumed_sampler ' + trainer.save_weights_for_sampler('after-restart').res
             self.fail(f"SDK did not reach restart boundary:\n{stdout}\n{stderr[-4000:]}\n{logs.read()[-4000:]}")
 
           run_id = ready.read_text()
-          server.kill()  # exercise journal recovery without graceful coordinator shutdown
+          server.kill()  # retain Redis and the worker while the coordinator loses its lease
           server.wait(timeout=15)
           self.assertIsNone(worker.poll(), "worker exited with the coordinator")
+          time.sleep(2.1)  # the dead coordinator cannot renew; replacement waits for its lease to expire
           coordinator()
           resume.touch()
           stdout, stderr = sdk.communicate(timeout=180)

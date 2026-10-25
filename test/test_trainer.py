@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -354,6 +355,47 @@ class TestTrainer(CoordinatorTest):
     with patch.object(worker.model, "optim_step", wraps=worker.model.optim_step) as step:
       await asyncio.gather(worker.step(block_ms=0), worker.step(block_ms=0))
     self.assertEqual(step.call_count, 1)
+
+  async def test_cancelled_step_retains_numerical_result_and_execution_lock(self):
+    run = await self.create_run()
+    worker = Trainer(self.bus, "p", Model(tiny))
+    await self.drain(worker)
+    await self.submit(run, Op.FORWARD_BACKWARD, proto_body(run))
+    await self.drain(worker)
+    request = await self.submit(run, Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.01}})
+    entered, release = threading.Event(), threading.Event()
+    original = worker.model.optim_step
+
+    def blocked_step(*args, **kwargs):
+      entered.set()
+      if not release.wait(5):
+        raise TimeoutError("test did not release the numerical thread")
+      return original(*args, **kwargs)
+
+    with patch.object(worker.model, "optim_step", side_effect=blocked_step) as optim:
+      first = asyncio.create_task(worker.step(block_ms=0))
+      second = None
+      try:
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+        first.cancel()
+        await asyncio.sleep(0)
+        first.cancel()  # repeated cancellation must not release the shared model
+        second = asyncio.create_task(worker.step(block_ms=0))
+        await asyncio.sleep(0)
+        self.assertFalse(first.done())
+        self.assertFalse(second.done())
+        self.assertTrue(worker.execution.locked())
+        self.assertEqual(optim.call_count, 1)
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+          await first
+        await second  # redelivery only retries acknowledgement of the cached reply
+      finally:
+        release.set()
+        await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+      self.assertEqual(optim.call_count, 1)
+    self.assertTrue((await self.bus.result(request, 0)).ok)
+    self.assertEqual(worker.pending, {})
 
   async def test_migration_keeps_pending_gradients_rng_and_run_identity(self):
     for rank in (0, 4):

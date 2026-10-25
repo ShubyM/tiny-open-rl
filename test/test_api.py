@@ -1,3 +1,4 @@
+import hashlib
 import json
 import unittest
 from unittest.mock import patch
@@ -10,6 +11,7 @@ from test.test_wire import json_body
 from tinyrl import gateway, wire
 from tinyrl.bus import Reply
 from tinyrl.client import WorkerClient
+from tinyrl.payloads import INLINE_BYTES, PayloadStore
 from tinyrl.proto import tinker_public_pb2 as pb
 from tinyrl.store import Store
 from tinyrl.trainer import Model, Trainer
@@ -35,7 +37,8 @@ class TestAPI(CoordinatorTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.store = Store(root=f"{self.tmpdir.name}/ckpt")
-    self.api = gateway.app(self.bus, worker_token="test-token")
+    self.payloads = PayloadStore(root=f"{self.tmpdir.name}/payloads")
+    self.api = gateway.app(self.bus, worker_token="test-token", payloads=self.payloads)
     self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.api), base_url="http://tinyrl")
     self.trainers: dict[str, Trainer] = {}
 
@@ -211,7 +214,7 @@ class TestAPI(CoordinatorTest):
       base_url="http://tinyrl",
       headers={"Authorization": "Bearer test-token"},
     ) as connection:
-      worker = WorkerClient(http=connection)
+      worker = WorkerClient(http=connection, payloads=self.payloads)
       self.assertTrue((await worker.register("worker", "lora:tiny"))["registered"])
       [command] = await worker.take("lora:tiny", "worker", block_ms=0)
       self.assertEqual(command.request_id, created.json()["request_id"])
@@ -220,6 +223,65 @@ class TestAPI(CoordinatorTest):
       self.assertEqual(await worker.finish(command, outcome), "already_committed")
       self.assertEqual(await worker.take("lora:tiny", "worker", block_ms=0), [])
     self.assertEqual(await self.bus.result(command.request_id, 0), outcome)
+
+  async def test_large_request_and_result_use_shared_files_through_worker_http(self):
+    created = await self.post("create_model", json={"base_model": "tiny", "lora_config": {"rank": 4}})
+    run = created.json()["model_id"]
+    async with httpx.AsyncClient(
+      transport=httpx.ASGITransport(app=self.api),
+      base_url="http://tinyrl",
+      headers={"Authorization": "Bearer test-token"},
+    ) as connection:
+      worker = WorkerClient(http=connection, payloads=self.payloads)
+      await worker.register("worker", "lora:tiny")
+      [create] = await worker.take("lora:tiny", "worker", block_ms=0)
+      await worker.finish(create, Reply(True, wire.JSON, b'{"type":"create_model"}'))
+
+      request = pb.ForwardBackwardRequest.FromString(proto_body(run, seq_id=1))
+      request.loss_fn_config_v2["padding"].text = "input-payload-" * 20000
+      body = request.SerializeToString()
+      submitted = await self.post("forward_backward", content=body, headers=PROTO)
+      self.assertEqual(submitted.status_code, 200)
+      [envelope] = await self.bus.take("lora:tiny", "worker", block_ms=0)
+      self.assertEqual(envelope.body, b"")
+      self.assertEqual(envelope.body_ref, hashlib.sha256(body).hexdigest())
+      self.assertEqual(envelope.body_size, len(body))
+
+      raw = await connection.post("/internal/take", json={"pool": "lora:tiny", "worker": "worker", "block_ms": 0})
+      self.assertEqual(raw.json()["commands"][0]["body"], "")
+      self.assertLess(len(raw.content), INLINE_BYTES)
+      [command] = await worker.take("lora:tiny", "worker", block_ms=0)
+      self.assertEqual(command.body, body)
+
+      output = json.dumps({"type": "forward_backward", "payload": "output-payload-" * 20000}).encode()
+      self.assertEqual(await worker.finish(command, Reply(True, wire.JSON, output)), "committed")
+      stored = await self.bus.result(command.request_id, 0)
+      self.assertEqual(stored.body, b"")
+      self.assertEqual(stored.body_ref, hashlib.sha256(output).hexdigest())
+      self.assertEqual(stored.body_size, len(output))
+      retrieved = await self.post("retrieve_future", json={"request_id": command.request_id})
+      self.assertEqual(retrieved.content, output)
+
+      # The live Redis data stays metadata-sized even with large input and output bodies.
+      client = self.redis_server.client
+      sizes = [client.memory_usage(key) for key in client.scan_iter(f"{self.bus.prefix}*")]
+      self.assertTrue(sizes)
+      self.assertLess(sum(sizes), len(body) // 2)
+
+  async def test_payload_write_failure_does_not_accept_or_consume_a_sequence(self):
+    run = await self.create_model()
+    request = pb.ForwardBackwardRequest.FromString(proto_body(run, seq_id=1))
+    request.loss_fn_config_v2["padding"].text = "input-payload-" * 20000
+    body = request.SerializeToString()
+    async with httpx.AsyncClient(
+      transport=httpx.ASGITransport(app=self.api, raise_app_exceptions=False), base_url="http://tinyrl"
+    ) as connection:
+      with patch.object(self.payloads, "put", side_effect=OSError("payload filesystem unavailable")):
+        failed = await connection.post("/api/v1/forward_backward", content=body, headers=PROTO)
+    self.assertEqual(failed.status_code, 500)
+    self.assertEqual((await self.bus.queue(run))["queued"], 0)
+    self.assertEqual((await self.bus.run(run))["cursor"], 0)
+    self.assertEqual((await self.post("forward_backward", content=body, headers=PROTO)).status_code, 200)
 
   async def test_pools(self):
     shared, also_shared = await self.create_model(), await self.create_model()

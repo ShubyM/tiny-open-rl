@@ -1,6 +1,6 @@
 """A trainer serves one pool: the LoRA adapters that share a base model, or a single full fine-tune.
 
-It executes coordinator-issued commands over HTTP and retains results until their journal acknowledgement.
+It executes coordinator-issued commands over HTTP and retains results until the coordinator acknowledges them.
 """
 
 from __future__ import annotations
@@ -505,7 +505,7 @@ class Trainer:
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
     self.done = self.registered = False
     self.generations: dict[str, int] = {}
-    self.pending: dict[tuple[str, str, int, str], Reply] = {}  # retained until journal acknowledgement
+    self.pending: dict[tuple[str, str, int, str], Reply] = {}  # retained until completion is acknowledged
     self.execution = asyncio.Lock()
     self.resume_device: torch.device | None = None
 
@@ -558,7 +558,18 @@ class Trainer:
           break
         identity = (cmd.run, cmd.entry_id, cmd.generation, cmd.token)
         if identity not in self.pending:
-          self.pending[identity] = await asyncio.to_thread(self.run, cmd)
+          # Cancelling an asyncio waiter cannot stop a numerical thread. Hold
+          # the lock and preserve its outcome before allowing another step.
+          execution = asyncio.get_running_loop().run_in_executor(None, self.run, cmd)
+          cancelled = False
+          while True:
+            try:
+              self.pending[identity] = await asyncio.shield(execution)
+              break
+            except asyncio.CancelledError:
+              cancelled = True
+          if cancelled:
+            raise asyncio.CancelledError
         while not self.done:
           try:
             status = await self.bus.finish(cmd, self.pending[identity])

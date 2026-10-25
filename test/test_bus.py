@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -8,8 +9,11 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
+from redis.asyncio.client import Pipeline
+from redis.exceptions import ConnectionError as RedisConnectionError
+
 from test.helpers import CoordinatorTest, new_id
-from tinyrl.bus import Bus, Op, Reply, Run
+from tinyrl.bus import Bus, CoordinatorUnavailable, Op, Reply, Run
 
 
 def ok(*, artifact="", **body) -> Reply:
@@ -77,7 +81,7 @@ class TestBus(CoordinatorTest):
     self.assertEqual(cmd.request_id, first)
     self.assertEqual([cmd], await self.bus.take("p", "w0", block_ms=0))
     await self.bus.close()
-    self.bus = Bus(self.path)
+    self.bus = Bus(url=self.url, namespace=self.namespace)
     self.assertEqual([cmd], await self.bus.take("p", "w0", block_ms=0))
     self.assertEqual(first, await self.bus.submit(run, Op.OPTIM_STEP, b'{"lr":1}', seq_id=0))
     await self.bus.finish(cmd, ok())
@@ -303,7 +307,7 @@ class TestBus(CoordinatorTest):
     run = await self.new_run(initialized=True)
     await self.bus.submit(run, Op.OPTIM_STEP, b"{}")
     await self.take()
-    self.bus.db.execute("UPDATE workers SET seen=?", (time.time() - 100,))
+    await self.bus.r.zadd(self.bus.key("workers"), {"w0": time.time() - 100})
     self.assertEqual(await self.bus.expire_workers(), 0)
     self.bus._started -= 100
     self.assertEqual(await self.bus.expire_workers(), 1)
@@ -325,31 +329,142 @@ class TestBus(CoordinatorTest):
     self.assertIsNone(await self.bus.session_info("absent"))
 
   async def test_exclusive_owner_and_committed_work_survives_process_exit(self):
-    with self.assertRaisesRegex(RuntimeError, "another coordinator"):
-      Bus(self.path)
+    other = Bus(url=self.url, namespace=self.namespace)
+    try:
+      with self.assertRaisesRegex(CoordinatorUnavailable, "another coordinator"):
+        await other.start()
+    finally:
+      await other.close()
     await self.bus.close()
     script = """
 import asyncio, os, sys
 from tinyrl.bus import Bus, Op, Run
 async def main():
-  bus = Bus(sys.argv[1])
+  bus = Bus(url=sys.argv[1], namespace=sys.argv[2], lease_seconds=.2)
   await bus.create(Run('durable', 'p', 'base', 8))
   request = await bus.submit('durable', Op.OPTIM_STEP, b'{}', seq_id=0)
   print(request, flush=True)
-  if sys.argv[2] == 'rollback':
-    bus.db.execute('BEGIN IMMEDIATE')
-    bus.db.execute("UPDATE runs SET cursor=99 WHERE id='durable'")
-  os._exit(0)
+  async with bus._transaction() as tx:
+    run = await tx.record(bus.key('run', 'durable'))
+    run['cursor'] = 99
+    tx.save(bus.key('run', 'durable'), run)
+    os._exit(0)  # no EXEC for the cursor update
 asyncio.run(main())
 """
     process = subprocess.run(
-      [sys.executable, "-c", script, self.path, "rollback"], cwd=os.getcwd(), capture_output=True, text=True, check=True
+      [sys.executable, "-c", script, self.url, self.namespace],
+      cwd=os.getcwd(),
+      capture_output=True,
+      text=True,
+      check=True,
     )
     request = process.stdout.strip()
-    self.bus = Bus(self.path)
+    self.redis_server.stop(kill=True)
+    self.redis_server.start()  # reload the AOF after an actual Redis process crash
+    await asyncio.sleep(0.25)
+    self.bus = Bus(url=self.url, namespace=self.namespace)
     self.assertEqual((await self.bus.run("durable"))["cursor"], 0)
     self.assertEqual(await self.bus.submit("durable", Op.OPTIM_STEP, b"{}", seq_id=0), request)
     self.assertEqual((await self.take()).request_id, request)
+
+  async def test_lost_exec_response_reconciles_admission_and_completion(self):
+    run = await self.new_run()
+    original = Pipeline.execute
+
+    async def committed_but_disconnected(pipe, *args, **kwargs):
+      await original(pipe, *args, **kwargs)
+      raise RedisConnectionError("connection lost after EXEC committed")
+
+    with patch.object(Pipeline, "execute", committed_but_disconnected):
+      with self.assertRaises(CoordinatorUnavailable):
+        await self.bus.submit(run, Op.OPTIM_STEP, b"{}", seq_id=0)
+    request = await self.bus.submit(run, Op.OPTIM_STEP, b"{}", seq_id=0)
+    self.assertEqual((await self.bus.queue(run))["queued"], 1)
+    cmd = await self.take()
+    self.assertEqual(cmd.request_id, request)
+    with patch.object(Pipeline, "execute", committed_but_disconnected):
+      with self.assertRaises(CoordinatorUnavailable):
+        await self.bus.finish(cmd, ok())
+    self.assertEqual(await self.bus.finish(cmd, ok()), "already_committed")
+    self.assertEqual((await self.bus.run(run))["steps"], 1)
+
+  async def test_expired_coordinator_cannot_commit_or_release_successors_lease(self):
+    run = await self.new_run()
+    successor = Bus(url=self.url, namespace=self.namespace)
+    try:
+      with self.assertRaises(CoordinatorUnavailable):
+        async with self.bus._transaction() as tx:
+          r = await tx.record(self.bus.key("run", run))
+          r["cursor"] = 99
+          tx.save(self.bus.key("run", run), r)
+          await self.bus.r.pexpire(self.bus.key("coordinator"), 1)
+          await asyncio.sleep(0.02)
+          await successor.start()
+      with self.assertRaises(CoordinatorUnavailable):
+        await self.bus.submit(run, Op.OPTIM_STEP, b"{}")
+      await self.bus.close()
+      self.assertEqual(await successor.r.get(successor.key("coordinator")), successor.token.encode())
+      self.assertEqual((await successor.run(run))["cursor"], 0)
+    finally:
+      await successor.close()
+
+  async def test_redis_runtime_transaction_error_fences_and_reports_required_repair(self):
+    run = await self.new_run()
+    wrong_type = self.bus.key("wrong_type")
+    await self.bus.r.set(wrong_type, "outside writer corrupted a hash")
+    with self.assertLogs("tinyrl.bus", level="ERROR") as logs:
+      with self.assertRaisesRegex(CoordinatorUnavailable, "inspect and repair"):
+        async with self.bus._transaction() as tx:
+          r = await tx.record(self.bus.key("run", run))
+          r["cursor"] = 99
+          tx.save(self.bus.key("run", run), r)
+          tx.write("hset", wrong_type, "field", "value")
+    # This is a real Redis runtime error: MULTI did not roll back the first
+    # command. The current process must halt writes and request explicit repair.
+    self.assertEqual((await self.bus.run(run))["cursor"], 99)
+    with self.assertRaises(CoordinatorUnavailable):
+      await self.bus.submit(run, Op.OPTIM_STEP, b"{}")
+    self.assertIn("repair this namespace before restarting", " ".join(logs.output))
+
+  async def test_payload_identity_is_independent_of_transport_and_logical_size_bounds_admission(self):
+    run = await self.new_run()
+    data = b"batch input"
+    ref = hashlib.sha256(data).hexdigest()
+    request = await self.bus.submit(run, Op.FORWARD_BACKWARD, data, seq_id=0)
+    self.assertEqual(
+      request, await self.bus.submit(run, Op.FORWARD_BACKWARD, b"", seq_id=0, body_ref=ref, body_size=len(data))
+    )
+    cmd = await self.take()
+    reply = ok(n=1)
+    self.assertEqual(await self.bus.finish(cmd, reply), "committed")
+    alternate = replace(reply, body=b"", body_ref=hashlib.sha256(reply.body).hexdigest(), body_size=len(reply.body))
+    self.assertEqual(await self.bus.finish(cmd, alternate), "already_committed")
+    big = b"x" * (1 << 20)
+    request = await self.bus.submit(
+      run, Op.FORWARD_BACKWARD, b"", seq_id=1, body_ref=hashlib.sha256(big).hexdigest(), body_size=len(big)
+    )
+    cmd = await self.take()
+    self.assertEqual((cmd.body, cmd.body_ref, cmd.body_size), (b"", hashlib.sha256(big).hexdigest(), len(big)))
+    stored = await self.bus.r.hgetall(self.bus.key("cmd", cmd.entry_id))
+    self.assertLess(sum(len(k) + len(v) for k, v in stored.items()), 4096)
+    await self.bus.finish(cmd, Reply(True, "application/octet-stream", b"", body_ref=cmd.body_ref, body_size=len(big)))
+    result = await self.bus.result(request, 0)
+    self.assertEqual((result.body, result.body_ref, result.body_size), (b"", cmd.body_ref, len(big)))
+    with patch("tinyrl.bus.MAX_COMMAND_BYTES", 100):
+      with self.assertRaisesRegex(ValueError, "MAX_COMMAND_BYTES"):
+        await self.bus.submit(run, Op.FORWARD_BACKWARD, b"", body_ref=ref, body_size=101)
+
+  async def test_single_command_prefetch_rotates_ready_runs_fairly(self):
+    runs = [await self.new_run() for _ in range(3)]
+    for run in runs:
+      for seq in range(2):
+        await self.bus.submit(run, Op.OPTIM_STEP, b"{}", seq_id=seq)
+    seen = []
+    for _ in range(6):
+      [cmd] = await self.bus.take("p", "w0", count=1, block_ms=0)
+      seen.append(cmd.run)
+      await self.bus.finish(cmd, ok())
+    self.assertEqual(seen, runs + runs)
 
 
 if __name__ == "__main__":
