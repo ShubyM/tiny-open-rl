@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tinyrl"
 version = "0.2.0"
-description = "The Tinker training API on Redis Streams and PyTorch."
+description = "The Tinker training API with a durable coordinator and PyTorch workers."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["fastapi", "uvicorn", "redis>=5", "protobuf>=5", "numpy", "torch", "transformers>=5", "peft>=0.15", "safetensors"]
+dependencies = ["fastapi", "uvicorn", "httpx", "protobuf>=5", "numpy", "torch", "transformers>=5", "peft>=0.15", "safetensors"]
 
 [project.optional-dependencies]
-testing = ["httpx", "ruff", "tabulate"]
+testing = ["ruff", "tabulate"]
 
 [tool.setuptools.packages.find]
 include = ["tinyrl*"]

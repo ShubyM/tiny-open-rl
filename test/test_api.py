@@ -1,14 +1,15 @@
 import json
-import tempfile
 import unittest
 from unittest.mock import patch
 
 import httpx
 import numpy as np
 
-from test.helpers import RedisTest, tiny
+from test.helpers import CoordinatorTest, tiny
 from test.test_wire import json_body
 from tinyrl import gateway, wire
+from tinyrl.bus import Reply
+from tinyrl.client import WorkerClient
 from tinyrl.proto import tinker_public_pb2 as pb
 from tinyrl.store import Store
 from tinyrl.trainer import Model, Trainer
@@ -16,9 +17,9 @@ from tinyrl.trainer import Model, Trainer
 PROTO = {"content-type": wire.PROTO}
 
 
-def proto_body(model_id: str, n: int = 12, loss_fn: str = "cross_entropy") -> bytes:
+def proto_body(model_id: str, n: int = 12, loss_fn: str = "cross_entropy", seq_id: int = 0) -> bytes:
   """A forward_backward the way the SDK sends it: two sequences that count up."""
-  req = pb.ForwardBackwardRequest(model_id=model_id, loss_fn=loss_fn)
+  req = pb.ForwardBackwardRequest(model_id=model_id, loss_fn=loss_fn, seq_id=seq_id)
   for start in (0, 40):
     tokens = np.arange(start, start + n + 1)
     datum = req.data.add()
@@ -30,11 +31,12 @@ def proto_body(model_id: str, n: int = 12, loss_fn: str = "cross_entropy") -> by
   return req.SerializeToString()
 
 
-class TestAPI(RedisTest):
+class TestAPI(CoordinatorTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
-    self.store = Store(root=tempfile.mkdtemp())
-    self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app(self.bus)), base_url="http://tinyrl")
+    self.store = Store(root=f"{self.tmpdir.name}/ckpt")
+    self.api = gateway.app(self.bus, worker_token="test-token")
+    self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.api), base_url="http://tinyrl")
     self.trainers: dict[str, Trainer] = {}
 
   async def asyncTearDown(self):
@@ -120,7 +122,9 @@ class TestAPI(RedisTest):
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
     self.assertEqual(sampler["path"], f"tinker://{run_id}/sampler_weights/step-0")
-    with open(f"{self.store.path(sampler['path'])}/adapter_config.json") as f:
+    resolved = await self.post("resolve_checkpoint", json={"path": sampler["path"]})
+    self.assertEqual(resolved.status_code, 200)
+    with open(f"{self.store.export(resolved.json()['ref'])}/adapter_config.json") as f:
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}
@@ -152,9 +156,70 @@ class TestAPI(RedisTest):
     self.assertIn("dpo", failed.json()["error"])
     self.assertEqual((await self.bus.run(run_id))["failed"], 1)
 
+    healthy_run = await self.create_model()
+    queued = await self.post("optim_step", json={"model_id": healthy_run})
     with patch.object(gateway, "WAIT", 0.01):
-      pending = await self.post("retrieve_future", json={"request_id": f"{run_id}/1-0"})
+      pending = await self.post("retrieve_future", json={"request_id": queued.json()["request_id"]})
       self.assertEqual(pending.json()["type"], "try_again")
+      unknown = await self.post("retrieve_future", json={"request_id": "unknown-request"})
+      self.assertIn("error", unknown.json())
+
+  async def test_sequence_order_and_retries_preserve_one_optimizer_step(self):
+    run_id = await self.create_model()
+    body = {"model_id": run_id, "seq_id": 2, "optim_params": {"learning_rate": 1e-2}}
+    optim = await self.post("optim_step", json=body)
+    self.assertEqual(await self.trainers["lora:tiny"].step(block_ms=0), 0)
+
+    forward_body = proto_body(run_id, seq_id=1)
+    forward = await self.post("forward_backward", content=forward_body, headers=PROTO)
+    retry = await self.post("forward_backward", content=forward_body, headers=PROTO)
+    self.assertEqual(retry.json(), forward.json())
+    conflict = await self.post("forward_backward", content=proto_body(run_id, n=8, seq_id=1), headers=PROTO)
+    self.assertEqual(conflict.status_code, 400)
+
+    await self.result(forward)
+    first = await self.result(optim)
+    retry = await self.post("optim_step", json=body)
+    self.assertEqual(retry.json(), optim.json())
+    self.assertEqual((await self.result(retry)).json(), first.json())
+    self.assertGreater(first.json()["metrics"]["grad_norm:mean"], 0)
+    self.assertEqual((await self.bus.run(run_id))["steps"], 1)
+
+  async def test_creation_and_header_retry_ids_are_stable(self):
+    session = (await self.post("create_session", json={})).json()["session_id"]
+    body = {"base_model": "tiny", "session_id": session, "model_seq_id": 7, "lora_config": {"rank": 4}}
+    created = await self.post("create_model", json=body)
+    self.assertEqual((await self.post("create_model", json=body)).json(), created.json())
+    conflict = await self.post("create_model", json={**body, "base_model": "different"})
+    self.assertEqual(conflict.status_code, 400)
+    run_id = created.json()["model_id"]
+    await self.result(created)
+
+    headers = {"Idempotency-Key": "one-step"}
+    step = await self.post("optim_step", json={"model_id": run_id}, headers=headers)
+    retry = await self.post("optim_step", json={"model_id": run_id}, headers=headers)
+    self.assertEqual(retry.json(), step.json())
+    await self.result(step)
+    self.assertEqual((await self.bus.run(run_id))["steps"], 1)
+
+  async def test_worker_http_requires_authentication_and_completion_is_idempotent(self):
+    denied = await self.http.post("/internal/register", json={"worker": "worker", "pool": "lora:tiny"})
+    self.assertEqual(denied.status_code, 401)
+    created = await self.post("create_model", json={"base_model": "tiny", "lora_config": {"rank": 4}})
+    async with httpx.AsyncClient(
+      transport=httpx.ASGITransport(app=self.api),
+      base_url="http://tinyrl",
+      headers={"Authorization": "Bearer test-token"},
+    ) as connection:
+      worker = WorkerClient(http=connection)
+      self.assertTrue((await worker.register("worker", "lora:tiny"))["registered"])
+      [command] = await worker.take("lora:tiny", "worker", block_ms=0)
+      self.assertEqual(command.request_id, created.json()["request_id"])
+      outcome = Reply(True, wire.JSON, b'{"type":"create_model"}')
+      self.assertEqual(await worker.finish(command, outcome), "committed")
+      self.assertEqual(await worker.finish(command, outcome), "already_committed")
+      self.assertEqual(await worker.take("lora:tiny", "worker", block_ms=0), [])
+    self.assertEqual(await self.bus.result(command.request_id, 0), outcome)
 
   async def test_pools(self):
     shared, also_shared = await self.create_model(), await self.create_model()

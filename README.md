@@ -1,8 +1,8 @@
 # tiny-open-rl
 
-The [Tinker](https://thinkingmachines.ai/tinker/) training API, built on Redis Streams and PyTorch.
+The [Tinker](https://thinkingmachines.ai/tinker/) training API, with a durable coordinator and PyTorch workers.
 
-The Tinker SDK trains through it unchanged, for LoRA adapters and full fine-tunes alike:
+The Tinker SDK trains LoRA adapters and full fine-tunes through the same API:
 
 ```python
 client = tinker.ServiceClient(base_url="http://localhost:8000")
@@ -12,83 +12,93 @@ for batch in data:
   trainer.forward_backward(batch, "importance_sampling")
   trainer.optim_step(types.AdamParams(learning_rate=4e-5))
 
-sampler_path = trainer.save_weights_for_sampler("step-100").result().path  # a PEFT adapter vLLM can load
+sampler_path = trainer.save_weights_for_sampler("step-100").result().path
 ```
 
 ## Run it
 
 ```sh
 pip install -e .
-redis-server &                                  # Redis 7 or newer
-python -m tinyrl.gateway &                      # the Tinker HTTP API, on :8000
-python -m tinyrl.trainer lora:Qwen/Qwen3-0.6B   # trains every LoRA on Qwen3-0.6B
+export COORDINATOR_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export JOURNAL="$PWD/data/journal.sqlite3"
+export CKPT="$PWD/data/checkpoints"
+python -m tinyrl.gateway &
+python -m tinyrl.trainer lora:Qwen/Qwen3-0.6B
 ```
 
-A **pool** is the set of runs one trainer serves. LoRA runs on the same base model share the pool `lora:<base_model>`.
+The gateway is the coordinator. It alone opens the SQLite journal; trainers connect over HTTP to `COORDINATOR_URL`
+(default `http://127.0.0.1:8000`). Give coordinator and workers the same `COORDINATOR_TOKEN`. The token authenticates the
+internal worker endpoints. Public API authentication and deployment TLS belong at the service boundary.
 
-A full fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive LoRA (`"openrl.exclusive": "true"`) gets a pool
-of its own, named by its model id. Start its trainer with `python -m tinyrl.trainer <model_id>`; it exits when the run is deleted.
-Starting trainers for new pools is the scheduler's job.
+`JOURNAL` must live on persistent storage. `CKPT` is a checkpoint directory shared by the trainers that exchange state.
+The journal stores command and ownership metadata; checkpoint tensors live in `CKPT`.
+
+A **pool** groups runs served by one trainer process. LoRA runs on the same base share `lora:<base_model>`. A full
+fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or exclusive LoRA (`"openrl.exclusive": "true"`) uses its
+model id as its pool. Start its trainer with `python -m tinyrl.trainer <model_id>`. Automatic worker provisioning is
+future scheduler work.
 
 ## How it works
 
-```
-sdk --http--> gateway --XADD--> tinyrl:q:<run> --XREADGROUP--> trainer --XADD--> tinyrl:f:<run>/<id> --XREAD--> gateway --> sdk
+```text
+SDK → coordinator HTTP API → SQLite command journal
+                              ↕ authenticated worker HTTP API
+                           trainer → immutable tensor store
 ```
 
-Every training call is a command on its run's Redis stream, and its reply is a stream with one entry, named by the request. That's the
-whole design. Redis does the bookkeeping that would otherwise take a database, a ledger and a heartbeat:
+The coordinator accepts commands durably, orders each run's commands, assigns them to registered worker sessions,
+and commits replies, counters, and checkpoint references in transactions. Client sequence ids and idempotency keys
+prevent retries from applying the same training command twice. Workers never open the journal or publish checkpoint
+aliases directly.
 
-* **The queue reads itself.** A pool's trainer reads its runs' streams through one consumer group, so `XINFO GROUPS` says what's queued,
-  and `XPENDING` says what's in flight, on which trainer, and for how long. `GET /api/v1/runs/<id>` just asks.
-* **A dead trainer fails fast.** The commands it took stay in the pending list. The next trainer to start claims them with `XAUTOCLAIM`
-  and fails them, so no client waits on work that died with its process.
-* **Retries are free.** `XREAD` from id `0` blocks until the reply is written and never consumes it, so `retrieve_future` can be retried,
-  or waited on by many clients, and every one of them gets the same answer.
-* **Deleted runs take no work.** A run is live exactly while its stream exists, so `XADD NOMKSTREAM` turns a call on a deleted run into a 404.
-* **Replies land atomically.** The reply, the acknowledgement and the run's step counter are written in one transaction.
-* **One wire format.** `forward_backward` stays protobuf from the SDK to the trainer, which reads the tensors straight out of the bytes.
-  Older SDKs' JSON is turned into the same protobuf at the gateway, and JSON clients get the output decoded back to JSON.
-* **One trainer.** A base model, with a PEFT adapter per run or the whole model for a single run, behind `create`, `forward_backward`,
-  `optim_step`, `state`, `weights`, `restore` and `delete`. Logprobs are computed `CHUNK` tokens at a time under checkpointing, so the
-  `[tokens, vocab]` logits never exist all at once. The optimizer updates fp32 master weights and keeps fp32 AdamW state, while the
-  forward pass runs in bf16 under autocast. A LoRA run's frozen base model stays bf16.
-* **Portable checkpoints.** Training checkpoints (`save_weights`) and sampler weights (`save_weights_for_sampler`) go through
-  [store.py](tinyrl/store.py) behind `put(uri)` and `get(uri)` as pure `safetensors` (no `torch.save` pickle), so any trainer can
-  resume a run with its exact fp32 weights and AdamW state.
+Each assignment carries a generation. A result from a replaced worker cannot complete a newer assignment. A completed
+reply can be retrieved repeatedly. Coordinator restarts preserve the journal; they do not replay uncertain optimizer
+steps automatically. Lost worker state is reported explicitly so the client can restore a checkpoint.
+
+`Model.state` describes training state with named tensors, including accumulated gradients and optimizer state.
+`Model.weights` produces sampler weights. Both use immutable `safetensors` bundles and metadata through `Store`.
+The coordinator binds a logical `tinker://` checkpoint name to its immutable reference only when the save completes.
+To export sampler weights for an external reader, resolve the returned URI with
+`POST /api/v1/resolve_checkpoint` and `{"path": "tinker://..."}`, then call `Store(root=CKPT).export(ref)` on a machine
+that can read the checkpoint directory. Sampling itself is not implemented.
+
+Authenticated `POST /internal/move` with `{"run_id": "...", "target_pool": "..."}` requests a journaled snapshot/restore
+handoff. Start a trainer for the destination pool first; an empty target parks the run durably. Inspect its phase with
+`GET /api/v1/runs/<id>`. A run requiring recovery can use `POST /internal/recover` with its `run_id`, checkpoint `path`,
+and optional `target_pool`; supply an immutable snapshot `ref` instead of `path` to recover a migration snapshot.
+Automatic placement decisions remain the scheduler's responsibility.
+
+The model uses fp32 trainable weights and AdamW state, with bf16 GPU forward passes. LoRA runs share a frozen base.
+Logprobs are computed in chunks to avoid materializing a full tokens-by-vocabulary tensor.
 
 ## Reading the code
 
-Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains the streams. Then read [gateway.py](tinyrl/gateway.py)
-to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to see how checkpoints are stored, and
-[trainer.py](tinyrl/trainer.py) to see how a command runs on the model.
+- [bus.py](tinyrl/bus.py): coordinator state transitions and the private SQLite journal.
+- [gateway.py](tinyrl/gateway.py): Tinker API and authenticated worker endpoints.
+- [client.py](tinyrl/client.py): workers' HTTP connection to the coordinator.
+- [trainer.py](tinyrl/trainer.py): training, snapshots, and the worker loop.
+- [store.py](tinyrl/store.py): immutable tensor bundles and HF/PEFT export.
+- [wire.py](tinyrl/wire.py): protobuf and JSON tensor conversion.
 
-| file | lines | what's in it |
-|---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 294 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 160 | runs, sessions, commands and replies on Redis |
-| [tinyrl/gateway.py](tinyrl/gateway.py) | 152 | the Tinker HTTP API |
-| [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
-| [tinyrl/store.py](tinyrl/store.py) | 68 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
-| [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
-
-`python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
-checkpoint disk the trainers and samplers share), `SHM` (optional local `/dev/shm` cache), `TOKEN_BUDGET` (padded tokens per pass;
-unset, each call sizes its passes to the free GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL` and `DEBUG=1`.
+`python sz.py` reports the maintained line-count budget. Runtime settings include `JOURNAL`, `CKPT`,
+`COORDINATOR_URL`, `COORDINATOR_TOKEN`, `PORT`, `TOKEN_BUDGET`, `CHUNK`, `GRAD_CKPT`, `WAIT`, and `DEBUG`.
 
 ## Test
 
 ```sh
-python -m unittest discover -s test -t .                             # starts its own redis-server, or set REDIS_URL
-TINKER_PYTHON=$(which python) python -m unittest test.test_tinker   # the real SDK, against redis, the gateway and a trainer as processes
+pip install -e '.[testing]' tinker
+python -m unittest discover -s test -t .
+TINKER_PYTHON=$(which python) python -m unittest test.test_tinker
 ```
 
-Every test runs against a real `redis-server` and a real (tiny, random) Llama. Nothing is faked.
+Tests use temporary SQLite journals and small random Llama models. The SDK test launches real coordinator and trainer
+processes and communicates over HTTP. No Redis service is required.
 
-## Not here yet
+## Deployment and remaining work
 
-* Sampling (`create_sampling_session`, `asample`). vLLM can already serve the adapters `save_weights_for_sampler` writes.
-* `create_training_client_from_state`.
-* Multi-GPU trainers (FSDP, context parallelism).
-* Running on Kubernetes: a scheduler that starts trainers for new pools, GPU time-slicing, and parking idle runs. The design is
-  in [docs/kubernetes.md](docs/kubernetes.md), and its first piece, one owner per pool, is on the `k8s-prototype` branch.
+The coordinator is one active process with a persistent journal. Restart and node failover can pause command dispatch;
+a second replica with an independent journal is not a safe failover mechanism. See [the Kubernetes design](docs/kubernetes.md)
+for restart, fencing, migration, and durability contracts.
+
+Kubernetes provisioning, automatic pool resizing, agent-driven GPU time-slicing, vLLM sampling, and multi-GPU trainers
+remain future integrations. The design keeps those capabilities and assigns their state transitions to the coordinator.

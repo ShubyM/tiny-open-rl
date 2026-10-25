@@ -5,3 +5,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+tinyrl-journal.sqlite*
+/data/journal.sqlite3*
+/data/checkpoints/

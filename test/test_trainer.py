@@ -11,10 +11,10 @@ import torch
 from peft import PeftModel
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from test.helpers import RedisTest, new_id, tiny
+from test.helpers import CoordinatorTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl import trainer, wire
-from tinyrl.bus import Op, Run
+from tinyrl.bus import Cmd, Op, Run
 from tinyrl.store import Store
 from tinyrl.trainer import LOSSES, Model, Trainer, batches, target_logprobs, token_budget
 
@@ -186,31 +186,29 @@ class TestModel(unittest.TestCase):
     store = Store(root=tempfile.mkdtemp())
     model, (a, b) = lora_runs(2)
     train(model, a, steps=3)
-    uri = f"tinker://{a}/weights/step-3"
-    store.put(uri, *model.state(a))
+    ref = store.put(*model.state(a))
     saved_weights = [p.detach().clone() for p in model.params[a].values()]
     saved_optimizer = copy.deepcopy(model.optimizers[a].state_dict())
 
     train(model, a, steps=3)
-    model.restore(a, *store.get(uri), optimizer=True)
+    model.restore(a, *store.get(ref), optimizer=True)
     self.assertTrue(same(saved_weights, model.params[a]))
     torch.testing.assert_close(model.optimizers[a].state_dict()["state"], saved_optimizer["state"])
 
-    model.restore(b, *store.get(uri), optimizer=False)  # a run can start from another run's checkpoint
+    model.restore(b, *store.get(ref), optimizer=False)  # a run can start from another run's checkpoint
     self.assertTrue(same(saved_weights, model.params[b]))
 
   def test_loading_a_checkpoint_that_does_not_fit_fails(self):
     store = Store(root=tempfile.mkdtemp())
     model, (a,) = lora_runs()
-    uri = f"tinker://{a}/sampler_weights/step-0"
-    store.put(uri, *model.weights(a))
+    ref = store.put(*model.weights(a))
 
     no_mlp = new_id()
     model.create(no_mlp, "tiny", 4, {**LORA, "train_mlp": False})
     with self.assertRaises(ValueError):
-      model.restore(no_mlp, *store.get(uri), optimizer=False)
+      model.restore(no_mlp, *store.get(ref), optimizer=False)
     with self.assertRaises(ValueError):
-      model.restore(a, *store.get(uri), optimizer=True)  # it was saved without the optimizer
+      model.restore(a, *store.get(ref), optimizer=True)  # it was saved without the optimizer
     with self.assertRaises(ValueError):
       store.get(f"tinker://{a}/weights/missing")
 
@@ -220,7 +218,7 @@ class TestModel(unittest.TestCase):
 
     model, (lora_run,) = lora_runs()
     train(model, lora_run, steps=3)
-    lora_dir = store.put(f"tinker://{lora_run}/sampler_weights/final", *model.weights(lora_run))
+    lora_dir = store.export(store.put(*model.weights(lora_run)))
     with torch.no_grad():
       torch.testing.assert_close(
         PeftModel.from_pretrained(tiny(), lora_dir).eval()(ids).logits,
@@ -230,7 +228,7 @@ class TestModel(unittest.TestCase):
     fft, fft_run = Model(tiny), new_id()
     fft.create(fft_run, "tiny", 0, {})
     train(fft, fft_run, steps=3)
-    fft_dir = store.put(f"tinker://{fft_run}/sampler_weights/final", *fft.weights(fft_run))
+    fft_dir = store.export(store.put(*fft.weights(fft_run)))
     with torch.no_grad():
       torch.testing.assert_close(
         LlamaForCausalLM.from_pretrained(fft_dir).eval()(ids).logits,
@@ -250,108 +248,221 @@ class TestModel(unittest.TestCase):
     with self.assertRaises(KeyError):
       model.optim_step(a, {})
 
+  def test_restore_rejects_shapes_before_changing_weights_gradients_or_optimizer(self):
+    model, (source, target) = lora_runs(2)
+    train(model, source, steps=2)
+    train(model, target, steps=1)
+    model.forward_backward(target, [counting(8)], "cross_entropy", {}, False)
+    weights = [p.clone() for p in model.params[target].values()]
+    gradients = [p.grad.clone() for p in model.params[target].values()]
+    optimizer = copy.deepcopy(model.optimizers[target].state_dict())
+    tensors, meta = model.state(source)
+    last = list(model.params[source])[-1]
+    for key in (last, f"{last}.exp_avg", f"__grad.{last}"):
+      broken, info = dict(tensors), copy.deepcopy(meta)
+      if key.startswith("__grad"):
+        info["grads"].append(last)
+      broken[key] = torch.zeros(1)
+      with self.assertRaises(ValueError):
+        model.restore(target, broken, info, optimizer=True)
+      self.assertTrue(same(weights, model.params[target]))
+      self.assertTrue(same(gradients, [p.grad for p in model.params[target].values()]))
+      torch.testing.assert_close(model.optimizers[target].state_dict(), optimizer)
 
-class TestTrainer(RedisTest):
-  async def submit(self, run: str, *cmds: tuple[Op, dict | bytes]) -> list[str]:
-    request_ids = []
-    for op, body in cmds:
-      request_ids.append(await self.bus.submit(run, op, body if isinstance(body, bytes) else json.dumps(body).encode()))
-    return request_ids
+  def test_snapshot_preserves_none_gradients_and_private_dropout_rng(self):
+    config = {**LORA, "lora_dropout": 0.25}
+    source, run = Model(tiny), new_id()
+    source.create(run, "tiny", 4, config)
+    train(source, run, steps=2)
+    source.forward_backward(run, [counting(8)], "cross_entropy", {}, False)
+    first = next(iter(source.params[run]))
+    source.params[run][first].grad = None
+    store = Store(root=tempfile.mkdtemp())
+    ref = store.put(*source.state(run))
+    restored, other = Model(tiny), new_id()
+    restored.create(other, "tiny", 4, config)
+    restored.restore(other, *store.get(ref), optimizer=True)
+    self.assertIsNone(restored.params[other][first].grad)
+    source.optim_step(run, {"learning_rate": 0.01})
+    restored.optim_step(other, {"learning_rate": 0.01})
+    self.assertTrue(same(source.params[run], restored.params[other]))
+    noise = new_id()
+    source.create(noise, "tiny", 4, {**config, "seed": 87})
+    train(source, noise, steps=2)
+    self.assertEqual(train(source, run, steps=2), train(restored, other, steps=2))
+    self.assertTrue(same(source.params[run], restored.params[other]))
 
-  async def test_commands_flow_through_and_delete_drops_the_run(self):
+
+class TestTrainer(CoordinatorTest):
+  async def submit(self, run: str, op: Op, body: dict | bytes):
+    return await self.bus.submit(run, op, body if isinstance(body, bytes) else json.dumps(body).encode())
+
+  async def create_run(self, pool="p", rank=4, lora=None):
     run = new_id()
-    await self.bus.create(Run(run, "p", "tiny", 4))
-    request_ids = await self.submit(
-      run,
-      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      (Op.FORWARD_BACKWARD, b"not protobuf"),
-      (Op.OPTIM_STEP, {"adam_params": {}}),
-      (Op.DELETE_MODEL, {}),
-    )
+    lora = LORA if lora is None else lora
+    await self.bus.create(Run(run, pool, "tiny", rank), body={"base_model": "tiny", "rank": rank, "lora": lora})
+    return run
 
-    t = Trainer(self.bus, "p", Model(tiny))
-    while await t.step(block_ms=10):
+  async def drain(self, worker):
+    while await worker.step(block_ms=0):
       pass
 
-    replies = [await self.bus.result(request_id, 0) for request_id in request_ids]
-    bodies = [json.loads(reply.body) for reply in replies]
-    self.assertEqual([reply.ok for reply in replies], [True, False, True, True])
-    self.assertEqual([body.get("type") for body in bodies], ["create_model", None, "optim_step", "delete_model"])
-    self.assertEqual(bodies[1]["category"], "user")
+  async def test_commands_and_failed_parse_preserve_order(self):
+    run = await self.create_run()
+    bad = await self.submit(run, Op.FORWARD_BACKWARD, b"not protobuf")
+    step = await self.submit(run, Op.OPTIM_STEP, {"adam_params": {}})
+    delete = await self.submit(run, Op.DELETE_MODEL, {})
+    worker = Trainer(self.bus, "p", Model(tiny))
+    await self.drain(worker)
+    self.assertFalse((await self.bus.result(bad, 0)).ok)
+    self.assertTrue((await self.bus.result(step, 0)).ok)
+    self.assertTrue((await self.bus.result(delete, 0)).ok)
+    self.assertEqual((await self.bus.run(run))["phase"], "deleted")
 
-    self.assertEqual((await self.bus.run(run))["steps"], 1)
-    self.assertIsNone(await self.bus.submit(run, Op.OPTIM_STEP, b"{}"))  # deleted
-    self.assertFalse(t.done)  # a LoRA trainer keeps serving its pool
+  async def test_lost_completion_response_does_not_execute_optimizer_twice(self):
+    run = await self.create_run()
+    worker = Trainer(self.bus, "p", Model(tiny))
+    await self.drain(worker)
+    await self.submit(run, Op.FORWARD_BACKWARD, proto_body(run))
+    await self.drain(worker)
+    request = await self.submit(run, Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.01}})
+    finish = self.bus.finish
+    dropped = False
 
-  async def test_a_new_trainer_fails_what_a_dead_one_left_in_flight(self):
-    run = new_id()
-    await self.bus.create(Run(run, "p", "tiny", 4))
-    [request_id] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}}))
-    await self.bus.take("p", "dead", block_ms=10)  # taken, and never answered
+    async def drop_response(cmd, reply):
+      nonlocal dropped
+      result = await finish(cmd, reply)
+      if not dropped:
+        dropped = True
+        raise ConnectionError("response disappeared after durable commit")
+      return result
 
-    t = Trainer(self.bus, "p", Model(tiny), worker="new")
-    t.done = True  # so serve() stops right after reclaiming
-    await t.serve()
+    with (
+      patch.object(self.bus, "finish", side_effect=drop_response),
+      patch.object(worker.model, "optim_step", wraps=worker.model.optim_step) as optim,
+    ):
+      await worker.step(block_ms=0)
+    self.assertEqual(optim.call_count, 1)
+    self.assertTrue((await self.bus.result(request, 0)).ok)
+    self.assertEqual(worker.pending, {})
 
-    reply = await self.bus.result(request_id, 1)
-    self.assertFalse(reply.ok)
-    self.assertEqual(json.loads(reply.body)["category"], "server")
-    self.assertEqual((await self.bus.queue(run))["in_flight"], [])
+  async def test_concurrent_step_callers_do_not_execute_one_attempt_twice(self):
+    run = await self.create_run()
+    worker = Trainer(self.bus, "p", Model(tiny))
+    await self.drain(worker)
+    await self.submit(run, Op.OPTIM_STEP, {"adam_params": {}})
+    with patch.object(worker.model, "optim_step", wraps=worker.model.optim_step) as step:
+      await asyncio.gather(worker.step(block_ms=0), worker.step(block_ms=0))
+    self.assertEqual(step.call_count, 1)
 
-  async def test_a_full_fine_tune_trainer_exits_with_its_run(self):
-    run = new_id()
-    await self.bus.create(Run(run, run, "tiny", 0))
-    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
+  async def test_migration_keeps_pending_gradients_rng_and_run_identity(self):
+    for rank in (0, 4):
+      config = {**LORA, "lora_dropout": 0.2} if rank else {"seed": 0}
+      pool_a, pool_b = f"a{rank}", f"b{rank}"
+      run = await self.create_run(pool_a, rank, config)
+      store = Store(root=f"{self.tmpdir.name}/artifacts-{rank}")
+      source = Trainer(self.bus, pool_a, Model(tiny), store=store)
+      target = Trainer(self.bus, pool_b, Model(tiny), store=store)
+      await self.drain(source)
+      control, ctrl = Model(tiny), new_id()
+      control.create(ctrl, "tiny", rank, config)
+      data = wire.datums(wire.parse(proto_body(run)))
+      control.forward_backward(ctrl, data, "cross_entropy", {}, False)
+      await self.submit(run, Op.FORWARD_BACKWARD, proto_body(run))
+      await self.drain(source)
+      before = [p.clone() for p in source.model.params[run].values()]
+      await self.bus.request_move(run, pool_b)
+      await source.step(block_ms=0)  # snapshot
+      await target.step(block_ms=0)  # restore inactive
+      self.assertIn(run, target.model.inactive)
+      with self.assertRaises(ValueError):
+        target.model.optim_step(run, {})
+      await target.step(block_ms=0)  # activate
+      await self.drain(source)  # detach old generation
+      self.assertNotIn(run, source.model.params)
+      self.assertEqual((await self.bus.run(run))["pool"], pool_b)
+      control.optim_step(ctrl, {"learning_rate": 0.01})
+      await self.submit(run, Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.01}})
+      await self.drain(target)
+      self.assertFalse(same(before, target.model.params[run]))
+      self.assertTrue(same(control.params[ctrl], target.model.params[run]))
+      # Further stochastic training must continue from the same private RNG state.
+      self.assertEqual(train(control, ctrl, steps=2), train(target.model, run, steps=2))
+      self.assertTrue(same(control.params[ctrl], target.model.params[run]))
 
-    t = Trainer(self.bus, run, Model(tiny))
-    await asyncio.wait_for(t.serve(), 60)
-    self.assertTrue(t.done)
-    self.assertEqual(await self.bus.runs(run), [])
-
-  async def test_a_run_moves_between_trainers_through_the_store(self):
-    store = Store(root=tempfile.mkdtemp(), shm=tempfile.mkdtemp())
-    for rank, lora in ((4, LORA), (0, {})):
-      ctrl, r1, r2 = new_id(), new_id(), new_id()
-      for r, pool in ((ctrl, f"ctrl-{rank}"), (r1, f"p1-{rank}"), (r2, f"p2-{rank}")):
-        await self.bus.create(Run(r, pool, "tiny", rank))
-
-      tc = Trainer(self.bus, f"ctrl-{rank}", Model(tiny), store=store)
-      t1 = Trainer(self.bus, f"p1-{rank}", Model(tiny), store=store)
-      t2 = Trainer(self.bus, f"p2-{rank}", Model(tiny), store=store)
-
-      for r in (ctrl, r1):
-        await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))
-
-      async def step_run(tr: Trainer, r: str) -> float:
-        fb, _ = await self.submit(
-          r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})
-        )
-        while await tr.step(block_ms=10):
-          pass
-        return wire.output_json((await self.bus.result(fb, 1)).body)["metrics"]["loss:sum"]
-
-      losses_ctrl = [await step_run(tc, ctrl) for _ in range(2)]
-      losses_moved = [await step_run(t1, r1) for _ in range(2)]
-
-      # save + delete on trainer 1, then create + load(optimizer=True) on trainer 2
-      uri = f"tinker://{r1}/weights/handoff"
-      await self.submit(r1, (Op.SAVE_WEIGHTS, {"uri": uri}), (Op.DELETE_MODEL, {}))
-      while await t1.step(block_ms=10):
-        pass
-      await self.submit(
-        r2,
-        (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}),
-        (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": True}),
+  async def test_partial_backward_failure_requires_recovery(self):
+    run = await self.create_run()
+    worker = Trainer(self.bus, "p", Model(tiny), store=Store(root=f"{self.tmpdir.name}/artifacts"))
+    await self.drain(worker)
+    saved = worker.store.put(*worker.model.state(run))
+    body = {"model_id": run, "forward_backward_input": {"loss_fn": "cross_entropy", "data": []}}
+    for n in (8, 9):
+      body["forward_backward_input"]["data"].append(
+        {
+          "model_input": {"chunks": [{"tokens": list(range(n))}]},
+          "loss_fn_inputs": {"target_tokens": list(range(1, n + 1)), "weights": [1.0] * (n if n == 8 else 2)},
+        }
       )
-      while await t2.step(block_ms=10):
-        pass
+    failed = await self.submit(run, Op.FORWARD_BACKWARD, wire.from_json(body))
+    await self.submit(run, Op.OPTIM_STEP, {"adam_params": {}})
+    with patch.object(trainer, "TOKEN_BUDGET", 8):
+      await self.drain(worker)
+    self.assertTrue((await self.bus.result(failed, 0)).recover)
+    self.assertEqual((await self.bus.run(run))["phase"], "recovery")
+    await self.bus.recover(run, saved, "p")
+    await self.drain(worker)
+    self.assertEqual((await self.bus.run(run))["phase"], "active")
+    self.assertTrue(all(p.grad is None for p in worker.model.params[run].values()))
 
-      for _ in range(3):
-        losses_ctrl.append(await step_run(tc, ctrl))
-        losses_moved.append(await step_run(t2, r2))
+  def test_local_parking_retains_live_model_and_gradients_without_store_io(self):
+    model, (run,) = lora_runs()
+    model.forward_backward(run, [counting(8)], "cross_entropy", {}, False)
+    params, lm = model.params[run], model.lm
+    gradients = [p.grad.clone() for p in params.values()]
+    worker = Trainer(self.bus, "p", model)
+    with patch.object(worker.store, "put", side_effect=AssertionError("local parking serialized a checkpoint")):
+      worker.park()
+      worker.resume()
+    self.assertIs(worker.model.lm, lm)
+    self.assertTrue(all(a is b for a, b in zip(params.values(), worker.model.params[run].values())))
+    self.assertTrue(same(gradients, [p.grad for p in params.values()]))
 
-      self.assertEqual(losses_moved, losses_ctrl, f"rank {rank}")
-      self.assertTrue(same(tc.model.params[ctrl], t2.model.params[r2]), f"rank {rank}")
+  def test_stale_detach_does_not_remove_returned_generation(self):
+    model, (run,) = lora_runs()
+    worker = Trainer(self.bus, "p", model)
+    worker.generations[run] = 3
+    reply = worker.run(Cmd(run, "old-detach", Op.DETACH, b"{}", generation=1))
+    self.assertTrue(reply.ok)
+    self.assertIn(run, model.params)
+
+  def test_restore_checks_coordinator_spec_before_removing_old_generation(self):
+    model, (run,) = lora_runs()
+    store = Store(root=f"{self.tmpdir.name}/artifacts")
+    tensors, meta = model.state(run)
+    ref = store.put(tensors, meta)
+    worker = Trainer(self.bus, "p", model, store=store)
+    worker.generations[run] = 1
+    before = [p.clone() for p in model.params[run].values()]
+    for wrong in (
+      {"base": "other", "rank": 4, "lora": LORA},
+      {"base": "tiny", "rank": 1, "lora": LORA},
+      {"base": "tiny", "rank": 4, "lora": {**LORA, "train_mlp": False}},
+    ):
+      body = json.dumps({"ref": ref, "recovery": True, "spec": wrong}).encode()
+      reply = worker.run(Cmd(run, "restore", Op.RESTORE, body, generation=2))
+      self.assertFalse(reply.ok)
+      self.assertEqual(worker.generations[run], 1)
+      self.assertTrue(same(before, model.params[run]))
+
+  def test_full_run_detach_frees_base_without_stopping_worker(self):
+    model, run = Model(tiny), new_id()
+    model.create(run, "tiny", 0, {})
+    worker = Trainer(self.bus, "p", model)
+    worker.generations[run] = 1
+    self.assertTrue(worker.run(Cmd(run, "detach", Op.DETACH, b"{}", generation=1)).ok)
+    self.assertIsNone(model.lm)
+    self.assertFalse(worker.done)
+    model.create(new_id(), "tiny", 0, {})
 
 
 if __name__ == "__main__":

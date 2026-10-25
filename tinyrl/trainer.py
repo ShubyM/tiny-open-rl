@@ -1,6 +1,6 @@
 """A trainer serves one pool: the LoRA adapters that share a base model, or a single full fine-tune.
 
-It takes commands from its pool's streams on the bus, runs each one on the model, and writes the reply back.
+It executes coordinator-issued commands over HTTP and retains results until their journal acknowledgement.
 """
 
 from __future__ import annotations
@@ -9,10 +9,12 @@ import asyncio
 import json
 import math
 import os
+import random
 import socket
 import sys
-import time
+import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -21,7 +23,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl import wire
-from tinyrl.bus import Bus, Cmd, Op, Reply
+from tinyrl.bus import Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.store import Store
 
@@ -143,6 +145,42 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
   return torch.cat([checkpoint(chunk_logprobs, h, t, use_reentrant=False) for h, t in chunks]).view(targets.shape)
 
 
+def capture_rng() -> dict:
+  return {
+    "cpu": torch.get_rng_state(),
+    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    "python": random.getstate(),
+    "numpy": np.random.get_state(),
+  }
+
+
+def restore_rng(state: dict) -> None:
+  devices = torch.cuda.device_count() if torch.cuda.is_available() else 0
+  if len(state["cuda"]) != devices:
+    raise ValueError("checkpoint RNG device topology does not fit this worker")
+  torch.set_rng_state(state["cpu"].cpu())
+  if state["cuda"]:
+    torch.cuda.set_rng_state_all(state["cuda"])
+  random.setstate(state["python"])
+  np.random.set_state(state["numpy"])
+
+
+def tuples(value):
+  return tuple(tuples(v) for v in value) if isinstance(value, (list, tuple)) else value
+
+
+def structural_spec(spec: dict) -> tuple:
+  config, rank = spec.get("config", spec.get("lora", {})), spec.get("rank")
+  options = (
+    ("train_attn", True),
+    ("train_mlp", True),
+    ("train_unembed", True),
+    ("lora_alpha", 16),
+    ("lora_dropout", 0.05),
+  )
+  return spec.get("base"), rank, tuple(config.get(k, v) for k, v in options) if rank else ()
+
+
 # ***** model *****
 
 
@@ -178,8 +216,27 @@ class Model:
     self.dtype = torch.float32
     self.params: dict[str, dict[str, torch.nn.Parameter]] = {}  # canonical name -> trainable parameter
     self.optimizers: dict[str, torch.optim.AdamW] = {}
+    self.specs: dict[str, dict] = {}
+    self.rng: dict[str, dict] = {}
+    self.inactive: set[str] = set()
 
   def create(self, run: str, base: str, rank: int, config: dict) -> None:
+    if run in self.params:
+      raise ValueError(f"model {run} already exists")
+    previous = capture_rng()
+    seed = config.get("seed")
+    seed = int.from_bytes(os.urandom(8), "little") if seed is None else seed
+    config = {**config, "seed": seed}
+    try:
+      random.seed(seed)
+      np.random.seed(seed % 2**32)
+      self._create(run, base, rank, config)
+      self.specs[run] = {"base": base, "rank": rank, "config": config}
+      self.rng[run] = capture_rng()
+    finally:
+      restore_rng(previous)
+
+  def _create(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
       self.lm, self.base, self.lora = self.load(base), base, rank > 0
       self.dtype = self.lm.dtype
@@ -213,15 +270,32 @@ class Model:
     for p in self.params[run].values():
       p.data = p.data.float()  # PEFT gives an adapter its base model's dtype, but master weights are fp32
 
-  def use(self, run: str) -> PreTrainedModel:
+  def use(self, run: str, *, allow_inactive: bool = False) -> PreTrainedModel:
     """The model, with the run's adapter active."""
     if self.lm is None or run not in self.params:
       raise KeyError(f"model {run} is not on this trainer, it was deleted or its trainer restarted")
+    if run in self.inactive and not allow_inactive:
+      raise ValueError(f"model {run} is prepared but not active")
     if self.lora:
       self.lm.set_adapter(run)
     return self.lm
 
+  @contextmanager
+  def random_state(self, run: str):
+    self.use(run)
+    previous = capture_rng()
+    try:
+      restore_rng(self.rng[run])
+      yield
+    finally:
+      self.rng[run] = capture_rng()
+      restore_rng(previous)
+
   def forward_backward(self, run: str, data: list[wire.Datum], loss_fn: str, config: dict, forward_only: bool):
+    with self.random_state(run):
+      return self._forward_backward(run, data, loss_fn, config, forward_only)
+
+  def _forward_backward(self, run: str, data: list[wire.Datum], loss_fn: str, config: dict, forward_only: bool):
     """Run the loss over every datum, accumulating gradients unless forward_only. Returns each datum's target
     logprobs, and the loss metrics."""
     if loss_fn not in LOSSES:
@@ -272,20 +346,39 @@ class Model:
     return {"grad_norm:mean": grad_norm}
 
   def state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
-    """A run's portable training checkpoint: fp32 master weights and named AdamW state, with no pickle."""
+    """Complete numerical state, including pending gradients and private RNG state."""
     self.use(run)
-    tensors = {name: p.detach() for name, p in self.params[run].items()}
-    optim = self.optimizers.get(run)
-    for name, p in self.params[run].items():
-      if optim and p in optim.state:
-        s = optim.state[p]
-        tensors[f"{name}.exp_avg"] = s["exp_avg"].detach()
-        tensors[f"{name}.exp_avg_sq"] = s["exp_avg_sq"].detach()
-        tensors[f"{name}.step"] = s["step"].detach()
-    return tensors, {"optimizer": True}
+    params, opt, rng = self.params[run], self.optimizers.get(run), self.rng[run]
+    tensors = {name: p.detach() for name, p in params.items()}
+    grads, moments = [], []
+    for name, p in params.items():
+      if p.grad is not None:
+        grads.append(name)
+        tensors[f"__grad.{name}"] = p.grad.detach()
+      if opt and p in opt.state and opt.state[p]:
+        moments.append(name)
+        for field in ("exp_avg", "exp_avg_sq", "step"):
+          tensors[f"{name}.{field}"] = opt.state[p][field].detach()
+    tensors["__rng.cpu"] = rng["cpu"]
+    tensors.update({f"__rng.cuda.{i}": value for i, value in enumerate(rng["cuda"])})
+    numpy = rng["numpy"]
+    meta = {
+      "schema": 1,
+      "optimizer": True,
+      "spec": self.specs[run],
+      "grads": grads,
+      "moments": moments,
+      "optimizer_group": {k: v for k, v in opt.param_groups[0].items() if k != "params"} if opt else None,
+      "rng": {
+        "cuda": len(rng["cuda"]),
+        "python": rng["python"],
+        "numpy": [numpy[0], numpy[1].tolist(), numpy[2], numpy[3], numpy[4]],
+      },
+    }
+    return tensors, meta
 
   def weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
-    """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
+    """Sampler weights and the config vLLM or PEFT reads."""
     lm = self.use(run)
     prefix = "base_model.model." if self.lora else ""
     tensors = {f"{prefix}{name}": p.detach().to(self.dtype) for name, p in self.params[run].items()}
@@ -293,37 +386,101 @@ class Model:
       cfg = {k: sorted(v) if isinstance(v, set) else v for k, v in lm.peft_config[run].to_dict().items()}
     else:
       cfg = lm.config.to_dict()
-    return tensors, {"lora": self.lora, "optimizer": False, "config": cfg}
+    return tensors, {"schema": 1, "spec": self.specs[run], "lora": self.lora, "optimizer": False, "config": cfg}
 
   def restore(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
-    self.use(run)
+    """Validate and stage the whole snapshot before changing any live parameter."""
+    self.use(run, allow_inactive=True)
+    params, spec = self.params[run], meta.get("spec", {})
+    if meta.get("schema") != 1 or structural_spec(spec) != structural_spec(self.specs[run]):
+      raise ValueError("checkpoint specification does not fit this model")
     if optimizer and not meta.get("optimizer"):
       raise ValueError("checkpoint has no optimizer state")
     suffixes = (".exp_avg", ".exp_avg_sq", ".step")
-    weights = {k.removeprefix("base_model.model."): v for k, v in tensors.items() if not k.endswith(suffixes)}
-    if not self.lora and "lm_head.weight" not in self.params[run]:
-      weights.pop("lm_head.weight", None)  # tied to embed_tokens
-    if weights.keys() != self.params[run].keys():
-      raise ValueError("checkpoint does not fit this model")
-    for name, p in self.params[run].items():
-      p.data.copy_(weights[name])
+    weights = {
+      k.removeprefix("base_model.model."): v
+      for k, v in tensors.items()
+      if not k.startswith("__") and not k.endswith(suffixes)
+    }
+    if weights.keys() != params.keys():
+      raise ValueError("checkpoint parameter names do not fit this model")
 
+    def parameter_tensor(value, p):
+      if value.shape != p.shape or not value.is_floating_point():
+        raise ValueError("checkpoint tensor shape or dtype does not fit this model")
+      return value.to(p.device, p.dtype, copy=True)
+
+    staged = {name: parameter_tensor(weights[name], p) for name, p in params.items()}
+    grads, moments = set(meta.get("grads", [])), set(meta.get("moments", []))
+    if not grads <= params.keys() or not moments <= params.keys():
+      raise ValueError("checkpoint gradient or optimizer names do not fit this model")
+    staged_grads = {name: parameter_tensor(tensors[f"__grad.{name}"], params[name]) for name in grads}
+    staged_moments = {}
+    for name in moments:
+      step = tensors[f"{name}.step"]
+      if step.ndim != 0 or not step.is_floating_point():
+        raise ValueError("checkpoint optimizer step must be a scalar")
+      staged_moments[name] = {
+        "step": step.to("cpu", torch.float32, copy=True),
+        **{field: parameter_tensor(tensors[f"{name}.{field}"], params[name]) for field in ("exp_avg", "exp_avg_sq")},
+      }
+    rng = self.rng[run]
+    if meta.get("optimizer"):
+      info = meta["rng"]
+      numpy = info["numpy"]
+      rng = {
+        "cpu": tensors["__rng.cpu"].clone(),
+        "cuda": [tensors[f"__rng.cuda.{i}"].clone() for i in range(info["cuda"])],
+        "python": tuples(info["python"]),
+        "numpy": (numpy[0], np.array(numpy[1], dtype=np.uint32), *numpy[2:]),
+      }
+      previous = capture_rng()
+      try:
+        restore_rng(rng)  # validate RNG encoding before touching weights
+      finally:
+        restore_rng(previous)
+    new_opt = None
+    if optimizer and meta.get("optimizer_group") is not None:
+      group = dict(meta["optimizer_group"])
+      if not group.pop("decoupled_weight_decay", True) or group.get("amsgrad"):
+        raise ValueError("checkpoint has unsupported optimizer settings")
+      group["betas"] = tuple(group["betas"])
+      try:
+        new_opt = torch.optim.AdamW(params.values(), **group)
+      except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid checkpoint optimizer settings: {error}") from error
+      for name, values in staged_moments.items():
+        new_opt.state[params[name]] = values
+    with torch.no_grad():
+      for name, p in params.items():
+        p.copy_(staged[name])
+        p.grad = staged_grads.get(name) if optimizer else None
     self.optimizers.pop(run, None)
-    if optimizer and any(k.endswith(".step") for k in tensors):
-      opt = self.optimizer(run)
-      for name, p in self.params[run].items():
-        opt.state[p] = {
-          "exp_avg": tensors[f"{name}.exp_avg"].to(p.device, torch.float32),
-          "exp_avg_sq": tensors[f"{name}.exp_avg_sq"].to(p.device, torch.float32),
-          "step": tensors[f"{name}.step"].cpu().float(),
-        }
+    if new_opt is not None:
+      self.optimizers[run] = new_opt
+    self.rng[run] = rng
+
+  def move(self, device: torch.device | str) -> None:
+    """Move a live pool, preserving parameter identities, gradients, and RNG."""
+    if self.lm is None:
+      return
+    self.lm.to(device)
+    for optimizer in self.optimizers.values():
+      for state in optimizer.state.values():
+        for name, value in state.items():
+          if isinstance(value, torch.Tensor):
+            state[name] = value.to("cpu" if name == "step" else device)
 
   def delete(self, run: str) -> None:
-    lm = self.use(run)
+    lm = self.use(run, allow_inactive=True)
+    full = not self.lora
     if self.lora:
       lm.delete_adapter(run)
-    del self.params[run]
+    del self.params[run], self.specs[run], self.rng[run]
+    self.inactive.discard(run)
     self.optimizers.pop(run, None)
+    if full:
+      self.lm, self.base, self.lora, self.dtype = None, "", True, torch.float32
 
 
 # ***** trainer *****
@@ -341,74 +498,172 @@ def fail(error: Exception) -> Reply:
 
 
 class Trainer:
-  def __init__(self, bus: Bus, pool: str, model: Model | None = None, worker: str = "", store: Store | None = None):
-    self.bus = bus
-    self.pool = pool
+  def __init__(self, bus, pool: str, model: Model | None = None, worker: str = "", store: Store | None = None):
+    self.bus, self.pool = bus, pool
     self.model = model if model is not None else Model()
     self.store = store if store is not None else Store()
-    self.worker = worker or f"{socket.gethostname()}-{os.getpid()}"
-    self.done = False
+    self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
+    self.done = self.registered = False
+    self.generations: dict[str, int] = {}
+    self.pending: dict[tuple[str, str, int, str], Reply] = {}  # retained until journal acknowledgement
+    self.execution = asyncio.Lock()
+    self.resume_device: torch.device | None = None
+
+  async def register(self) -> None:
+    if not self.registered:
+      result = await self.bus.register(self.worker, self.pool)
+      if not result.get("registered"):
+        raise RuntimeError("coordinator rejected this worker incarnation")
+      self.registered = True
+
+  async def keep(self) -> None:
+    while not self.done:
+      try:
+        if not await self.bus.heartbeat(self.worker):
+          self.done = True
+          return
+      except (ConnectionError, OSError, TimeoutError):
+        pass  # commands/results remain pinned while the same coordinator reconnects
+      await asyncio.sleep(1)
 
   async def serve(self) -> None:
-    # anything still in flight in the pool was taken by a trainer that died
-    for cmd in await self.bus.reclaim(self.pool, self.worker):
-      await self.bus.finish(cmd, fail(RuntimeError(f"its trainer died during {cmd.op}")))
-
+    await self.register()
     while not self.done:
       await self.step()
 
+  def park(self) -> None:
+    """At an execution boundary, retain the live pool in CPU RAM, including gradients."""
+    if self.model.lm is not None and self.resume_device is None:
+      self.resume_device = self.model.lm.device
+      self.model.move("cpu")
+      if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+  def resume(self) -> None:
+    if self.resume_device is not None:
+      self.model.move(self.resume_device)
+      self.resume_device = None
+
   async def step(self, count: int = 16, block_ms: int = 1000) -> int:
-    """Take the next commands from the pool and run them. Returns how many there were."""
-    cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
-    for cmd in cmds:
-      start = time.perf_counter()
-      reply = await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
-      await self.bus.finish(cmd, reply)
+    async with self.execution:
+      return await self._step(count, block_ms)
 
-      if cmd.op == Op.DELETE_MODEL and reply.ok:
-        await self.bus.drop(cmd.run, self.pool)
-        self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
+  async def _step(self, count: int, block_ms: int) -> int:
+    await self.register()
+    renewing = asyncio.create_task(self.keep())
+    try:
+      cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
+      for cmd in cmds:
+        if self.done:
+          break
+        identity = (cmd.run, cmd.entry_id, cmd.generation, cmd.token)
+        if identity not in self.pending:
+          self.pending[identity] = await asyncio.to_thread(self.run, cmd)
+        while not self.done:
+          try:
+            status = await self.bus.finish(cmd, self.pending[identity])
+            break
+          except (ConnectionError, OSError, TimeoutError):
+            await asyncio.sleep(0.25)
+        else:
+          break
+        del self.pending[identity]
+        if status == "stale":
+          self.forget(cmd.run, cmd.generation)
+        if DEBUG:
+          print(f"{self.pool} {cmd.request_id} {cmd.op} {status}")
+      return len(cmds)
+    finally:
+      renewing.cancel()
+      try:
+        await renewing
+      except asyncio.CancelledError:
+        pass
 
-      if DEBUG:
-        ms = (time.perf_counter() - start) * 1000
-        error = "" if reply.ok else f"  {reply.body.decode()}"
-        print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
-    return len(cmds)
+  def forget(self, run: str, generation: int) -> None:
+    if self.generations.get(run) == generation:
+      if run in self.model.params:
+        self.model.delete(run)
+      self.generations.pop(run, None)
 
   def run(self, cmd: Cmd) -> Reply:
-    """Run one command on the model. A failure becomes the reply, never an exception."""
-    model = self.model
+    model, mutating = self.model, False
     try:
+      if self.resume_device is not None and cmd.op in (Op.FORWARD_BACKWARD, Op.OPTIM_STEP, Op.CREATE_MODEL):
+        raise ValueError("pool is parked; the agent must resume it before dispatch")
+      generation = self.generations.get(cmd.run)
+      if cmd.op not in (Op.CREATE_MODEL, Op.RESTORE, Op.DETACH) and generation != cmd.generation:
+        raise ValueError("command generation does not own this local model")
       if cmd.op == Op.FORWARD_BACKWARD:
         req = wire.parse(cmd.body)
-        data, loss_fn, config = wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req)
-        logprobs, metrics = model.forward_backward(cmd.run, data, loss_fn, config, req.forward_only)
+        data, config = wire.datums(req), wire.loss_config(req)
+        mutating = not req.forward_only
+        logprobs, metrics = model.forward_backward(
+          cmd.run, data, req.loss_fn or "cross_entropy", config, req.forward_only
+        )
         return Reply(True, wire.PROTO, wire.output(logprobs, metrics))
 
-      args = json.loads(cmd.body)
+      args, artifact = json.loads(cmd.body), ""
       match cmd.op:
         case Op.CREATE_MODEL:
           model.create(cmd.run, args["base_model"], args["rank"], args["lora"])
+          self.generations[cmd.run] = cmd.generation
         case Op.OPTIM_STEP:
+          mutating = True
           return ok({"type": cmd.op, "metrics": model.optim_step(cmd.run, args["adam_params"])})
-        case Op.SAVE_WEIGHTS:
-          self.store.put(args["uri"], *model.state(cmd.run))
+        case Op.SAVE_WEIGHTS | Op.SNAPSHOT:
+          tensors, meta = model.state(cmd.run)
+          meta["boundary"] = args.get("boundary", {"generation": cmd.generation, "command": cmd.request_id})
+          artifact = self.store.put(tensors, meta)
         case Op.SAVE_WEIGHTS_FOR_SAMPLER:
-          self.store.put(args["uri"], *model.weights(cmd.run))
+          artifact = self.store.put(*model.weights(cmd.run))
         case Op.LOAD_WEIGHTS:
-          model.restore(cmd.run, *self.store.get(args["uri"]), args["optimizer"])
-        case Op.DELETE_MODEL:
-          model.delete(cmd.run)
+          mutating = True
+          model.restore(cmd.run, *self.store.get(args["ref"]), args["optimizer"])
+        case Op.RESTORE:
+          tensors, meta = self.store.get(args["ref"])
+          if structural_spec(meta.get("spec", {})) != structural_spec(args.get("spec", {})):
+            raise ValueError("checkpoint specification differs from the coordinator's run")
+          if not args.get("recovery") and meta.get("boundary") != args.get("boundary"):
+            raise ValueError("snapshot does not match the migration boundary")
+          if generation is not None:
+            if generation >= cmd.generation:
+              raise ValueError("a current model already occupies this run on the destination")
+            self.forget(cmd.run, generation)
+          spec = meta["spec"]
+          model.create(cmd.run, spec["base"], spec["rank"], spec["config"])
+          model.inactive.add(cmd.run)
+          try:
+            model.restore(cmd.run, tensors, meta, optimizer=True)
+          except Exception:
+            model.delete(cmd.run)
+            raise
+          self.generations[cmd.run] = cmd.generation
+        case Op.ACTIVATE:
+          model.use(cmd.run, allow_inactive=True)
+          model.inactive.discard(cmd.run)
+        case Op.DELETE_MODEL | Op.DETACH:
+          self.forget(cmd.run, cmd.generation)
         case _:
           raise ValueError(f"unknown op {cmd.op}")
-
-      reply = {"type": cmd.op, "model_id": cmd.run}
+      body = {"type": cmd.op, "model_id": cmd.run}
       if "uri" in args:
-        reply["path"] = args["uri"]
-      return ok(reply)
-    except Exception as e:
-      return fail(e)
+        body["path"] = args["uri"]
+      return Reply(True, wire.JSON, json.dumps(body).encode(), artifact=artifact)
+    except Exception as error:
+      reply = fail(error)
+      validation = cmd.op in (Op.LOAD_WEIGHTS, Op.RESTORE) and isinstance(error, (ValueError, KeyError))
+      return Reply(reply.ok, reply.content_type, reply.body, recover=mutating and not validation)
 
 
 if __name__ == "__main__":
-  asyncio.run(Trainer(Bus(), sys.argv[1]).serve())
+  from tinyrl.client import WorkerClient
+
+  async def main():
+    client = WorkerClient()
+    try:
+      await Trainer(client, sys.argv[1]).serve()
+    finally:
+      await client.close()
+
+  asyncio.run(main())

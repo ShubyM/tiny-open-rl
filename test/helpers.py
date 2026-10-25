@@ -1,14 +1,11 @@
-import os
-import subprocess
 import tempfile
-import time
 import unittest
 import uuid
 
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from tinyrl.bus import Bus, connect
+from tinyrl.bus import Bus
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -30,38 +27,14 @@ def new_id() -> str:
   return str(uuid.uuid4())
 
 
-def start_redis(socket_path: str) -> subprocess.Popen:
-  args = ["--port", "0", "--unixsocket", socket_path, "--save", "", "--appendonly", "no"]
-  proc = subprocess.Popen([os.getenv("REDIS_SERVER", "redis-server"), *args], stdout=subprocess.DEVNULL)
-  for _ in range(500):
-    if os.path.exists(socket_path):
-      break
-    time.sleep(0.01)
-  return proc
-
-
-class RedisTest(unittest.IsolatedAsyncioTestCase):
-  """Starts a throwaway redis-server for the test class, or uses REDIS_URL. Each test gets an empty database."""
-
-  proc: subprocess.Popen | None = None
-
-  @classmethod
-  def setUpClass(cls):
-    if os.getenv("REDIS_URL"):
-      cls.url = os.environ["REDIS_URL"]
-      return
-    socket_path = f"{tempfile.mkdtemp()}/redis.sock"
-    cls.proc = start_redis(socket_path)
-    cls.url = f"unix://{socket_path}"
-
-  @classmethod
-  def tearDownClass(cls):
-    if cls.proc:
-      cls.proc.terminate()
+class CoordinatorTest(unittest.IsolatedAsyncioTestCase):
+  """Each test owns a real coordinator and a private SQLite journal."""
 
   async def asyncSetUp(self):
-    self.bus = Bus(connect(self.url))
-    await self.bus.r.flushall()
+    self.tmpdir = tempfile.TemporaryDirectory()
+    self.path = f"{self.tmpdir.name}/journal.sqlite3"
+    self.bus = Bus(self.path)
 
   async def asyncTearDown(self):
-    await self.bus.r.aclose()
+    await self.bus.close()
+    self.tmpdir.cleanup()
