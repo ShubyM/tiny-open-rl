@@ -34,11 +34,11 @@ flowchart LR
   with plain `nvidia.com/gpu` requests, sized to the pools that need them (1, 2, 4 or 8 GPUs). An agent starts a trainer
   for each pool placed on it and decides which of them are on its GPUs.
 - **Every workload scales with demand**, each the way its state allows. LoRA pools grow and shrink by moving runs between
-  them: a run moves the way it's checkpointed, parked to disk in the format `save_weights` already writes and loaded by
-  the next pool's trainer, about a second for a LoRA run. A full fine-tune holds a GPU only while it trains. Samplers, when
-  tinyrl has them, scale by replicas.
-- **Parking** covers time-slicing and checkpointing. A trainer parks its pool's tensors to host RAM when its agent needs
-  the GPU for another pool, and parks a run to disk when the run goes idle or moves.
+  them: a run moves by streaming its state directly to the new trainer via `peer://` in under 100 ms (or parking to disk if
+  idle). A full fine-tune holds a GPU only while it trains. Samplers, when tinyrl has them, scale by replicas.
+- **State transport** moves pure tensors where they need to go. A fast `Store` abstraction handles time-slicing
+  (`mem://` at 50 GB/s), pool resizing and sampler sync (`peer://` at 12–50 GB/s), and cold parking (`file://` at 1 GB/s).
+  Because state moves in milliseconds rather than minutes, dynamic resizing is cheap and weight sync never stalls training.
 - **A pool has one owner.** A trainer serves a pool only while it holds the pool's lease in Redis, and every reply is
   written by a script that checks the lease first.
 
@@ -64,7 +64,7 @@ Everything [bus.py](../tinyrl/bus.py) has today stays. What's new, and who write
 |---|---|---|---|
 | `pool` in `tinyrl:run:<run>`, and `tinyrl:pool:<pool>` | the run's pool, and each pool's runs | **whoever holds the run**: the scheduler while the run is in no pool, its pool's trainer while it's in one | trainers, scheduler |
 | `release_to` in `tinyrl:run:<run>` | a request: move the run to this pool, or to none | scheduler; the trainer clears it when it's done | the run's trainer |
-| `parked` in `tinyrl:run:<run>` | path of the run's state on disk, if that's where it is | the trainer that parked it, and the one that loads it | trainers |
+| `parked` in `tinyrl:run:<run>` | URI of the run's state (`mem://`, `peer://`, or `file://`), if not in GPU memory | the trainer that parked it, and the one that loads it | trainers, scheduler |
 | `tinyrl:owner:<pool>` | string with a 10 s TTL: the lease | the trainer that holds it | trainers, scheduler, gateway |
 | `tinyrl:place:<pool>` | string: an agent id | scheduler | agents |
 | `tinyrl:agent:<id>` | hash {gpus, gpu_bytes, host_bytes, gpu_model} with a 30 s TTL: a heartbeat | that agent | scheduler |
@@ -92,11 +92,11 @@ sequenceDiagram
   T->>R: SET owner:pool NX PX 10000, fail what a dead owner left
   T->>R: XREADGROUP, run create_model, finish
   C->>G: retrieve_future, "paused_capacity" until a trainer owns the run's pool
-  Note over A,T: time-slicing: the agent says park or resume, the trainer moves its pool between GPU and host RAM
+  Note over A,T: time-slicing: the agent says park or resume, trainer moves pool via mem:// (host RAM, 50 GB/s)
   S->>R: the pool is overloaded: make a second pool, release_to = it, for half its runs
-  T->>R: between batches: park those runs to disk, move them to the new pool, under the old pool's lease
+  T->>R: between batches: stream runs to new pool via peer:// (<100 ms), move them to the new pool
   S->>R: a run idle for 30 min: release_to = none
-  T->>R: park it to disk, take it out of the pool
+  T->>R: park it to file:// on disk, take it out of the pool
   S->>R: a pool with no runs for 10 min: DEL place:pool, and its trainer stops
 ```
 
@@ -134,15 +134,17 @@ waits for every other's `forward_backward`. Ten GPUs serving one run each is the
   pools don't flap.
 
 **Releasing a run** is one operation, used for growing, shrinking, idling and draining. Between batches, so nothing of the
-run is in flight, the trainer saves the run with its optimizer to `CKPT/<run>/park/<step>`, frees it, and in one script,
-under its pool's lease, moves the run from its pool to the target (or to none), records `parked`, and clears `release_to`.
-Commands that arrive meanwhile wait in the run's stream. The target pool's trainer sees the run in its pool, and before the
-run's next command it recreates the adapter from the run's recorded config, loads the parked state, and deletes `parked`.
+run is in flight, the trainer packages the run's adapter weights and fp32 AdamW state and transfers it through the `Store`:
+streams directly to the target trainer over `peer://` (or `mem://` if on the same agent), or writes to `file://` if idling
+to disk. In one script under its pool's lease, it moves the run from its pool to the target (or to none), records the state
+URI in `parked`, and clears `release_to`. Commands that arrive meanwhile wait in the run's stream. The target pool's trainer
+sees the run in its pool, recreates the adapter from the run's recorded config, loads the state via `Store.get`, and deletes
+`parked`.
 
-| Moving a run | State | To disk and back |
-|---|---|---|
-| 0.5B LoRA, rank 32 on every linear layer | 17.6M adapter parameters × 12 B = 0.21 GB | 0.2 s on Filestore (2 GB/s) |
-| 8B LoRA (Qwen3-8B), rank 32, output head included | 92M × 12 B = 1.1 GB | 1.1 s on Filestore, 0.2 s on Lustre (10 GB/s) |
+| Moving a run | State | Over `peer://` (100 Gbps) | Over shared disk (Filestore) |
+|---|---|---|---|
+| 0.5B LoRA, rank 32 on every linear layer | 17.6M adapter parameters × 12 B = 0.21 GB | **17 ms** | 0.2 s (2 GB/s) |
+| 8B LoRA (Qwen3-8B), rank 32, output head included | 92M × 12 B = 1.1 GB | **88 ms** | 1.1 s (2 GB/s) |
 
 A new pool on a base costs one base model load from the shared Hugging Face cache, about 8 s for an 8B model on Filestore,
 plus an agent pod if no agent has room.
@@ -176,6 +178,65 @@ grows, fewer when it drains, and scaling down saves nothing because there's noth
 adapter on its base, so its replicas serve every run on that base. A full fine-tune's sampler serves one run, and each of
 its replicas reloads the weights after every training step, so its replicas are worth adding only while sampling takes
 much longer than that reload.
+
+## State transport: getting weights somewhere fast
+
+A checkpoint is not a container, a VM snapshot or an opaque CUDA driver dump. It is a piece of state that lets any trainer
+process on any compatible GPU resume a run:
+
+- **The tensors**: model weights (bf16 for a LoRA base, bf16/fp32 for adapters or a full fine-tune), fp32 master weights, and
+  AdamW momentum and variance moments ($m$ and $v$ in `optimizer.state`).
+- **The metadata**: step count, learning rate schedule, and RNG seeds.
+
+Nothing else matters. If you can get those tensors into a trainer's memory quickly, a run can pause, resume, change GPUs,
+split across pools, move between nodes, or push updated weights to a fleet of samplers, anywhere in the cluster.
+
+### The `Store` abstraction
+
+Instead of coupling checkpoints to file paths on a slow shared disk, state moves through a uniform `Store`:
+
+```python
+class Store:
+  """Transfers model and optimizer state between devices, processes and nodes."""
+  async def put(self, uri: str, state: dict[str, Tensor]) -> None: ...
+  async def get(self, uri: str) -> dict[str, Tensor]: ...
+```
+
+The URI scheme picks the fastest physical path available:
+
+| Tier | URI scheme | Physical link | Speed | What it's for |
+|---|---|---|---|---|
+| **Host memory** | `mem://<run>` | PCIe Gen5 / NVLink intra-node | 50–64 GB/s | Taking turns on a GPU (time-slicing); zero-network trainer-to-sampler weight handover on the same node |
+| **Peer stream** | `peer://<agent>:<port>/<run>` | 100G–800G cluster fabric (TCP / RoCE RDMA) | 12–50 GB/s | Moving runs between pools (dynamic resizing); migrating off a preempted spot node; cross-node sampler updates |
+| **Durable storage** | `file://<path>` or `gcs://<bucket>/<path>` | Shared Filestore / Lustre / GCS | 0.5–2 GB/s | Cold idle parking (>30 min) when nodes scale down; explicit user `save_weights("step-100")`; disaster backup |
+
+### What state transfer costs
+
+Transfer times across physical tiers on an H100 node with a 100 Gbps network fabric (or 400 Gbps on A3 Ultra / H200):
+
+| Workload | State size | `mem://` (PCIe, 50 GB/s) | `peer://` (100 Gbps, 12.5 GB/s) | `peer://` (400 Gbps, 50 GB/s) | Shared disk (1 GB/s Filestore) |
+|---|---|---|---|---|---|
+| **LoRA run** (rank 32 on 8B base) | 1.13 GB (adapter + fp32 AdamW) | **23 ms** | **90 ms** | **23 ms** | 1.1 s |
+| **1.5B full fine-tune** | 18.5 GB (1.54B × 12 B) | **0.37 s** | **1.48 s** | **0.37 s** | 18.5 s |
+| **8B sampler weights** (inference only) | 16.4 GB (8.19B × 2 B bf16) | **0.33 s** | **1.31 s** | **0.33 s** | 16.4 s (74–88 s on NFS) |
+| **8B full fine-tune** (8.19B × 12 B) | 98.3 GB (fp32 master + moments) | **2.0 s** (0.25 s/GPU across 8) | **7.8 s** | **2.0 s** | 49–98 s |
+
+### Why fast transport enables dynamic resizing
+
+When state transfer is fast, operations that are normally painful become cheap:
+
+1. **Splitting and merging LoRA pools.** When the scheduler detects that pool `lora:Qwen3-8B:1` is overloaded, it starts
+   `lora:Qwen3-8B:2` on another agent. Moving three runs over `peer://` takes under 300 ms total. The old trainer writes
+   state into the peer stream between batches; the new trainer reads it into its base model and immediately begins taking
+   commands. Neither touches disk.
+2. **Eliminating the RL weight sync bottleneck.** In open-rl's full fine-tune benchmark (`docs/fft/fft.md` §9), saving
+   weights to shared NFS took 74 to 88 seconds out of every 128 s step—over 60% of the entire run time. With `Store`, a
+   trainer pushes 16.4 GB of bf16 weights to a local sampler over `mem://` in **0.33 s**, or to remote sampler pods over
+   `peer://` in **1.31 s**. The steady-state RL step drops from 138 s to ~51 s, more than doubling cluster throughput.
+3. **Resuming anywhere.** If a spot node receives a 30 s termination notice, the agent streams its runs' state to a
+   replacement agent pod in 2 seconds. The scheduler updates `tinyrl:place:<pool>`, and training resumes on the new node
+   without lost steps. If an agent crashes without warning, the run resumes from its last periodic cold checkpoint on
+   `file://`.
 
 ## Pools onto agents
 
@@ -237,10 +298,11 @@ A wrong guess costs one placement, not a run.
 `Model.park` moves tensors off the GPU: the weights, the gradients, and the AdamW moments, which live in `optimizer.state`,
 not in the module, so moving the module isn't enough.
 
-| Park to | For | Decided by | Survives |
-|---|---|---|---|
-| host RAM, a whole pool | taking turns on a GPU | the agent | nothing; it's the same process |
-| disk, one run, in [`Model.save`](../tinyrl/trainer.py)'s format with the optimizer | idle runs, moving runs between pools, draining | the scheduler, by asking for a release | a process crash, a lost node |
+| Park to | Store URI | For | Decided by | Survives |
+|---|---|---|---|---|
+| host RAM, a whole pool | `mem://` | taking turns on a GPU | the agent | nothing; it's the same process |
+| peer stream, one run | `peer://` | moving runs between pools, spot migration | the scheduler, by asking for a release | a single node migration |
+| disk, one run, with optimizer | `file://` | idle runs, draining nodes, user checkpoints | the scheduler or client | a process crash, a lost node |
 
 **The agent decides what's on its GPUs, and nothing else does.** Every second it picks the resident set: pools with queued
 work, least recently served first, as many as fit; then idle pools, if there's room left. It tells the rest to park over
@@ -252,8 +314,8 @@ everything fits, nothing parks, and CUDA interleaves the processes' kernels by i
 parks cheaply: an 8B base is 16.4 GB of bf16, about 0.33 s to host RAM. Idle runs inside a busy LoRA pool don't hold memory
 either: after 30 minutes without a command they're released to disk, one at a time.
 
-**A disk park is a checkpoint you could load**, and it's restored only if nothing has happened to the run since: `parked`
-is written as the run leaves its pool and deleted by the trainer that loads it. So a crash after a restore can't bring back
+**A park is a checkpoint you could load**, and it's restored only if nothing has happened to the run since: `parked`
+is written as the run leaves its pool and deleted by the trainer that loads it via `Store.get`. So a crash after a restore can't bring back
 stale state; it surfaces as an error, the way a crash does today.
 
 What a pool's trip to host RAM costs on an H100, at about 50 GB/s pinned (20 GB/s pageable):
@@ -327,8 +389,9 @@ When tinyrl has a sampler (vLLM serving what `save_weights_for_sampler` writes),
 It parks with vLLM's `sleep(level=1)` and resumes with `wake_up()`, and the agent treats it like a trainer, with its
 sampling queue as its demand. Its replicas scale with that queue (see Scaling every workload), and the scheduler places
 them on the agents that have their runs' trainers, so a run's sampler and trainer take turns on one GPU and weight sync can
-go through the node's `/dev/shm` instead of the shared disk. For small models both stay resident and only their kernels
-interleave.
+go through the node's `/dev/shm` (`mem://`) instead of the shared disk. When samplers run on dedicated GPU nodes to handle
+large rollout batches, the trainer pushes updated weights to them over `peer://` (1.31 s for 8B) instead of stalling on
+shared NFS. For small models both stay resident and only their kernels interleave.
 
 A full fine-tune's sampler checkpoint is fp32, because the master weights are. vLLM's `dtype="auto"` would serve an fp32
 checkpoint in fp16, so the sampler should run with `--dtype bfloat16`, or the save should write a bf16 copy.
@@ -339,13 +402,14 @@ checkpoint in fp16, so the sampler should run with `--dtype bfloat16`, or the sa
 |---|---:|---|
 | [bus.py](../tinyrl/bus.py) | 160 → ~210 | `own`, `renew`, `release`; the fenced `finish`; `reclaim` with a minimum idle time (prototyped); assigning and releasing runs; placement, heartbeat and load helpers |
 | [trainer.py](../tinyrl/trainer.py) | 271 → ~335 | the lease loop and the sweep in `Trainer.serve` (prototyped); `Model.park`; releasing runs to disk and restoring them; reporting load; obeying park and resume |
+| `store.py` | new, ~80 | tiered state transport: `mem://` (host RAM / `/dev/shm`), `peer://` (TCP / RDMA streaming socket), `file://` (safetensors on disk / GCS) |
 | `agent.py` | new, ~110 | the heartbeat, a trainer per placed pool, the residency loop |
 | `scheduler.py` | new, ~170 | assigning runs, growing and shrinking pools, placing pools, agent pods through the Kubernetes API |
 | `estimator.py` | new, ~25 | parameter count from the config on the meta device, and bytes per parameter |
 | [gateway.py](../tinyrl/gateway.py) | 154 → ~152 | `pool_for` moves to the scheduler; the run records its LoRA config; `paused_capacity` |
 | `k8s/` | ~120 lines of YAML | gateway, Redis with AOF, the scheduler and its Role, a pre-pull DaemonSet |
 
-About 1,100 lines of Python, up from 692.
+About 1,180 lines of Python, up from 692.
 
 ## Testing
 
@@ -364,14 +428,16 @@ keeps the truth in Redis, which already holds every command, and asks Kubernetes
 | | open-rl | tinyrl |
 |---|---|---|
 | What gets placed | a pod per worker process | a pool's process, onto an agent pod that already has GPUs |
-| LoRA capacity | one worker per base model; its Workload name's instance index "stays 0 until adapter capacity accounting exists" | as many pools per base as load needs; runs move between them in about a second |
+| LoRA capacity | one worker per base model; its Workload name's instance index "stays 0 until adapter capacity accounting exists" | as many pools per base as load needs; runs move between them over `peer://` in ~90 ms |
 | Placement | a Go controller (~2,700 lines, with a 1,274-line design doc): binpack or spread, kube-scheduler as the capacity probe, ledger seats booked by compare-and-swap, assignment IDs, a 2-minute wedge grace | a Python loop (~170 lines): runs into pools by load, pools onto agents by measured size |
 | Sharing a GPU | several pods share one DRA claim, seated on a `ClaimLedger` | the processes in one agent pod share its GPUs, requested as plain `nvidia.com/gpu` |
 | Who takes turns | a time-slicer DaemonSet on the host network; workers `ACQUIRE` and `RELEASE` it around each batch; one resident per claim | the agent, for its own GPUs; pools stay resident together when they fit, least recently served first when they don't |
-| Getting state off the GPU | two ways: cuda-checkpoint through llm-d's snapshot agent (privileged, host PID namespace, finds processes from env tags), and the full fine-tune worker's own sleep and wake | one: the trainer parks tensors to host RAM, or a run to disk |
+| Getting state off the GPU | two ways: cuda-checkpoint through llm-d's snapshot agent (privileged, host PID namespace, finds processes from env tags), and the full fine-tune worker's own sleep and wake | one: the trainer parks pure tensors to host RAM (`mem://`, 50 GB/s), or streams via `peer://` / `file://` |
+| State transport | separate mechanisms: POSIX file writes for weights, cuda-checkpoint UVM memory dumps for time-slicing | unified `Store`: pure tensors over `mem://` (PCIe, 50 GB/s), `peer://` (network, 12–50 GB/s), or `file://` (durable disk) |
+| Weight sync to samplers | written to shared NFS (`/mnt/shared/open-rl/...`), stalling the step for 74 to 88 s | streamed via `Store`: `mem://` on the same node (0.33 s) or `peer://` across nodes (1.31 s) |
 | LoRA workers | exclusive: always resident, never share a GPU | park like any other pool, and their idle runs go to disk |
 | Checkpoints | separate from parking | a run parked to disk is a `save_weights` checkpoint |
-| Moving work | recreate the worker's pod, since a pod's claims can't change | release runs to disk and load them in another pool |
+| Moving work | recreate the worker's pod, since a pod's claims can't change | stream the run's tensors to the target pool's trainer over `peer://` (<100 ms) |
 | One owner | agreement between the Workload's status, a ledger seat, an assignment ID and the pod's env; workers are trusted to obey the daemon | a lease per pool, checked by the same script that writes each reply or moves a run |
 | Queues | Redis lists drained with `LPOP`, so work in flight is tracked separately | Redis streams: `XPENDING` knows what's in flight, `XAUTOCLAIM` hands it to the next owner |
 | Sizing | tables of parameter counts and KV-cache bytes per model name; unknown models are sized as Qwen3-8B | the parameter count from the model's config, then what the trainer measures |
@@ -407,6 +473,10 @@ past the lease is still a design.
 - **An agent DaemonSet.** It never makes a pod pending, so the cluster never scales up.
 - **cuda-checkpoint.** It needs a privileged agent in the host PID namespace to find processes, and it moves a whole CUDA
   context instead of the tensors that matter.
+- **Staging state migrations and weight sync through shared disk (Filestore / NFS).** In open-rl's benchmark, writing
+  weights to shared disk took 74 to 88 s out of a 138 s step, dominating the entire RL cycle. Staging moving runs through
+  NFS also incurs filesystem lock contention and metadata latency. Direct peer streaming (`peer://`) moves state at wire
+  speed (12 to 50 GB/s) directly into the receiving trainer's memory.
 
 ## Open questions
 
