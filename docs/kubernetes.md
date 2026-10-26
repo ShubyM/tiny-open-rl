@@ -1,6 +1,7 @@
 # tinyrl on Kubernetes
 
-**Status.** Portable checkpoints and one owner per pool are built. Nothing else here exists yet.
+**Status.** Portable checkpoints, one owner per pool, and per-run telemetry (`GET /metrics`) are built. Nothing else here
+exists yet. Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
 
 Today you start a trainer for each pool by hand: `python -m tinyrl.trainer <pool>`. Nothing starts trainers for new pools,
 sizes them, puts them on GPUs, shares a GPU between them, grows them when they're busy, moves them off a dying Spot node,
@@ -15,14 +16,14 @@ flowchart LR
   SDK["Tinker SDK"] --> GW["gateway"]
   GW -- "XADD commands" --> R[("Redis: streams, leases, refs")]
   S["scheduler"] -- "runs into pools, pools onto agents" --> R
-  S -- "creates and deletes agent pods" --> K["Kubernetes + cluster autoscaler"]
-  K --> A1["agent pod, 1 GPU"]
-  K --> A2["agent pod, 1 GPU"]
-  K --> A8["agent pod, 8 GPUs"]
+  S -- "creates and deletes agent pods, one per node" --> K["Kubernetes + cluster autoscaler"]
+  K --> A1["agent: L4 node, 1 GPU"]
+  K --> A2["agent: L4 node, 1 GPU"]
+  K --> A8["agent: H100 node, 8 GPUs"]
   A1 -- "starts, parks, resumes" --> T1["trainer: Qwen3-8B LoRA pool #1"]
   A2 --> T2["trainer: Qwen3-8B LoRA pool #2"]
   A8 --> T3["trainer: 8B full fine-tune"]
-  A2 --> V1["sampler: vLLM replica"]
+  A2 --> V1["sampler: vLLM or another engine"]
   T1 & T2 & T3 -- "lease, take, finish" --> R
   T1 & T2 & T3 <-- "put / get by ref" --> ST[("Store: /dev/shm, peer net, GCS/disk")]
   ST -- "get bf16 weights by ref" --> V1
@@ -36,15 +37,19 @@ flowchart LR
 - **One state store does every transfer.** User checkpoints (`save_weights` / `load_weights`), sampler weight sync
   (`save_weights_for_sampler`), GPU time-slicing, resizing LoRA pools, migrating full fine-tunes off crowded or preempted
   nodes, and idling runs to zero GPUs all call the same `store.put` and `store.get`. `put` stages tensors into `/dev/shm`
-  (`emptyDir: {medium: Memory}`, ~50 GB/s PCIe Gen5) so the GPU is free in under half a second, serves remote nodes
+  (`emptyDir: {medium: Memory}`, 26.6 GB/s measured on an H100) so the GPU is free in under a second for most bundles, serves remote nodes
   straight from that RAM over the pod network (gVNIC TCP/HTTP, or GPUDirect-TCPX / RoCE RDMA on A3/A4), and flushes durable
   checkpoints to shared disk or GCS in the background.
 - **A pool is the set of runs one trainer serves**, as the README says today: some LoRA runs on one base model, or one full
   fine-tune. What changes is who makes pools. Today [`pool_for`](../tinyrl/gateway.py) puts every LoRA run on a base into
   one pool, so one GPU serves them all. Here the scheduler makes pools, and a base model gets as many as its load needs.
-- **What gets placed is a pool's process**, onto an agent pod that holds GPUs. The scheduler creates agent pods with plain
-  `nvidia.com/gpu` requests, sized to the pools that need them (1, 2, 4 or 8 GPUs). An agent starts a process for each
-  pool or sampler placed on it and decides which of them are resident on its GPUs.
+- **What gets placed is a pool's process**, onto GPUs of an agent. GPU node pools are dedicated to tinyrl, so there is one
+  agent pod per node, and it requests every GPU on the node with plain `nvidia.com/gpu`. The agent starts a process for
+  each pool or sampler placed on it, with `CUDA_VISIBLE_DEVICES` set to the GPUs the placement names. Processes that share
+  a GPU take turns on it through a Redis lease, and each one parks its own state when it yields.
+- **Moves are cheap, so placement can be wrong.** Parking a LoRA run takes about 41 ms, so the scheduler doesn't pick
+  binpack or spread up front. It moves work toward the load it measures, one move per tick, and corrects a bad move on
+  the next tick.
 - **A pool has one owner.** A trainer serves a pool only while it holds the pool's lease in Redis. Every reply, checkpoint
   `ref` pointer, and run handoff is committed in a WATCH/MULTI/EXEC transaction on the lease key.
 
@@ -53,17 +58,18 @@ flowchart LR
 | Piece | Runs as | Code | Does |
 |---|---|---|---|
 | gateway | Deployment | [gateway.py](../tinyrl/gateway.py) | the Tinker API, as today. It stops picking a run's pool or filesystem paths: it records the run's base, rank and LoRA config, and passes logical `tinker://` URIs. While a run has no trainer, `retrieve_future` answers `queue_state: "paused_capacity"`, which the SDK logs, instead of `"active"`. |
-| scheduler | Deployment, 1 replica | new: `tinyrl/scheduler.py` | puts runs into pools and pools/samplers onto agents; grows, shrinks, drains and defragments pools with load; creates agent pods when nothing has room, and deletes empty ones |
-| agent | one per agent pod | new: `tinyrl/agent.py` | starts and stops a trainer or sampler per placement on it; decides which are resident on its GPUs; serves `/dev/shm` blobs to peers; watches for Spot preemption |
+| scheduler | Deployment, 1 replica | new: `tinyrl/scheduler.py` | puts runs into pools and pools/samplers onto agents; one loop moves work toward a target utilization, which grows, shrinks, drains and defragments; creates agent pods when nothing has room, and deletes empty ones |
+| agent | one pod per GPU node, holding all its GPUs | new: `tinyrl/agent.py` | starts and stops a trainer or sampler per placement on it; serves `/dev/shm` blobs to peers; watches for Spot preemption |
 | trainer | a process in an agent pod | [trainer.py](../tinyrl/trainer.py), extended | serves its pool while it holds the lease; puts and gets run state and sampler weights through `store.py` |
-| sampler | a process in an agent pod | new: `tinyrl/sampler.py` | runs vLLM; pulls bf16 weights or LoRA adapters from `store.py`; sleeps and wakes on its agent's GPU |
+| sampler | a process in an agent pod | new: `tinyrl/sampler.py` | wraps an inference engine (vLLM first, not required) behind a small interface; takes weights from `store.py` through the engine's own weight-loading hook; sleeps and wakes on its agent's GPU |
 | store | library in trainers, samplers and agents | new: `tinyrl/store.py` | `put`, `get`, `drop` across `/dev/shm`, peer network, and durable storage (`CKPT` or GCS) |
 | Redis | StatefulSet, AOF on | | streams, leases, checkpoint `ref`s, blob locations, placements, heartbeats, load |
 
-Kubernetes sees a gateway, a scheduler, Redis and some agent pods (each mounting `emptyDir: {medium: Memory}` at
-`/dev/shm`, since Kubernetes otherwise caps `/dev/shm` at 64 MiB). The scheduler needs one namespaced Role (`create`,
-`delete`, `list` on Pods). Nothing is privileged, nothing uses the host network, and there are no CRDs. A pre-pull
-DaemonSet on GPU node pools, or GKE image streaming, keeps a new agent from waiting on the image.
+Kubernetes sees a gateway, a scheduler, Redis and one agent pod per GPU node (each mounting `emptyDir: {medium: Memory}`
+at `/dev/shm`, since Kubernetes otherwise caps `/dev/shm` at 64 MiB). Every process on a node shares that one `/dev/shm`,
+so parking, resuming and moving a run to other GPUs on the same node never touch the network. The scheduler needs one namespaced Role (`create`,
+`delete`, `list` on Pods). Nothing is privileged, nothing uses the host network, and there are no CRDs. GKE image streaming
+keeps a new node's agent from waiting on the full image pull.
 
 ## State in Redis
 
@@ -77,9 +83,11 @@ Everything [bus.py](../tinyrl/bus.py) has today stays. What's new, and who write
 | `tinyrl:ckpt:<run>` | hash `{<kind>/<name>: ref}` mapping `tinker://` URIs to immutable `ref`s | `Bus.finish`, under the pool's lease | trainers, samplers |
 | `tinyrl:loc:<ref>` | string with TTL: peer address of an agent holding `<ref>` in `/dev/shm` | the agent that staged `<ref>` | any trainer or sampler calling `store.get` |
 | `tinyrl:owner:<pool>` | string with a 10 s TTL: the lease | the trainer that holds it | trainers, scheduler, gateway |
-| `tinyrl:place:<pool>` | string: an agent id | scheduler | agents |
+| `tinyrl:place:<pool>` | string: an agent id and its GPU indexes, like `<agent>/0,1` | scheduler | agents |
 | `tinyrl:agent:<id>` | hash `{gpus, gpu_bytes, host_bytes, gpu_model, addr, draining}` with a 30 s TTL | that agent | scheduler, store |
-| `tinyrl:load:<pool>` | hash `{gpu_bytes, host_bytes, busy, wait}`: measured | the pool's trainer | scheduler, agent |
+| `tinyrl:gpu:<agent>:<i>` | string with a TTL: the process holding GPU `i`, a lease like `tinyrl:owner:<pool>` | the process holding it | processes on that agent |
+| `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | counters (built): calls run, time queued, time running | `Bus.finish`, under the pool's lease | scheduler, `GET /metrics` |
+| `gpu_bytes`, `host_bytes` in `tinyrl:run:<run>` | measured state size, so a move's cost is known | the run's trainer | scheduler |
 
 A run's membership has one writer at a time, and the writer changes hands with the run. The scheduler can only put a run
 into a pool while it's in none (checked in the same WATCH/MULTI/EXEC transaction that writes it), and only the trainer holding a run can take
@@ -104,12 +112,12 @@ sequenceDiagram
   T->>R: SET owner:pool NX PX 10000, fail what a dead owner left
   T->>R: XREADGROUP, run create_model, finish
   C->>G: retrieve_future, "paused_capacity" until a trainer owns the run's pool
-  Note over A,ST: time-slicing: agent says park or resume, T moves its pool between GPU and /dev/shm
+  Note over T,ST: time-slicing: T yields tinyrl:gpu:<agent> between batches when another process waits, parking its state to /dev/shm
   C->>G: save_weights_for_sampler
   T->>ST: store.put(weights(run), durable=False) -> ref
   T->>R: fenced finish publishes tinker://.../sampler_weights/step-k -> ref
   Note over ST: any sampler replica anywhere calls store.get(ref) and updates vLLM in place
-  S->>R: resize, defrag, idle, or Spot drain: set release_to = target_pool (or "")
+  S->>R: one move per tick (relieve, consolidate, idle, or Spot drain): set release_to = target_pool (or "")
   T->>ST: between batches: store.put(state(run), durable=True) -> ref
   T->>R: under old pool's lease: move run, set parked = ref, clear release_to
   Note over T,ST: next trainer anywhere calls store.get(ref), restores, clears parked, drop(ref)
@@ -162,7 +170,7 @@ Because `ref` is write-once, readers never see torn or overwritten files, and a 
 `put` without harming anything—its `Bus.finish` transaction rejects publishing `ref` to `tinyrl:ckpt:<run>`. Every `put` and
 `get` moves through up to three tiers behind that interface:
 
-1. **Tier 1 — GPU ↔ `/dev/shm` on the agent (~50 GB/s pinned D2H/H2D per GPU on PCIe Gen5).**
+1. **Tier 1 — GPU ↔ `/dev/shm` on the agent (26.6 GB/s pinned D2H, 25 GB/s H2D, measured per GPU on `a3-highgpu-1g`).**
    `store.put` writes a `safetensors` buffer into `/dev/shm/tinyrl/<ref>` and sets `tinyrl:loc:<ref>` to the agent's peer
    endpoint in Redis. As soon as `/dev/shm` has the bytes, **GPU memory can be freed and the trainer is done waiting**.
    Same-node readers—a trainer resuming after a time-slice turn, or a colocated sampler—`mmap` `/dev/shm/tinyrl/<ref>`
@@ -179,21 +187,21 @@ Because `ref` is write-once, readers never see torn or overwritten files, and a 
    background for live moves) and evicts the `/dev/shm` copy once space is needed. If no live peer holds `<ref>`,
    `store.get` reads from durable storage.
 
-| Payload | Size | Tier 1: same-node `/dev/shm` (50 GB/s/GPU) | Tier 2: peer gVNIC (20 GB/s) | Tier 2: peer TCPX / RDMA (100–400 GB/s) | Tier 3: GCS / Lustre (~10 GB/s) | Tier 3: Filestore (2 GB/s) |
+| Payload | Size | Tier 1: same-node `/dev/shm` (26.6 GB/s/GPU) | Tier 2: peer gVNIC (20 GB/s) | Tier 2: peer TCPX / RDMA (100–400 GB/s) | Tier 3: GCS / Lustre (~10 GB/s) | Tier 3: Filestore (2 GB/s) |
 |---|---:|---:|---:|---:|---:|---:|
-| 0.5B LoRA `state` | 0.21 GB | 4 ms | 10 ms | < 5 ms | 20 ms | 0.1 s |
-| 8B LoRA `state` | 1.1 GB | 22 ms | 55 ms | 3–11 ms | 0.11 s | 0.6 s |
-| **8B sampler `weights` (bf16)** | **16.4 GB** | **0.33 s** | **0.8 s** | **0.04–0.16 s** | **1.6 s** | **8.2 s** |
-| 1.5B FFT `state` | 18.5 GB | 0.37 s | 0.9 s | 0.05–0.19 s | 1.9 s | 9.3 s |
-| **8B FFT `state` + AdamW** | **98 GB** | **2.0 s (0.25 s ×8)** | **4.9 s** | **0.25–1.0 s** | **9.8 s** | **49 s** |
+| 0.5B LoRA `state` | 0.21 GB | 8 ms | 10 ms | < 5 ms | 20 ms | 0.1 s |
+| 8B LoRA `state` | 1.1 GB | 41 ms | 55 ms | 3–11 ms | 0.11 s | 0.6 s |
+| **8B sampler `weights` (bf16)** | **16.4 GB** | **0.62 s** | **0.8 s** | **0.04–0.16 s** | **1.6 s** | **8.2 s** |
+| 1.5B FFT `state` | 18.5 GB | 0.70 s | 0.9 s | 0.05–0.19 s | 1.9 s | 9.3 s |
+| **8B FFT `state` + AdamW** | **98 GB** | **3.7 s (0.46 s ×8)** | **4.9 s** | **0.25–1.0 s** | **9.8 s** | **49 s** |
 
 ### Every state movement is the same call
 
 | Operation | What happens | Tier hit on the critical path | Trainer stall |
 |---|---|---|---|
-| **Time-slice park / resume** | `ref = store.put(pool_state, durable=False)` → free GPU; later `store.get(ref, "cuda")` | Tier 1 (`/dev/shm` on same agent) | 25 ms (LoRA) to 0.37 s (1.5B FFT) |
-| **Sampler weight sync** (`save_weights_for_sampler`) | `ref = store.put(weights(run), durable=False)`; fenced publish to `tinyrl:ckpt:<run>`; samplers call `store.get(ref)` | Tier 1 if colocated, Tier 2 if remote (never touches disk) | **0.04 to 0.33 s** (vs. 74–88 s on NFS) |
-| **Move a run** (LoRA split/merge, crowded agent, defrag) | `ref = store.put(state(run), durable=True)` → fenced `parked = ref`; target trainer calls `store.get(ref)` | Tier 1 stage + Tier 2 peer pull (Tier 3 flushes in background) | **22 ms** stage (8B LoRA); **0.05–0.9 s** peer pull |
+| **Time-slice park / resume** | `ref = store.put(pool_state, durable=False)` → free GPU; later `store.get(ref, "cuda")` | Tier 1 (`/dev/shm` on same agent) | 41 ms (8B LoRA run) to 0.70 s (1.5B FFT) |
+| **Sampler weight sync** (`save_weights_for_sampler`) | `ref = store.put(weights(run), durable=False)`; fenced publish to `tinyrl:ckpt:<run>`; samplers call `store.get(ref)` | Tier 1 if colocated, Tier 2 if remote (never touches disk) | **0.04 to 0.62 s** (vs. 74–88 s on NFS) |
+| **Move a run** (LoRA split/merge, crowded agent, defrag) | `ref = store.put(state(run), durable=True)` → fenced `parked = ref`; target trainer calls `store.get(ref)` | Tier 1 stage + Tier 2 peer pull (Tier 3 flushes in background) | **41 ms** stage (8B LoRA); **0.05–0.9 s** peer pull |
 | **Idle scale-to-zero or Spot drain** | `ref = store.put(state(run), durable=True)` → leave pool (`release_to = ""`) | Tier 1 stage → Tier 3 flush before pod exit | 0.02–2 s GPU release; survives pod/node deletion |
 | **User checkpoint** (`save_weights` / `load_weights`) | `ref = store.put(state(run), durable=True)` → flush to Tier 3 → fenced publish to `tinyrl:ckpt:<run>` | Tier 1 + Tier 3 | 0.1–10 s on Lustre/GCS |
 
@@ -204,13 +212,14 @@ scales and moves with demand:
 
 | Workload | What it holds | How it scales & moves | Signal | What a change costs |
 |---|---|---|---|---|
-| LoRA trainer pool | a frozen bf16 base, plus 0.21–1.1 GB of adapter `state` per run | more or fewer pools per base; runs hop between pools or park when idle | `busy`, `wait`, memory | 22 ms to stage + ~55 ms peer pull per 8B LoRA run |
-| full fine-tune trainer | 18.5 GB (1.5B) to 98 GB (8B) of `state` | time-shares GPUs via Tier 1 between steps; migrates across nodes (crowded agent, Spot drain, defrag, idle) or changes GPU width across a release via Tier 2/3 | agent resident set, `wait`, `draining` | 0.25–2 s locally; 0.25–5 s across nodes over `Peer` |
+| LoRA trainer pool | a frozen bf16 base, plus 0.21–1.1 GB of adapter `state` per run | more or fewer pools per base; runs hop between pools or park when idle | `busy`, `wait`, memory | 41 ms to stage + ~55 ms peer pull per 8B LoRA run |
+| full fine-tune trainer | 18.5 GB (1.5B) to 98 GB (8B) of `state` | time-shares GPUs via Tier 1 between steps; migrates across nodes (crowded agent, Spot drain, defrag, idle) or changes GPU width across a release via Tier 2/3 | agent utilization, `wait`, `draining` | 0.46–3.7 s locally; 0.25–5 s across nodes over `Peer` |
 | sampler | 3.1–16.4 GB of bf16 `weights`, plus droppable KV cache | stateless replicas anywhere in the cluster | sampling queue | 0.04–0.8 s to pull bf16 weights; 0 s to scale down |
 
-Every trainer reports two numbers once a minute: how busy it was (`busy`, the fraction of the minute spent running
-commands) and how long commands waited (`wait`, the mean time from a command's `XADD` to its start, read from its stream
-entry ID, which is a timestamp).
+The signals are counters every run already has (built): `cmds`, `wait_ms` (from a command's `XADD`, read from its stream
+entry ID, to its start) and `busy_ms`. The scheduler diffs them between ticks to get each run's, pool's and agent's
+utilization and mean queueing delay over the last interval. `GET /metrics` serves the same counters to Prometheus, so a
+dashboard and the scheduler always see the same numbers.
 
 ### LoRA trainer pools: elastic pools per base
 
@@ -218,17 +227,15 @@ One GPU serving every LoRA run on a base is a queue that grows with the number o
 training and 50 s sampling and scoring: one GPU keeps up with about six such runs, and from the seventh on, every run
 waits for every other's `forward_backward`. Ten GPUs serving one run each is the opposite mistake. So:
 
-- **Assigning.** A run with queued work and no pool (a new run, or one waking from idle) goes into the pool on its base
-  with the most room: memory for its adapter, and `busy` below the grow threshold. If none has room, the scheduler makes
-  a pool. A full fine-tune, or a run marked `openrl.exclusive`, always gets a pool of its own.
-- **Growing.** When a LoRA pool's commands wait more than 5 s on average for a minute while it's more than 85% busy, and it
-  has at least two active runs, the scheduler makes a second pool on the same base, waits until a trainer owns it, then asks
-  the busy pool to release half its active runs to it.
-- **Shrinking.** When two pools on a base have both been under 30% busy for 10 minutes and their runs fit on one GPU, the
-  scheduler asks the smaller to release all of its runs to the other. Empty pools retire.
+- **Assigning.** A run with queued work and no pool (a new run, or one waking from idle) goes into the least utilized pool
+  on its base that has memory for its adapter. If every pool on the base is over `TARGET_UTIL`, the scheduler makes a
+  pool. A full fine-tune, or a run marked `openrl.exclusive`, always gets a pool of its own. This step can ship first and
+  alone: `pool_for` picks the least busy `lora:<base>:<n>` from the run counters, and no run ever moves.
+- **Growing and shrinking aren't separate rules.** They fall out of the loop in [Moving work toward the
+  target](#moving-work-toward-the-target): a hot pool sheds runs to a cooler one, and a cold pool's runs drain into others
+  until it's empty and retires.
 - **The hard cap is memory**: the base model, plus each run's adapter state, plus a floor for activations, must fit the GPU.
   Load sets the soft cap below it. `MAX_RUNS_PER_POOL` is there for operators who want a fixed cap.
-- **Hysteresis.** Grow and shrink thresholds sit far apart, and a base is resized at most once every two minutes.
 
 **Releasing a run** is one operation across growing, shrinking, migrating, idling and draining. Between batches, so nothing
 of the run is in flight, the trainer calls `ref = store.put(state(run), durable=True)`, frees the run from GPU memory, and
@@ -243,7 +250,7 @@ steps buys little once `Store` removes the 74–88 s NFS bottleneck: training is
 change moves 12 B/param and alters floating-point reduction order. Instead, it scales cleanly at two timescales:
 
 1. **Step to step on one agent (Tier 1).** Between `optim_step` and the next `forward_backward`, while the client generates
-   rollouts and rewards, the agent parks the full fine-tune to `/dev/shm` (0.37 s for 1.5B, 0.25–2 s for 8B) whenever
+   rollouts and rewards, the agent parks the full fine-tune to `/dev/shm` (0.70 s for 1.5B, 0.46–3.7 s for 8B) whenever
    another pool on the agent has queued work.
 2. **Across nodes and hardware shapes (Tiers 2 & 3).** A full fine-tune is never pinned to the node or GPU SKU it started
    on:
@@ -270,63 +277,101 @@ completely decoupled from trainer placement**:
 
 ## Pools onto agents
 
-The scheduler's placement loop runs alongside `resize`:
+The scheduler places waiting work, then makes at most one move:
 
 ```python
 async def tick(self) -> None:
-  agents = await self.bus.agents()  # live heartbeats, with GPU/host memory, addr and draining flag
-  pools = await self.bus.pools()  # each pool's runs, load, placement and size
+  agents = await self.bus.agents()  # live heartbeats: GPU and host memory, addr, draining
+  units = await self.bus.units()  # LoRA runs, full fine-tune pools and samplers, with utilization, wait and state bytes
 
-  await self.resize(pools, agents)  # assign, grow, shrink, idle-release, and drain Spot agents
+  for agent in agents.values():
+    if agent.draining:  # a Spot notice: everything on it leaves first
+      await self.release_all(agent, units)
+  await self.place_waiting(units, agents)  # best fit decreasing onto GPUs, or one pending agent pod per node shape
 
-  for pool in pools.values():
-    if pool.placed_on and pool.placed_on not in agents:  # its agent died: wait out lease, place again
-      await self.bus.unplace(pool.name)
-    elif pool.placed_on and pool.empty_for_s > EMPTY_POOL_S:  # no runs left: retire it
-      await self.bus.unplace(pool.name)
-    elif pool.starved_on_crowded_agent:  # high wait, low busy: migrate via the store
-      await self.evacuate(pool)
-
-  waiting = [p for p in pools.values() if p.runs and not p.placed_on]
-  for pool in sorted(waiting, key=lambda p: p.size.gpu_bytes, reverse=True):  # best-fit decreasing
-    agent = best_fit([a for a in agents.values() if not a.draining], pool.size, pool.gpus)
-    if agent:
-      await self.bus.place(pool.name, agent.id)
-      agent.reserve(pool.size)
-    else:
-      await self.kube.ensure_pending_agent(pool.gpus, pool.size)  # at most one pending pod per shape
+  move = relieve(units, agents) or consolidate(units, agents)
+  if move:
+    await self.bus.request_release(move.unit, move.target)  # sets release_to; the unit's trainer moves it between batches
 
   for agent in agents.values():
     if agent.empty_for_s > EMPTY_AGENT_S:
-      await self.kube.delete_agent(agent.id)  # cluster autoscaler removes empty nodes
+      await self.kube.delete_agent(agent.id)  # the cluster autoscaler removes the empty node
 ```
 
-- **A pool fits an agent** when its GPU footprint fits the agent's GPUs on its own, and the footprints placed on the agent
-  fit its `/dev/shm` budget. An agent can hold more pools than its GPUs fit simultaneously and take turns between them;
-  `OVERSUBSCRIBE` caps that multiple.
-- **Waiting isn't always compute saturation.** High `wait` with low `busy` means a pool is waiting for GPU turns on a
-  crowded agent, so the scheduler migrates it to an uncrowded agent via `Store` instead of splitting it.
-- **Scaling up and down.** Unplaced work creates at most one pending agent pod per GPU shape (`nodeSelector` picks L4,
-  H100, H200 or B200 by memory). Agents with no placements and no unflushed `durable=True` blobs for 10 minutes are
-  deleted. Queue lag is never the scale-down signal: an RL trainer's queue is empty throughout sampling, and runs leave
-  agents only by parking to `Store`.
+- **A pool fits a set of an agent's GPUs** when its GPU footprint fits those GPUs on its own, and the footprints placed on
+  the agent fit its `/dev/shm` budget. GPUs can hold more pools than fit at once, and they take turns; `OVERSUBSCRIBE`
+  caps that multiple. A multi-GPU pool takes GPUs on one NVLink domain.
+- **Scaling up and down.** Unplaced work creates at most one pending agent pod per node shape, requesting all of that
+  shape's GPUs, so the cluster autoscaler adds exactly one node (`nodeSelector` picks L4, H100, H200 or B200 by memory).
+  Agents with no placements and no unflushed `durable=True` blobs for 10 minutes are deleted. Queue lag is never the
+  scale-down signal: an RL trainer's queue is empty throughout sampling, and runs leave agents only by parking to
+  `Store`.
+
+### Moving work toward the target
+
+One setting, `TARGET_UTIL` (0.7 to start), replaces binpack and spread. A GPU's utilization is the summed `busy_ms` rate of
+every process on it, and an agent's is the mean over its GPUs. Moves between GPUs on one agent cost only a restore from
+`/dev/shm`, so the loop prefers them. Each tick picks at most one move:
+
+1. **Relieve.** A GPU above `TARGET_UTIL + BAND` moves its hottest movable unit to the coolest GPU that has room and
+   stays under `TARGET_UTIL` afterward. The move happens only when the wait it saves, from the measured `wait_ms` rate,
+   exceeds its cost: the unit's state bytes divided by the bandwidth of the tier the move uses. High wait with low busy,
+   a pool starved for GPU turns on a crowded agent, is the same case.
+2. **Consolidate.** When the cluster is below `TARGET_UTIL - BAND`, the emptiest agent's units move into the others. Once
+   it's empty, it's deleted.
+3. **Cool down.** A unit that moved doesn't move again for `COOLDOWN_S` (120 s).
+
+`TARGET_UTIL` near 1 packs work onto as few GPUs as fit it, and a low value spreads it out. What moves depends on cost:
+
+| Unit | Move cost | Moves on |
+|---|---|---|
+| LoRA run | 41 ms stage + ~55 ms peer pull (8B) | relieve, consolidate, idle, Spot drain |
+| full fine-tune pool | 0.46–3.7 s locally, 0.25–5 s across nodes (8B) | relieve or consolidate only when the saved wait is larger; idle, Spot drain |
+| sampler | nothing to save | anything; scale out and in on the sampling queue |
+| multi-node gang | one shard per rank, all ranks at once | idle and Spot drain only |
+
+The loop is a greedy controller, not an optimizer, and that's the point: a wrong move costs one cheap move on the next
+tick. Gandiva (OSDI 2018) made the same argument for suspend and migrate, and Llumnix (OSDI 2024) and dLoRA (OSDI 2024)
+move requests and adapters instead of fixing a policy. `TARGET_UTIL`, `BAND` and `COOLDOWN_S` are the only parameters to
+tune, and the [telemetry](../README.md#telemetry) queries show whether they're right.
 
 ## Taking turns on an agent's GPUs
 
-**The agent decides what's on its GPUs, and nothing else does.** Every second it chooses the resident set: placements with
-queued work, least recently served first, as many as fit in VRAM; then idle ones if room remains. It tells evicted
-processes to park (`store.put(..., durable=False)` into `/dev/shm`, or vLLM `sleep(level=1)`) over stdin and waits for
-acknowledgement before waking the next (`store.get(..., device="cuda")` or `wake_up()`), so two processes never race into
-an OOM. A busy placement keeps its seat for at least 30 seconds or until its queue empties. When everything fits at once,
-nothing parks and CUDA interleaves kernels on its own.
+**When everything fits, nothing parks.** All processes on the agent stay resident and CUDA interleaves their kernels.
+When they don't fit, they take turns through one Redis lease per GPU, `tinyrl:gpu:<agent>:<i>`, using the same `SET NX PX`,
+`SET IFEQ` and `DELEX IFEQ` calls as the pool lease. A process on several GPUs takes their leases in index order, so two
+processes never deadlock:
 
-**LoRA pools park like any other.** An active LoRA pool stays resident while it has queued work; an idle 8B LoRA base parks
-16.4 GB of bf16 to `/dev/shm` in 0.33 s. Individual runs inside a busy LoRA pool that sit idle for 30 minutes are released
-to `Store` (`durable=True`), one at a time.
+1. A process with queued work and no seat sets `wait` on the lease's key and retries `SET NX`.
+2. Between batches, the holder checks for a waiter. If one waits and the holder has held the seat for 30 s, or its own
+   queue is empty, it parks and releases the lease.
+3. Parking is in the application, not the driver. A trainer calls `store.put(..., durable=False)` and
+   `torch.cuda.empty_cache()`. A sampler puts its engine to sleep.
+
+Measured on an H100: parking 16 GB takes 0.60 s, resuming takes 0.64 s, and 725–781 MiB stay on the GPU (529 MiB of
+CUDA context, about 210 MiB of cuBLAS, and allocator slack). vLLM's level 1 sleep leaves 808 MiB on an L4. That leftover
+caps how many processes one GPU can host, at about 0.8 GB each.
+
+There's no queue for the lease: whoever retries first after a release wins. Jain's index in `/metrics` shows whether
+that's fair enough, and a queue gets added only if it isn't.
+
+**LoRA pools park like any other, and so do their runs.** An active LoRA pool stays resident while it has queued work; an
+idle 8B LoRA base parks 16.4 GB of bf16 to `/dev/shm` in 0.62 s. A run inside a busy pool that sits idle for 30 minutes
+is released to `Store` (`durable=True`) on its own, which frees its adapter and optimizer state without stopping the
+pool's other runs.
 
 With fp32 master weights an 8B full fine-tune (98 GB between steps, 131 GB at peak) doesn't fit an 80 GB H100 on its own;
 it needs an H200 or B200, or multi-GPU FSDP. Three 1.5B full fine-tunes share an 80 GB GPU between steps (55 GB) without
 parking, or two at peak (49 GB).
+
+## Multi-node pools
+
+A 70B full fine-tune needs about 1.1 TB of `state` (16 B/param at peak), more than one 8-GPU node. A multi-node pool is
+a gang of whole-node agents created together by one LeaderWorkerSet group, on compact placement. Rank 0 holds the pool
+lease and talks to the bus, and the other ranks follow it. `tinyrl:place:<pool>` holds a list of agents. Every rank
+takes the leases of its GPUs, so the gang parks and resumes together, and each rank `put`s its own canonical shard, so
+the `ref` is a list. The trainer tears down NCCL communicators before parking and rebuilds them after. DRA earns a place
+here only for RDMA NICs, if GKE multi-networking doesn't already cover them.
 
 ## Estimator
 
@@ -384,16 +429,31 @@ over subsequent steps.
 
 ## Samplers
 
-A sampler (`tinyrl/sampler.py`) wraps vLLM's `AsyncLLMEngine` and uses the same `Bus` and `Store`:
+A sampler (`tinyrl/sampler.py`) is any inference engine behind four calls. vLLM is the first engine, not a requirement.
 
-- **In-place full fine-tune updates.** The sampler boots vLLM once from `base` (`dtype="bfloat16"`). When a sampling call
-  names `tinker://<run>/sampler_weights/<step>`, the sampler resolves its `ref` in `tinyrl:ckpt:<run>`, pulls the bf16
-  tensors via `store.get(ref)` (0.33 s from local `/dev/shm`, or 0.04–0.8 s from a peer), updates vLLM's weights in place
-  via `collective_rpc("load_weights")`, and resets the prefix cache—no engine restart and no disk round-trip.
-- **LoRA adapters.** `store.get(ref)` fetches the 35–184 MB bf16 adapter in milliseconds into `/dev/shm/tinyrl/<ref>` for
-  vLLM's `LoRARequest`, evicting least recently used adapters when local slots fill up.
-- **GPU sharing.** On an agent shared with trainers, the sampler obeys the agent's stdin `park` / `resume` protocol via
-  vLLM's `sleep(level=1)` and `wake_up()`.
+```python
+class Engine(Protocol):
+  def sample(self, prompts: list[list[int]], params: dict) -> list[list[int]]: ...
+  def load(self, tensors: Iterable[tuple[str, Tensor]]) -> None: ...  # full weights, a delta, or an adapter, in place
+  def sleep(self) -> None: ...
+  def wake(self) -> None: ...
+```
+
+- **Weights go through the engine's own loading hook**, not a restart or a reload from disk. Measured with Qwen2.5-7B on
+  an L4: vLLM's `reload_weights`, which reads from disk, wakes in 5.2 s warm and 19 s cold, while a level 1 wake, which
+  copies the same 15 GB back from host memory, takes 1.6 s. So `load` streams tensors from `store.get(ref)` straight into
+  the engine's weight loader (vLLM's `load_weights` path) and resets the prefix cache.
+- **Full fine-tunes sync deltas against anchors.** One RL step changes the weights a little. The trainer `put`s an anchor,
+  a full bf16 `weights` bundle, every `ANCHOR_STEPS` steps, and a delta for every step in between. A sampler that holds
+  step `k` applies the deltas after `k`. A new or lagging sampler pulls the latest anchor, then its deltas. Anchors also
+  bound the rounding drift of applying bf16 deltas. Anchors and deltas are ordinary `ref`s, so they live in the store's
+  tiers like everything else: anchors flush to Tier 3, deltas mostly stay in Tiers 1 and 2.
+- **LoRA adapters move whole.** An adapter is 35–184 MB, so a delta saves little. `store.get(ref)` fetches it into
+  `/dev/shm/tinyrl/<ref>` for the engine's adapter loader (vLLM's `LoRARequest`), evicting least recently used adapters
+  when local slots fill up.
+- **GPU sharing.** The sampler takes the agent's GPU lease like any process, and `sleep` / `wake` park it. For RL, sleeping
+  without keeping the stale weights (vLLM level 2) and then `load`ing the new ones may beat a level 1 wake. That hasn't
+  been measured yet.
 
 ## Code
 
@@ -402,13 +462,13 @@ A sampler (`tinyrl/sampler.py`) wraps vLLM's `AsyncLLMEngine` and uses the same 
 | [bus.py](../tinyrl/bus.py) | 160 → ~215 | `own`, `renew`, `release`; fenced `finish` (with `ckpt` `ref` publish) and `release_run`; `reclaim` with minimum idle time (prototyped); placement, heartbeat, load and `loc` helpers |
 | `store.py` | new, ~85 | `Store.put`, `get` and `drop` across `/dev/shm` mmap, peer range pulls, and durable `safetensors` on `CKPT` / GCS |
 | [trainer.py](../tinyrl/trainer.py) | 271 → ~335 | lease loop and sweep (prototyped); `Model.weights` (bf16) and `Model.state` (fp32 weights + named AdamW `exp_avg`, `exp_avg_sq`, `step`); parking, releasing and restoring through `Store`; load reporting |
-| `agent.py` | new, ~125 | heartbeat, Spot preemption watch, process supervisor, GPU residency loop, `/dev/shm` peer server |
-| `scheduler.py` | new, ~175 | assigning runs, LoRA grow/shrink, Spot drain and crowded-agent migration, best-fit placement, agent Pods |
+| `agent.py` | new, ~90 | heartbeat, Spot preemption watch, process supervisor, `/dev/shm` peer server |
+| `scheduler.py` | new, ~150 | assigning runs, best-fit placement, the relieve / consolidate loop, Spot drain, agent Pods |
 | `estimator.py` | new, ~25 | parameter count from `AutoConfig` on `meta` device, bytes/param |
 | [gateway.py](../tinyrl/gateway.py) | 154 → ~145 | `pool_for` and `CKPT` paths go away; records LoRA config; passes `tinker://` URIs; `paused_capacity` |
-| `k8s/` | ~120 lines of YAML | gateway, Redis with AOF, scheduler + Role, pre-pull DaemonSet |
+| `k8s/` | ~120 lines of YAML | gateway, Redis with AOF, scheduler + Role; GKE image streaming instead of a pre-pull DaemonSet |
 
-About 1,175 lines of Python (plus `sampler.py` when vLLM sampling lands), up from 692.
+About 1,115 lines of Python (plus `sampler.py` when vLLM sampling lands), up from 692.
 
 ## Testing
 
@@ -419,10 +479,12 @@ Against a real `redis-server`, real subprocesses, `/dev/shm`, loopback peer HTTP
   extend to named-tensor `Store` across Tier 1 `/dev/shm`, Tier 2 peer HTTP, and Tier 3 fallback when the source peer dies).
 - Zombie trainer fenced during `save_weights`: verify its `Store` `ref` is never published to `tinyrl:ckpt:<run>`.
 - Live run migration between two running trainers (`release_to`) while commands keep arriving.
-- Scheduler decisions (LoRA split/merge, idle release, Spot `draining=1`, crowded-agent evacuation) and agent GPU residency.
+- Scheduler decisions as a pure function of counters and heartbeats (relieve, consolidate, cooldown, Spot `draining=1`),
+  and the GPU lease handing off between two processes.
 
-On a real GKE GPU cluster: VRAM release on `park` and vLLM `sleep(level=1)`, cross-node throughput over gVNIC and
-TCPX/RDMA, Spot VM evacuation within 30 s, and node autoscaling in both directions.
+On a real GKE GPU cluster, done: VRAM left after an app-level park and after vLLM sleep, and Tier 1 bandwidth. Still to
+do: cross-node throughput over gVNIC and TCPX/RDMA, delta weight sync, Spot VM evacuation within 30 s, and node
+autoscaling in both directions.
 
 ## How this differs from open-rl
 
@@ -432,12 +494,12 @@ Kubernetes only for GPU pods.
 
 | | open-rl | tinyrl |
 |---|---|---|
-| Checkpoints & weight sync | mutable paths on shared NFS (`save_pretrained` + `torch.save`): 74–88 s per 8B FFT step (`docs/fft/fft.md` §9) | immutable `ref`s in `Store`: GPU → `/dev/shm` in 0.04–0.37 s, streamed to peers/samplers from RAM in < 1 s, flushed to GCS/disk in background |
+| Checkpoints & weight sync | mutable paths on shared NFS (`save_pretrained` + `torch.save`): 74–88 s per 8B FFT step (`docs/fft/fft.md` §9) | immutable `ref`s in `Store`: GPU → `/dev/shm` in 0.01–0.70 s, streamed to peers/samplers from RAM in < 1 s, flushed to GCS/disk in background |
 | Where a run can resume | LoRA pinned to `instance-0`; FFT tied to its pod's GPU count and pickled optimizer; samplers require shared FS | anywhere in the cluster—any pool, any node, any sampler replica, and (with canonical tensors) any FSDP GPU width |
 | What gets placed | a Pod + DRA `ResourceClaim` per worker process | a pool or sampler process onto an agent Pod with plain `nvidia.com/gpu` |
-| LoRA capacity | one worker per base model (`instance` hardcoded to 0) | elastic pools per base; runs hop between pools in < 0.5 s through `Store` |
-| Placement | ~2,700-line Go controller (`Workload` + `ClaimLedger` CRDs, kube-scheduler probes, CAS seat booking, 2-min wedge grace) | ~175-line Python loop over Redis load and heartbeats |
-| Sharing a GPU | host-network time-slicer DaemonSet; pods `ACQUIRE`/`RELEASE` around batches, one resident per claim | the agent, over stdin; placements stay co-resident when they fit, least recently served when they don't |
+| LoRA capacity | one worker per base model (`instance` hardcoded to 0) | elastic pools per base; runs hop between pools in about 0.1 s through `Store` |
+| Placement | ~2,700-line Go controller (`Workload` + `ClaimLedger` CRDs, kube-scheduler probes, CAS seat booking, 2-min wedge grace), binpack or spread | ~150-line Python loop over run counters and heartbeats, one `TARGET_UTIL` setting |
+| Sharing a GPU | host-network time-slicer DaemonSet; pods `ACQUIRE`/`RELEASE` around batches, one resident per claim | a Redis lease per agent; processes stay co-resident when they fit and park themselves when they don't |
 | Getting state off GPU | two ways: privileged host-PID `cuda-checkpoint` DaemonSet + custom FFT sleep/wake | one: `store.put` and `store.get`, used for time-slicing, sampler sync, resizing, Spot drain and checkpoints |
 | LoRA workers | exclusive: always resident, never share a GPU | park and migrate through `Store` like any other pool |
 | One owner & fencing | cooperative agreement across CRD status, ledger seat, assignment ID and env vars; NFS writes unfenced | Redis lease per pool; WATCH transaction fences every reply, checkpoint `ref` publish, and run handoff |
@@ -453,9 +515,22 @@ selection, `kubectl get workloads` visibility (tinyrl exposes state via Redis / 
 
 - **Writing every park and weight sync straight through POSIX/NFS `save_pretrained`.** On Filestore (2 GB/s), parking a
   1.5B full fine-tune takes 9 s each way and an 8B one takes 49 s; in open-rl's benchmark, `save_pretrained` took 74–88 s
-  per step. Staging to `/dev/shm` frees the GPU in 0.37 s and lets peers and samplers pull straight from RAM.
-- **`cuda-checkpoint` for migration and time-slicing.** Needs a privileged host-PID daemon, snapshots opaque CUDA driver
-  state tied to exact GPU SKU and count, and can neither reshard across GPU widths nor feed weights to vLLM.
+  per step. Staging to `/dev/shm` frees the GPU in 0.70 s and lets peers and samplers pull straight from RAM.
+- **`cuda-checkpoint` and the driver checkpoint API for migration and time-slicing.** Snapshots opaque CUDA driver state
+  tied to one GPU SKU and count, and can neither reshard across GPU widths nor feed weights to a sampler. Measured on an
+  H100: checkpointing about 18 GB took 24.6 s (0.7 GB/s without hugepages), and a failed restore left the GPU unusable
+  until its VM was recreated. GPU-CR and llm-d's `cuda` and `direct_memory` backends build on the same API.
+- **llm-d time-slicing as the GPU arbiter.** Its orchestrator's `Acquire` / `Yield` does what the Redis GPU lease does, and
+  its Snapshot Agent is a privileged host-PID DaemonSet. Its `app_endpoint` backend calls the same engine sleep endpoint the
+  sampler calls itself.
+- **An agent pod per pool shape (1, 2, 4 or 8 GPUs).** kube-scheduler would pack GPUs within a node, and each pod would
+  get its own memory limit. But `/dev/shm` is per pod, so same-node parks and moves would go over the network, and a
+  new pool shape would wait on a new pod's image pull (52 s for a 4.3 GB PyTorch image, measured). With dedicated GPU
+  node pools, one agent per node is simpler and faster. Per-pod agents fit better on nodes shared with other workloads.
+- **Fixed binpack or spread modes.** A placement has to be right when it's made, which is hard. Cheap moves let one
+  `TARGET_UTIL` setting cover both, with the loop correcting mistakes.
+- **Goodput-based schedulers (Pollux, Sia).** They need online models of each job's throughput and statistical efficiency.
+  The greedy loop needs only the counters every run already has.
 - **Trainers claiming pools directly with no scheduler.** A worker that parks a pool in its local `/dev/shm` and drops the
   lease lets another node take the pool before `/dev/shm` state has flushed, or spin up duplicate base models unpacked.
 - **Per-run leases across symmetric LoRA replicas.** Works, but renews a lease per run and fences per run instead of one
@@ -476,5 +551,8 @@ selection, `kubectl get workloads` visibility (tinyrl exposes state via Redis / 
    nodes hold `<ref>` in RAM and flush asynchronously? (Synchronous on Lustre/GCS is simpler and keeps strict durability.)
 3. Keep Tinker's crash semantics (unexpected node loss fails steps since the client's last `save_weights`), or optionally
    background-checkpoint active runs to `Store` every `N` steps?
-4. Are the LoRA resize thresholds right: grow at >5 s mean wait while >85% busy, shrink below 30% busy for 10 minutes?
-5. One agent pod per pool shape (1, 2, 4, 8 GPUs), or one whole-node agent pod per GPU VM managing all of its GPUs?
+4. What are the right starting values for `TARGET_UTIL` (0.7), `BAND` (0.15) and `COOLDOWN_S` (120 s)? The telemetry
+   queries in the README measure the result.
+5. How should deltas be encoded (a dense bf16 difference, top-k sparse, or quantized), and what `ANCHOR_STEPS` balances
+   delta size against a lagging sampler's catch-up time?
+6. Does vLLM level 2 sleep plus `load` of new weights beat a level 1 wake plus `load` for RL samplers?
