@@ -1,7 +1,7 @@
 """Starts a trainer for every pool that has runs and no trainer, on this node's GPUs.
 
-python -m tinyrl.agent replaces starting `python -m tinyrl.trainer <pool>` by hand. Each trainer gets the GPU with the
-fewest trainers on it. A pool's lease still decides who serves it, so a second agent only adds standby trainers.
+python -m tinyrl.node_daemon replaces starting `python -m tinyrl.trainer <pool>` by hand. Each trainer gets the GPU with
+the fewest trainers on it. A pool's lease still decides who serves it, so a second node daemon only adds standbys.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ GPUS = getenv("GPUS", 1)
 TICK = 1.0
 
 
-class Agent:
+class NodeDaemon:
   def __init__(self, bus: Bus, gpus: int = GPUS):
     self.bus = bus
     self.gpus = gpus
@@ -51,4 +51,4 @@ class Agent:
 
 if __name__ == "__main__":
   signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so serve's finally stops the trainers
-  asyncio.run(Agent(Bus()).serve())
+  asyncio.run(NodeDaemon(Bus()).serve())

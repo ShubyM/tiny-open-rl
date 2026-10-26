@@ -21,7 +21,7 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path  # a P
 pip install -e .
 redis-server &                                  # Redis 8.4 or newer
 python -m tinyrl.gateway &                      # the Tinker HTTP API, on :8000
-python -m tinyrl.agent                          # starts a trainer for each pool that has runs
+python -m tinyrl.node_daemon                    # starts a trainer for each pool that has runs
 ```
 
 A **pool** is the set of runs one trainer serves. LoRA runs on the same base model share the pool `lora:<base_model>`.
@@ -29,7 +29,7 @@ A **pool** is the set of runs one trainer serves. LoRA runs on the same base mod
 A full fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive LoRA (`"openrl.exclusive": "true"`) gets a pool
 of its own, named by its model id. Its trainer exits when the run is deleted.
 
-The agent starts `python -m tinyrl.trainer <pool>` for every pool that has runs and no trainer, and starts it again if it dies.
+The node daemon starts `python -m tinyrl.trainer <pool>` for every pool that has runs and no trainer, and starts it again if it dies.
 Each trainer gets the GPU with the fewest trainers (`GPUS`, default 1). You can still start a trainer by hand instead.
 
 ## How it works
@@ -74,7 +74,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 162 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
 | [tinyrl/store.py](tinyrl/store.py) | 38 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
-| [tinyrl/agent.py](tinyrl/agent.py) | 38 | starts a trainer for each pool that has runs and no trainer |
+| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 38 | starts a trainer for each pool that has runs and no trainer |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
