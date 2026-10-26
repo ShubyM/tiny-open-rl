@@ -33,6 +33,8 @@ LIVE_SECONDS = 120  # a session is live this long after its last heartbeat
 REPLY_TTL = getenv("REPLY_TTL", 3600)
 SESSION_TTL = getenv("SESSION_TTL", 7 * 24 * 3600)
 LEASE_MS = getenv("LEASE_MS", 10000)  # a trainer owns its pool this long after its last renewal
+UTIL_MS = getenv("UTIL_MS", 10000)  # a trainer reports how busy it was over this window
+NODE_MS = 30000  # a node daemon is live this long after its last heartbeat
 
 
 def key(*parts: str) -> str:
@@ -283,6 +285,41 @@ class Bus:
   async def owner(self, pool: str) -> str | None:
     worker = await self.r.get(key("owner", pool))
     return worker.decode() if worker else None
+
+  # ***** load *****
+
+  async def report(self, pool: str, util: float) -> None:
+    """A trainer's busy fraction over the last UTIL_MS. It now counts the runs placed since the last report."""
+    p = self.r.pipeline(transaction=True)
+    p.set(key("util", pool), util, px=3 * UTIL_MS)
+    p.delete(key("placed", pool))
+    await p.execute()
+
+  async def placed(self, pool: str) -> None:
+    p = self.r.pipeline(transaction=True)
+    p.incr(key("placed", pool))
+    p.pexpire(key("placed", pool), 3 * UTIL_MS)
+    await p.execute()
+
+  async def loads(self, pools: list[str]) -> list[tuple[float | None, int, int]]:
+    """Each pool's last reported busy fraction (None if it has none), runs placed since, and runs."""
+    p = self.r.pipeline()
+    for pool in pools:
+      p.get(key("util", pool))
+      p.get(key("placed", pool))
+      p.scard(key("pool", pool))
+    got = await p.execute()
+    return [(None if u is None else float(u), int(n or 0), runs) for u, n, runs in zip(got[::3], got[1::3], got[2::3])]
+
+  async def heartbeat(self, node: str, gpus: int) -> None:
+    await self.r.hset(key("nodes"), node, json.dumps({"gpus": gpus, "until": time.time() + NODE_MS / 1000}))
+
+  async def gpus(self) -> int:
+    """The GPUs of every live node daemon."""
+    nodes = {k: json.loads(v) for k, v in (await self.r.hgetall(key("nodes"))).items()}
+    if dead := [k for k, v in nodes.items() if v["until"] < time.time()]:
+      await self.r.hdel(key("nodes"), *dead)
+    return sum(v["gpus"] for v in nodes.values() if v["until"] >= time.time())
 
   # ***** replies *****
 

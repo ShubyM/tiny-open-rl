@@ -21,7 +21,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl import wire
-from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
+from tinyrl.bus import LEASE_MS, UTIL_MS, Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.store import Store
 
@@ -349,6 +349,7 @@ class Trainer:
     self.store = store if store is not None else Store()
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.done = False
+    self.busy = 0.0  # seconds spent running commands since the last load report
 
   async def serve(self) -> None:
     await self.own()
@@ -368,12 +369,16 @@ class Trainer:
       await asyncio.sleep(LEASE_MS / 4000)
 
   async def keep(self) -> None:
-    """Renew the pool's lease until another trainer has it."""
+    """Renew the pool's lease until another trainer has it, and report how busy the trainer was every UTIL_MS."""
+    reported = time.time()
     while not self.done:
       await asyncio.sleep(LEASE_MS / 4000)
       if not await self.bus.renew(self.pool, self.worker):
         self.done = True
         return
+      if (now := time.time()) - reported >= UTIL_MS / 1000:
+        await self.bus.report(self.pool, min(1.0, self.busy / (now - reported)))
+        self.busy, reported = 0.0, now
 
   async def fail_stranded(self, min_idle_ms: int) -> None:
     for cmd in await self.bus.reclaim(self.pool, self.worker, min_idle_ms):
@@ -389,6 +394,7 @@ class Trainer:
       start = time.time()
       first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
       reply = first or await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
+      self.busy += time.time() - start
       if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
         self.done = True  # another trainer owns the pool now
         break

@@ -20,6 +20,8 @@ from tinyrl.bus import Bus, Op, Run
 from tinyrl.helpers import getenv
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
+TARGET_UTIL = getenv("TARGET_UTIL", 0.7)  # a LoRA shard busier than this gets no new runs while another can open
+NEW_RUN_UTIL = 0.1  # the load a new run adds before any shard on its base has reported
 
 
 # ***** requests *****
@@ -68,12 +70,25 @@ def checkpoint_uri(run: str, kind: str, name: str) -> str:
   return f"tinker://{run}/{kind}/{name}"
 
 
-def pool_for(run: str, base_model: str, rank: int, metadata: dict) -> str:
-  """LoRA runs on a base model share its trainer unless one asks for its own. A full fine-tune always gets its own."""
-  exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
-  if rank == 0 or exclusive:
+async def pool_for(bus: Bus, run: str, base_model: str, rank: int, metadata: dict) -> str:
+  """A full fine-tune, or a LoRA run that asks for it, gets a pool of its own. Other LoRA runs on a base share one of
+  its shards, lora:<base>:<n>: the least loaded, or a new one once all are over TARGET_UTIL, up to one per live GPU.
+  A shard's load is its last reported busy fraction plus an estimate for each run placed on it since, so a burst of
+  new runs spreads out instead of all landing on the shard that looked idle."""
+  if rank == 0 or str(metadata.get("openrl.exclusive")).lower() == "true":
     return run
-  return f"lora:{base_model}"
+  shards = [p for p in await bus.pools() if p.startswith(f"lora:{base_model}:")]
+  shards.sort(key=lambda p: int(p.rsplit(":", 1)[1]))
+  loads = await bus.loads(shards)
+  measured = [(u, runs - placed) for u, placed, runs in loads if u is not None and runs > placed]  # runs it measured
+  per_run = sum(u for u, _ in measured) / sum(runs for _, runs in measured) if measured else NEW_RUN_UTIL
+  scores = [(u or 0) + placed * per_run for u, placed, _ in loads]
+  if (scores and min(scores) < TARGET_UTIL) or len(shards) >= max(1, await bus.gpus()):
+    pool = shards[scores.index(min(scores))]
+  else:
+    pool = f"lora:{base_model}:{len(shards)}"
+  await bus.placed(pool)
+  return pool
 
 
 def app(bus: Bus | None = None) -> FastAPI:
@@ -125,7 +140,8 @@ def app(bus: Bus | None = None) -> FastAPI:
     metadata, lora = req.user_metadata or {}, req.lora_config or {}
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     run = str(uuid.uuid4())
-    await bus.create(Run(run, pool_for(run, req.base_model, rank, metadata), req.base_model, rank, req.session_id))
+    pool = await pool_for(bus, run, req.base_model, rank, metadata)
+    await bus.create(Run(run, pool, req.base_model, rank, req.session_id))
     return await submit(run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora})
 
   @api.post("/api/v1/get_info")
