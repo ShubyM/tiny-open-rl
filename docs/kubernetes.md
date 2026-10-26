@@ -47,9 +47,12 @@ flowchart LR
   agent pod per node, and it requests every GPU on the node with plain `nvidia.com/gpu`. The agent starts a process for
   each pool or sampler placed on it, with `CUDA_VISIBLE_DEVICES` set to the GPUs the placement names. Processes that share
   a GPU take turns on it through a Redis lease, and each one parks its own state when it yields.
+- **GPUs come in two tiers.** Reserved capacity is billed whether it's used or not, so its node pools stay at full size
+  and a DaemonSet puts an agent on every node. Burst capacity (on-demand, Spot, or DWS flex-start) is billed only while it
+  runs, so the scheduler adds burst nodes when work waits and removes them as soon as they drain.
 - **Moves are cheap, so placement can be wrong.** Parking a LoRA run takes about 41 ms, so the scheduler doesn't pick
-  binpack or spread up front. It moves work toward the load it measures, one move per tick, and corrects a bad move on
-  the next tick.
+  binpack or spread up front. It moves work toward the load it measures, a few moves per tick on separate GPUs, and
+  corrects a bad move on the next tick.
 - **A pool has one owner.** A trainer serves a pool only while it holds the pool's lease in Redis. Every reply, checkpoint
   `ref` pointer, and run handoff is committed in a WATCH/MULTI/EXEC transaction on the lease key.
 
@@ -59,7 +62,7 @@ flowchart LR
 |---|---|---|---|
 | gateway | Deployment | [gateway.py](../tinyrl/gateway.py) | the Tinker API, as today. It stops picking a run's pool or filesystem paths: it records the run's base, rank and LoRA config, and passes logical `tinker://` URIs. While a run has no trainer, `retrieve_future` answers `queue_state: "paused_capacity"`, which the SDK logs, instead of `"active"`. |
 | scheduler | Deployment, 1 replica | new: `tinyrl/scheduler.py` | puts runs into pools and pools/samplers onto agents; one loop moves work toward a target utilization, which grows, shrinks, drains and defragments; creates agent pods when nothing has room, and deletes empty ones |
-| agent | one pod per GPU node, holding all its GPUs | new: `tinyrl/agent.py` | starts and stops a trainer or sampler per placement on it; serves `/dev/shm` blobs to peers; watches for Spot preemption |
+| agent | one pod per GPU node, holding all its GPUs: a DaemonSet on reserved pools, a pod the scheduler creates on burst pools | new: `tinyrl/agent.py` | starts and stops a trainer or sampler per placement on it; serves `/dev/shm` blobs to peers; watches for Spot preemption |
 | trainer | a process in an agent pod | [trainer.py](../tinyrl/trainer.py), extended | serves its pool while it holds the lease; puts and gets run state and sampler weights through `store.py` |
 | sampler | a process in an agent pod | new: `tinyrl/sampler.py` | wraps an inference engine (vLLM first, not required) behind a small interface; takes weights from `store.py` through the engine's own weight-loading hook; sleeps and wakes on its agent's GPU |
 | store | library in trainers, samplers and agents | new: `tinyrl/store.py` | `put`, `get`, `drop` across `/dev/shm`, peer network, and durable storage (`CKPT` or GCS) |
@@ -67,13 +70,16 @@ flowchart LR
 
 Kubernetes sees a gateway, a scheduler, Redis and one agent pod per GPU node (each mounting `emptyDir: {medium: Memory}`
 at `/dev/shm`, since Kubernetes otherwise caps `/dev/shm` at 64 MiB). Every process on a node shares that one `/dev/shm`,
-so parking, resuming and moving a run to other GPUs on the same node never touch the network. The scheduler needs one namespaced Role (`create`,
-`delete`, `list` on Pods). Nothing is privileged, nothing uses the host network, and there are no CRDs. GKE image streaming
+so parking, resuming and moving a run to other GPUs on the same node never touch the network. On burst pools the scheduler
+creates and deletes agent pods, which is how GKE's cluster autoscaler and DWS flex-start know to add and remove nodes, so it
+needs one namespaced Role (`create`, `delete`, `list` on Pods). Nothing is privileged, nothing uses the host network, and there are no CRDs. GKE image streaming
 keeps a new node's agent from waiting on the full image pull.
 
 ## State in Redis
 
-Everything [bus.py](../tinyrl/bus.py) has today stays. What's new, and who writes it:
+Everything [bus.py](../tinyrl/bus.py) has today stays. The scheduler, agents and samplers reach this state only through
+`Bus` methods (`agents()`, `units()`, `place()`, `request_release()`), never through keys, so the store behind `Bus` can
+change without touching scheduling. What's new, and who writes it:
 
 | Key | Type | Written by | Read by |
 |---|---|---|---|
@@ -84,7 +90,7 @@ Everything [bus.py](../tinyrl/bus.py) has today stays. What's new, and who write
 | `tinyrl:loc:<ref>` | string with TTL: peer address of an agent holding `<ref>` in `/dev/shm` | the agent that staged `<ref>` | any trainer or sampler calling `store.get` |
 | `tinyrl:owner:<pool>` | string with a 10 s TTL: the lease | the trainer that holds it | trainers, scheduler, gateway |
 | `tinyrl:place:<pool>` | string: an agent id and its GPU indexes, like `<agent>/0,1` | scheduler | agents |
-| `tinyrl:agent:<id>` | hash `{gpus, gpu_bytes, host_bytes, gpu_model, addr, draining}` with a 30 s TTL | that agent | scheduler, store |
+| `tinyrl:agent:<id>` | hash `{gpus, gpu_bytes, host_bytes, gpu_model, tier, addr, draining}` with a 30 s TTL; `tier` is `reserved` or `burst`, from a node label | that agent | scheduler, store |
 | `tinyrl:gpu:<agent>:<i>` | string with a TTL: the process holding GPU `i`, a lease like `tinyrl:owner:<pool>` | the process holding it | processes on that agent |
 | `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | counters (built): calls run, time queued, time running | `Bus.finish`, under the pool's lease | scheduler, `GET /metrics` |
 | `gpu_bytes`, `host_bytes` in `tinyrl:run:<run>` | measured state size, so a move's cost is known | the run's trainer | scheduler |
@@ -107,7 +113,7 @@ sequenceDiagram
   C->>G: create_model
   G->>R: create the run with no pool, XADD create_model
   S->>R: queued work, no pool: assign to a pool with room, or make a pool
-  S->>A: place a new pool on an agent with room, or create an agent pod
+  S->>A: place a new pool on GPUs with room, or create a burst agent pod
   A->>T: start a trainer for the pool
   T->>R: SET owner:pool NX PX 10000, fail what a dead owner left
   T->>R: XREADGROUP, run create_model, finish
@@ -117,7 +123,7 @@ sequenceDiagram
   T->>ST: store.put(weights(run), durable=False) -> ref
   T->>R: fenced finish publishes tinker://.../sampler_weights/step-k -> ref
   Note over ST: any sampler replica anywhere calls store.get(ref) and updates vLLM in place
-  S->>R: one move per tick (relieve, consolidate, idle, or Spot drain): set release_to = target_pool (or "")
+  S->>R: moves on separate GPUs each tick (relieve, consolidate, idle, or Spot drain): set release_to = target_pool (or "")
   T->>ST: between batches: store.put(state(run), durable=True) -> ref
   T->>R: under old pool's lease: move run, set parked = ref, clear release_to
   Note over T,ST: next trainer anywhere calls store.get(ref), restores, clears parked, drop(ref)
@@ -277,7 +283,7 @@ completely decoupled from trainer placement**:
 
 ## Pools onto agents
 
-The scheduler places waiting work, then makes at most one move:
+The scheduler places waiting work, then makes moves that touch separate GPUs:
 
 ```python
 async def tick(self) -> None:
@@ -287,22 +293,23 @@ async def tick(self) -> None:
   for agent in agents.values():
     if agent.draining:  # a Spot notice: everything on it leaves first
       await self.release_all(agent, units)
-  await self.place_waiting(units, agents)  # best fit decreasing onto GPUs, or one pending agent pod per node shape
+  await self.place_waiting(units, agents)  # best fit decreasing onto GPUs, reserved first, or one pending burst agent pod
 
-  move = relieve(units, agents) or consolidate(units, agents)
-  if move:
+  for move in plan_moves(units, agents):  # relieve, then consolidate; no two moves share a GPU
     await self.bus.request_release(move.unit, move.target)  # sets release_to; the unit's trainer moves it between batches
 
   for agent in agents.values():
-    if agent.empty_for_s > EMPTY_AGENT_S:
-      await self.kube.delete_agent(agent.id)  # the cluster autoscaler removes the empty node
+    if agent.tier == "burst" and agent.empty_for_s > EMPTY_AGENT_S:
+      await self.kube.delete_agent(agent.id)  # the cluster autoscaler removes the empty burst node
 ```
 
 - **A pool fits a set of an agent's GPUs** when its GPU footprint fits those GPUs on its own, and the footprints placed on
   the agent fit its `/dev/shm` budget. GPUs can hold more pools than fit at once, and they take turns; `OVERSUBSCRIBE`
   caps that multiple. A multi-GPU pool takes GPUs on one NVLink domain.
-- **Scaling up and down.** Unplaced work creates at most one pending agent pod per node shape, requesting all of that
-  shape's GPUs, so the cluster autoscaler adds exactly one node (`nodeSelector` picks L4, H100, H200 or B200 by memory).
+- **Scaling up and down happens only on burst pools.** Reserved nodes are always up, and the scheduler never removes one.
+  Unplaced work that doesn't fit the reserved fleet creates at most one pending burst agent pod per node shape,
+  requesting all of that shape's GPUs, so the cluster autoscaler or DWS flex-start adds exactly one node (`nodeSelector`
+  picks L4, H100, H200 or B200 by memory). A multi-node gang asks for its nodes all at once with a `ProvisioningRequest`.
   Agents with no placements and no unflushed `durable=True` blobs for 10 minutes are deleted. Queue lag is never the
   scale-down signal: an RL trainer's queue is empty throughout sampling, and runs leave agents only by parking to
   `Store`.
@@ -311,14 +318,16 @@ async def tick(self) -> None:
 
 One setting, `TARGET_UTIL` (0.7 to start), replaces binpack and spread. A GPU's utilization is the summed `busy_ms` rate of
 every process on it, and an agent's is the mean over its GPUs. Moves between GPUs on one agent cost only a restore from
-`/dev/shm`, so the loop prefers them. Each tick picks at most one move:
+`/dev/shm`, so the loop prefers them. Each tick plans moves until every candidate is taken, and no two moves in one tick
+touch the same GPU:
 
 1. **Relieve.** A GPU above `TARGET_UTIL + BAND` moves its hottest movable unit to the coolest GPU that has room and
    stays under `TARGET_UTIL` afterward. The move happens only when the wait it saves, from the measured `wait_ms` rate,
    exceeds its cost: the unit's state bytes divided by the bandwidth of the tier the move uses. High wait with low busy,
    a pool starved for GPU turns on a crowded agent, is the same case.
-2. **Consolidate.** When the cluster is below `TARGET_UTIL - BAND`, the emptiest agent's units move into the others. Once
-   it's empty, it's deleted.
+2. **Consolidate.** When the cluster is below `TARGET_UTIL - BAND`, units move off the most expensive agent first: burst
+   before reserved, and the emptiest among equals. An empty burst agent is deleted. A reserved GPU costs nothing more to
+   use, so the loop fills reserved GPUs before burst ones and never deletes a reserved agent.
 3. **Cool down.** A unit that moved doesn't move again for `COOLDOWN_S` (120 s).
 
 `TARGET_UTIL` near 1 packs work onto as few GPUs as fit it, and a low value spreads it out. What moves depends on cost:
@@ -334,6 +343,15 @@ The loop is a greedy controller, not an optimizer, and that's the point: a wrong
 tick. Gandiva (OSDI 2018) made the same argument for suspend and migrate, and Llumnix (OSDI 2024) and dLoRA (OSDI 2024)
 move requests and adapters instead of fixing a policy. `TARGET_UTIL`, `BAND` and `COOLDOWN_S` are the only parameters to
 tune, and the [telemetry](../README.md#telemetry) queries show whether they're right.
+
+### Keeping scale-up off the critical path
+
+A burst node takes minutes to be useful. Recreating an H100 node took about 2 min 15 s to `Ready` and about 45 s more
+before its GPU was usable (measured). A 4.3 GB PyTorch image took 52 s to pull (measured), and a cold vLLM start took
+190 s (measured, see [Samplers](#samplers)). So no call waits for a new node. New work starts right away on reserved GPUs,
+taking turns if it has to, and the loop spreads it onto burst nodes once they're up. Moves are cheap enough that the
+first placement doesn't have to be the final one. The scheduler also asks for burst nodes when utilization has stayed
+above `TARGET_UTIL` for a while, before work queues.
 
 ## Taking turns on an agent's GPUs
 
@@ -451,6 +469,10 @@ class Engine(Protocol):
 - **LoRA adapters move whole.** An adapter is 35–184 MB, so a delta saves little. `store.get(ref)` fetches it into
   `/dev/shm/tinyrl/<ref>` for the engine's adapter loader (vLLM's `LoRARequest`), evicting least recently used adapters
   when local slots fill up.
+- **Startup.** Measured with Qwen2.5-7B on an L4 (vLLM 0.32): 190 s fully cold, 58 s with weights local and the compile
+  cache warm, and 26.6 s from a process that had already imported vLLM, with weights in `/dev/shm` and 8 CUDA graph sizes
+  instead of 51. A sleeping engine wakes in 1.6 s. So each node keeps one sleeping engine for each config it has served,
+  at about 0.8 GB of GPU memory each, and a new config takes the 26.6 s path.
 - **GPU sharing.** The sampler takes the agent's GPU lease like any process, and `sleep` / `wake` park it. For RL, sleeping
   without keeping the stale weights (vLLM level 2) and then `load`ing the new ones may beat a level 1 wake. That hasn't
   been measured yet.
@@ -463,10 +485,10 @@ class Engine(Protocol):
 | `store.py` | new, ~85 | `Store.put`, `get` and `drop` across `/dev/shm` mmap, peer range pulls, and durable `safetensors` on `CKPT` / GCS |
 | [trainer.py](../tinyrl/trainer.py) | 271 → ~335 | lease loop and sweep (prototyped); `Model.weights` (bf16) and `Model.state` (fp32 weights + named AdamW `exp_avg`, `exp_avg_sq`, `step`); parking, releasing and restoring through `Store`; load reporting |
 | `agent.py` | new, ~90 | heartbeat, Spot preemption watch, process supervisor, `/dev/shm` peer server |
-| `scheduler.py` | new, ~150 | assigning runs, best-fit placement, the relieve / consolidate loop, Spot drain, agent Pods |
+| `scheduler.py` | new, ~150 | assigning runs, best-fit placement, the relieve / consolidate loop, Spot drain, burst agent Pods |
 | `estimator.py` | new, ~25 | parameter count from `AutoConfig` on `meta` device, bytes/param |
 | [gateway.py](../tinyrl/gateway.py) | 154 → ~145 | `pool_for` and `CKPT` paths go away; records LoRA config; passes `tinker://` URIs; `paused_capacity` |
-| `k8s/` | ~120 lines of YAML | gateway, Redis with AOF, scheduler + Role; GKE image streaming instead of a pre-pull DaemonSet |
+| `k8s/` | ~120 lines of YAML | gateway, Redis with AOF, scheduler + Role, agent DaemonSet for reserved pools; GKE image streaming instead of a pre-pull DaemonSet |
 
 About 1,115 lines of Python (plus `sampler.py` when vLLM sampling lands), up from 692.
 
@@ -527,6 +549,13 @@ selection, `kubectl get workloads` visibility (tinyrl exposes state via Redis / 
   get its own memory limit. But `/dev/shm` is per pod, so same-node parks and moves would go over the network, and a
   new pool shape would wait on a new pod's image pull (52 s for a 4.3 GB PyTorch image, measured). With dedicated GPU
   node pools, one agent per node is simpler and faster. Per-pod agents fit better on nodes shared with other workloads.
+- **Resizing burst node pools directly** instead of creating pending agent pods. It gives exact control of which node
+  goes, but it skips the cluster autoscaler, and DWS flex-start capacity is handed out through pending pods and
+  `ProvisioningRequest`s. Deleting a drained burst agent's pod already lets the autoscaler remove that node.
+- **Ray for process supervision and moving bytes.** Placement groups, actors on chosen GPUs and the object store would
+  replace the agent's supervisor and the store's peer tier, a few hundred lines. They don't cover taking turns on a GPU,
+  leases, durable checkpoints or Tinker's semantics, and they add a head node and a large dependency. Revisit when
+  multi-node full fine-tunes are common, since all-or-nothing placement across nodes is where Ray helps most.
 - **Fixed binpack or spread modes.** A placement has to be right when it's made, which is hard. Cheap moves let one
   `TARGET_UTIL` setting cover both, with the loop correcting mistakes.
 - **Goodput-based schedulers (Pollux, Sia).** They need online models of each job's throughput and statistical efficiency.
