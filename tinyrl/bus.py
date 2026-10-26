@@ -128,8 +128,11 @@ class Bus:
     record = json.dumps({**asdict(run), "created": time.time()})
     p = self.r.pipeline(transaction=True)
     p.xgroup_create(key("q", run.id), GROUP, id="0", mkstream=True)
+    p.sadd(key("pools"), run.pool)
     p.sadd(key("pool", run.pool), run.id)
-    p.hset(key("run", run.id), mapping={"record": record, "steps": 0, "failed": 0})
+    p.hset(
+      key("run", run.id), mapping={"record": record, "steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0}
+    )
     if run.session:
       p.sadd(key("sess", run.session, "runs"), run.id)
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
@@ -141,11 +144,23 @@ class Bus:
       return None
 
     record = json.loads(fields.pop(b"record"))
-    counters = {name.decode(): int(value) for name, value in fields.items()}  # steps and failed
+    counters = {name.decode(): int(value) for name, value in fields.items()}  # steps, failed, cmds, busy_ms, wait_ms
     return {**record, **counters}
 
   async def runs(self, pool: str) -> list[str]:
     return [run_id.decode() for run_id in await self.r.smembers(key("pool", pool))]
+
+  async def stats(self) -> dict[tuple[str, str], dict]:
+    """The counters of every run still in a pool, by (pool, run)."""
+    runs = [
+      (pool.decode(), run_id)
+      for pool in await self.r.smembers(key("pools"))
+      for run_id in await self.runs(pool.decode())
+    ]
+    p = self.r.pipeline()
+    for _, run_id in runs:
+      p.hgetall(key("run", run_id))
+    return {at: {k.decode(): int(v) for k, v in f.items() if k != b"record"} for at, f in zip(runs, await p.execute())}
 
   async def drop(self, run_id: str, pool: str) -> None:
     """Take a deleted run out of its pool and delete its stream, in one transaction."""
@@ -184,15 +199,25 @@ class Bus:
       cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
     return cmds
 
-  async def finish(self, cmd: Cmd, reply: Reply, pool: str, worker: str, repeat: bool = False) -> bool:
+  async def finish(
+    self, cmd: Cmd, reply: Reply, pool: str, worker: str, repeat: bool = False, started: float | None = None
+  ) -> bool:
     """Write a command's reply, acknowledge the command, and count it, all at once, if `worker` still owns the pool.
-    Returns False, having written nothing, if it doesn't: another trainer took the pool over and fails the command."""
-    counter = ""
+    Returns False, having written nothing, if it doesn't: another trainer took the pool over and fails the command.
+    A command run at time.time() `started` also counts its wait since it was queued, and how long it ran."""
+    counts = {}
     if not repeat:
       if not reply.ok:
-        counter = "failed"
+        counts["failed"] = 1
       elif cmd.op == Op.OPTIM_STEP:
-        counter = "steps"
+        counts["steps"] = 1
+      if started is not None:
+        queued_ms = int(cmd.entry_id.split("-")[0])  # a stream entry id starts with redis' clock when it was added
+        counts |= {
+          "cmds": 1,
+          "wait_ms": max(0, int(started * 1000) - queued_ms),
+          "busy_ms": int((time.time() - started) * 1000),
+        }
 
     k = key("owner", pool)
     while True:
@@ -208,8 +233,8 @@ class Bus:
           p.expire(key("f", cmd.request_id), REPLY_TTL)
           p.xack(key("q", cmd.run), GROUP, cmd.entry_id)
           p.xdel(key("q", cmd.run), cmd.entry_id)
-          if counter:
-            p.hincrby(key("run", cmd.run), counter, 1)
+          for name, n in counts.items():
+            p.hincrby(key("run", cmd.run), name, n)
           if not repeat and cmd.seq is not None:
             p.set(key("seq", cmd.run, str(cmd.seq)), cmd.request_id, ex=REPLY_TTL)
           await p.execute()

@@ -1,3 +1,4 @@
+import asyncio
 import glob
 import json
 import os
@@ -90,12 +91,27 @@ class TestAPI(RedisTest):
     run = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
     self.assertEqual((run["steps"], run["failed"], run["session"]), (8, 0, session_id))
     self.assertEqual((run["live"], run["queued"], run["in_flight"]), (True, 0, []))
+    self.assertEqual(run["cmds"], 17)
+    metrics = (await self.http.get("/metrics")).text
+    self.assertIn(f'tinyrl_steps_total{{pool="lora:tiny",run="{run_id}"}} 8\n', metrics)
+    self.assertIn(f'tinyrl_busy_seconds_total{{pool="lora:tiny",run="{run_id}"}} {run["busy_ms"] / 1000}\n', metrics)
 
     session = (await self.http.get(f"/api/v1/sessions/{session_id}")).json()
     self.assertEqual((session["runs"], session["live"]), ([run_id], True))
 
     info = (await self.post("get_info", json={"model_id": run_id})).json()
     self.assertEqual(info["model_data"], {"model_name": "tiny", "tokenizer_id": "tiny"})
+
+  async def test_a_call_counts_its_time_in_the_queue_and_running(self):
+    run_id = await self.create_model()
+    before = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
+    submitted = await self.post("forward_backward", content=proto_body(run_id), headers=PROTO)
+    await asyncio.sleep(0.3)
+    await self.result(submitted)
+    after = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
+    self.assertEqual(after["cmds"] - before["cmds"], 1)
+    self.assertGreaterEqual(after["wait_ms"] - before["wait_ms"], 300)
+    self.assertGreater(after["busy_ms"] - before["busy_ms"], 0)
 
   async def test_json_clients_get_json(self):
     run_id = await self.create_model()
