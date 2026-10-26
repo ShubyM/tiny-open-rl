@@ -456,9 +456,9 @@ class Trainer:
     if self.seated:
       return
     while not await self.bus.own(f"gpu:{GPU}", self.worker):
-      await self.bus.want(GPU, self.worker)
+      await self.bus.request_gpu(GPU, self.worker)
       await asyncio.sleep(0.05)
-    await self.bus.unwant(GPU, self.worker)
+    await self.bus.withdraw_request(GPU, self.worker)
     await asyncio.to_thread(self.model.resume)
     self.seated = time.time()
 
@@ -466,7 +466,7 @@ class Trainer:
     """Between batches, give the GPU to a trainer that waits for it, once this one is idle or has had it HOLD_S."""
     if not self.seated or not (idle or time.time() - self.seated >= HOLD_S):
       return
-    if await self.bus.wanted(GPU, self.worker):
+    if await self.bus.others_requested(GPU, self.worker):
       await asyncio.to_thread(self.model.park)
       await self.bus.release(f"gpu:{GPU}", self.worker)
       self.seated = 0.0

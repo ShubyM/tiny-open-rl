@@ -75,10 +75,14 @@ class TestParking(unittest.TestCase):
         _, metrics = model.forward_backward("x", data, "cross_entropy", {}, False)
         losses[id(model)].append(metrics["loss:sum"])
         if model is parked:  # between forward_backward and optim_step, so gradients move too
+          # what the allocator holds for them: each tensor's bytes, rounded up to its 512 byte blocks
+          on_gpu = sum(-(-t.numel() * t.element_size() // 512) * 512 for t in model.tensors() if t.is_cuda)
           before = torch.cuda.memory_allocated()
           model.park()
-          self.assertLess(torch.cuda.memory_allocated(), before / 10)
+          self.assertFalse(any(t.is_cuda for t in model.tensors()))
+          self.assertEqual(before - torch.cuda.memory_allocated(), on_gpu)  # all of it freed, nothing else
           model.resume()
+          self.assertTrue(all(t.is_cuda or not t.is_pinned() for t in model.tensors()))
         model.optim_step("x", {"learning_rate": 1e-2})
     self.assertEqual(losses[id(parked)], losses[id(resident)])
 

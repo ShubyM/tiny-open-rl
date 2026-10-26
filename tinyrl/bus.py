@@ -288,13 +288,13 @@ class Bus:
 
   # ***** taking turns on a GPU, whose lease is own("gpu:<node>:<i>") *****
 
-  async def want(self, gpu: str, worker: str) -> None:
+  async def request_gpu(self, gpu: str, worker: str) -> None:
     await self.r.zadd(key("wait", gpu), {worker: time.time() + LEASE_MS / 1000})
 
-  async def unwant(self, gpu: str, worker: str) -> None:
+  async def withdraw_request(self, gpu: str, worker: str) -> None:
     await self.r.zrem(key("wait", gpu), worker)
 
-  async def wanted(self, gpu: str, worker: str) -> bool:
+  async def others_requested(self, gpu: str, worker: str) -> bool:
     """Whether another trainer has asked for the GPU within the last LEASE_MS."""
     return any(w.decode() != worker for w in await self.r.zrangebyscore(key("wait", gpu), time.time(), "+inf"))
 
