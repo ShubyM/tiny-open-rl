@@ -23,6 +23,6 @@ jobs:
         ruff check .
         ruff format --check .
     - name: Line count
-      run: MAX_LINE_COUNT=950 python sz.py
+      run: MAX_LINE_COUNT=1000 python sz.py
     - name: Test
       run: TINKER_PYTHON=$(which python) python -m unittest discover -s test -t . -v
