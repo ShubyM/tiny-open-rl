@@ -12,7 +12,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from tinyrl import wire
@@ -213,6 +213,16 @@ def app(bus: Bus | None = None) -> FastAPI:
     if session is None:
       raise HTTPException(404, f"no session {session_id}")
     return session
+
+  @api.get("/metrics")
+  async def metrics():
+    """Every run's counters for Prometheus. README.md has the queries for utilization, queueing delay and fairness."""
+    lines = []
+    for (pool, run), counters in (await bus.stats()).items():
+      for name, n in counters.items():
+        name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
+        lines.append(f'tinyrl_{name}_total{{pool="{pool}",run="{run}"}} {n}')
+    return PlainTextResponse("\n".join(lines) + "\n")
 
   return api
 

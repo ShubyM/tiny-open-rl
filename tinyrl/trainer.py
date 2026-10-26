@@ -386,10 +386,10 @@ class Trainer:
       return 0
     cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
     for cmd in cmds:
-      start = time.perf_counter()
+      start = time.time()
       first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
       reply = first or await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
-      if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None):
+      if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
         self.done = True  # another trainer owns the pool now
         break
 
@@ -398,7 +398,7 @@ class Trainer:
         self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
 
       if DEBUG:
-        ms = (time.perf_counter() - start) * 1000
+        ms = (time.time() - start) * 1000
         error = "" if reply.ok else f"  {reply.body.decode()}"
         print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
     return len(cmds)

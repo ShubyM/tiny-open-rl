@@ -68,8 +68,8 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 | file | lines | what's in it |
 |---|---:|---|
 | [tinyrl/trainer.py](tinyrl/trainer.py) | 319 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 200 | runs, sessions, commands and replies on Redis |
-| [tinyrl/gateway.py](tinyrl/gateway.py) | 154 | the Tinker HTTP API |
+| [tinyrl/bus.py](tinyrl/bus.py) | 222 | runs, sessions, commands and replies on Redis |
+| [tinyrl/gateway.py](tinyrl/gateway.py) | 162 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
 | [tinyrl/store.py](tinyrl/store.py) | 38 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
@@ -77,6 +77,25 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS` and `DEBUG=1`.
+
+## Telemetry
+
+Every run's hash counts the commands it ran (`cmds`), the time they spent queued (`wait_ms`, from the stream entry id to the
+trainer starting it) and running (`busy_ms`), plus `steps` and `failed`. The trainer writes them in the same transaction as
+the reply. `GET /api/v1/runs/<run>` shows one run's counters, and `GET /metrics` shows every run's in Prometheus' text
+format, as `tinyrl_<counter>_total{pool, run}` in seconds. The numbers scheduling papers report are queries over those
+counters:
+
+| measure | PromQL |
+|---|---|
+| utilization of a pool's trainer | `sum by (pool) (rate(tinyrl_busy_seconds_total[5m]))` |
+| mean queueing delay per call | `sum by (pool) (rate(tinyrl_wait_seconds_total[5m])) / sum by (pool) (rate(tinyrl_cmds_total[5m]))` |
+| slowdown, (wait + run) / run | `1 + sum by (pool) (rate(tinyrl_wait_seconds_total[5m])) / sum by (pool) (rate(tinyrl_busy_seconds_total[5m]))` |
+| throughput, optimizer steps per second | `sum by (pool) (rate(tinyrl_steps_total[5m]))` |
+| fairness, Jain's index of the GPU time active runs get (1 is equal shares) | `sum(rate(tinyrl_busy_seconds_total[5m]) > 0) ^ 2 / (count(rate(tinyrl_busy_seconds_total[5m]) > 0) * sum((rate(tinyrl_busy_seconds_total[5m]) > 0) ^ 2))` |
+| failure rate | `sum by (pool) (rate(tinyrl_failed_total[5m])) / sum by (pool) (rate(tinyrl_cmds_total[5m]))` |
+
+A run's wait includes waiting on its own earlier calls, since a run's calls run in order.
 
 ## Throughput simulator
 
