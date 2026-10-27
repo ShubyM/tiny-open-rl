@@ -93,8 +93,8 @@ class TestAPI(RedisTest):
     self.assertEqual((run["live"], run["queued"], run["in_flight"]), (True, 0, []))
     self.assertEqual(run["cmds"], 17)
     metrics = (await self.http.get("/metrics")).text
-    self.assertIn(f'tinyrl_steps_total{{pool="lora:tiny",run="{run_id}"}} 8\n', metrics)
-    self.assertIn(f'tinyrl_busy_seconds_total{{pool="lora:tiny",run="{run_id}"}} {run["busy_ms"] / 1000}\n', metrics)
+    self.assertIn(f'tinyrl_steps_total{{pool="lora:tiny:0",run="{run_id}"}} 8\n', metrics)
+    self.assertIn(f'tinyrl_busy_seconds_total{{pool="lora:tiny:0",run="{run_id}"}} {run["busy_ms"] / 1000}\n', metrics)
 
     session = (await self.http.get(f"/api/v1/sessions/{session_id}")).json()
     self.assertEqual((session["runs"], session["live"]), ([run_id], True))
@@ -183,7 +183,7 @@ class TestAPI(RedisTest):
     exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})
 
     pools = [(await self.bus.run(run_id))["pool"] for run_id in (shared, also_shared, full, exclusive)]
-    self.assertEqual(pools, ["lora:tiny", "lora:tiny", full, exclusive])
+    self.assertEqual(pools, ["lora:tiny:0", "lora:tiny:0", full, exclusive])
     self.assertEqual((await self.bus.run(full))["rank"], 0)
     self.assertEqual((await self.post("get_info", json={"model_id": full})).json()["lora_rank"], 16)
 

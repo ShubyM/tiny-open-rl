@@ -24,7 +24,10 @@ python -m tinyrl.gateway &                      # the Tinker HTTP API, on :8000
 python -m tinyrl.node_daemon                    # starts a trainer for each pool that has runs
 ```
 
-A **pool** is the set of runs one trainer serves. LoRA runs on the same base model share the pool `lora:<base_model>`.
+A **pool** is the set of runs one trainer serves. LoRA runs on the same base model share a pool, `lora:<base_model>:<n>`. A new run
+goes to the least loaded of its base's pools. Once all of them are busier than `TARGET_UTIL` (0.7), it opens another, up to one
+per GPU the node daemons report. A pool's load is how busy its trainer was over the last `UTIL_MS`, plus an estimate for each run
+placed on it since.
 
 A full fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive LoRA (`"openrl.exclusive": "true"`) gets a pool
 of its own, named by its model id. Its trainer exits when the run is deleted.
@@ -69,17 +72,17 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 319 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 227 | runs, sessions, commands and replies on Redis |
-| [tinyrl/gateway.py](tinyrl/gateway.py) | 162 | the Tinker HTTP API |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 325 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/bus.py](tinyrl/bus.py) | 254 | runs, sessions, commands and replies on Redis |
+| [tinyrl/gateway.py](tinyrl/gateway.py) | 175 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
 | [tinyrl/store.py](tinyrl/store.py) | 38 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
-| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 38 | starts a trainer for each pool that has runs and no trainer |
+| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 41 | starts a trainer for each pool that has runs and no trainer |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS` and `DEBUG=1`.
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `TARGET_UTIL`, `UTIL_MS` and `DEBUG=1`.
 
 ## Telemetry
 

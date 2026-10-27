@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import socket
 import subprocess
 import sys
 
@@ -24,8 +25,10 @@ class NodeDaemon:
     self.bus = bus
     self.gpus = gpus
     self.trainers: dict[str, tuple[int, subprocess.Popen]] = {}  # pool -> (gpu, process)
+    self.id = f"{socket.gethostname()}-{os.getpid()}"
 
   async def tick(self) -> None:
+    await self.bus.heartbeat(self.id, self.gpus)  # how many shards a LoRA base can spread over
     for pool, (_, proc) in list(self.trainers.items()):
       if proc.poll() is not None:  # it exited: its pool emptied, it lost the lease, or it crashed
         del self.trainers[pool]
