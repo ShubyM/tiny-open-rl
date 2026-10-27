@@ -91,7 +91,7 @@ class Sampler:
     self.store = store if store is not None else Store()
     self.lora = not pool.startswith("sampler:fft:")
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
-    self.names: dict[tuple[str, int], str] = {}  # (uri, mtime) -> the engine's name for that checkpoint
+    self.names: dict[tuple[str, str], str] = {}  # (uri, version) -> the engine's name for that checkpoint
     self.done = False
     self.seated = 0.0  # when this sampler took its GPU's lease, or 0 while it doesn't hold it
 
@@ -162,9 +162,9 @@ class Sampler:
     """The engine's name for a checkpoint, which the engine loads unless it already holds it."""
     if not uri:
       return None
-    key = (uri, os.stat(self.store.file(uri)).st_mtime_ns)  # a checkpoint name can be saved again
-    name = self.names.setdefault(key, f"c{len(self.names)}")
-    await self.engine.load(name, self.store.path(uri))
+    path, version = await asyncio.to_thread(self.store.local, uri)  # a checkpoint name can be saved again
+    name = self.names.setdefault((uri, version), f"c{len(self.names)}")
+    await self.engine.load(name, path)
     return name
 
   @contextlib.asynccontextmanager

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import uuid
 
 import torch
 
@@ -27,6 +28,23 @@ class TestStore(unittest.TestCase):
     store = Store(root=tempfile.mkdtemp())
     with self.assertRaises(ValueError):
       store.get("tinker://run-1/weights/missing")
+
+  def test_a_remote_checkpoint_saved_on_one_node_loads_on_another(self):
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
+    uri = "tinker://run-1/sampler_weights/step-1"
+    saver.put(uri, {"w": torch.ones(4)}, {"lora": True, "config": {"r": 4}})
+
+    folder, version = loader.local(uri)
+    self.assertEqual(sorted(os.listdir(folder)), ["adapter_config.json", "adapter_model.safetensors"])
+    self.assertTrue(torch.equal(loader.get(uri)[0]["w"], torch.ones(4)))
+    self.assertEqual(loader.local(uri), (folder, version))  # downloaded once
+
+    saver.put(uri, {"w": torch.zeros(4)}, {"lora": True, "config": {"r": 4}})  # the same name, saved again
+    self.assertNotEqual(loader.local(uri)[1], version)
+    self.assertTrue(torch.equal(loader.get(uri)[0]["w"], torch.zeros(4)))
+    with self.assertRaises(ValueError):
+      loader.get("tinker://run-1/weights/missing")
 
 
 if __name__ == "__main__":

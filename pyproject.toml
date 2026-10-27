@@ -8,9 +8,10 @@ version = "0.2.0"
 description = "The Tinker training API on Redis Streams and PyTorch."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["fastapi", "uvicorn", "redis>=7.1", "protobuf>=5", "numpy", "torch", "transformers>=5", "peft>=0.15", "safetensors"]
+dependencies = ["fastapi", "uvicorn", "redis>=7.1", "protobuf>=5", "numpy", "torch", "transformers>=5", "peft>=0.15", "safetensors", "fsspec"]
 
 [project.optional-dependencies]
+gcs = ["gcsfs"]
 testing = ["httpx", "ruff", "tabulate"]
 
 [tool.setuptools.packages.find]
