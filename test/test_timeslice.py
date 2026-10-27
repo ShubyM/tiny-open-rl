@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import unittest
 from unittest.mock import patch
@@ -60,6 +61,35 @@ class TestTakingTurns(RedisTest):
       await a.step(block_ms=10)  # past HOLD_S, so it yields after this batch
       self.assertEqual(await waiting, 1)
       self.assertTrue(a.model.parked)
+
+  async def test_full_finetune_releases_gpu_on_exit(self):
+    with patch.object(trainer, "GPU", "node-a:0"):
+      t = Trainer(self.bus, "a", Model(tiny), worker="a")
+      run = new_id()
+      await self.bus.create(Run(run, "a", "tiny", 0))
+      await self.submit(run, Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}})
+      await self.submit(run, Op.DELETE_MODEL, {})
+
+      await t.serve()
+
+      self.assertIsNone(await self.bus.owner("gpu:node-a:0"))
+
+  async def test_cancelled_step_withdraws_gpu_request(self):
+    with patch.object(trainer, "GPU", "node-a:0"):
+      a, _ = await self.trainer("a")
+      await a.step(block_ms=10)
+
+      b, _ = await self.trainer("b")
+      waiting = asyncio.create_task(b.step(block_ms=10))
+      await asyncio.sleep(0.3)
+
+      self.assertTrue(await self.bus.others_requested("node-a:0", "a"))
+
+      waiting.cancel()
+      with contextlib.suppress(asyncio.CancelledError):
+        await waiting
+
+      self.assertFalse(await self.bus.others_requested("node-a:0", "a"))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")

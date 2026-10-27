@@ -398,6 +398,9 @@ class Trainer:
         await self.fail_stranded(STRANDED_MS)
     finally:
       renewing.cancel()
+      if GPU:
+        await self.bus.release(f"gpu:{GPU}", self.worker)
+        self.seated = 0.0
       await self.bus.release(self.pool, self.worker)
 
   async def own(self) -> None:
@@ -457,10 +460,12 @@ class Trainer:
     """Hold the GPU for a batch: wait for this trainer's turn and bring its tensors back. After the batch, yield it if
     another trainer asked for it and this one has had it HOLD_S. With no GPU to share, it does nothing."""
     if gpu and not self.seated:
-      while not await self.bus.own(f"gpu:{gpu}", self.worker):
-        await self.bus.request_gpu(gpu, self.worker)
-        await asyncio.sleep(0.05)
-      await self.bus.withdraw_request(gpu, self.worker)
+      try:
+        while not await self.bus.own(f"gpu:{gpu}", self.worker):
+          await self.bus.request_gpu(gpu, self.worker)
+          await asyncio.sleep(0.05)
+      finally:
+        await self.bus.withdraw_request(gpu, self.worker)
       await asyncio.to_thread(self.model.resume)
       self.seated = time.time()
     try:
