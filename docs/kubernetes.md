@@ -1,11 +1,14 @@
 # tinyrl on Kubernetes
 
-**Status.** Portable checkpoints, one owner per pool, and per-run telemetry (`GET /metrics`) are built. Nothing else here
-exists yet. Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
+**Status.** Portable `safetensors` checkpoints (`store.py`), one owner per pool, per-run telemetry (`GET /metrics`), a
+single-node process supervisor (`node_daemon.py`), load-based LoRA pool sharding, and cooperative GPU time-slicing to
+pinned host memory are built. Multi-node placement, live run migration, `/dev/shm` + peer `Store` tiers, Spot drain, and
+samplers do not exist yet. Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
 
-Today you start a trainer for each pool by hand: `python -m tinyrl.trainer <pool>`. Nothing starts trainers for new pools,
-sizes them, puts them on GPUs, shares a GPU between them, grows them when they're busy, moves them off a dying Spot node,
-or brings them back after a crash. This is the design for the piece that does, on GKE.
+Today [`node_daemon.py`](../tinyrl/node_daemon.py) runs on one machine and starts a trainer for every pool that has runs,
+while [`gateway.py`](../tinyrl/gateway.py) picks each LoRA run's pool once at creation time. Nothing places pools across
+multiple GPU nodes, sizes them up front, moves runs off hot or dying Spot nodes, or scales burst nodes with load. This is
+the design for the piece that does, on GKE.
 
 ## The idea
 
@@ -41,8 +44,9 @@ flowchart LR
   straight from that RAM over the pod network (gVNIC TCP/HTTP, or GPUDirect-TCPX / RoCE RDMA on A3/A4), and flushes durable
   checkpoints to shared disk or GCS in the background.
 - **A pool is the set of runs one trainer serves**, as the README says today: some LoRA runs on one base model, or one full
-  fine-tune. What changes is who makes pools. Today [`pool_for`](../tinyrl/gateway.py) puts every LoRA run on a base into
-  one pool, so one GPU serves them all. Here the scheduler makes pools, and a base model gets as many as its load needs.
+  fine-tune. What changes is how runs move between pools. Today [`pool_for`](../tinyrl/gateway.py) shards a base's LoRA
+  runs across pools when each run is created, and a run stays there. Here the scheduler owns pools and moves runs between
+  them as load shifts.
 - **What gets placed is a pool's process**, onto GPUs of a node daemon. GPU node pools are dedicated to tinyrl, so there is one
   node daemon pod per node, and it requests every GPU on the node with plain `nvidia.com/gpu`. The node daemon starts a process for
   each pool or sampler placed on it, with `CUDA_VISIBLE_DEVICES` set to the GPUs the placement names. Processes that share
@@ -62,10 +66,10 @@ flowchart LR
 |---|---|---|---|
 | gateway | Deployment | [gateway.py](../tinyrl/gateway.py) | the Tinker API, as today. It stops picking a run's pool or filesystem paths: it records the run's base, rank and LoRA config, and passes logical `tinker://` URIs. While a run has no trainer, `retrieve_future` answers `queue_state: "paused_capacity"`, which the SDK logs, instead of `"active"`. |
 | scheduler | Deployment, 1 replica | new: `tinyrl/scheduler.py` | puts runs into pools and pools/samplers onto node daemons; one loop moves work toward a target utilization, which grows, shrinks, drains and defragments; creates node daemon pods when nothing has room, and deletes empty ones |
-| node daemon | one pod per GPU node, holding all its GPUs: a DaemonSet on reserved pools, a pod the scheduler creates on burst pools | new: `tinyrl/node_daemon.py` | starts and stops a trainer or sampler per placement on it; serves `/dev/shm` blobs to peers; watches for Spot preemption |
+| node daemon | one pod per GPU node, holding all its GPUs: a DaemonSet on reserved pools, a pod the scheduler creates on burst pools | [node_daemon.py](../tinyrl/node_daemon.py), extended | starts and stops a trainer or sampler per placement on it; serves `/dev/shm` blobs to peers; watches for Spot preemption |
 | trainer | a process in a node daemon pod | [trainer.py](../tinyrl/trainer.py), extended | serves its pool while it holds the lease; puts and gets run state and sampler weights through `store.py` |
 | sampler | a process in a node daemon pod | new: `tinyrl/sampler.py` | wraps an inference engine (vLLM first, not required) behind a small interface; takes weights from `store.py` through the engine's own weight-loading hook; sleeps and wakes on its node daemon's GPU |
-| store | library in trainers, samplers and node daemons | new: `tinyrl/store.py` | `put`, `get`, `drop` across `/dev/shm`, peer network, and durable storage (`CKPT` or GCS) |
+| store | library in trainers, samplers and node daemons | [store.py](../tinyrl/store.py), extended | `put`, `get`, `drop` across `/dev/shm`, peer network, and durable storage (`CKPT` or GCS) |
 | Redis | StatefulSet, AOF on | | streams, leases, checkpoint `ref`s, blob locations, placements, heartbeats, load |
 
 Kubernetes sees a gateway, a scheduler, Redis and one node daemon pod per GPU node (each mounting `emptyDir: {medium: Memory}`
@@ -131,10 +135,10 @@ sequenceDiagram
 
 ## The store: a trainer can resume anywhere
 
-Today [`Model.save`](../tinyrl/trainer.py) calls Hugging Face's `save_pretrained` and `torch.save(optimizer.state_dict())`
-to a mutable directory on `CKPT`. In open-rl's two-job 8B full fine-tune benchmark (`docs/fft/fft.md` §9), writing sampler
-weights to shared NFS took **74 to 88 seconds of every 130-second RL step**—three fifths of the whole job spent waiting on
-storage while GPUs sat idle.
+Today [`Store`](../tinyrl/store.py) writes named `safetensors` bundles (`Model.state` and `Model.weights`) to a local
+`CKPT` directory. Mounting `CKPT` on shared NFS does not scale across nodes. In open-rl's two-job 8B full fine-tune
+benchmark (`docs/fft/fft.md` §9), writing sampler weights (`save_pretrained` + `torch.save`) to shared NFS took **74 to 88
+seconds of every 130-second RL step**, leaving GPUs idle for three fifths of the job.
 
 What a trainer or sampler actually needs to move is just a flat `dict[str, torch.Tensor]` plus a small JSON `meta` dict
 (`base`, `rank`, `lora`, `step`):
@@ -481,28 +485,28 @@ class Engine(Protocol):
 
 | File | Lines | Change |
 |---|---:|---|
-| [bus.py](../tinyrl/bus.py) | 160 → ~215 | `own`, `renew`, `release`; fenced `finish` (with `ckpt` `ref` publish) and `release_run`; `reclaim` with minimum idle time (prototyped); placement, heartbeat, load and `loc` helpers |
-| `store.py` | new, ~85 | `Store.put`, `get` and `drop` across `/dev/shm` mmap, peer range pulls, and durable `safetensors` on `CKPT` / GCS |
-| [trainer.py](../tinyrl/trainer.py) | 271 → ~335 | lease loop and sweep (prototyped); `Model.weights` (bf16) and `Model.state` (fp32 weights + named AdamW `exp_avg`, `exp_avg_sq`, `step`); parking, releasing and restoring through `Store`; load reporting |
-| `node_daemon.py` | new, ~90 | heartbeat, Spot preemption watch, process supervisor, `/dev/shm` peer server |
+| [trainer.py](../tinyrl/trainer.py) | 382 → ~410 | parking, releasing and restoring runs through `Store` (lease loop, sweep, `Model.weights`/`state`, load reporting, and pinned-memory parking are built) |
+| [bus.py](../tinyrl/bus.py) | 260 → ~295 | fenced `ckpt` `ref` publish and `release_run`; placement and `loc` helpers (leases, fenced `finish`, `reclaim`, node heartbeats, utilization, and GPU wait set are built) |
+| [gateway.py](../tinyrl/gateway.py) | 175 → ~150 | `pool_for` and `CKPT` paths go away; records LoRA config; passes `tinker://` URIs; `paused_capacity` |
+| [node_daemon.py](../tinyrl/node_daemon.py) | 41 → ~90 | per-node placements, Spot preemption watch, `/dev/shm` peer server (process supervisor, heartbeat, and GPU lease assignment are built) |
+| [store.py](../tinyrl/store.py) | 38 → ~85 | immutable `ref`s across `/dev/shm` mmap, peer range pulls, `drop`, and GCS (durable `safetensors` `put` and `get` on `CKPT` are built) |
 | `scheduler.py` | new, ~150 | assigning runs, best-fit placement, the relieve / consolidate loop, Spot drain, burst node daemon Pods |
 | `estimator.py` | new, ~25 | parameter count from `AutoConfig` on `meta` device, bytes/param |
-| [gateway.py](../tinyrl/gateway.py) | 154 → ~145 | `pool_for` and `CKPT` paths go away; records LoRA config; passes `tinker://` URIs; `paused_capacity` |
 | `k8s/` | ~120 lines of YAML | gateway, Redis with AOF, scheduler + Role, node daemon DaemonSet for reserved pools; GKE image streaming instead of a pre-pull DaemonSet |
 
-About 1,115 lines of Python (plus `sampler.py` when vLLM sampling lands), up from 692.
+With [wire.py](../tinyrl/wire.py) (94), [helpers.py](../tinyrl/helpers.py) (12), and [`__init__.py`](../tinyrl/__init__.py) (1) unchanged, that is about 1,310 lines of Python (plus `sampler.py` when vLLM sampling lands), up from 1,003 today.
 
 ## Testing
 
-Against a real `redis-server`, real subprocesses, `/dev/shm`, loopback peer HTTP, and tiny CPU models—no cluster needed:
+Against a real `redis-server`, real subprocesses, `/dev/shm`, loopback peer HTTP, and tiny CPU models, with no cluster needed:
 
 - Lease takeover under `SIGSTOP` and stranded-command sweep (`test_lease.py`, done).
-- Bitwise-identical training continuation across `state(run)` → `Store` → restore into a fresh `Model` (done for disk,
+- Process supervision (`test_node_daemon.py`, done), load-based LoRA sharding (`test_shards.py`, done), and GPU lease turn-taking plus CUDA pinned-memory parking (`test_timeslice.py`, done).
+- Bitwise-identical training continuation across `state(run)` → `Store` → restore into a fresh `Model` (done for disk in `test_store.py`,
   extend to named-tensor `Store` across Tier 1 `/dev/shm`, Tier 2 peer HTTP, and Tier 3 fallback when the source peer dies).
 - Zombie trainer fenced during `save_weights`: verify its `Store` `ref` is never published to `tinyrl:ckpt:<run>`.
 - Live run migration between two running trainers (`release_to`) while commands keep arriving.
-- Scheduler decisions as a pure function of counters and heartbeats (relieve, consolidate, cooldown, Spot `draining=1`),
-  and the GPU lease handing off between two processes.
+- Scheduler decisions as a pure function of counters and heartbeats (relieve, consolidate, cooldown, Spot `draining=1`).
 
 On a real GKE GPU cluster, done: VRAM left after an app-level park and after vLLM sleep, and Tier 1 bandwidth. Still to
 do: cross-node throughput over gVNIC and TCPX/RDMA, delta weight sync, Spot VM evacuation within 30 s, and node
@@ -528,7 +532,7 @@ Kubernetes only for GPU pods.
 | Queues | Redis lists (`LPOP`), separate in-flight tracking | Redis streams (`XPENDING` + `XAUTOCLAIM`) |
 | Sizing | hardcoded parameter/KV tables per model name (unknown → Qwen3-8B) | exact `meta`-device parameter count from `AutoConfig`, then live measurement |
 | Privileges | 2 CRDs, ClusterRole, DRA driver, host-network + privileged host-PID DaemonSets | 1 namespaced Role over Pods |
-| Size | ~4,000+ lines across Go controller, time-slicer (677), worker managers (432), estimator (128), and CRDs | ~480 lines of new Python |
+| Size | ~4,000+ lines across Go controller, time-slicer (677), worker managers (432), estimator (128), and CRDs | ~310 more lines of Python (~1,310 total) |
 
 What open-rl has today that this doesn't yet: working vLLM samplers, multi-GPU FSDP training, DRA attribute-based GPU
 selection, `kubectl get workloads` visibility (tinyrl exposes state via Redis / `/api/v1/runs`), and real cluster miles.
