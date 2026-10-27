@@ -28,6 +28,13 @@ class Store:
   def path(self, uri: str) -> str:
     return f"{self.root}/{uri.removeprefix('tinker://')}"
 
+  def file(self, uri: str) -> str:
+    folder = self.path(uri)
+    files = sorted(glob.glob(f"{folder}/*.safetensors"))
+    if not files:
+      raise ValueError(f"no checkpoint at {uri}")
+    return files[0]
+
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
     folder, info = self.path(uri), dict(meta or {})
     cpu = {k: v.detach().cpu().contiguous() for k, v in tensors.items()}
@@ -45,11 +52,12 @@ class Store:
     return folder
 
   def get(self, uri: str, *, device: str = "cpu") -> tuple[dict[str, torch.Tensor], dict]:
-    folder = self.path(uri)
-    files = sorted(glob.glob(f"{folder}/*.safetensors"))
-    if not files:
-      raise ValueError(f"no checkpoint at {uri}")
-    src = files[0]
+    src = self.file(uri)
     with safetensors.safe_open(src, framework="pt", device=device) as f:
       meta = json.loads((f.metadata() or {}).get("meta", "{}"))
       return {k: f.get_tensor(k) for k in f.keys()}, meta
+
+  def meta(self, uri: str) -> dict:
+    src = self.file(uri)
+    with safetensors.safe_open(src, framework="pt", device="cpu") as f:
+      return json.loads((f.metadata() or {}).get("meta", "{}"))

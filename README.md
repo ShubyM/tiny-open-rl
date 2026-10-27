@@ -32,8 +32,10 @@ placed on it since.
 A full fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive LoRA (`"openrl.exclusive": "true"`) gets a pool
 of its own, named by its model id. Its trainer exits when the run is deleted.
 
-The node daemon starts `python -m tinyrl.trainer <pool>` for every pool that has runs and no trainer, and starts it again if it dies.
-Each trainer gets the GPU with the fewest trainers (`GPUS`, default 1). You can still start a trainer by hand instead.
+The node daemon starts `python -m tinyrl.trainer <pool>` for every training pool and `python -m tinyrl.sampler <pool>`
+for every sampling pool that has runs and no worker, and starts them again if they die. With `SAMPLER=vllm` a sampler
+runs `vllm serve` on a local port and drives it over HTTP. Otherwise it samples with transformers in process. Each worker gets the GPU with the fewest workers (`GPUS`, default 1). You can still start a
+trainer or sampler by hand instead.
 
 Trainers on one GPU take turns through a lease on it. Between batches, a trainer with nothing to do, or one that has had the GPU
 for `HOLD_S` (30 s), yields it to a trainer that waits: it copies its weights, gradients and AdamW state to pinned host memory,
@@ -46,9 +48,9 @@ sdk --http--> gateway --XADD--> tinyrl:q:<run> --XREADGROUP--> trainer --XADD-->
 ```
 
 Every training call is a command on its run's Redis stream, and its reply is a stream with one entry, named by the request. That's the
-whole design. Redis does the bookkeeping that would otherwise take a database, a ledger and a heartbeat:
+whole design. Redis does the bookkeeping that would otherwise take a database, a ledger and a heartbeat.
 
-* **The queue reads itself.** A pool's trainer reads its runs' streams through one consumer group, so `XINFO GROUPS` says what's queued,
+* **The queue reads itself.** A pool's trainer reads its runs' streams through one consumer group so `XINFO GROUPS` says what's queued,
   and `XPENDING` says what's in flight, on which trainer, and for how long. `GET /api/v1/runs/<id>` just asks.
 * **A dead trainer fails fast.** The commands it took stay in the pending list. The next trainer to start claims them with `XAUTOCLAIM`
   and fails them, so no client waits on work that died with its process.
@@ -76,17 +78,19 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 387 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 260 | runs, sessions, commands and replies on Redis |
-| [tinyrl/gateway.py](tinyrl/gateway.py) | 175 | the Tinker HTTP API |
-| [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
-| [tinyrl/store.py](tinyrl/store.py) | 38 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
-| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 41 | starts a trainer for each pool that has runs and no trainer |
+| [tinyrl/sampler.py](tinyrl/sampler.py) | 302 | sampling pools, on `vllm serve` over HTTP or transformers in process |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 389 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/bus.py](tinyrl/bus.py) | 264 | runs, sessions, commands and replies on Redis |
+| [tinyrl/gateway.py](tinyrl/gateway.py) | 270 | the Tinker HTTP API |
+| [tinyrl/wire.py](tinyrl/wire.py) | 155 | the Tinker protobuf, to numpy and back |
+| [tinyrl/store.py](tinyrl/store.py) | 44 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
+| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 42 | starts a trainer for each pool that has runs and no trainer |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `HOLD_S`, `TARGET_UTIL`, `UTIL_MS` and `DEBUG=1`.
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `HOLD_S`, `TARGET_UTIL`,
+`UTIL_MS`, `SAMPLER`, `VLLM_ARGS` and `DEBUG=1`.
 
 ## Telemetry
 
@@ -123,7 +127,6 @@ Every test runs against a real `redis-server` and a real (tiny, random) Llama. N
 
 ## Not here yet
 
-* Sampling (`create_sampling_session`, `asample`). vLLM can already serve the adapters `save_weights_for_sampler` writes.
 * `create_training_client_from_state`.
 * Multi-GPU trainers (FSDP, context parallelism).
 * Running on Kubernetes: a scheduler that places pools across nodes, GPU time-slicing, and parking idle runs. The design is

@@ -1,9 +1,9 @@
 # tinyrl on Kubernetes
 
 **Status.** Portable `safetensors` checkpoints (`store.py`), one owner per pool, per-run telemetry (`GET /metrics`), a
-single-node process supervisor (`node_daemon.py`), load-based LoRA pool sharding, and cooperative GPU time-slicing to
-pinned host memory are built. Multi-node placement, live run migration, `/dev/shm` + peer `Store` tiers, Spot drain, and
-samplers do not exist yet. Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
+single-node process supervisor (`node_daemon.py`), load-based LoRA pool sharding, cooperative GPU time-slicing to
+pinned host memory, and samplers (`sampler.py`) are built. Multi-node placement, live run migration, `/dev/shm` + peer `Store` tiers, and
+Spot drain do not exist yet. Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
 
 Today [`node_daemon.py`](../tinyrl/node_daemon.py) runs on one machine and starts a trainer for every pool that has runs,
 while [`gateway.py`](../tinyrl/gateway.py) picks each LoRA run's pool once at creation time. Nothing places pools across
@@ -451,14 +451,15 @@ over subsequent steps.
 
 ## Samplers
 
-A sampler (`tinyrl/sampler.py`) is any inference engine behind four calls. vLLM is the first engine, not a requirement.
+A sampler (`tinyrl/sampler.py`) is any inference engine behind five calls. vLLM is the first engine, not a requirement.
 
 ```python
 class Engine(Protocol):
-  def sample(self, prompts: list[list[int]], params: dict) -> list[list[int]]: ...
-  def load(self, tensors: Iterable[tuple[str, Tensor]]) -> None: ...  # full weights, a delta, or an adapter, in place
-  def sleep(self) -> None: ...
-  def wake(self) -> None: ...
+  async def load_lora(self, name: str, path: str) -> None: ...
+  async def load_weights(self, path: str) -> None: ...  # a full fine-tune's weights, in place
+  async def sample(self, job: dict, adapter: str | None) -> Out: ...
+  async def sleep(self) -> None: ...
+  async def wake(self) -> None: ...
 ```
 
 - **Weights go through the engine's own loading hook**, not a restart or a reload from disk. Measured with Qwen2.5-7B on
@@ -494,7 +495,7 @@ class Engine(Protocol):
 | `estimator.py` | new, ~25 | parameter count from `AutoConfig` on `meta` device, bytes/param |
 | `k8s/` | ~120 lines of YAML | gateway, Redis with AOF, scheduler + Role, node daemon DaemonSet for reserved pools; GKE image streaming instead of a pre-pull DaemonSet |
 
-With [wire.py](../tinyrl/wire.py) (94), [helpers.py](../tinyrl/helpers.py) (12), and [`__init__.py`](../tinyrl/__init__.py) (1) unchanged, that is about 1,310 lines of Python (plus `sampler.py` when vLLM sampling lands), up from 1,003 today.
+With [wire.py](../tinyrl/wire.py), [sampler.py](../tinyrl/sampler.py), [helpers.py](../tinyrl/helpers.py), and [`__init__.py`](../tinyrl/__init__.py), see [`README.md`](../README.md) for current line counts.
 
 ## Testing
 

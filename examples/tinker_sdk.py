@@ -35,3 +35,33 @@ print(f"state   {state}")
 print(f"sampler {sampler}")
 
 assert losses[-1] < losses[0] * 0.7, f"the loss barely moved: {losses}"
+
+sampler_client = trainer.save_weights_and_get_sampling_client()
+print(f"sampler_session {sampler_client._sampling_session_id}")
+
+prompt_tokens = [1, 2, 3]
+out = sampler_client.sample(
+  prompt=types.ModelInput.from_ints(prompt_tokens),
+  num_samples=2,
+  sampling_params=types.SamplingParams(max_tokens=4, temperature=1.0),
+).result()
+
+seq = out.sequences[0]
+print(f"sampled {seq.tokens} stop_reason {seq.stop_reason}")
+
+prompt_lps = sampler_client.compute_logprobs(
+  types.ModelInput.from_ints(prompt_tokens + list(seq.tokens)), prompt_logprobs_last_n=len(seq.tokens)
+).result()
+
+is_datum = types.Datum(
+  model_input=types.ModelInput.from_ints(prompt_tokens + list(seq.tokens)[:-1]),
+  loss_fn_inputs={
+    "target_tokens": list(seq.tokens),
+    "logprobs": list(seq.logprobs),
+    "advantages": [1.0] * len(seq.tokens),
+    "weights": [1.0] * len(seq.tokens),
+  },
+)
+fwdbwd_is = trainer.forward_backward([is_datum], "importance_sampling")
+optim_is = trainer.optim_step(types.AdamParams(learning_rate=1e-3))
+print(f"importance_sampling loss {fwdbwd_is.result().metrics['loss:sum']:.4f}")

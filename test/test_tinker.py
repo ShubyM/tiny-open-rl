@@ -57,6 +57,10 @@ class TestTinkerSDK(unittest.TestCase):
     finally:
       for proc in procs:
         proc.terminate()
+        try:
+          proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+          proc.kill()
 
 
 if __name__ == "__main__":
