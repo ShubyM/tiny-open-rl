@@ -293,10 +293,10 @@ async def tick(self) -> None:
   for node in nodes.values():
     if node.draining:  # a Spot notice: everything on it leaves first
       await self.release_all(node, units)
-  await self.place_waiting(units, nodes)  # best fit decreasing onto GPUs, reserved first, or one pending burst node daemon pod
+  await self.place_waiting(units, nodes)  # best fit decreasing onto GPUs, reserved first, or one pending burst pod
 
   for move in plan_moves(units, nodes):  # relieve, then consolidate; no two moves share a GPU
-    await self.bus.request_release(move.unit, move.target)  # sets release_to; the unit's trainer moves it between batches
+    await self.bus.request_release(move.unit, move.target)  # sets release_to; its trainer moves it between batches
 
   for node in nodes.values():
     if node.tier == "burst" and node.empty_for_s > EMPTY_NODE_S:
