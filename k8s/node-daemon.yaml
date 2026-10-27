@@ -1,0 +1,32 @@
+# One node daemon per GPU node, holding all of its GPUs. Label a node pool tinyrl-gpu=true to run tinyrl on it.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-daemon
+spec:
+  selector:
+    matchLabels: {app: node-daemon}
+  template:
+    metadata:
+      labels: {app: node-daemon}
+    spec:
+      nodeSelector: {tinyrl-gpu: "true"}
+      tolerations:
+      - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      - {key: tinyrl-gpu, operator: Exists, effect: NoSchedule}
+      # a Spot node gets 30 s of notice: the node daemon gives its trainers DRAIN_S (20 s) to save their runs
+      terminationGracePeriodSeconds: 25
+      containers:
+      - name: node-daemon
+        image: tinyrl
+        envFrom:
+        - configMapRef: {name: tinyrl}
+        env:
+        - {name: GPUS, value: "1"}
+        resources:
+          limits: {nvidia.com/gpu: 1}
+        volumeMounts:
+        - {name: shm, mountPath: /dev/shm}
+      volumes:
+      - name: shm
+        emptyDir: {medium: Memory}

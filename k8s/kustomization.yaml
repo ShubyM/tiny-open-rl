@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: tinyrl
+resources:
+- namespace.yaml
+- redis.yaml
+- gateway.yaml
+- node-daemon.yaml
+configMapGenerator:
+- name: tinyrl
+  literals:
+  - REDIS_URL=redis://redis:6379
+  - CKPT=gs://open-rl-2-sandbox-102433-tinyrl/ckpt
+  - CKPT_CACHE=/dev/shm/tinyrl-cache
+images:
+- name: tinyrl
+  newName: us-central1-docker.pkg.dev/open-rl-2-sandbox-102433/open-rl/tinyrl
+  newTag: latest
