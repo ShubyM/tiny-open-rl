@@ -38,7 +38,13 @@ class TestTinkerSDK(unittest.TestCase):
     tiny().save_pretrained(base)  # a base model on disk, loaded the way any other is
 
     port = free_port()
-    env = {**os.environ, "REDIS_URL": f"unix://{tmp}/redis.sock", "PORT": str(port), "CKPT": f"{tmp}/ckpt"}
+    env = {
+      **os.environ,
+      "REDIS_URL": f"unix://{tmp}/redis.sock",
+      "PORT": str(port),
+      "CKPT": f"{tmp}/ckpt",
+      "ENGINE": "test.helpers:FakeEngine",  # the sampler's engine, since CI has no GPU for vLLM
+    }
     procs = [start_redis(f"{tmp}/redis.sock")]
     try:
       procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.gateway"], env=env))

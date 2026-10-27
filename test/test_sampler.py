@@ -2,17 +2,18 @@ import asyncio
 import json
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 
-from test.helpers import RedisTest, tiny
+from test.helpers import FakeEngine, RedisTest, tiny
 from tinyrl import wire
 from tinyrl.bus import Op, Run
 from tinyrl.gateway import app
-from tinyrl.sampler import HFEngine, Out, Sampler, Seq, VLLMServer, encode
+from tinyrl.sampler import Out, Sampler, Seq, encode
 from tinyrl.store import Store
 from tinyrl.trainer import Trainer
+from tinyrl.vllm import VLLM
 
 JOB = {
   "prompt": [1, 2, 3],
@@ -35,31 +36,19 @@ def tokens(chunks: list[int]) -> dict:
 
 
 class TestSampler(RedisTest):
-  async def test_hf_engine_samples_and_scores(self):
-    base = f"{tempfile.mkdtemp()}/tiny"
-    tiny().save_pretrained(base)
-    engine = HFEngine(base)
+  def test_encode_masks_the_prompt_before_last_n_and_pads_top_k(self):
+    out = Out(
+      [Seq([9], [-3.0], [{9: -3.0, 7: -0.5}], False)],
+      [None, {2: -1.0, 5: -0.1}, {3: -2.0}],
+    )
+    job = JOB | {"prompt_logprobs": True, "prompt_logprobs_last_n": 1, "topk_prompt": 2, "topk_sample": 1}
+    res = wire.sample_json(encode(job, out))
+    self.assertEqual(res["prompt_logprobs"], [None, None, -2.0])
+    self.assertEqual(res["topk_prompt_logprobs"], [None, None, [[3, -2.0]]])
+    self.assertEqual(res["sequences"][0]["topk_logprobs"], [[[7, -0.5]]])
+    self.assertEqual(res["sequences"][0]["stop_reason"], "length")
 
-    async def sample(**job) -> dict:
-      job = JOB | job
-      return wire.sample_json(encode(job, await engine.sample(job, None)))
-
-    out = await sample(num_samples=2, prompt_logprobs=True, prompt_logprobs_last_n=1, topk_prompt=2, topk_sample=2)
-    a, b = out["sequences"]
-    self.assertEqual(a["tokens"], b["tokens"])
-    self.assertEqual(out["prompt_logprobs"][:2], [None, None])
-    self.assertIsInstance(out["prompt_logprobs"][2], float)
-    self.assertEqual(out["topk_prompt_logprobs"][:2], [None, None])
-    self.assertEqual(len(out["topk_prompt_logprobs"][2]), 2)
-    self.assertEqual(len(a["topk_logprobs"]), len(a["tokens"]))
-
-    seeded = {"temperature": 1.0, "seed": 42, "max_tokens": 5}
-    self.assertEqual((await sample(**seeded))["sequences"], (await sample(**seeded))["sequences"])
-
-    stopped = (await sample(max_tokens=10, stop=[a["tokens"][0]]))["sequences"][0]
-    self.assertEqual((stopped["tokens"], stopped["stop_reason"]), ([a["tokens"][0]], "stop"))
-
-  async def test_vllm_server_speaks_the_completions_api(self):
+  async def test_vllm_speaks_the_completions_api(self):
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -68,41 +57,29 @@ class TestSampler(RedisTest):
         return httpx.Response(200)
       choice = {
         "index": 0,
-        "finish_reason": "length",
+        "finish_reason": "stop",
         "token_ids": [9],
         "logprobs": {"token_logprobs": [-3.0], "top_logprobs": [{"token_id:9": -3.0, "token_id:7": -0.5}]},
-        "prompt_logprobs": [None, {"2": {"logprob": -1.0}, "5": {"logprob": -0.1}}, {"3": {"logprob": -2.0}}],
+        "prompt_logprobs": [None, {"2": {"logprob": -1.0}}, {"3": {"logprob": -2.0}}],
       }
       return httpx.Response(200, json={"choices": [choice]})
 
-    server = VLLMServer(
-      "http://vllm", "base", httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://vllm")
-    )
-    await server.load_lora("a0", "/ckpt/a")
-    await server.load_weights("/ckpt/w")
-    await server.sleep()
-    await server.wake()
-    self.assertEqual(
-      [path for path, _ in calls],
-      ["/v1/load_lora_adapter", "/collective_rpc", "/reset_prefix_cache", "/sleep", "/wake_up"],
-    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://vllm")
+    engine = VLLM("http://vllm", "base", client=client)
+    await engine.load_lora("a0", "/ckpt/a")
+    await engine.load_weights("/ckpt/w")
+    await engine.sleep()
+    await engine.wake()
+    paths = [path for path, _ in calls]
+    self.assertEqual(paths, ["/v1/load_lora_adapter", "/collective_rpc", "/reset_prefix_cache", "/sleep", "/wake_up"])
 
-    job = JOB | {
-      "stop": ["\n", 4],
-      "prompt_logprobs": True,
-      "prompt_logprobs_last_n": 1,
-      "topk_prompt": 2,
-      "topk_sample": 1,
-    }
-    out = wire.sample_json(encode(job, await server.sample(job, "a0")))
+    job = JOB | {"stop": ["\n", 4], "prompt_logprobs": True, "topk_sample": 1}
+    out = await engine.sample(job, "a0")
     req = calls[-1][1]
     self.assertEqual((req["model"], req["stop"], req["stop_token_ids"]), ("a0", ["\n"], [4]))
-    self.assertEqual((req["logprobs"], req["prompt_logprobs"]), (1, 2))
-    self.assertEqual(out["sequences"][0]["tokens"], [9])
-    self.assertEqual(out["sequences"][0]["stop_reason"], "length")
-    self.assertEqual(out["sequences"][0]["topk_logprobs"], [[[7, -0.5]]])
-    self.assertEqual(out["prompt_logprobs"], [None, None, -2.0])
-    self.assertEqual(out["topk_prompt_logprobs"], [None, None, [[3, -2.0]]])
+    self.assertEqual((req["logprobs"], req["prompt_logprobs"]), (1, 1))
+    self.assertEqual(out.seqs, [Seq([9], [-3.0], [{9: -3.0, 7: -0.5}], True)])
+    self.assertEqual(out.prompt, [None, {2: -1.0}, {3: -2.0}])
 
   async def test_the_sdk_calls_sample_lora_base_and_full_finetunes(self):
     base = f"{tempfile.mkdtemp()}/tiny"
@@ -124,15 +101,14 @@ class TestSampler(RedisTest):
     trainer = Trainer(self.bus, f"lora:{base}:0", store=store)
     await self.own(trainer)
     await trainer.step(block_ms=0)
-    sampler = Sampler(self.bus, f"sampler:{base}", store=store)
+    sampler = Sampler(self.bus, f"sampler:{base}", engine=FakeEngine, store=store)
     await self.own(sampler)
 
     sid = await save_for_sampler(trainer, run)
     self.assertTrue((await client.get(f"/api/v1/samplers/{sid}")).json()["model_path"].startswith("tinker://"))
     first = await call("join_sampling_session", {"sampling_session_id": sid})
-    self.assertEqual(
-      (await call("join_sampling_session", {"sampling_session_id": sid}))["client_counter"], first["client_counter"] + 1
-    )
+    second = await call("join_sampling_session", {"sampling_session_id": sid})
+    self.assertEqual(second["client_counter"], first["client_counter"] + 1)
 
     job = {"sampling_session_id": sid, "seq_id": 7, "prompt": tokens([1, 2, 3]), "prompt_logprobs": True}
     replies = []
@@ -141,24 +117,34 @@ class TestSampler(RedisTest):
       await sampler.step(block_ms=0)
       replies.append(await call("retrieve_future", {"request_id": request_id}))
     self.assertEqual(replies[0], replies[1])
-    self.assertEqual(replies[0]["prompt_logprobs"][0], None)
+    self.assertEqual(replies[0]["prompt_logprobs"], [None, -1.0, -1.0])
 
     request_id = (await call("asample", {"base_model": base, "prompt": tokens([1, 2])}))["request_id"]
     await sampler.step(block_ms=0)
     self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
+    calls = sampler.engine.calls
+    self.assertEqual(calls[0], ("start", base, True))
+    self.assertEqual(
+      [c for c in calls if c[0] == "load_lora"],
+      [("load_lora", "a0", store.path(f"tinker://{run}/sampler_weights/step-0"))],
+    )
+    self.assertEqual([c for c in calls if c[0] == "sample"], [("sample", "a0"), ("sample", None)])  # the retry ran once
 
-    fft = await call("create_model", {"base_model": base, "user_metadata": {"openrl.fine_tuning_type": "full"}})
-    fft_trainer = Trainer(self.bus, fft["model_id"], store=store)
+    fft = (await call("create_model", {"base_model": base, "user_metadata": {"openrl.fine_tuning_type": "full"}}))[
+      "model_id"
+    ]
+    fft_trainer = Trainer(self.bus, fft, store=store)
     await self.own(fft_trainer)
     await fft_trainer.step(block_ms=0)
-    fft_sid = await save_for_sampler(fft_trainer, fft["model_id"])
-    self.assertEqual((await self.bus.run(fft_sid))["pool"], f"sampler:fft:{fft['model_id']}")
-    fft_sampler = Sampler(self.bus, f"sampler:fft:{fft['model_id']}", store=store)
+    fft_sid = await save_for_sampler(fft_trainer, fft)
+    self.assertEqual((await self.bus.run(fft_sid))["pool"], f"sampler:fft:{fft}")
+    fft_sampler = Sampler(self.bus, f"sampler:fft:{fft}", engine=FakeEngine, store=store)
     await self.own(fft_sampler)
     request_id = (await call("asample", {"sampling_session_id": fft_sid, "prompt": tokens([1, 2])}))["request_id"]
     await fft_sampler.step(block_ms=0)
     res = await client.post("/api/v1/retrieve_future", json={"request_id": request_id}, headers={"Accept": wire.PROTO})
     self.assertEqual(res.headers["content-type"], wire.PROTO)
+    self.assertIn(("load_weights", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.engine.calls)
     await client.aclose()
 
   @patch("tinyrl.trainer.HOLD_S", 0.0)
@@ -171,9 +157,7 @@ class TestSampler(RedisTest):
     model = MagicMock()
     model.optim_step.return_value = {"grad_norm:mean": 0.5}
     trainer = Trainer(self.bus, "t1", model=model)
-    engine = AsyncMock()
-    engine.sample.return_value = Out([Seq([5], [-0.2], [{5: -0.2}], True)], [])
-    sampler = Sampler(self.bus, "sampler:base", engine=engine)
+    sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine)
 
     tasks = [asyncio.create_task(trainer.serve()), asyncio.create_task(sampler.serve())]
     try:
@@ -184,11 +168,12 @@ class TestSampler(RedisTest):
       ]:
         reply = await self.bus.result(await self.bus.submit(run, op, json.dumps(body).encode()), 5)
         self.assertTrue(reply.ok, reply.body)
-      self.assertGreaterEqual(engine.sleep.call_count, 1)
+      self.assertIn(("sleep",), sampler.engine.calls)
     finally:
       trainer.done = sampler.done = True
       await asyncio.gather(*tasks)
     self.assertIsNone(await self.bus.owner("gpu:node-a:0"))
+    self.assertEqual(sampler.engine.calls[-1], ("close",))
 
 
 if __name__ == "__main__":

@@ -451,15 +451,18 @@ over subsequent steps.
 
 ## Samplers
 
-A sampler (`tinyrl/sampler.py`) is any inference engine behind five calls. vLLM is the first engine, not a requirement.
+A sampler (`tinyrl/sampler.py`) is any inference engine behind seven calls. vLLM is the first engine, not a requirement.
 
 ```python
 class Engine(Protocol):
+  @classmethod
+  async def start(cls, base: str, lora: bool) -> Engine: ...
   async def load_lora(self, name: str, path: str) -> None: ...
   async def load_weights(self, path: str) -> None: ...  # a full fine-tune's weights, in place
   async def sample(self, job: dict, adapter: str | None) -> Out: ...
   async def sleep(self) -> None: ...
   async def wake(self) -> None: ...
+  async def close(self) -> None: ...
 ```
 
 - **Weights go through the engine's own loading hook**, not a restart or a reload from disk. Measured with Qwen2.5-7B on

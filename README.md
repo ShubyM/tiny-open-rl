@@ -33,8 +33,8 @@ A full fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exc
 of its own, named by its model id. Its trainer exits when the run is deleted.
 
 The node daemon starts `python -m tinyrl.trainer <pool>` for every training pool and `python -m tinyrl.sampler <pool>`
-for every sampling pool that has runs and no worker, and starts them again if they die. With `SAMPLER=vllm` a sampler
-runs `vllm serve` on a local port and drives it over HTTP. Otherwise it samples with transformers in process. Each worker gets the GPU with the fewest workers (`GPUS`, default 1). You can still start a
+for every sampling pool that has runs and no worker, and starts them again if they die. A sampler starts its
+engine on its first command. The engine is vLLM, `vllm serve` on a local port, unless `ENGINE` names another. Each worker gets the GPU with the fewest workers (`GPUS`, default 1). You can still start a
 trainer or sampler by hand instead.
 
 Trainers on one GPU take turns through a lease on it. Between batches, a trainer with nothing to do, or one that has had the GPU
@@ -78,7 +78,8 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/sampler.py](tinyrl/sampler.py) | 302 | sampling pools, on `vllm serve` over HTTP or transformers in process |
+| [tinyrl/sampler.py](tinyrl/sampler.py) | 171 | sampling pools, through an engine that knows nothing of Redis |
+| [tinyrl/vllm.py](tinyrl/vllm.py) | 87 | the vLLM engine: `vllm serve` over HTTP |
 | [tinyrl/trainer.py](tinyrl/trainer.py) | 389 | the losses, token budget batching, the model, and the trainer loop |
 | [tinyrl/bus.py](tinyrl/bus.py) | 264 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 270 | the Tinker HTTP API |
@@ -90,7 +91,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `HOLD_S`, `TARGET_UTIL`,
-`UTIL_MS`, `SAMPLER`, `VLLM_ARGS` and `DEBUG=1`.
+`UTIL_MS`, `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
 
 ## Telemetry
 
