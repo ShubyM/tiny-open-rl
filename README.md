@@ -79,7 +79,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 | file | lines | what's in it |
 |---|---:|---|
 | [tinyrl/sampler.py](tinyrl/sampler.py) | 162 | sampling pools, through an engine that knows nothing of Redis |
-| [tinyrl/vllm.py](tinyrl/vllm.py) | 99 | the vLLM engine: `vllm serve` over HTTP |
+| [tinyrl/vllm.py](tinyrl/vllm.py) | 102 | the vLLM engine: `vllm serve` over HTTP |
 | [tinyrl/trainer.py](tinyrl/trainer.py) | 389 | the losses, token budget batching, the model, and the trainer loop |
 | [tinyrl/bus.py](tinyrl/bus.py) | 264 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 270 | the Tinker HTTP API |

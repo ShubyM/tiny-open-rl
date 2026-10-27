@@ -63,7 +63,10 @@ class VLLM:
   async def close(self) -> None:
     if self.server:
       self.server.terminate()
-      await asyncio.to_thread(self.server.wait)
+      try:
+        await asyncio.to_thread(self.server.wait, 30)
+      except subprocess.TimeoutExpired:
+        self.server.kill()
     await self.http.aclose()
 
   async def post(self, path: str, **kwargs) -> httpx.Response:
