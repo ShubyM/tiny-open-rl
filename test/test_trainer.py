@@ -371,6 +371,73 @@ class TestTrainer(RedisTest):
       self.assertEqual(losses_moved, losses_ctrl, f"rank {rank}")
       self.assertTrue(same(tc.model.params[ctrl], t2.model.params[r2]), f"rank {rank}")
 
+  async def test_a_stopped_trainer_saves_its_runs_and_the_next_one_trains_on_exactly(self):
+    store = Store(root=tempfile.mkdtemp())
+    for rank, lora in ((4, LORA), (0, {})):
+      ctrl, run = new_id(), new_id()
+      await self.bus.create(Run(ctrl, f"ctrl-{rank}", "tiny", rank, lora=lora))
+      await self.bus.create(Run(run, f"p-{rank}", "tiny", rank, lora=lora))
+      tc, first = (Trainer(self.bus, pool, Model(tiny), store=store) for pool in (f"ctrl-{rank}", f"p-{rank}"))
+      serving = [asyncio.create_task(tc.serve()), asyncio.create_task(first.serve())]
+
+      async def call(r: str, op: Op, body: dict | bytes):
+        [request_id] = await self.submit(r, (op, body))
+        return await self.bus.result(request_id, 60)
+
+      async def step(r: str) -> float:
+        fb = await call(r, Op.FORWARD_BACKWARD, proto_body(r))
+        self.assertTrue((await call(r, Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})).ok)
+        return wire.output_json(fb.body)["metrics"]["loss:sum"]
+
+      for r in (ctrl, run):
+        self.assertTrue((await call(r, Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora})).ok)
+      losses_ctrl = [await step(ctrl) for _ in range(2)]
+      losses = [await step(run) for _ in range(2)]
+
+      first.stop()  # what SIGTERM does
+      await serving.pop()
+      self.assertIsNotNone(await self.bus.parked(run))
+
+      second = Trainer(self.bus, f"p-{rank}", Model(tiny), store=store)
+      serving.append(asyncio.create_task(second.serve()))
+      for _ in range(3):
+        losses_ctrl.append(await step(ctrl))
+        losses.append(await step(run))
+      self.assertEqual(losses, losses_ctrl, f"rank {rank}")
+      self.assertIsNone(await self.bus.parked(run))  # restored once, so a later crash can't bring back old state
+
+      tc.done = second.done = True
+      await asyncio.gather(*serving)
+
+  async def test_a_run_whose_trainer_died_unsaved_fails_until_it_loads_a_checkpoint(self):
+    store = Store(root=tempfile.mkdtemp())
+    run, uri = new_id(), "tinker://saved/weights/step-1"
+    await self.bus.create(Run(run, "p", "tiny", 4, lora=LORA))
+    await self.submit(
+      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
+    )
+    first = Trainer(self.bus, "p", Model(tiny), store=store)
+    await self.own(first)
+    while await first.step(block_ms=10):
+      pass
+    for task in self.renewal_tasks:  # it dies without saving
+      task.cancel()
+    await self.bus.release("p", first.worker)
+
+    second = Trainer(self.bus, "p", Model(tiny), store=store)
+    await self.own(second)
+    ids = await self.submit(
+      run,
+      (Op.OPTIM_STEP, {"adam_params": {}}),
+      (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": True}),
+      (Op.OPTIM_STEP, {"adam_params": {}}),
+    )
+    while await second.step(block_ms=10):
+      pass
+    replies = [await self.bus.result(request_id, 1) for request_id in ids]
+    self.assertEqual([reply.ok for reply in replies], [False, True, True])
+    self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
+
 
 if __name__ == "__main__":
   unittest.main()

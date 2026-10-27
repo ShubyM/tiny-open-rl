@@ -56,7 +56,6 @@ class TestShards(RedisTest):
       t.busy = 0.05  # 50 ms of commands in a 100 ms window
       while (await self.bus.loads(["lora:tiny:0"]))[0][0] is None:
         await asyncio.sleep(0.01)
-      t.done = True
-      await keeping
+      keeping.cancel()  # keep() renews until serve() cancels it
     util = (await self.bus.loads(["lora:tiny:0"]))[0][0]
     self.assertTrue(0.2 < util <= 0.5, util)

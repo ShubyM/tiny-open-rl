@@ -55,6 +55,8 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
   and `XPENDING` says what's in flight, on which trainer, and for how long. `GET /api/v1/runs/<id>` just asks.
 * **A dead trainer fails fast.** The commands it took stay in the pending list. The next trainer to start claims them with `XAUTOCLAIM`
   and fails them, so no client waits on work that died with its process.
+* **A stopping trainer saves its runs.** On SIGTERM a trainer finishes its batch, saves every run's weights and AdamW state
+  to the store, and the pool's next trainer, on any node, restores them before running their next command.
 * **Retries are free.** `XREAD` from id `0` blocks until the reply is written and never consumes it, so
   `retrieve_future` can be retried, or waited on by many clients, and every one of them gets the same answer.
   A call the SDK retries with the same `seq_id` runs once, and every attempt gets the first attempt's answer.
@@ -82,12 +84,12 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 |---|---:|---|
 | [tinyrl/sampler.py](tinyrl/sampler.py) | 162 | sampling pools, through an engine that knows nothing of Redis |
 | [tinyrl/vllm.py](tinyrl/vllm.py) | 102 | the vLLM engine: `vllm serve` over HTTP |
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 389 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 270 | runs, sessions, commands and replies on Redis |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 422 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/bus.py](tinyrl/bus.py) | 289 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 270 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 155 | the Tinker protobuf, to numpy and back |
 | [tinyrl/store.py](tinyrl/store.py) | 71 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
-| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 60 | places pools on node daemons, and runs the ones placed on this one |
+| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 67 | places pools on node daemons, and runs the ones placed on this one |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
