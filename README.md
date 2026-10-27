@@ -21,14 +21,16 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path  # a P
 pip install -e .
 redis-server &                                  # Redis 8.4 or newer
 python -m tinyrl.gateway &                      # the Tinker HTTP API, on :8000
-python -m tinyrl.trainer lora:Qwen/Qwen3-0.6B   # trains every LoRA on Qwen3-0.6B
+python -m tinyrl.node_daemon                    # starts a trainer for each pool that has runs
 ```
 
 A **pool** is the set of runs one trainer serves. LoRA runs on the same base model share the pool `lora:<base_model>`.
 
 A full fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive LoRA (`"openrl.exclusive": "true"`) gets a pool
-of its own, named by its model id. Start its trainer with `python -m tinyrl.trainer <model_id>`; it exits when the run is deleted.
-Starting trainers for new pools is the scheduler's job.
+of its own, named by its model id. Its trainer exits when the run is deleted.
+
+The node daemon starts `python -m tinyrl.trainer <pool>` for every pool that has runs and no trainer, and starts it again if it dies.
+Each trainer gets the GPU with the fewest trainers (`GPUS`, default 1). You can still start a trainer by hand instead.
 
 ## How it works
 
@@ -68,15 +70,16 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 | file | lines | what's in it |
 |---|---:|---|
 | [tinyrl/trainer.py](tinyrl/trainer.py) | 319 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 222 | runs, sessions, commands and replies on Redis |
+| [tinyrl/bus.py](tinyrl/bus.py) | 227 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 162 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
 | [tinyrl/store.py](tinyrl/store.py) | 38 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
+| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 38 | starts a trainer for each pool that has runs and no trainer |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS` and `DEBUG=1`.
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS` and `DEBUG=1`.
 
 ## Telemetry
 
@@ -116,5 +119,5 @@ Every test runs against a real `redis-server` and a real (tiny, random) Llama. N
 * Sampling (`create_sampling_session`, `asample`). vLLM can already serve the adapters `save_weights_for_sampler` writes.
 * `create_training_client_from_state`.
 * Multi-GPU trainers (FSDP, context parallelism).
-* Running on Kubernetes: a scheduler that starts trainers for new pools, GPU time-slicing, and parking idle runs. The design is
+* Running on Kubernetes: a scheduler that places pools across nodes, GPU time-slicing, and parking idle runs. The design is
   in [docs/kubernetes.md](docs/kubernetes.md).

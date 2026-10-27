@@ -150,6 +150,9 @@ class Bus:
   async def runs(self, pool: str) -> list[str]:
     return [run_id.decode() for run_id in await self.r.smembers(key("pool", pool))]
 
+  async def pools(self) -> list[str]:
+    return sorted(pool.decode() for pool in await self.r.smembers(key("pools")))
+
   async def stats(self) -> dict[tuple[str, str], dict]:
     """The counters of every run still in a pool, by (pool, run)."""
     runs = [
@@ -276,6 +279,10 @@ class Bus:
 
   async def release(self, pool: str, worker: str) -> None:
     await self.r.delex(key("owner", pool), ifeq=worker)
+
+  async def owner(self, pool: str) -> str | None:
+    worker = await self.r.get(key("owner", pool))
+    return worker.decode() if worker else None
 
   # ***** replies *****
 
