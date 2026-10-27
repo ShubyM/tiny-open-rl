@@ -74,3 +74,38 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     for task in self.renewal_tasks:
       task.cancel()
     await self.bus.r.aclose()
+
+
+class FakeEngine:
+  """A sampling engine that needs no GPU: each sample counts up from the last prompt token, every logprob is -1, and
+  `calls` records what the sampler asked of it."""
+
+  def __init__(self):
+    self.calls = []
+
+  @classmethod
+  async def start(cls, base: str, lora: bool) -> "FakeEngine":
+    engine = cls()
+    engine.calls.append(("start", base, lora))
+    return engine
+
+  async def load(self, name: str, path: str) -> None:
+    self.calls.append(("load", name, path))
+
+  async def sleep(self) -> None:
+    self.calls.append(("sleep",))
+
+  async def wake(self) -> None:
+    self.calls.append(("wake",))
+
+  async def close(self) -> None:
+    self.calls.append(("close",))
+
+  async def sample(self, job: dict, name: str | None):
+    from tinyrl.sampler import Out, Seq
+
+    self.calls.append(("sample", name))
+    tokens = [(job["prompt"][-1] + 1 + i) % 32 for i in range(job["max_tokens"])]
+    top = [{t: -1.0, 0: -2.0} for t in tokens]
+    seqs = [Seq(tokens, [-1.0] * len(tokens), top, False) for _ in range(job["num_samples"])]
+    return Out(seqs, [None] + [{t: -1.0, 0: -2.0} for t in job["prompt"][1:]])

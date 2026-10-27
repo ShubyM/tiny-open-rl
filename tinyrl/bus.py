@@ -49,6 +49,7 @@ class Op(StrEnum):
   SAVE_WEIGHTS_FOR_SAMPLER = "save_weights_for_sampler"
   LOAD_WEIGHTS = "load_weights"
   DELETE_MODEL = "delete_model"
+  SAMPLE = "sample"
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class Run:
   base: str
   rank: int
   session: str = ""
+  model_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +153,9 @@ class Bus:
 
   async def runs(self, pool: str) -> list[str]:
     return [run_id.decode() for run_id in await self.r.smembers(key("pool", pool))]
+
+  async def join(self, run_id: str) -> int:
+    return int(await self.r.incr(key("clients", run_id)))
 
   async def pools(self) -> list[str]:
     return sorted(pool.decode() for pool in await self.r.smembers(key("pools")))

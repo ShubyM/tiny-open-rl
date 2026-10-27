@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from tinyrl import wire
 from tinyrl.bus import Bus, Op, Run
 from tinyrl.helpers import getenv
+from tinyrl.store import Store
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
 TARGET_UTIL = getenv("TARGET_UTIL", 0.7)  # a LoRA shard busier than this gets no new runs while another can open
@@ -91,8 +92,9 @@ async def pool_for(bus: Bus, run: str, base_model: str, rank: int, metadata: dic
   return pool
 
 
-def app(bus: Bus | None = None) -> FastAPI:
+def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   bus = bus if bus is not None else Bus()
+  store = store if store is not None else Store()
   api = FastAPI(title="tiny-open-rl")
 
   def bad_request(_: Request, e: Exception) -> JSONResponse:
@@ -108,6 +110,30 @@ def app(bus: Bus | None = None) -> FastAPI:
     if request_id is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
+
+  async def open_sampler(base_model: str | None, model_path: str | None, session_id: str = "") -> str:
+    if model_path:
+      if not model_path.startswith("tinker://"):
+        raise ValueError(f"bad model_path {model_path}")
+      uri = checkpoint_uri("x", "sampler_weights", model_path)
+      train_run = uri.removeprefix("tinker://").split("/", 1)[0]
+      train = await bus.run(train_run)
+      if train and train["base"]:
+        base, lora = train["base"], train["rank"] > 0
+      else:
+        meta = store.meta(uri)
+        base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
+      if not base:
+        raise ValueError("could not resolve base_model")
+    else:
+      if not base_model:
+        raise ValueError("base_model required when model_path is None")
+      base, lora, uri = base_model, True, None
+
+    pool = f"sampler:{base}" if lora else f"sampler:fft:{train_run}"
+    sid = f"samp-{uuid.uuid4().hex[:12]}"
+    await bus.create(Run(sid, pool, base, int(lora), session_id, model_path=uri))
+    return sid
 
   # ***** service *****
 
@@ -193,6 +219,17 @@ def app(bus: Bus | None = None) -> FastAPI:
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveRequest):
+    if req.path is None or req.sampling_session_seq_id is not None:
+      train = await bus.run(req.model_id)
+      if not train:
+        raise HTTPException(404, f"no model {req.model_id}")
+      seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
+      name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
+      uri = checkpoint_uri(req.model_id, "sampler_weights", name)
+      sid = await open_sampler(train["base"], uri, train.get("session", ""))
+      return await submit(
+        req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri, "sampling_session_id": sid}, req.seq_id
+      )
     return await save(req, Op.SAVE_WEIGHTS_FOR_SAMPLER, "sampler_weights")
 
   @api.post("/api/v1/load_weights")
@@ -211,8 +248,79 @@ def app(bus: Bus | None = None) -> FastAPI:
     if reply is None:
       return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
     if reply.content_type == wire.PROTO and wire.PROTO not in accept:
+      if req.request_id.startswith("samp-"):
+        return wire.sample_json(reply.body)
       return wire.output_json(reply.body)  # an older client, which reads JSON
     return Response(reply.body, media_type=reply.content_type)
+
+  # ***** sampling *****
+
+  @api.post("/api/v1/create_sampling_session")
+  async def create_sampling_session(req: Request):
+    data = await req.json()
+    sid = await open_sampler(data.get("base_model"), data.get("model_path"), data.get("session_id", ""))
+    return {"type": "create_sampling_session", "sampling_session_id": sid}
+
+  @api.post("/api/v1/join_sampling_session")
+  async def join_sampling_session(req: Request):
+    data = await req.json()
+    sid = data.get("sampling_session_id")
+    if not await bus.run(sid):
+      raise HTTPException(404, f"no session {sid}")
+    return {"type": "join_sampling_session", "client_counter": await bus.join(sid)}
+
+  @api.get("/api/v1/samplers/{sampler_id}")
+  async def get_sampler(sampler_id: str):
+    run = await bus.run(sampler_id)
+    if not run:
+      raise HTTPException(404, f"no sampler {sampler_id}")
+    return {"sampler_id": sampler_id, "base_model": run["base"], "model_path": run.get("model_path")}
+
+  @api.post("/api/v1/asample")
+  async def asample(req: Request):
+    data = await req.json()
+    prompt = data.get("prompt", {})
+    chunks = prompt.get("chunks", [])
+    if not all(c.get("type") == "encoded_text" for c in chunks):
+      raise ValueError("only encoded_text chunks are supported")
+    tokens = [int(t) for c in chunks for t in c.get("tokens", [])]
+    if not tokens:
+      raise ValueError("prompt is empty")
+
+    if data.get("target_prompt_logprobs") is not None or data.get("prompt_alt_tokens_k", 0) > 0:
+      raise ValueError("target_prompt_logprobs and prompt_alt_tokens are not supported")
+
+    last_n = data.get("prompt_logprobs_last_n")
+    if last_n is not None:
+      if not data.get("prompt_logprobs"):
+        raise ValueError("prompt_logprobs must be true if prompt_logprobs_last_n is set")
+      if not (1 <= last_n <= len(tokens) - 1):
+        raise ValueError("prompt_logprobs_last_n must be between 1 and len(tokens) - 1")
+
+    sid = data.get("sampling_session_id") or await open_sampler(data.get("base_model"), data.get("model_path"))
+
+    num_samples = int(data.get("num_samples", 1))
+    params = data.get("sampling_params", {})
+    job = {
+      "prompt": tokens,
+      "num_samples": num_samples,
+      "max_tokens": params.get("max_tokens") or 128,
+      "temperature": float(params.get("temperature", 1.0)),
+      "top_k": int(params.get("top_k", -1)),
+      "top_p": float(params.get("top_p", 1.0)),
+      "seed": params.get("seed"),
+      "stop": params.get("stop"),
+      "prompt_logprobs": bool(data.get("prompt_logprobs")),
+      "prompt_logprobs_last_n": last_n,
+      "topk_prompt": int(data.get("topk_prompt_logprobs", 0)),
+      "topk_sample": int(data.get("topk_sample_logprobs", 0)),
+    }
+
+    res = await submit(sid, Op.SAMPLE, job, data.get("seq_id"))
+    return {
+      "request_id": res["request_id"],
+      "sample_sequence_ids": [f"{res['request_id']}:{i}" for i in range(num_samples)],
+    }
 
   # ***** inspection *****
 

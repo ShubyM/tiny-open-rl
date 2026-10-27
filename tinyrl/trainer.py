@@ -300,7 +300,7 @@ class Model:
       cfg = {k: sorted(v) if isinstance(v, set) else v for k, v in lm.peft_config[run].to_dict().items()}
     else:
       cfg = lm.config.to_dict()
-    return tensors, {"lora": self.lora, "optimizer": False, "config": cfg}
+    return tensors, {"base": self.base, "lora": self.lora, "optimizer": False, "config": cfg}
 
   def restore(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
     self.use(run)
@@ -511,6 +511,8 @@ class Trainer:
       reply = {"type": cmd.op, "model_id": cmd.run}
       if "uri" in args:
         reply["path"] = args["uri"]
+      if "sampling_session_id" in args:
+        reply["sampling_session_id"] = args["sampling_session_id"]
       return ok(reply)
     except Exception as e:
       return fail(e)

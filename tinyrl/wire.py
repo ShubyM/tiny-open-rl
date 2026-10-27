@@ -1,7 +1,7 @@
 """The Tinker wire format.
 
-forward_backward travels as protobuf end to end: the gateway forwards the bytes untouched, and the trainer reads the
-tensors straight out of them. Every other call is JSON.
+forward_backward and SampleResponse travel as protobuf end to end: the gateway forwards the bytes untouched, and the
+workers read or write tensors straight to them. Every other call is JSON.
 """
 
 import sys
@@ -145,3 +145,75 @@ def unbatch(tensor: pb.BatchedTensor) -> list[np.ndarray]:
 
 def tensor_json(x: np.ndarray) -> dict:
   return {"data": x.tolist(), "dtype": "int64" if x.dtype.kind == "i" else "float32", "shape": list(x.shape)}
+
+
+@dataclass(frozen=True)
+class SampleOut:
+  stop: bool
+  tokens: np.ndarray
+  logprobs: np.ndarray
+  topk: tuple[np.ndarray, np.ndarray] | None = None
+
+
+def sample_output(
+  sequences: list[SampleOut],
+  prompt_logprobs: np.ndarray | None = None,
+  topk_prompt: tuple[np.ndarray, np.ndarray] | None = None,
+) -> bytes:
+  out = pb.SampleResponse()
+  for s in sequences:
+    seq = out.sequences.add()
+    seq.stop_reason = pb.STOP_REASON_STOP if s.stop else pb.STOP_REASON_LENGTH
+    seq.tokens = s.tokens.astype(np.int32).tobytes()
+    seq.logprobs = s.logprobs.astype(np.float32).tobytes()
+    if s.topk:
+      tk_ids, tk_lps = s.topk
+      seq.topk_sampled_logprobs.token_ids = tk_ids.astype(np.int32).tobytes()
+      seq.topk_sampled_logprobs.logprobs = tk_lps.astype(np.float32).tobytes()
+      seq.topk_sampled_logprobs.k = tk_ids.shape[-1]
+      seq.topk_sampled_logprobs.length = tk_ids.shape[0]
+
+  if prompt_logprobs is not None:
+    out.prompt_logprobs = prompt_logprobs.astype(np.float32).tobytes()
+  if topk_prompt is not None:
+    tk_ids, tk_lps = topk_prompt
+    out.topk_prompt_logprobs.token_ids = tk_ids.astype(np.int32).tobytes()
+    out.topk_prompt_logprobs.logprobs = tk_lps.astype(np.float32).tobytes()
+    out.topk_prompt_logprobs.k = tk_ids.shape[-1]
+    out.topk_prompt_logprobs.length = tk_ids.shape[0]
+
+  return out.SerializeToString()
+
+
+def _format_topk(tk_pb):
+  k, length = tk_pb.k, tk_pb.length
+  ids = np.frombuffer(tk_pb.token_ids, np.int32).reshape(length, k)
+  lps = np.frombuffer(tk_pb.logprobs, np.float32).reshape(length, k)
+  res = []
+  for i in range(length):
+    if ids[i, 0] == 0 and lps[i, 0] == -99999.0:
+      res.append(None)
+    else:
+      res.append([[int(tid), float(lp)] for tid, lp in zip(ids[i], lps[i]) if not (tid == 0 and lp == -99999.0)])
+  return res
+
+
+def sample_json(raw: bytes) -> dict:
+  out = pb.SampleResponse.FromString(raw)
+  sequences = []
+  for seq in out.sequences:
+    item = {
+      "stop_reason": "stop" if seq.stop_reason == pb.STOP_REASON_STOP else "length",
+      "tokens": np.frombuffer(seq.tokens, np.int32).tolist(),
+      "logprobs": np.frombuffer(seq.logprobs, np.float32).tolist(),
+    }
+    if seq.HasField("topk_sampled_logprobs"):
+      item["topk_logprobs"] = _format_topk(seq.topk_sampled_logprobs)
+    sequences.append(item)
+
+  res = {"type": "sample", "sequences": sequences}
+  if out.prompt_logprobs:
+    res["prompt_logprobs"] = [None if np.isnan(x) else float(x) for x in np.frombuffer(out.prompt_logprobs, np.float32)]
+  if out.HasField("topk_prompt_logprobs"):
+    res["topk_prompt_logprobs"] = _format_topk(out.topk_prompt_logprobs)
+  return res
