@@ -65,18 +65,21 @@ class TestSampler(RedisTest):
       return httpx.Response(200, json={"choices": [choice]})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://vllm")
-    engine = VLLM("http://vllm", "base", client=client)
-    await engine.load_lora("a0", "/ckpt/a")
-    await engine.load_weights("/ckpt/w")
+    full = VLLM("http://vllm", "base", lora=False, client=client)
+    await full.load("c0", "/ckpt/w")
+    await full.load("c0", "/ckpt/w")  # already in place
+    engine = VLLM("http://vllm", "base", lora=True, client=client)
+    await engine.load("c0", "/ckpt/a")
+    await engine.load("c0", "/ckpt/a")
     await engine.sleep()
     await engine.wake()
     paths = [path for path, _ in calls]
-    self.assertEqual(paths, ["/v1/load_lora_adapter", "/collective_rpc", "/reset_prefix_cache", "/sleep", "/wake_up"])
+    self.assertEqual(paths, ["/collective_rpc", "/reset_prefix_cache", "/v1/load_lora_adapter", "/sleep", "/wake_up"])
 
     job = JOB | {"stop": ["\n", 4], "prompt_logprobs": True, "topk_sample": 1}
-    out = await engine.sample(job, "a0")
+    out = await engine.sample(job, "c0")
     req = calls[-1][1]
-    self.assertEqual((req["model"], req["stop"], req["stop_token_ids"]), ("a0", ["\n"], [4]))
+    self.assertEqual((req["model"], req["stop"], req["stop_token_ids"]), ("c0", ["\n"], [4]))
     self.assertEqual((req["logprobs"], req["prompt_logprobs"]), (1, 1))
     self.assertEqual(out.seqs, [Seq([9], [-3.0], [{9: -3.0, 7: -0.5}], True)])
     self.assertEqual(out.prompt, [None, {2: -1.0}, {3: -2.0}])
@@ -125,10 +128,10 @@ class TestSampler(RedisTest):
     calls = sampler.engine.calls
     self.assertEqual(calls[0], ("start", base, True))
     self.assertEqual(
-      [c for c in calls if c[0] == "load_lora"],
-      [("load_lora", "a0", store.path(f"tinker://{run}/sampler_weights/step-0"))],
+      [c for c in calls if c[0] == "load"],
+      [("load", "c0", store.path(f"tinker://{run}/sampler_weights/step-0"))],
     )
-    self.assertEqual([c for c in calls if c[0] == "sample"], [("sample", "a0"), ("sample", None)])  # the retry ran once
+    self.assertEqual([c for c in calls if c[0] == "sample"], [("sample", "c0"), ("sample", None)])  # the retry ran once
 
     fft = (await call("create_model", {"base_model": base, "user_metadata": {"openrl.fine_tuning_type": "full"}}))[
       "model_id"
@@ -144,7 +147,7 @@ class TestSampler(RedisTest):
     await fft_sampler.step(block_ms=0)
     res = await client.post("/api/v1/retrieve_future", json={"request_id": request_id}, headers={"Accept": wire.PROTO})
     self.assertEqual(res.headers["content-type"], wire.PROTO)
-    self.assertIn(("load_weights", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.engine.calls)
+    self.assertIn(("load", "c0", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.engine.calls)
     await client.aclose()
 
   @patch("tinyrl.trainer.HOLD_S", 0.0)

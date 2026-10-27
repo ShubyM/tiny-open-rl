@@ -48,9 +48,8 @@ class Out:
 class Engine(Protocol):
   @classmethod
   async def start(cls, base: str, lora: bool) -> Engine: ...
-  async def load_lora(self, name: str, path: str) -> None: ...
-  async def load_weights(self, path: str) -> None: ...
-  async def sample(self, job: dict, adapter: str | None) -> Out: ...
+  async def load(self, name: str, path: str) -> None: ...  # an adapter, or a full fine-tune's weights in place
+  async def sample(self, job: dict, name: str | None) -> Out: ...  # name is a loaded checkpoint, or None for the base
   async def sleep(self) -> None: ...
   async def wake(self) -> None: ...
   async def close(self) -> None: ...
@@ -92,8 +91,7 @@ class Sampler:
     self.store = store if store is not None else Store()
     self.lora = not pool.startswith("sampler:fft:")
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
-    self.adapters: dict[tuple[str, int], str] = {}
-    self.loaded: tuple[str, int] | None = None
+    self.names: dict[tuple[str, int], str] = {}  # (uri, mtime) -> the engine's name for that checkpoint
     self.done = False
     self.seated = 0.0  # when this sampler took its GPU's lease, or 0 while it doesn't hold it
 
@@ -161,20 +159,13 @@ class Sampler:
       return fail(e)
 
   async def load(self, uri: str | None) -> str | None:
-    """Get a checkpoint into the engine: an adapter, whose name is returned, or a full fine-tune's weights."""
+    """The engine's name for a checkpoint, which the engine loads unless it already holds it."""
     if not uri:
       return None
     key = (uri, os.stat(self.store.file(uri)).st_mtime_ns)  # a checkpoint name can be saved again
-    if self.lora:
-      if key not in self.adapters:
-        name = f"a{len(self.adapters)}"
-        await self.engine.load_lora(name, self.store.path(uri))
-        self.adapters[key] = name
-      return self.adapters[key]
-    if key != self.loaded:
-      await self.engine.load_weights(self.store.path(uri))
-      self.loaded = key
-    return None
+    name = self.names.setdefault(key, f"c{len(self.names)}")
+    await self.engine.load(name, self.store.path(uri))
+    return name
 
   @contextlib.asynccontextmanager
   async def acquire(self):

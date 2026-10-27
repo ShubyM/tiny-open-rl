@@ -30,11 +30,18 @@ def by_id(logprobs: dict) -> dict[int, float]:
 
 class VLLM:
   def __init__(
-    self, url: str, base: str, server: subprocess.Popen | None = None, client: httpx.AsyncClient | None = None
+    self,
+    url: str,
+    base: str,
+    lora: bool,
+    server: subprocess.Popen | None = None,
+    client: httpx.AsyncClient | None = None,
   ):
     self.http = client or httpx.AsyncClient(base_url=url, timeout=None)
     self.base = base
+    self.lora = lora
     self.server = server
+    self.loaded: set[str] = set()  # adapters, or the one full fine-tune checkpoint whose weights are in place
 
   @classmethod
   async def start(cls, base: str, lora: bool) -> VLLM:
@@ -45,7 +52,7 @@ class VLLM:
     args += ["--enable-lora", "--max-lora-rank", "64"] if lora else []
     env = {**os.environ, "VLLM_SERVER_DEV_MODE": "1", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True"}
     server = subprocess.Popen([*args, *shlex.split(VLLM_ARGS)], env=env)
-    engine = cls(f"http://127.0.0.1:{port}", base, server)
+    engine = cls(f"http://127.0.0.1:{port}", base, lora, server)
     while server.poll() is None:
       with contextlib.suppress(httpx.HTTPError):
         if (await engine.http.get("/health")).is_success:
@@ -64,12 +71,16 @@ class VLLM:
     res.raise_for_status()
     return res
 
-  async def load_lora(self, name: str, path: str) -> None:
-    await self.post("/v1/load_lora_adapter", json={"lora_name": name, "lora_path": path})
-
-  async def load_weights(self, path: str) -> None:
-    await self.post("/collective_rpc", json={"method": "reload_weights", "kwargs": {"weights_path": path}})
-    await self.post("/reset_prefix_cache")
+  async def load(self, name: str, path: str) -> None:
+    if name in self.loaded:
+      return
+    if self.lora:
+      await self.post("/v1/load_lora_adapter", json={"lora_name": name, "lora_path": path})
+      self.loaded.add(name)
+    else:
+      await self.post("/collective_rpc", json={"method": "reload_weights", "kwargs": {"weights_path": path}})
+      await self.post("/reset_prefix_cache")
+      self.loaded = {name}
 
   async def sleep(self) -> None:
     await self.post("/sleep", params={"level": 1})
@@ -77,11 +88,11 @@ class VLLM:
   async def wake(self) -> None:
     await self.post("/wake_up")
 
-  async def sample(self, job: dict, adapter: str | None) -> Out:
+  async def sample(self, job: dict, name: str | None) -> Out:
     strs, ids = split_stop(job["stop"])
     scored = job["prompt_logprobs"] or job["topk_prompt"] > 0
     req = {
-      "model": adapter or self.base,
+      "model": name if self.lora and name else self.base,
       "prompt": job["prompt"],
       "n": job["num_samples"],
       "max_tokens": job["max_tokens"],

@@ -89,11 +89,8 @@ class FakeEngine:
     engine.calls.append(("start", base, lora))
     return engine
 
-  async def load_lora(self, name: str, path: str) -> None:
-    self.calls.append(("load_lora", name, path))
-
-  async def load_weights(self, path: str) -> None:
-    self.calls.append(("load_weights", path))
+  async def load(self, name: str, path: str) -> None:
+    self.calls.append(("load", name, path))
 
   async def sleep(self) -> None:
     self.calls.append(("sleep",))
@@ -104,10 +101,10 @@ class FakeEngine:
   async def close(self) -> None:
     self.calls.append(("close",))
 
-  async def sample(self, job: dict, adapter: str | None):
+  async def sample(self, job: dict, name: str | None):
     from tinyrl.sampler import Out, Seq
 
-    self.calls.append(("sample", adapter))
+    self.calls.append(("sample", name))
     tokens = [(job["prompt"][-1] + 1 + i) % 32 for i in range(job["max_tokens"])]
     top = [{t: -1.0, 0: -2.0} for t in tokens]
     seqs = [Seq(tokens, [-1.0] * len(tokens), top, False) for _ in range(job["num_samples"])]
