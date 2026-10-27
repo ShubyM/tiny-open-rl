@@ -35,6 +35,10 @@ of its own, named by its model id. Its trainer exits when the run is deleted.
 The node daemon starts `python -m tinyrl.trainer <pool>` for every pool that has runs and no trainer, and starts it again if it dies.
 Each trainer gets the GPU with the fewest trainers (`GPUS`, default 1). You can still start a trainer by hand instead.
 
+Trainers on one GPU take turns through a lease on it. Between batches, a trainer with nothing to do, or one that has had the GPU
+for `HOLD_S` (30 s), yields it to a trainer that waits: it copies its weights, gradients and AdamW state to pinned host memory,
+frees the GPU, and copies them back on its next turn.
+
 ## How it works
 
 ```
@@ -72,8 +76,8 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 325 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 254 | runs, sessions, commands and replies on Redis |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 382 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/bus.py](tinyrl/bus.py) | 260 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 175 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
 | [tinyrl/store.py](tinyrl/store.py) | 38 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
@@ -82,7 +86,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `TARGET_UTIL`, `UTIL_MS` and `DEBUG=1`.
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `HOLD_S`, `TARGET_UTIL`, `UTIL_MS` and `DEBUG=1`.
 
 ## Telemetry
 

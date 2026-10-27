@@ -39,7 +39,8 @@ class NodeDaemon:
   def start(self, pool: str) -> tuple[int, subprocess.Popen]:
     on = [gpu for gpu, _ in self.trainers.values()]
     gpu = min(range(self.gpus), key=on.count)
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)}
+    # trainers on one GPU take turns on it, named by host so trainers a restarted node daemon left running count too
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu), "GPU": f"{socket.gethostname()}:{gpu}"}
     return gpu, subprocess.Popen([sys.executable, "-m", "tinyrl.trainer", pool], env=env)
 
   async def serve(self) -> None:
