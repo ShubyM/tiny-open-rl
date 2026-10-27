@@ -119,8 +119,10 @@ class Sampler:
   async def keep(self) -> None:
     while not self.done:
       await asyncio.sleep(LEASE_MS / 4000)
-      if not await self.bus.renew(self.pool, self.worker):
-        self.done = True
+      if not await self.bus.renew(self.pool, self.worker) and not await self.bus.own(self.pool, self.worker):
+        self.done = (
+          True  # another sampler took the pool. An expired lease nobody took, as after a Redis restart, is taken again
+        )
         return
       if self.seated and not await self.bus.renew(f"gpu:{GPU}", self.worker):
         self.seated = 0.0

@@ -82,14 +82,14 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/sampler.py](tinyrl/sampler.py) | 162 | sampling pools, through an engine that knows nothing of Redis |
+| [tinyrl/sampler.py](tinyrl/sampler.py) | 164 | sampling pools, through an engine that knows nothing of Redis |
 | [tinyrl/vllm.py](tinyrl/vllm.py) | 102 | the vLLM engine: `vllm serve` over HTTP |
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 422 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 289 | runs, sessions, commands and replies on Redis |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 429 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/bus.py](tinyrl/bus.py) | 291 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 270 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 155 | the Tinker protobuf, to numpy and back |
-| [tinyrl/store.py](tinyrl/store.py) | 71 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
-| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 67 | places pools on node daemons, and runs the ones placed on this one |
+| [tinyrl/store.py](tinyrl/store.py) | 70 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
+| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 69 | places pools on node daemons, and runs the ones placed on this one |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the

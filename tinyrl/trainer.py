@@ -417,7 +417,7 @@ class Trainer:
     reported = time.time()
     while True:  # until serve() cancels it, so the lease holds while a stopping trainer saves its runs
       await asyncio.sleep(LEASE_MS / 4000)
-      if not await self.bus.renew(self.pool, self.worker):
+      if not await self.bus.renew(self.pool, self.worker) and not await self.reown():
         self.done = True
         return
       if self.seated and not await self.bus.renew(f"gpu:{GPU}", self.worker):
@@ -425,6 +425,16 @@ class Trainer:
       if (now := time.time()) - reported >= UTIL_MS / 1000:
         await self.bus.report(self.pool, min(1.0, self.busy / (now - reported)))
         self.busy, reported = 0.0, now
+
+  async def reown(self) -> bool:
+    """Take the pool's lease again if it ran out with nobody taking it, as it does while Redis restarts. Not if another
+    trainer has parked one of this trainer's runs since, which it only does after serving the pool."""
+    if not await self.bus.own(self.pool, self.worker):
+      return False
+    if any([await self.bus.parked(run) for run in self.model.params]):
+      await self.bus.release(self.pool, self.worker)
+      return False
+    return True
 
   def stop(self) -> None:
     """Finish the batch in hand, save every run for the pool's next trainer, and exit. SIGTERM calls it."""

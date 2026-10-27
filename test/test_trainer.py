@@ -409,6 +409,20 @@ class TestTrainer(RedisTest):
       tc.done = second.done = True
       await asyncio.gather(*serving)
 
+  @patch("tinyrl.trainer.LEASE_MS", 200)
+  async def test_a_trainer_takes_its_lease_again_when_redis_loses_it(self):
+    t = Trainer(self.bus, "p", Model(tiny))
+    await self.own(t)
+    await self.bus.r.delete("tinyrl:owner:p")  # what a Redis restart longer than the lease does
+    await asyncio.sleep(0.2)
+    self.assertEqual((await self.bus.owner("p"), t.done), (t.worker, False))
+
+    t.model.params["r"] = {}  # but not once another trainer has served the pool and parked its run
+    await self.bus.r.set("tinyrl:parked:r", "tinker://r/parked/1")
+    await self.bus.r.delete("tinyrl:owner:p")
+    await asyncio.sleep(0.2)
+    self.assertEqual((await self.bus.owner("p"), t.done), (None, True))
+
   async def test_a_run_whose_trainer_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     store = Store(root=tempfile.mkdtemp())
     run, uri = new_id(), "tinker://saved/weights/step-1"
