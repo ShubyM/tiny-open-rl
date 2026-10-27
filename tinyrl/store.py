@@ -32,7 +32,7 @@ class Store:
   def __init__(self, root: str | None = None, cache: str | None = None):
     self.root = (CKPT if root is None else root).rstrip("/")
     self.remote = "://" in self.root
-    self.fs, self.base = fsspec.core.url_to_fs(self.root)
+    self.fs, self.base = fsspec.core.url_to_fs(self.root, auto_mkdir=True)  # a file:// URL makes folders as it writes
     self.cache = CKPT_CACHE if cache is None else cache
 
   def path(self, uri: str) -> str:
@@ -49,7 +49,6 @@ class Store:
       pathlib.Path(f"{folder}/{names[0]}").write_text(json.dumps(cfg))
     safetensors.torch.save_file(cpu, f"{folder}/{names[-1]}", metadata={"meta": json.dumps(info)})
     if self.remote:
-      self.fs.makedirs(self.path(uri), exist_ok=True)
       for name in names:  # the weights last, since a reader finds a checkpoint by its weights
         self.fs.put_file(f"{folder}/{name}", f"{self.path(uri)}/{name}")
       shutil.rmtree(folder)
