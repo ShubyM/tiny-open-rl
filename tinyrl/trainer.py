@@ -6,6 +6,7 @@ It takes commands from its pool's streams on the bus, runs each one on the model
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -428,47 +429,51 @@ class Trainer:
     if self.done:
       return 0
     cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
-    if GPU:
-      await (self.sit() if cmds else self.yield_gpu(idle=True))
-    for cmd in cmds:
-      start = time.time()
-      first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
-      reply = first or await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
-      self.busy += time.time() - start
-      if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
-        self.done = True  # another trainer owns the pool now
-        break
+    if not cmds:
+      await self.yield_gpu(GPU, idle=True)  # nothing to run: hand the GPU over now if another trainer asked for it
+      return 0
+    async with self.acquire(GPU):
+      for cmd in cmds:
+        start = time.time()
+        first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
+        reply = first or await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
+        self.busy += time.time() - start
+        if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
+          self.done = True  # another trainer owns the pool now
+          break
 
-      if cmd.op == Op.DELETE_MODEL and reply.ok:
-        await self.bus.drop(cmd.run, self.pool)
-        self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
+        if cmd.op == Op.DELETE_MODEL and reply.ok:
+          await self.bus.drop(cmd.run, self.pool)
+          self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
 
-      if DEBUG:
-        ms = (time.time() - start) * 1000
-        error = "" if reply.ok else f"  {reply.body.decode()}"
-        print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
-    if GPU and cmds:
-      await self.yield_gpu(idle=False)
+        if DEBUG:
+          ms = (time.time() - start) * 1000
+          error = "" if reply.ok else f"  {reply.body.decode()}"
+          print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
     return len(cmds)
 
-  async def sit(self) -> None:
-    """Take this trainer's turn on its GPU, waiting for the trainer that has it to yield, and bring its tensors back."""
-    if self.seated:
-      return
-    while not await self.bus.own(f"gpu:{GPU}", self.worker):
-      await self.bus.request_gpu(GPU, self.worker)
-      await asyncio.sleep(0.05)
-    await self.bus.withdraw_request(GPU, self.worker)
-    await asyncio.to_thread(self.model.resume)
-    self.seated = time.time()
+  @contextlib.asynccontextmanager
+  async def acquire(self, gpu: str):
+    """Hold the GPU for a batch: wait for this trainer's turn and bring its tensors back. After the batch, yield it if
+    another trainer asked for it and this one has had it HOLD_S. With no GPU to share, it does nothing."""
+    if gpu and not self.seated:
+      while not await self.bus.own(f"gpu:{gpu}", self.worker):
+        await self.bus.request_gpu(gpu, self.worker)
+        await asyncio.sleep(0.05)
+      await self.bus.withdraw_request(gpu, self.worker)
+      await asyncio.to_thread(self.model.resume)
+      self.seated = time.time()
+    try:
+      yield
+    finally:
+      await self.yield_gpu(gpu, idle=False)
 
-  async def yield_gpu(self, idle: bool) -> None:
-    """Between batches, give the GPU to a trainer that waits for it, once this one is idle or has had it HOLD_S."""
-    if not self.seated or not (idle or time.time() - self.seated >= HOLD_S):
-      return
-    if await self.bus.others_requested(GPU, self.worker):
+  async def yield_gpu(self, gpu: str, idle: bool) -> None:
+    """Park and release the GPU if another trainer asked for it, once this one is idle or has had it HOLD_S."""
+    held = self.seated and (idle or time.time() - self.seated >= HOLD_S)
+    if held and await self.bus.others_requested(gpu, self.worker):
       await asyncio.to_thread(self.model.park)
-      await self.bus.release(f"gpu:{GPU}", self.worker)
+      await self.bus.release(f"gpu:{gpu}", self.worker)
       self.seated = 0.0
 
   def run(self, cmd: Cmd) -> Reply:

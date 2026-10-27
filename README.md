@@ -76,7 +76,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 378 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 382 | the losses, token budget batching, the model, and the trainer loop |
 | [tinyrl/bus.py](tinyrl/bus.py) | 260 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 175 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 94 | the Tinker protobuf, to numpy and back |
