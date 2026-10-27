@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from test.helpers import RedisTest, new_id, tiny
 from tinyrl.bus import Op, Run
@@ -50,6 +50,32 @@ class TestNodeDaemon(RedisTest):
         for _, proc in daemon.trainers.values():
           proc.terminate()
           proc.wait()
+
+  @patch("tinyrl.bus.NODE_MS", 600)
+  @patch("tinyrl.bus.LEASE_MS", 600)
+  async def test_pools_spread_over_nodes_and_move_off_a_dead_one(self):
+    for run in ("r1", "r2"):
+      await self.bus.create(Run(run, f"pool-{run}", "base", 4))
+    a, b = NodeDaemon(self.bus, gpus=1, node="a"), NodeDaemon(self.bus, gpus=1, node="b")
+    with patch("subprocess.Popen", side_effect=lambda *_, **__: MagicMock(**{"poll.return_value": None})):
+      await b.bus.heartbeat("b", 1)
+      await a.tick()  # a holds the scheduler lease and places one pool on each live node daemon
+      await b.tick()
+      self.assertEqual(sorted(await self.bus.placements()), ["pool-r1", "pool-r2"])
+      self.assertEqual(sorted((await self.bus.placements()).values()), ["a", "b"])
+      self.assertEqual(len(a.trainers) + len(b.trainers), 2)
+
+      for _ in range(30):  # a dies, so b takes the scheduler lease and a's pool once their leases run out
+        await asyncio.sleep(0.1)
+        await b.tick()
+      self.assertEqual(set((await self.bus.placements()).values()), {"b"})
+      self.assertEqual(sorted(b.trainers), ["pool-r1", "pool-r2"])
+
+      proc = b.trainers["pool-r1"][1]
+      await self.bus.drop("r1", "pool-r1")
+      await b.tick()  # an empty pool's process is stopped
+      self.assertEqual(sorted(b.trainers), ["pool-r2"])
+      proc.terminate.assert_called()
 
   def test_each_trainer_gets_the_least_used_gpu(self):
     daemon = NodeDaemon(None, gpus=2)

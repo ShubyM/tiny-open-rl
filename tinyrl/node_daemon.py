@@ -1,12 +1,15 @@
-"""Starts a trainer for every pool that has runs and no trainer, on this node's GPUs.
+"""Runs the trainers and samplers placed on this node, on its GPUs.
 
-python -m tinyrl.node_daemon replaces starting `python -m tinyrl.trainer <pool>` by hand. Each trainer gets the GPU with
-the fewest trainers on it. A pool's lease still decides who serves it, so a second node daemon only adds standbys.
+python -m tinyrl.node_daemon replaces starting `python -m tinyrl.trainer <pool>` by hand. Every node daemon heartbeats
+into Redis. The one holding the scheduler lease places each pool that has runs on the live node daemon with the fewest
+pools per GPU, and moves a dead node daemon's pools to live ones. Each node daemon runs the pools placed on it, each on
+its least used GPU, and stops the ones placed elsewhere. A pool's lease still decides who serves it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import os
 import signal
 import socket
@@ -18,23 +21,40 @@ from tinyrl.helpers import getenv
 
 GPUS = getenv("GPUS", 1)
 TICK = 1.0
+SCHEDULER = "scheduler"  # the lease whose holder places pools
 
 
 class NodeDaemon:
-  def __init__(self, bus: Bus, gpus: int = GPUS):
+  def __init__(self, bus: Bus, gpus: int = GPUS, node: str = ""):
     self.bus = bus
     self.gpus = gpus
     self.trainers: dict[str, tuple[int, subprocess.Popen]] = {}  # pool -> (gpu, process)
-    self.id = f"{socket.gethostname()}-{os.getpid()}"
+    self.id = node or f"{socket.gethostname()}-{os.getpid()}"
 
   async def tick(self) -> None:
-    await self.bus.heartbeat(self.id, self.gpus)  # how many shards a LoRA base can spread over
+    await self.bus.heartbeat(self.id, self.gpus)
+    if await self.bus.renew(SCHEDULER, self.id) or await self.bus.own(SCHEDULER, self.id):
+      await self.schedule()
+    placed = await self.bus.placements()
     for pool, (_, proc) in list(self.trainers.items()):
-      if proc.poll() is not None:  # it exited: its pool emptied, it lost the lease, or it crashed
+      if proc.poll() is not None or placed.get(pool) != self.id:  # it exited, or its pool moved or emptied
+        proc.terminate()
         del self.trainers[pool]
-    for pool in await self.bus.pools():
-      if pool not in self.trainers and await self.bus.runs(pool) and not await self.bus.owner(pool):
+    for pool, node in placed.items():
+      if node == self.id and pool not in self.trainers:
         self.trainers[pool] = self.start(pool)
+
+  async def schedule(self) -> None:
+    nodes, placed = await self.bus.nodes(), await self.bus.placements()
+    pools = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)}
+    for pool in set(placed) - pools:
+      await self.bus.place(pool, None)
+      del placed[pool]
+    for pool in sorted(pools):
+      if placed.get(pool) not in nodes and nodes:
+        load = collections.Counter(placed.values())
+        placed[pool] = min(nodes, key=lambda node: load[node] / nodes[node])
+        await self.bus.place(pool, placed[pool])
 
   def start(self, pool: str) -> tuple[int, subprocess.Popen]:
     on = [gpu for gpu, _ in self.trainers.values()]
@@ -52,6 +72,7 @@ class NodeDaemon:
     finally:
       for _, proc in self.trainers.values():
         proc.terminate()
+      await self.bus.release(SCHEDULER, self.id)
 
 
 if __name__ == "__main__":
