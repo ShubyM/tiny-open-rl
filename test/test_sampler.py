@@ -153,8 +153,19 @@ class TestSampler(RedisTest):
   @patch("tinyrl.trainer.HOLD_S", 0.0)
   @patch("tinyrl.sampler.HOLD_S", 0.0)
   @patch("tinyrl.trainer.GPU", "node-a:0")
-  @patch("tinyrl.sampler.GPU", "node-a:0")
+  @patch("tinyrl.sampler.GPUS", ["node-a:0"])
   async def test_a_trainer_and_a_sampler_take_turns_on_one_gpu(self):
+    await self.take_turns()
+
+  @patch("tinyrl.trainer.HOLD_S", 0.0)
+  @patch("tinyrl.sampler.HOLD_S", 0.0)
+  @patch("tinyrl.trainer.GPU", "node-a:1")
+  @patch("tinyrl.sampler.GPUS", ["node-a:0", "node-a:1"])
+  async def test_a_tensor_parallel_sampler_takes_turns_on_both_its_gpus(self):
+    await self.take_turns()
+    self.assertIsNone(await self.bus.owner("gpu:node-a:1"))
+
+  async def take_turns(self):
     await self.bus.create(Run("t1", "t1", "base", 0))
     await self.bus.create(Run("samp-1", "sampler:base", "base", 1))
     model = MagicMock()
