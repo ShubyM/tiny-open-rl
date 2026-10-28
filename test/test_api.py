@@ -187,6 +187,13 @@ class TestAPI(RedisTest):
     self.assertEqual((await self.bus.run(full))["rank"], 0)
     self.assertEqual((await self.post("get_info", json={"model_id": full})).json()["lora_rank"], 16)
 
+  async def test_session_tags_apply_to_its_models(self):
+    """TINKER_TAGS reach the server on create_session, which is how open-rl clients ask for a full fine-tune."""
+    tags = ["openrl.fine_tuning_type=full", "openrl.recipe=rl"]
+    session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
+    full = await self.create_model(session_id=session.json()["session_id"])
+    self.assertEqual(((await self.bus.run(full))["rank"], (await self.bus.run(full))["pool"]), (0, full))
+
   async def test_delete(self):
     run_id = await self.create_model()
     deleted = await self.post("delete_model", json={"model_id": run_id})

@@ -105,11 +105,13 @@ class Bus:
 
   # ***** sessions *****
 
-  async def session(self, session_id: str) -> None:
-    """Open a session, or record a heartbeat on one."""
+  async def session(self, session_id: str, metadata: dict | None = None) -> None:
+    """Open a session, or record a heartbeat on one. `metadata` applies to every model the session creates."""
     k, now = key("sess", session_id), time.time()
     p = self.r.pipeline()
     p.hsetnx(k, "created", now)
+    if metadata:
+      p.hset(k, "metadata", json.dumps(metadata))
     p.hset(k, "seen", now)
     p.expire(k, SESSION_TTL)
     p.expire(f"{k}:runs", SESSION_TTL)
@@ -130,6 +132,7 @@ class Bus:
       "seen": seen,
       "live": time.time() - seen < LIVE_SECONDS,
       "runs": sorted(r.decode() for r in runs),
+      "metadata": json.loads(record.get(b"metadata") or "{}"),
     }
 
   # ***** runs *****
