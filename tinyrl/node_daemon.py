@@ -10,16 +10,19 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import os
 import signal
 import socket
 import subprocess
 import sys
+import time
 
 from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
 
 GPUS = getenv("GPUS", 1)
+DRAIN_S = getenv("DRAIN_S", 20.0)  # how long a stopping node daemon waits for its trainers to save their runs
 TICK = 1.0
 SCHEDULER = "scheduler"  # the lease whose holder places pools
 
@@ -71,7 +74,11 @@ class NodeDaemon:
         await asyncio.sleep(TICK)
     finally:
       for _, proc in self.trainers.values():
-        proc.terminate()
+        proc.terminate()  # a trainer saves its runs, then exits
+      deadline = time.monotonic() + DRAIN_S
+      for _, proc in self.trainers.values():
+        with contextlib.suppress(subprocess.TimeoutExpired):
+          proc.wait(max(0.0, deadline - time.monotonic()))
       await self.bus.release(SCHEDULER, self.id)
 
 

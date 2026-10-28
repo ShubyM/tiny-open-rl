@@ -159,6 +159,7 @@ class TestSampler(RedisTest):
     await self.bus.create(Run("samp-1", "sampler:base", "base", 1))
     model = MagicMock()
     model.optim_step.return_value = {"grad_norm:mean": 0.5}
+    model.params = {"t1": {}}  # the trainer holds run t1
     trainer = Trainer(self.bus, "t1", model=model)
     sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine)
 

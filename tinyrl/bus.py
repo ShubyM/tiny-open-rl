@@ -21,7 +21,7 @@ import asyncio
 import json
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 
 import redis.asyncio as redis
@@ -60,6 +60,7 @@ class Run:
   rank: int
   session: str = ""
   model_path: str | None = None
+  lora: dict = field(default_factory=dict)  # the LoRA config it was created with, to create it again elsewhere
 
 
 @dataclass(frozen=True)
@@ -176,7 +177,7 @@ class Bus:
     """Take a deleted run out of its pool and delete its stream, in one transaction."""
     p = self.r.pipeline(transaction=True)
     p.srem(key("pool", pool), run_id)
-    p.delete(key("q", run_id))
+    p.delete(key("q", run_id), key("parked", run_id))
     await p.execute()
 
   # ***** commands *****
@@ -273,6 +274,29 @@ class Bus:
       _, entries, _ = await self.r.xautoclaim(stream, GROUP, worker, min_idle_time=min_idle_ms, count=10000)
       cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
     return cmds
+
+  # ***** parked runs: the state a stopping trainer saved, for the next trainer to restore *****
+
+  async def park(self, run_id: str, uri: str | None, pool: str, worker: str) -> bool:
+    """Record where a run's state was saved, or clear it with None, if `worker` still owns the run's pool."""
+    k = key("owner", pool)
+    while True:
+      try:
+        async with self.r.pipeline(transaction=True) as p:
+          await p.watch(k)
+          if await p.get(k) != worker.encode():
+            await p.unwatch()
+            return False
+          p.multi()
+          p.set(key("parked", run_id), uri) if uri else p.delete(key("parked", run_id))
+          await p.execute()
+          return True
+      except redis.WatchError:  # the lease was renewed, maybe by this worker
+        continue
+
+  async def parked(self, run_id: str) -> str | None:
+    uri = await self.r.get(key("parked", run_id))
+    return uri.decode() if uri else None
 
   # ***** pool leases *****
 

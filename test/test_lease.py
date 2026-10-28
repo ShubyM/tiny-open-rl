@@ -72,6 +72,24 @@ class TestLease(RedisTest):
           proc.terminate()
           proc.wait()
 
+  async def test_sigterm_saves_the_runs_before_the_trainer_exits(self):
+    base, ckpt = f"{tempfile.mkdtemp()}/tiny", tempfile.mkdtemp()
+    tiny().save_pretrained(base)
+    pool, run = f"lora:{base}", new_id()
+    await self.bus.create(Run(run, pool, base, 4, lora=LORA))
+    env = {**os.environ, "REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS), "CKPT": ckpt}
+    proc = subprocess.Popen([sys.executable, "-m", "tinyrl.trainer", pool], env=env)
+    try:
+      self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
+      proc.terminate()
+      self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
+      uri = await self.bus.parked(run)
+      self.assertTrue(os.path.exists(f"{ckpt}/{uri.removeprefix('tinker://')}/state.safetensors"))
+      self.assertIsNone(await self.bus.owner(pool))  # released, so the next trainer starts at once
+    finally:
+      if proc.poll() is None:
+        proc.kill()
+
 
 if __name__ == "__main__":
   unittest.main()

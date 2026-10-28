@@ -10,6 +10,7 @@ import contextlib
 import json
 import math
 import os
+import signal
 import socket
 import sys
 import time
@@ -385,6 +386,7 @@ class Trainer:
     self.store = store if store is not None else Store()
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.done = False
+    self.draining = False
     self.busy = 0.0  # seconds spent running commands since the last load report
     self.seated = 0.0  # when this trainer took its GPU's lease, or 0 while it doesn't hold it
 
@@ -396,6 +398,8 @@ class Trainer:
       while not self.done:
         await self.step()
         await self.fail_stranded(STRANDED_MS)
+      if self.draining:
+        await self.drain()
     finally:
       renewing.cancel()
       if GPU:
@@ -411,7 +415,7 @@ class Trainer:
   async def keep(self) -> None:
     """Renew the pool's lease until another trainer has it, and report how busy the trainer was every UTIL_MS."""
     reported = time.time()
-    while not self.done:
+    while True:  # until serve() cancels it, so the lease holds while a stopping trainer saves its runs
       await asyncio.sleep(LEASE_MS / 4000)
       if not await self.bus.renew(self.pool, self.worker):
         self.done = True
@@ -421,6 +425,38 @@ class Trainer:
       if (now := time.time()) - reported >= UTIL_MS / 1000:
         await self.bus.report(self.pool, min(1.0, self.busy / (now - reported)))
         self.busy, reported = 0.0, now
+
+  def stop(self) -> None:
+    """Finish the batch in hand, save every run for the pool's next trainer, and exit. SIGTERM calls it."""
+    self.done = self.draining = True
+
+  async def drain(self) -> None:
+    for run in list(self.model.params):
+      uri = f"tinker://{run}/parked/{time.time_ns()}"
+      await asyncio.to_thread(self.store.put, uri, *self.model.state(run))
+      await self.bus.park(run, uri, self.pool, self.worker)
+
+  async def recover(self, cmd: Cmd) -> None:
+    """Bring back a run this trainer doesn't hold: from the state its last trainer saved when it stopped, or empty, for
+    load_weights to fill. A run whose trainer died without saving it can't go on from where it was."""
+    run, uri = await self.bus.run(cmd.run), await self.bus.parked(cmd.run)
+    if not uri and cmd.op not in (Op.LOAD_WEIGHTS, Op.DELETE_MODEL):
+      raise KeyError(
+        f"model {cmd.run} lost its unsaved steps when its trainer stopped. load_state to go on from a checkpoint"
+      )
+    await asyncio.to_thread(self.model.create, cmd.run, run["base"], run["rank"], run.get("lora", {}))
+    if uri:
+      tensors, meta = await asyncio.to_thread(self.store.get, uri)
+      await asyncio.to_thread(self.model.restore, cmd.run, tensors, meta, True)
+      await self.bus.park(cmd.run, None, self.pool, self.worker)
+
+  async def answer(self, cmd: Cmd) -> Reply:
+    try:
+      if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
+        await self.recover(cmd)
+    except Exception as e:
+      return fail(e)
+    return await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
 
   async def fail_stranded(self, min_idle_ms: int) -> None:
     for cmd in await self.bus.reclaim(self.pool, self.worker, min_idle_ms):
@@ -439,7 +475,7 @@ class Trainer:
       for cmd in cmds:
         start = time.time()
         first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
-        reply = first or await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
+        reply = first or await self.answer(cmd)
         self.busy += time.time() - start
         if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
           self.done = True  # another trainer owns the pool now
@@ -518,5 +554,11 @@ class Trainer:
       return fail(e)
 
 
+async def main(pool: str) -> None:
+  trainer = Trainer(Bus(), pool)
+  asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, trainer.stop)
+  await trainer.serve()
+
+
 if __name__ == "__main__":
-  asyncio.run(Trainer(Bus(), sys.argv[1]).serve())
+  asyncio.run(main(sys.argv[1]))

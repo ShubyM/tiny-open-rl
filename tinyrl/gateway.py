@@ -167,7 +167,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     run = str(uuid.uuid4())
     pool = await pool_for(bus, run, req.base_model, rank, metadata)
-    await bus.create(Run(run, pool, req.base_model, rank, req.session_id))
+    await bus.create(Run(run, pool, req.base_model, rank, req.session_id, lora=lora))
     return await submit(run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora})
 
   @api.post("/api/v1/get_info")
