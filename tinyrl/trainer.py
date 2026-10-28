@@ -507,8 +507,7 @@ class Trainer:
     another trainer asked for it and this one has had it HOLD_S. With no GPU to share, it does nothing."""
     if gpu and not self.seated:
       try:
-        while not await self.bus.own(f"gpu:{gpu}", self.worker):
-          await self.bus.request_gpu(gpu, self.worker)
+        while not await self.bus.take_gpu(gpu, self.worker):
           await asyncio.sleep(0.05)
       finally:
         await self.bus.withdraw_request(gpu, self.worker)

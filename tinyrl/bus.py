@@ -327,15 +327,30 @@ class Bus:
   async def set_width(self, pool: str, width: int) -> None:
     await self.r.set(key("width", pool), width)
 
-  async def request_gpu(self, gpu: str, worker: str) -> None:
-    await self.r.zadd(key("wait", gpu), {worker: time.time() + LEASE_MS / 1000})
+  async def take_gpu(self, gpu: str, worker: str) -> bool:
+    """Take the GPU's lease if it's free and `worker` has waited longest for it, so whoever polls fastest can't jump
+    the line. A wait counts from the first ask; a waiter that hasn't asked for LEASE_MS drops out of the line. Only
+    the lease's SET NX has to be atomic: the line just decides who may try it."""
+    now = time.time()
+    p = self.r.pipeline(transaction=False)
+    p.zadd(key("wait", gpu), {worker: now}, nx=True)  # in line since its first ask
+    p.zadd(key("alive", gpu), {worker: now + LEASE_MS / 1000})  # still asking until then
+    p.zrangebyscore(key("alive", gpu), "-inf", now)
+    if dead := (await p.execute())[-1]:
+      await self.r.zrem(key("wait", gpu), *dead)
+      await self.r.zrem(key("alive", gpu), *dead)
+    if await self.r.zrange(key("wait", gpu), 0, 0) != [worker.encode()] or not await self.own(f"gpu:{gpu}", worker):
+      return False
+    await self.withdraw_request(gpu, worker)
+    return True
 
   async def withdraw_request(self, gpu: str, worker: str) -> None:
     await self.r.zrem(key("wait", gpu), worker)
+    await self.r.zrem(key("alive", gpu), worker)
 
   async def others_requested(self, gpu: str, worker: str) -> bool:
     """Whether another trainer has asked for the GPU within the last LEASE_MS."""
-    return any(w.decode() != worker for w in await self.r.zrangebyscore(key("wait", gpu), time.time(), "+inf"))
+    return any(w.decode() != worker for w in await self.r.zrangebyscore(key("alive", gpu), time.time(), "+inf"))
 
   # ***** load *****
 

@@ -177,13 +177,12 @@ class Sampler:
       try:  # take every GPU in index order, so two samplers that share GPUs never wait on each other
         while len(held) < len(GPUS):
           gpu = GPUS[len(held)]
-          if await self.bus.own(f"gpu:{gpu}", self.worker):
+          if await self.bus.take_gpu(gpu, self.worker):
             held.append(gpu)
             continue
           if not await self.renew_gpus(held):  # one expired while it waited for the next: start over
             await self.release_gpus(held)
             held = []
-          await self.bus.request_gpu(gpu, self.worker)
           await asyncio.sleep(0.05)
       finally:
         for gpu in GPUS:
