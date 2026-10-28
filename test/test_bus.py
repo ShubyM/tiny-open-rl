@@ -171,5 +171,24 @@ class TestRedisRestart(unittest.IsolatedAsyncioTestCase):
       proc.terminate()
 
 
+class TestGpuLine(RedisTest):
+  async def test_the_longest_waiter_gets_a_freed_gpu_however_fast_others_poll(self):
+    self.assertTrue(await self.bus.take_gpu("node-a:0", "holder"))
+    self.assertFalse(await self.bus.take_gpu("node-a:0", "first"))
+    for _ in range(5):  # a later waiter that polls more often stays behind
+      self.assertFalse(await self.bus.take_gpu("node-a:0", "second"))
+    await self.bus.release("gpu:node-a:0", "holder")
+    self.assertFalse(await self.bus.take_gpu("node-a:0", "second"))
+    self.assertTrue(await self.bus.take_gpu("node-a:0", "first"))
+    self.assertTrue(await self.bus.others_requested("node-a:0", "first"))
+
+  async def test_a_waiter_that_stops_asking_drops_out_of_line(self):
+    self.assertTrue(await self.bus.take_gpu("node-a:0", "holder"))
+    self.assertFalse(await self.bus.take_gpu("node-a:0", "gone"))
+    await self.bus.release("gpu:node-a:0", "holder")
+    await self.bus.r.zadd(key("alive", "node-a:0"), {"gone": 0})  # its last ask expired, as if it died
+    self.assertTrue(await self.bus.take_gpu("node-a:0", "next"))
+
+
 if __name__ == "__main__":
   unittest.main()
