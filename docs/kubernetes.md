@@ -1,5 +1,9 @@
 # tinyrl on Kubernetes
 
+**Proposed local scheduler revision.** [Fair scheduling inside a node daemon](node-scheduler.md) keeps the whole-node
+daemon architecture and specifies weighted GPU-time accounting, memory admission, and acknowledged engine switching.
+It proposes replacing the Redis GPU-lease race in "Taking turns" below. It is a design proposal, not implemented behavior.
+
 **Status.** Portable `safetensors` checkpoints (`store.py`), one owner per pool, per-run telemetry (`GET /metrics`), a
 single-node process supervisor (`node_daemon.py`), load-based LoRA pool sharding, cooperative GPU time-slicing to
 pinned host memory, and samplers (`sampler.py`) are built. Multi-node placement, live run migration, `/dev/shm` + peer `Store` tiers, and
