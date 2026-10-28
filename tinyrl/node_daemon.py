@@ -67,7 +67,7 @@ class NodeDaemon:
     # trainers on one GPU take turns on it, named by host so trainers a restarted node daemon left running count too
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu), "GPU": f"{socket.gethostname()}:{gpu}"}
     mod = "tinyrl.sampler" if pool.startswith("sampler:") else "tinyrl.trainer"
-    return gpu, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
+    return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
 
   async def serve(self) -> None:
     try:

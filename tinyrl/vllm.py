@@ -50,6 +50,8 @@ class VLLM:
       port = s.getsockname()[1]
     args = ["vllm", "serve", base, "--host", "127.0.0.1", "--port", str(port), "--enable-sleep-mode"]
     args += ["--enable-lora", "--max-lora-rank", "64"] if lora else []
+    if (tp := len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))) > 1:
+      args += ["--tensor-parallel-size", str(tp)]
     env = {**os.environ, "VLLM_SERVER_DEV_MODE": "1", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True"}
     server = subprocess.Popen([*args, *shlex.split(VLLM_ARGS)], env=env)
     engine = cls(f"http://127.0.0.1:{port}", base, lora, server)

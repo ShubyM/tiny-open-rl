@@ -27,6 +27,8 @@ from tinyrl.helpers import getenv
 from tinyrl.store import Store
 from tinyrl.trainer import GPU, HOLD_S, STRANDED_MS, fail
 
+GPUS = GPU.split(",") if GPU else []  # the leases of every GPU this sampler runs on, as tensor parallel ranks
+
 ENGINE = getenv("ENGINE", "tinyrl.vllm:VLLM")
 MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
 
@@ -107,9 +109,8 @@ class Sampler:
       renewing.cancel()
       if self.engine:
         await self.engine.close()
-      if GPU:
-        await self.bus.release(f"gpu:{GPU}", self.worker)
-        self.seated = 0.0
+      await self.release_gpus(GPUS)
+      self.seated = 0.0
       await self.bus.release(self.pool, self.worker)
 
   async def own(self) -> None:
@@ -124,7 +125,7 @@ class Sampler:
           True  # another sampler took the pool. An expired lease nobody took, as after a Redis restart, is taken again
         )
         return
-      if self.seated and not await self.bus.renew(f"gpu:{GPU}", self.worker):
+      if self.seated and not await self.renew_gpus(GPUS):
         self.seated = 0.0
 
   async def fail_stranded(self, min_idle_ms: int) -> None:
@@ -171,13 +172,21 @@ class Sampler:
 
   @contextlib.asynccontextmanager
   async def acquire(self):
-    if GPU and not self.seated:
-      try:
-        while not await self.bus.own(f"gpu:{GPU}", self.worker):
-          await self.bus.request_gpu(GPU, self.worker)
+    if GPUS and not self.seated:
+      held: list[str] = []
+      try:  # take every GPU in index order, so two samplers that share GPUs never wait on each other
+        while len(held) < len(GPUS):
+          gpu = GPUS[len(held)]
+          if await self.bus.take_gpu(gpu, self.worker):
+            held.append(gpu)
+            continue
+          if not await self.renew_gpus(held):  # one expired while it waited for the next: start over
+            await self.release_gpus(held)
+            held = []
           await asyncio.sleep(0.05)
       finally:
-        await self.bus.withdraw_request(GPU, self.worker)
+        for gpu in GPUS:
+          await self.bus.withdraw_request(gpu, self.worker)
       if self.engine:
         await self.engine.wake()
       self.seated = time.time()
@@ -188,11 +197,18 @@ class Sampler:
 
   async def yield_gpu(self, idle: bool) -> None:
     held = self.seated and (idle or time.time() - self.seated >= HOLD_S)
-    if held and await self.bus.others_requested(GPU, self.worker):
+    if held and any([await self.bus.others_requested(gpu, self.worker) for gpu in GPUS]):
       if self.engine:
         await self.engine.sleep()
-      await self.bus.release(f"gpu:{GPU}", self.worker)
+      await self.release_gpus(GPUS)
       self.seated = 0.0
+
+  async def renew_gpus(self, gpus: list[str]) -> bool:
+    return all([await self.bus.renew(f"gpu:{gpu}", self.worker) for gpu in gpus])
+
+  async def release_gpus(self, gpus: list[str]) -> None:
+    for gpu in gpus:
+      await self.bus.release(f"gpu:{gpu}", self.worker)
 
 
 if __name__ == "__main__":
