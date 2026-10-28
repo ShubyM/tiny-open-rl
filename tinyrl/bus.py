@@ -331,12 +331,23 @@ class Bus:
   async def heartbeat(self, node: str, gpus: int) -> None:
     await self.r.hset(key("nodes"), node, json.dumps({"gpus": gpus, "until": time.time() + NODE_MS / 1000}))
 
-  async def gpus(self) -> int:
-    """The GPUs of every live node daemon."""
-    nodes = {k: json.loads(v) for k, v in (await self.r.hgetall(key("nodes"))).items()}
+  async def nodes(self) -> dict[str, int]:
+    """The GPU count of every live node daemon, by id."""
+    nodes = {k.decode(): json.loads(v) for k, v in (await self.r.hgetall(key("nodes"))).items()}
     if dead := [k for k, v in nodes.items() if v["until"] < time.time()]:
       await self.r.hdel(key("nodes"), *dead)
-    return sum(v["gpus"] for v in nodes.values() if v["until"] >= time.time())
+    return {k: v["gpus"] for k, v in nodes.items() if k not in dead}
+
+  async def gpus(self) -> int:
+    return sum((await self.nodes()).values())
+
+  # ***** placement: which node daemon runs each pool's trainer or sampler *****
+
+  async def placements(self) -> dict[str, str]:
+    return {k.decode(): v.decode() for k, v in (await self.r.hgetall(key("place"))).items()}
+
+  async def place(self, pool: str, node: str | None) -> None:
+    await (self.r.hset(key("place"), pool, node) if node else self.r.hdel(key("place"), pool))
 
   # ***** replies *****
 
