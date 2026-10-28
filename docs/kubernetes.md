@@ -397,15 +397,18 @@ here only for RDMA NICs, if GKE multi-networking doesn't already cover them.
 
 ## Estimator
 
-No model-size tables. Before a run's first placement, build its model on PyTorch's `meta` device from its config
-(`AutoConfig.from_pretrained`) and count parameters. [trainer.py](../tinyrl/trainer.py) keeps fp32 master weights, so a
-full fine-tune holds 16 bytes per parameter at peak (weights, gradients and two AdamW moments) and 12 between steps,
-because `optimizer.zero_grad()` frees the gradients. A LoRA pool holds 2 bytes per parameter of bf16 base, plus 16 per
-adapter parameter of each run. Activations don't need estimating: [`token_budget`](../tinyrl/trainer.py) sizes every pass
-to the GPU memory that's free.
+No model-size tables. Before a run's first placement, the estimator reads its exact byte requirement using `huggingface_hub.get_safetensors_metadata` (without downloading) for base weights, and building the LoRA config on the `meta` device to count adapter parameters. [trainer.py](../tinyrl/trainer.py) keeps fp32 master weights, so a full fine-tune holds 16 bytes per parameter at peak (weights, gradients and two AdamW moments). A LoRA pool holds base bytes plus 16 per adapter parameter of each run. Samplers hold base bytes plus one maximum-length KV sequence. Overhead is fixed at 0.75 GB per process.
 
-Once running, the trainer writes measured bytes to `tinyrl:load:<pool>` every minute, and the scheduler and node daemon use that
-from then on.
+Measured on an H100, 1 run each:
+
+| Model | Params from `meta` device | Checkpoint safetensors header | Real bf16 load |
+|---|---|---|---|
+| Qwen3-8B | 8,190,735,360 | identical | 16.3815 GB allocated, 19 KB over the estimate |
+| Qwen2.5-0.5B (tied) | 494,032,768 | identical | |
+| Qwen3-30B-A3B | 30,532,122,624 | identical | |
+| Qwen3-32B | 32,762,123,264 | identical | |
+
+Activations are left to the dynamic [`token_budget`](../tinyrl/trainer.py) parameter. Once running, the trainer writes measured bytes to `tinyrl:load:<pool>` every minute, and the scheduler and node daemon use that from then on.
 
 ## One owner per pool
 
