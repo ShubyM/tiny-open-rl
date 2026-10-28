@@ -1,10 +1,11 @@
 import asyncio
 import json
+import tempfile
 import time
 import unittest
 
-from test.helpers import RedisTest, new_id
-from tinyrl.bus import Cmd, Op, Reply, Run, key
+from test.helpers import RedisTest, new_id, start_redis
+from tinyrl.bus import Bus, Cmd, Op, Reply, Run, connect, key
 
 
 def ok(**body) -> Reply:
@@ -145,6 +146,29 @@ class TestBus(RedisTest):
     self.assertTrue(session["live"])
     self.assertEqual(session["runs"], [run_id])
     self.assertIsNone(await self.bus.session_info("nope"))
+
+
+class TestRedisRestart(unittest.IsolatedAsyncioTestCase):
+  async def test_a_call_waits_out_a_redis_restart(self):
+    sock = f"{tempfile.mkdtemp()}/redis.sock"
+    proc = start_redis(sock)
+    bus = Bus(connect(f"unix://{sock}"))
+    try:
+      await bus.heartbeat("node-a", 1)
+      proc.terminate()
+      proc.wait()
+
+      async def restart():
+        await asyncio.sleep(2)
+        return start_redis(sock)
+
+      restarting = asyncio.create_task(restart())
+      await bus.heartbeat("node-a", 1)  # retried until Redis is back, instead of raising
+      proc = await restarting
+      self.assertEqual(await bus.gpus(), 1)
+    finally:
+      await bus.r.aclose()
+      proc.terminate()
 
 
 if __name__ == "__main__":

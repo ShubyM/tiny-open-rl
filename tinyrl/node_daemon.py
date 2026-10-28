@@ -36,8 +36,10 @@ class NodeDaemon:
 
   async def tick(self) -> None:
     await self.bus.heartbeat(self.id, self.gpus)
-    if await self.bus.renew(SCHEDULER, self.id) or await self.bus.own(SCHEDULER, self.id):
+    if await self.bus.renew(SCHEDULER, self.id):
       await self.schedule()
+    else:  # a new scheduler waits a tick, so after a Redis restart every node daemon heartbeats before it judges them
+      await self.bus.own(SCHEDULER, self.id)
     placed = await self.bus.placements()
     for pool, (_, proc) in list(self.trainers.items()):
       if proc.poll() is not None or placed.get(pool) != self.id:  # it exited, or its pool moved or emptied

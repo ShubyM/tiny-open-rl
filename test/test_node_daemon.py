@@ -25,7 +25,8 @@ class TestNodeDaemon(RedisTest):
     with patch.dict(os.environ, {"REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS)}):
       daemon = NodeDaemon(self.bus, gpus=2)
       try:
-        await daemon.tick()
+        await daemon.tick()  # it takes the scheduler lease
+        await daemon.tick()  # and places the pool on itself
         self.assertEqual(list(daemon.trainers), [pool])  # not the pool whose runs are all gone
         request_id = await self.bus.submit(
           run, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
@@ -59,7 +60,8 @@ class TestNodeDaemon(RedisTest):
     a, b = NodeDaemon(self.bus, gpus=1, node="a"), NodeDaemon(self.bus, gpus=1, node="b")
     with patch("subprocess.Popen", side_effect=lambda *_, **__: MagicMock(**{"poll.return_value": None})):
       await b.bus.heartbeat("b", 1)
-      await a.tick()  # a holds the scheduler lease and places one pool on each live node daemon
+      await a.tick()  # a takes the scheduler lease
+      await a.tick()  # and places one pool on each live node daemon
       await b.tick()
       self.assertEqual(sorted(await self.bus.placements()), ["pool-r1", "pool-r2"])
       self.assertEqual(sorted((await self.bus.placements()).values()), ["a", "b"])

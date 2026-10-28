@@ -42,6 +42,14 @@ Trainers on one GPU take turns through a lease on it. Between batches, a trainer
 for `HOLD_S` (30 s), yields it to a trainer that waits: it copies its weights, gradients and AdamW state to pinned host memory,
 frees the GPU, and copies them back on its next turn.
 
+### On Kubernetes
+
+[k8s/](k8s) runs Redis with an append-only file, the gateway, and a node daemon on every node labeled `tinyrl-gpu=true`.
+Build the image from [Dockerfile](Dockerfile), point `CKPT` in [k8s/kustomization.yaml](k8s/kustomization.yaml) at a
+bucket the nodes' service account can write, and run `kubectl apply -k k8s/`. A drained node's trainers save their runs,
+and a dead node's pools move to live nodes. `python k8s/e2e.py` breaks a running cluster on purpose and checks it
+survives.
+
 ## How it works
 
 ```
@@ -82,14 +90,14 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/sampler.py](tinyrl/sampler.py) | 162 | sampling pools, through an engine that knows nothing of Redis |
+| [tinyrl/sampler.py](tinyrl/sampler.py) | 164 | sampling pools, through an engine that knows nothing of Redis |
 | [tinyrl/vllm.py](tinyrl/vllm.py) | 102 | the vLLM engine: `vllm serve` over HTTP |
-| [tinyrl/trainer.py](tinyrl/trainer.py) | 422 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 289 | runs, sessions, commands and replies on Redis |
+| [tinyrl/trainer.py](tinyrl/trainer.py) | 429 | the losses, token budget batching, the model, and the trainer loop |
+| [tinyrl/bus.py](tinyrl/bus.py) | 291 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 270 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 155 | the Tinker protobuf, to numpy and back |
-| [tinyrl/store.py](tinyrl/store.py) | 71 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
-| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 67 | places pools on node daemons, and runs the ones placed on this one |
+| [tinyrl/store.py](tinyrl/store.py) | 70 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
+| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 69 | places pools on node daemons, and runs the ones placed on this one |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
@@ -134,5 +142,5 @@ Every test runs against a real `redis-server` and a real (tiny, random) Llama. N
 
 * `create_training_client_from_state`.
 * Multi-GPU trainers (FSDP, context parallelism).
-* Running on Kubernetes: a scheduler that places pools across nodes, GPU time-slicing, and parking idle runs. The design is
-  in [docs/kubernetes.md](docs/kubernetes.md).
+* Moving runs between live nodes to balance load, parking idle runs, and the `/dev/shm` and peer checkpoint tiers. The
+  design is in [docs/kubernetes.md](docs/kubernetes.md).
