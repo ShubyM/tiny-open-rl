@@ -92,8 +92,11 @@ def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
 
 def connect(url: str) -> redis.Redis:
   # a reply is waited for with a blocking read of up to 30s, and redis-py gives up on a read after 5s by default.
-  # Retrying a dropped connection for about a minute rides out a Redis restart, which keeps its data in its AOF file
-  return redis.from_url(url, socket_timeout=None, retry=Retry(ExponentialBackoff(cap=2.0, base=0.1), 30))
+  # Retrying a dropped connection for about a minute rides out a Redis restart, which keeps its data in its AOF file.
+  # Each request the gateway waits on holds a connection for that read, and redis-py's pool stops at 100 by default
+  # ("Too many connections" at 400 concurrent samples): allow as many as Redis itself does (maxclients 10000)
+  retry = Retry(ExponentialBackoff(cap=2.0, base=0.1), 30)
+  return redis.from_url(url, socket_timeout=None, retry=retry, max_connections=10_000)
 
 
 class Bus:

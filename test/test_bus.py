@@ -51,6 +51,11 @@ class TestBus(RedisTest):
     self.assertLess(time.perf_counter() - start, 0.5)
     self.assertEqual(await self.bus.result(request_id, 0), ok(n=1))
 
+  async def test_hundreds_of_requests_wait_for_replies_at_once(self):
+    """Each wait holds a Redis connection, as when 400 sampling requests are in flight through one gateway."""
+    got = await asyncio.gather(*[self.bus.result(f"req-{i}", 0.5) for i in range(300)])
+    self.assertEqual(got, [None] * 300)
+
   async def test_waiting_for_a_reply_outlasts_the_socket_timeout(self):
     run_id = await self.new_run()
     request_id = await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
