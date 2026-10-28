@@ -320,6 +320,13 @@ class Bus:
 
   # ***** taking turns on a GPU, whose lease is own("gpu:<node>:<i>") *****
 
+  async def width(self, pool: str) -> int:
+    """How many GPUs the pool's process runs on, 1 unless set_width said otherwise."""
+    return int(await self.r.get(key("width", pool)) or 1)
+
+  async def set_width(self, pool: str, width: int) -> None:
+    await self.r.set(key("width", pool), width)
+
   async def request_gpu(self, gpu: str, worker: str) -> None:
     await self.r.zadd(key("wait", gpu), {worker: time.time() + LEASE_MS / 1000})
 

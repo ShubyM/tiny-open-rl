@@ -31,7 +31,7 @@ class NodeDaemon:
   def __init__(self, bus: Bus, gpus: int = GPUS, node: str = ""):
     self.bus = bus
     self.gpus = gpus
-    self.trainers: dict[str, tuple[int, subprocess.Popen]] = {}  # pool -> (gpu, process)
+    self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # pool -> (its GPUs, process)
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
 
   async def tick(self) -> None:
@@ -47,7 +47,7 @@ class NodeDaemon:
         del self.trainers[pool]
     for pool, node in placed.items():
       if node == self.id and pool not in self.trainers:
-        self.trainers[pool] = self.start(pool)
+        self.trainers[pool] = self.start(pool, await self.bus.width(pool))
 
   async def schedule(self) -> None:
     nodes, placed = await self.bus.nodes(), await self.bus.placements()
@@ -61,13 +61,16 @@ class NodeDaemon:
         placed[pool] = min(nodes, key=lambda node: load[node] / nodes[node])
         await self.bus.place(pool, placed[pool])
 
-  def start(self, pool: str) -> tuple[int, subprocess.Popen]:
-    on = [gpu for gpu, _ in self.trainers.values()]
-    gpu = min(range(self.gpus), key=on.count)
-    # trainers on one GPU take turns on it, named by host so trainers a restarted node daemon left running count too
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu), "GPU": f"{socket.gethostname()}:{gpu}"}
+  def start(self, pool: str, width: int = 1) -> tuple[list[int], subprocess.Popen]:
+    """Start a pool's process on `width` GPUs: the least used block of them, aligned so blocks never straddle."""
+    on = [gpu for gpus, _ in self.trainers.values() for gpu in gpus]
+    first = min(range(0, self.gpus - width + 1, width), key=lambda i: sum(map(on.count, range(i, i + width))))
+    gpus = list(range(first, first + width))
+    # processes on one GPU take turns on it, named by host so processes a restarted node daemon left running count too
+    leases = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus)), "GPU": leases}
     mod = "tinyrl.sampler" if pool.startswith("sampler:") else "tinyrl.trainer"
-    return gpu, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
+    return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
 
   async def serve(self) -> None:
     try:

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import socket
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -87,6 +88,16 @@ class TestNodeDaemon(RedisTest):
       daemon.trainers["c"] = daemon.start("c")
     gpus = [call.kwargs["env"]["CUDA_VISIBLE_DEVICES"] for call in popen.call_args_list]
     self.assertEqual(gpus, ["0", "1", "0"])
+
+  def test_a_wide_pool_gets_an_aligned_block_of_the_least_used_gpus(self):
+    daemon = NodeDaemon(None, gpus=4)
+    with patch("subprocess.Popen") as popen:
+      daemon.trainers = {"a": daemon.start("a")}  # one GPU: 0
+      daemon.trainers["tp"] = daemon.start("tp", width=2)  # 0-1 is busier than 2-3
+      daemon.trainers["b"] = daemon.start("b")
+    envs = [call.kwargs["env"] for call in popen.call_args_list]
+    self.assertEqual([env["CUDA_VISIBLE_DEVICES"] for env in envs], ["0", "2,3", "1"])
+    self.assertEqual(envs[1]["GPU"].split(","), [f"{socket.gethostname()}:2", f"{socket.gethostname()}:3"])
 
 
 if __name__ == "__main__":
