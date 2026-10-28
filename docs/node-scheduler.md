@@ -64,6 +64,91 @@ daemon implementation. If burst nodes also use DaemonSets, provision node capaci
 does not drive the Kubernetes autoscaler. Placeholder pods requesting GPUs already reserved by the daemon double-count
 demand. Node provisioning is outside this single-node scheduling loop.
 
+## Byte budgets and pipeline admission
+
+Bound data movement separately from GPU service. A request-count limit treats a short prompt and a large training
+batch alike; byte budgets provide backpressure proportional to the estimated payload. Use a sliding window whose
+credits return when a stage completes, rather than a bytes-per-second token bucket. Slower stages then retain their
+credits longer and naturally reduce new submissions.
+
+| Stage | Account for | Release or transfer the reservation when |
+|---|---|---|
+| Client dispatch | Estimated input bytes being serialized and submitted | Server accepts the command and returns its request ID |
+| Server input queue | Accepted payloads waiting for execution, plus bounded reorder buffers | Payload leaves the queue; any execution/staging copy has its own accounted reservation |
+| GPU execution | GPU-seconds and admitted GPU/host memory | Engine acknowledges release or all relevant processes exit |
+| Server result retention | Completed outputs awaiting retrieval or expiration | The acknowledged retrieval/retention contract permits deletion, or retention expires |
+| Client result fetch | Advertised result bytes being downloaded and decoded | Retrieval and deserialization finish |
+
+All physical copies must be accounted for during a handoff; releasing one reservation must not create an unbudgeted
+intermediate buffer. Retained results and accepted commands need both byte and count limits, since tiny objects still
+consume metadata and connection resources. Client windows smooth traffic, server admission bounds aggregate backlog,
+and GPU-time accounting selects service among runnable accounts. Each has a different resource and lifetime.
+
+### Existing SDK controls
+
+The inspected Tinker SDK at commit `3ba0810` already fetches `/api/v1/client/config` when its internal holder is
+constructed. The server can return the following supported fields instead of requiring a new client implementation:
+
+| Field | SDK default | Meaning |
+|---|---|---|
+| `fwdbwd_max_chunk_len` | 1,024 | Target maximum examples per training chunk |
+| `fwdbwd_max_chunk_bytes_count` | 5,000,000 bytes | Target estimated uncompressed protobuf bytes per training chunk |
+| `fwdbwd_dispatch_bytes_semaphore_size` | 50,000,000 bytes | Training payloads concurrently being submitted |
+| `sample_dispatch_bytes_semaphore_size` | 10 MiB | Estimated prompt bytes concurrently being submitted |
+| `inflight_response_bytes_semaphore_size` | 50 MiB | Concurrent result fetches using advertised payload sizes |
+
+These are built-in SDK defaults, not measured settings for tinyrl or evidence of Tinker's deployed production quotas.
+Training estimates include token storage and loss-input arrays before optional compression. An oversized individual
+example is not split by the chunker, so the chunk target is not an enforced maximum request size. The server must
+validate sizes itself and bound decompression, parsing, and staging memory, not just compressed HTTP bytes.
+
+The SDK releases training and sampling dispatch credits after submission returns an accepted future, before waiting
+for GPU execution. For example, a 500 MB batch split into roughly 100 chunks targeting 5 MB can upload through a
+nominal 50 MB window; accepted chunks free credits for subsequent uploads. Without a separate server input budget,
+this merely transfers the backlog into Redis or another server-side store.
+
+Its byte semaphore is intentionally soft: it admits while its remaining balance is nonnegative, then subtracts the
+new request's estimate. A 10 MB budget can admit two 7 MB requests before blocking the next. The limits belong to a
+holder and can be multiplied by additional holders/processes. They do not cap the caller's original dataset, cached
+results, or total process memory. The server needs independently enforced aggregate and per-account limits.
+
+Sampling also uses request-count gates and a shared backoff signal. Following recent backpressure it reduces dispatch
+concurrency and charges new prompt submissions at 20 times their normal byte estimate. This is feedback for upload
+pressure, not an estimate of decode work or a KV-cache allocation. Result-fetch credits are acquired when completion
+metadata supplies a payload size and released after retrieval; application-held results can outlive those credits.
+
+The byte-budget fields are in startup client config, not the separately refreshed dynamic config. Changes affect newly
+constructed holders; do not promise immediate retuning of existing clients. Enable compression, metadata-only result
+retrieval, or other protocol features only after implementing their matching server behavior. Values should follow
+measurements of gateway, Redis, and worker pressure rather than copying another deployment's defaults.
+
+Reference code: [config fields](https://github.com/thinking-machines-lab/tinker/blob/3ba0810907775e9938e912ed457af5dd08313708/src/tinker/types/client_config_response.py),
+[holder budgets](https://github.com/thinking-machines-lab/tinker/blob/3ba0810907775e9938e912ed457af5dd08313708/src/tinker/lib/internal_client_holder.py),
+[training dispatch](https://github.com/thinking-machines-lab/tinker/blob/3ba0810907775e9938e912ed457af5dd08313708/src/tinker/lib/public_interfaces/training_client.py),
+[sampling dispatch](https://github.com/thinking-machines-lab/tinker/blob/3ba0810907775e9938e912ed457af5dd08313708/src/tinker/lib/public_interfaces/sampling_client.py),
+and [result fetch](https://github.com/thinking-machines-lab/tinker/blob/3ba0810907775e9938e912ed457af5dd08313708/src/tinker/lib/api_future_impl.py).
+
+### Server admission and progress
+
+Reserve queue bytes atomically with durable command acceptance. Duplicate admissions reuse the original command and
+reservation. Cancellation, failure, and payload handoff release each reservation once, at the correct lifecycle point;
+a disconnected client or ambiguous admission response does not prove the command was rejected. Bound unretrieved
+outputs without re-executing a training mutation when publication or download fails. Keep independent capacity for
+heartbeats, cancellation, ownership checks, and recovery so payload backpressure cannot block the control operations
+needed to drain the queue. Admission across accounts also needs a starvation policy; GPU fairness cannot repair an
+account that never gets into the server queue.
+
+Strict server queue limits must be designed together with sequence ordering. The inspected SDK's parallel training
+path submits later chunks first and waits for their acceptance before submitting the first chunk. If those later
+chunks fill a bounded server queue that cannot drain before the missing first sequence arrives, retrying admission
+can deadlock before the client even sends that first chunk. Reserving headroom for a gap-closing request alone is not
+sufficient when the client is still waiting for acceptance of the other chunks.
+
+Initially return `parallel_fwdbwd_chunks: false` while introducing bounded admission and a proper per-run sequencer,
+so the SDK submits the leading chunk first. Supporting the parallel mode later requires an explicit bounded logical
+batch reservation/admission protocol or another proven progress rule. Oversized batches need a terminal rejection or
+supported streaming path, rather than infinite admission retries. Preserve stable request identities through retries.
+
 ## Fairness accounting
 
 Track each admitted account's weight, runnable state, cumulative GPU-seconds, virtual service, and oldest queued work.
@@ -213,8 +298,9 @@ own protocol and tests; the single-node queue does not implement them automatica
    GPU arbitration with daemon-controlled grants for existing one-GPU engines. Retain distributed ownership fencing.
 2. Add service accounting and a pure selection function. Build deterministic event-driven trace simulation before
    tuning locality preference or switching quanta. Keep policy separate from process supervision.
-3. Add host/GPU memory admission, cache bounds, and measured switching costs. Add GPU-mask reservations when real
-   multi-GPU engines are available; test the policy against simulated wider groups earlier.
+3. Add host/GPU memory admission, server input/result byte budgets, compatible SDK dispatch settings, cache bounds,
+   and measured switching costs. Establish sequence ordering and admission progress before enabling parallel training
+   chunks. Add GPU-mask reservations when real multi-GPU engines are available; test wider groups in simulation earlier.
 4. Add tenant hierarchy or shared-batch attribution when the corresponding product requirement is introduced.
    Keep burst provisioning, live cross-node balancing, and multi-node suspension outside the first implementation.
 
@@ -227,10 +313,16 @@ The simulation suite should include:
 - A wide trainer behind endless narrow jobs; verify a reservation eventually starts it under bounded yield assumptions.
 - Variable command lengths and switching costs; measure queue latency and actual overhead, including quantum overruns.
 - Infeasible memory requests, cache pressure, and simultaneous transfers; no double-admission of the same memory.
+- Mixed tiny and oversized payloads, compression, slow uploads, and bursts of completed results; verify every byte
+  reservation's lifetime and client soft-window overshoot without treating SDK budgets as hard server caps.
+- Many client holders and one flooding account; enforce aggregate/per-account queue limits and preserve control traffic.
+- Out-of-order training chunks with a full queue, retrying admissions, cancellation, and expired/unretrieved results;
+  prove admission progress and single-release accounting, including a batch larger than the entire queue budget.
 - Failed park/resume, late acknowledgements, and daemon restart; never grant overlapping execution by assuming release.
 
 Report normalized service while accounts are runnable, maximum and percentile waits, switching overhead, admission
-failures, and useful throughput. Jain's index of raw busy time alone cannot establish weighted, demand-aware fairness.
+failures, queued/result bytes, stage-specific budget waits, and useful throughput. Jain's index of raw busy time alone
+cannot establish weighted, demand-aware fairness.
 Then test real PyTorch/vLLM processes and GPU memory release; CPU simulation cannot establish CUDA safety or engine
 preemption bounds. No such scheduler implementation or validation result is included in this proposal.
 
