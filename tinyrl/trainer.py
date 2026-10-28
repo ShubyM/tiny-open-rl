@@ -18,9 +18,10 @@ from collections.abc import Callable
 
 import numpy as np
 import torch
+import transformers
 from peft import LoraConfig
 from torch.utils.checkpoint import checkpoint
-from transformers import AutoModelForCausalLM, PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl import wire
 from tinyrl.bus import LEASE_MS, UTIL_MS, Bus, Cmd, Op, Reply
@@ -154,10 +155,16 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
 
 
 def load(name: str) -> PreTrainedModel:
+  """The class the checkpoint names in its config, which is the one vLLM serves, so the weights and adapters a
+  trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal
+  checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and
+  vLLM drops an adapter whose names it can't map, without an error."""
+  arch = (AutoConfig.from_pretrained(name).architectures or [""])[0]
+  cls = getattr(transformers, arch, AutoModelForCausalLM)
   # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create
   if torch.cuda.is_available():
-    return AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="auto")
-  return AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
+    return cls.from_pretrained(name, dtype=torch.bfloat16, device_map="auto")
+  return cls.from_pretrained(name, dtype=torch.float32)
 
 
 def lora_targets(lm: PreTrainedModel, config: dict) -> list[str]:

@@ -453,5 +453,42 @@ class TestTrainer(RedisTest):
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
 
 
+class TestCheckpointNames(unittest.TestCase):
+  def test_a_multimodal_checkpoint_trains_under_its_own_parameter_names(self):
+    """Qwen3.5's checkpoint and vLLM name its layers model.language_model.*, its causal LM class model.layers.*. The
+    trainer loads the class the checkpoint names, so a saved adapter's weights carry names vLLM maps."""
+    from safetensors import safe_open
+    from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
+
+    text = {
+      "hidden_size": 32,
+      "intermediate_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 1,
+      "head_dim": 16,
+      "linear_num_key_heads": 1,
+      "linear_num_value_heads": 2,
+      "linear_key_head_dim": 16,
+      "linear_value_head_dim": 16,
+      "vocab_size": 128,
+      "layer_types": ["linear_attention", "full_attention"],
+    }
+    vision = {"hidden_size": 16, "intermediate_size": 32, "depth": 1, "num_heads": 2, "out_hidden_size": 32}
+    path = tempfile.mkdtemp()
+    Qwen3_5ForConditionalGeneration(Qwen3_5Config(text_config=text, vision_config=vision)).save_pretrained(path)
+    with safe_open(f"{path}/model.safetensors", "pt") as f:
+      names = set(f.keys())
+
+    model, run = Model(trainer.load), new_id()
+    model.create(run, path, 4, LORA)
+    train(model, run, steps=1)
+    tensors, meta = model.weights(run)
+    for key in tensors:  # base_model.model.<module>.lora_A.<...>: the module is one the checkpoint has
+      module = key.removeprefix("base_model.model.").split(".lora_")[0]
+      self.assertIn(f"{module}.weight", names)
+    self.assertTrue(any(".language_model.layers." in key for key in tensors))
+
+
 if __name__ == "__main__":
   unittest.main()
