@@ -42,6 +42,14 @@ Trainers on one GPU take turns through a lease on it. Between batches, a trainer
 for `HOLD_S` (30 s), yields it to a trainer that waits: it copies its weights, gradients and AdamW state to pinned host memory,
 frees the GPU, and copies them back on its next turn.
 
+### On Kubernetes
+
+[k8s/](k8s) runs Redis with an append-only file, the gateway, and a node daemon on every node labeled `tinyrl-gpu=true`.
+Build the image from [Dockerfile](Dockerfile), point `CKPT` in [k8s/kustomization.yaml](k8s/kustomization.yaml) at a
+bucket the nodes' service account can write, and run `kubectl apply -k k8s/`. A drained node's trainers save their runs,
+and a dead node's pools move to live nodes. `python k8s/e2e.py` breaks a running cluster on purpose and checks it
+survives.
+
 ## How it works
 
 ```
@@ -134,5 +142,5 @@ Every test runs against a real `redis-server` and a real (tiny, random) Llama. N
 
 * `create_training_client_from_state`.
 * Multi-GPU trainers (FSDP, context parallelism).
-* Running on Kubernetes: a scheduler that places pools across nodes, GPU time-slicing, and parking idle runs. The design is
-  in [docs/kubernetes.md](docs/kubernetes.md).
+* Moving runs between live nodes to balance load, parking idle runs, and the `/dev/shm` and peer checkpoint tiers. The
+  design is in [docs/kubernetes.md](docs/kubernetes.md).
