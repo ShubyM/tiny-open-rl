@@ -42,7 +42,8 @@ class TestTinkerSDK(unittest.TestCase):
       **os.environ,
       "REDIS_URL": f"unix://{tmp}/redis.sock",
       "PORT": str(port),
-      "CKPT": f"{tmp}/ckpt",
+      "CKPT": f"file://{tmp}/ckpt",  # a URL, so checkpoints go through upload and download as they do on GCS
+      "CKPT_CACHE": f"{tmp}/cache",
       "ENGINE": "test.helpers:FakeEngine",  # the sampler's engine, since CI has no GPU for vLLM
     }
     procs = [start_redis(f"{tmp}/redis.sock")]

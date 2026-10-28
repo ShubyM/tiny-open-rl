@@ -67,7 +67,8 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
   forward pass runs in bf16 under autocast. A LoRA run's frozen base model stays bf16.
 * **Portable checkpoints.** Training checkpoints (`save_weights`) and sampler weights (`save_weights_for_sampler`) go through
   [store.py](tinyrl/store.py) behind `put(uri)` and `get(uri)` as pure `safetensors` (no `torch.save` pickle), so any trainer can
-  resume a run with its exact fp32 weights and AdamW state.
+  resume a run with its exact fp32 weights and AdamW state. `CKPT` can be a bucket (`gs://...`, with `pip install .[gcs]`), so
+  every node sees every checkpoint.
 * **One owner per pool.** A trainer serves a pool only while it holds the pool's lease. A WATCH/MULTI/EXEC transaction on the lease key checks the lease before any reply lands.
 
 ## Reading the code
@@ -84,12 +85,12 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 | [tinyrl/bus.py](tinyrl/bus.py) | 264 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 270 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 155 | the Tinker protobuf, to numpy and back |
-| [tinyrl/store.py](tinyrl/store.py) | 44 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
+| [tinyrl/store.py](tinyrl/store.py) | 71 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
 | [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 42 | starts a trainer for each pool that has runs and no trainer |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
-checkpoint disk the trainers and samplers share), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
+checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps checkpoints it downloaded), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `HOLD_S`, `TARGET_UTIL`,
 `UTIL_MS`, `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
 
