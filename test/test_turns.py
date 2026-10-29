@@ -8,7 +8,7 @@ from tinyrl.turns import GpuTurn
 class TestScheduler(RedisTest):
   async def start(self, *pools: str, quantum: float = 30.0) -> asyncio.Task:
     await self.running({pool: [0] for pool in pools})
-    return asyncio.create_task(scheduler.run(self.bus, scheduler.Policy(quantum=quantum)))
+    return asyncio.create_task(scheduler.run(self.bus, quantum))
 
   async def decisions(self) -> list[tuple[str, str, str]]:
     return [

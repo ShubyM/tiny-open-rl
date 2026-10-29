@@ -1,36 +1,53 @@
-import json
 import random
 import unittest
 
 from tinyrl.bus import Event
 from tinyrl.scheduler import (
+  QUANTUM,
   RULES,
-  Policy,
-  PoolName,
-  RunningPool,
-  ShardLoad,
   State,
-  check,
-  choose_gpus,
+  choose_gpu,
   choose_pool,
   choose_sampler_pool,
   decide,
   fold,
-  gpu_zones,
+  holders,
+  parse_pool,
   settings,
   start_order,
-  to_json,
+  zone,
 )
 
 GIB = 1024**3
+
+
+def check(s: State) -> list[str]:
+  """Every broken invariant of the scheduler's state, as one message each."""
+  bad = []
+  for node, (gpus, gpu) in sorted(s.nodes.items()):
+    for k in [(node, i) for i in range(gpus)]:
+      held = holders(s, k)
+      memory = [s.pools[n].memory for n in held]
+      if len(held) > 1 and not (gpu and all(memory) and sum(memory) <= gpu):
+        bad.append(f"{k} has holders that do not fit together")
+  for name, p in sorted(s.pools.items()):
+    if p.node is not None and p.node not in s.nodes:
+      bad.append(f"{name} is placed on {p.node}, which is not up")
+    if p.running and p.node is None:
+      bad.append(f"{name} runs but is not placed")
+    if p.asked and p.since is not None:
+      bad.append(f"{name} holds its GPUs and waits for them")
+    if p.revoked and p.since is None:
+      bad.append(f"{name} is revoked but holds nothing")
+  return bad
 
 
 class Log:
   """Appends facts the way workers and node daemons do, then decides the way the scheduler does, folding each decision
   back as it would read it from the log. Checks the invariants after every entry, and that nothing is decided twice."""
 
-  def __init__(self, test: unittest.TestCase, policy: Policy = Policy()):
-    self.test, self.s, self.t, self.entries = test, State(policy=policy), 0.0, []
+  def __init__(self, test: unittest.TestCase, quantum: float = QUANTUM):
+    self.test, self.s, self.t, self.entries = test, State(quantum=quantum), 0.0, []
 
   def append(self, kind: str, body: dict) -> None:
     self.entries.append(Event(str(len(self.entries)), self.t, kind, body))
@@ -109,12 +126,6 @@ class TestPlacement(unittest.TestCase):
       log("run_created", run=name, pool=name)
     self.assertEqual([log.s.pools[n].gpus for n in ("lora:a:0", "lora:b:0", "lora:c:0")], [(0,), (1,), (0,)])
 
-  def test_a_wide_pool_gets_an_aligned_block_of_the_least_used_gpus(self):
-    running = []
-    for name in ("lora:a:0", "lora:tp:0", "lora:b:0"):
-      running.append(RunningPool(name, choose_gpus(name, 2, 16, running).choice))
-    self.assertEqual([r.gpus for r in running], [[0, 1], [2, 3], [0, 1]])
-
   def test_shared_fft_samplers_get_a_memory_budget_on_large_gpus(self):
     log = Log(self)
     log.node(8, memory=81559 * MIB)
@@ -140,8 +151,8 @@ class TestPlacement(unittest.TestCase):
 
 
 class TestTurns(unittest.TestCase):
-  def one_gpu(self, *names: str, policy: Policy = Policy()) -> Log:
-    log = Log(self, policy)
+  def one_gpu(self, *names: str) -> Log:
+    log = Log(self)
     log.node(1)
     for name in names:
       log.pool(name)
@@ -284,10 +295,10 @@ class TestLog(unittest.TestCase):
     s = State()
     for e in log.entries:
       s = fold(s, e)
-    self.assertEqual(to_json(s), to_json(log.s))
+    self.assertEqual(s, log.s)
 
   def test_every_waiter_gets_a_turn_within_its_place_in_line_times_the_quantum(self):
-    log = Log(self, Policy(quantum=30.0))
+    log = Log(self, quantum=30.0)
     log.node(1)
     names = [f"p{i}" for i in range(6)]
     for name in names:
@@ -312,76 +323,58 @@ class TestLog(unittest.TestCase):
 
 
 class TestPoolsAndGpus(unittest.TestCase):
-  def test_pool_parse_and_pairs_with(self):
-    p1 = PoolName.parse("lora:base:0")
-    self.assertEqual(p1.role, "trainer")
-    self.assertTrue(p1.shared)
-    self.assertEqual(p1.target, "base")
-
-    p2 = PoolName.parse("sampler:base")
-    self.assertEqual(p2.role, "sampler")
-    self.assertTrue(p2.shared)
-    self.assertEqual(p2.target, "base")
-
-    self.assertTrue(p1.pairs_with(p2))
-
-    p3 = PoolName.parse("run")
-    self.assertEqual(p3.role, "trainer")
-    self.assertFalse(p3.shared)
-    self.assertEqual(p3.target, "run")
-
-    p4 = PoolName.parse("sampler:fft:run")
-    self.assertEqual(p4.role, "sampler")
-    self.assertFalse(p4.shared)
-    self.assertEqual(p4.target, "run")
-
-    self.assertTrue(p3.pairs_with(p4))
-    self.assertFalse(p1.pairs_with(p3))
+  def test_a_pool_s_role_and_model_come_from_its_name(self):
+    self.assertEqual(parse_pool("lora:base:0"), ("trainer", True, "base"))
+    self.assertEqual(parse_pool("lora:org/model"), ("trainer", True, "org/model"))
+    self.assertEqual(parse_pool("sampler:base"), ("sampler", True, "base"))
+    self.assertEqual(parse_pool("run"), ("trainer", False, "run"))
+    self.assertEqual(parse_pool("sampler:fft:run"), ("sampler", False, "run"))
+    self.assertEqual(parse_pool("sampler:lora:run"), ("sampler", False, "run"))
 
   def test_choose_pool(self):
-    shards = [ShardLoad("lora:b:0", None, 0, 13)]
+    shards = [("lora:b:0", None, 0, 13)]
     d = choose_pool("r", "b", 1, False, shards, 8, target_util=0.7, new_run_util=0.04)
-    self.assertEqual(d.choice, "lora:b:0")
-    self.assertEqual(d.rule, "reuse_shard_under_target")
+    self.assertEqual(d["choice"], "lora:b:0")
+    self.assertEqual(d["rule"], "reuse_shard_under_target")
 
-    shards[0] = ShardLoad("lora:b:0", None, 18, 18)
+    shards[0] = ("lora:b:0", None, 18, 18)
     d = choose_pool("r", "b", 1, False, shards, 8, target_util=0.7, new_run_util=0.04)
-    self.assertEqual(d.choice, "lora:b:1")
-    self.assertEqual(d.rule, "open_new_shard")
+    self.assertEqual(d["choice"], "lora:b:1")
+    self.assertEqual(d["rule"], "open_new_shard")
 
-    shards = [ShardLoad("lora:b:0", 0.1, 5, 10)]
+    shards = [("lora:b:0", 0.1, 5, 10)]
     d = choose_pool("r", "b", 1, False, shards, 8, target_util=0.7, new_run_util=0.04)
-    self.assertEqual(d.choice, "lora:b:0")
-    self.assertEqual(d.detail["per_run"], 0.02)
+    self.assertEqual(d["choice"], "lora:b:0")
+    self.assertEqual(d["per_run"], 0.02)
 
     d = choose_pool("r", "b", 0, False, shards, 8)
-    self.assertEqual(d.choice, "r")
-    self.assertEqual(d.rule, "dedicated_fft")
+    self.assertEqual(d["choice"], "r")
+    self.assertEqual(d["rule"], "dedicated_fft")
 
     d = choose_pool("r", "b", 1, True, shards, 8)
-    self.assertEqual(d.choice, "r")
-    self.assertEqual(d.rule, "dedicated_exclusive")
+    self.assertEqual(d["choice"], "r")
+    self.assertEqual(d["rule"], "dedicated_exclusive")
 
   def test_choose_sampler_pool(self):
     d = choose_sampler_pool("b", False, "r")
-    self.assertEqual(d.choice, "sampler:fft:b")
-    self.assertEqual(d.rule, "shared_fft_sampler")
+    self.assertEqual(d["choice"], "sampler:fft:b")
+    self.assertEqual(d["rule"], "shared_fft_sampler")
 
     d = choose_sampler_pool("b", False, "r", True)
-    self.assertEqual(d.choice, "sampler:fft:r")
-    self.assertEqual(d.rule, "dedicated_fft_sampler")
+    self.assertEqual(d["choice"], "sampler:fft:r")
+    self.assertEqual(d["rule"], "dedicated_fft_sampler")
 
     d = choose_sampler_pool("", False, "r")
-    self.assertEqual(d.choice, "sampler:fft:r")
-    self.assertEqual(d.rule, "dedicated_fft_sampler")
+    self.assertEqual(d["choice"], "sampler:fft:r")
+    self.assertEqual(d["rule"], "dedicated_fft_sampler")
 
     d = choose_sampler_pool("b", True, "r", True)
-    self.assertEqual(d.choice, "sampler:lora:r")
-    self.assertEqual(d.rule, "dedicated_exclusive_sampler")
+    self.assertEqual(d["choice"], "sampler:lora:r")
+    self.assertEqual(d["rule"], "dedicated_exclusive_sampler")
 
     d = choose_sampler_pool("b", True, "r", False)
-    self.assertEqual(d.choice, "sampler:b")
-    self.assertEqual(d.rule, "shared_lora_sampler")
+    self.assertEqual(d["choice"], "sampler:b")
+    self.assertEqual(d["rule"], "shared_lora_sampler")
 
   def test_start_order(self):
     pools = ["lora:b:0", "sampler:b", "run", "sampler:fft:run"]
@@ -407,16 +400,12 @@ class TestPoolsAndGpus(unittest.TestCase):
 
     for _ in range(1000):
       rnd.shuffle(pools)
-      running = []
-      excl = set()
-
+      running, excl = {}, set()
       for p in pools:
         if p in ("gemma-x", "sampler:fft:gemma-x"):
           excl.add(p)
-        dec = choose_gpus(p, 1, 8, running, excl)
-        running.append(RunningPool(p, dec.choice))
-
-      placements = {r.pool: r.gpus[0] for r in running}
+        running[p] = (choose_gpu(p, 8, running, excl)[0],)
+      placements = {p: gpus[0] for p, gpus in running.items()}
 
       st_gpus = {placements["lora:google/gemma-4-E2B:0"], placements["lora:Qwen/Qwen3-0.6B-Base:0"]}
       self.assertEqual(st_gpus, {0, 1})
@@ -437,115 +426,70 @@ class TestPoolsAndGpus(unittest.TestCase):
 
   def test_2gpu_exclusive_node(self):
     excl = {"qwen-lora-x", "sampler:lora:qwen-lora-x"}
-    running = []
-
-    d1 = choose_gpus("qwen-lora-x", 1, 2, running, excl)
-    running.append(RunningPool("qwen-lora-x", d1.choice))
-    self.assertEqual(d1.choice, [0])
-
-    d2 = choose_gpus("sampler:lora:qwen-lora-x", 1, 2, running, excl)
-    running.append(RunningPool("sampler:lora:qwen-lora-x", d2.choice))
-    self.assertEqual(d2.choice, [1])
+    self.assertEqual(choose_gpu("qwen-lora-x", 2, {}, excl)[0], 0)
+    self.assertEqual(choose_gpu("sampler:lora:qwen-lora-x", 2, {"qwen-lora-x": (0,)}, excl)[0], 1)
 
   def test_fuzzer(self):
     rnd = random.Random(42)
     for _ in range(500):
       gpus = rnd.choice([1, 2, 4, 8, 16])
-      width = rnd.choice([1, 2, 4])
-      if width > gpus:
-        continue
-
-      active = set()
-      excl = set()
+      active, excl = set(), set()
       for _ in range(20):
-        action = rnd.choice(["add_trainer", "add_sampler", "remove"])
+        action, r = rnd.choice(["add_trainer", "add_sampler", "remove"]), rnd.random()
         if action == "add_trainer":
-          r = rnd.random()
-          if r < 0.2:
-            name = f"excl-{rnd.randint(1, 20)}"
-            excl.add(name)
-          elif r < 0.5:
-            name = f"ts-{rnd.randint(1, 20)}"
-          else:
-            name = f"lora:b-{rnd.randint(1, 5)}:{rnd.randint(0, 2)}"
+          name = f"excl-{rnd.randint(1, 20)}" if r < 0.2 else f"ts-{rnd.randint(1, 20)}" if r < 0.5 else None
+          name = name or f"lora:b-{rnd.randint(1, 5)}:{rnd.randint(0, 2)}"
+          excl |= {name} if r < 0.2 else set()
           active.add(name)
         elif action == "add_sampler":
-          r = rnd.random()
           if excl and r < 0.25:
             name = f"sampler:fft:{rnd.choice(sorted(excl))}"
             excl.add(name)
-          elif r < 0.55:
-            name = f"sampler:fft:ts-{rnd.randint(1, 20)}"
           else:
-            name = f"sampler:b-{rnd.randint(1, 5)}"
+            name = f"sampler:fft:ts-{rnd.randint(1, 20)}" if r < 0.55 else f"sampler:b-{rnd.randint(1, 5)}"
           active.add(name)
-        elif action == "remove" and active:
-          p = rnd.choice(sorted(active))
-          active.remove(p)
+        elif active:
+          active.remove(rnd.choice(sorted(active)))
 
-      stream_order = sorted(active)
-      rnd.shuffle(stream_order)
-      streaming_running = []
-      streaming_excl = set()
-      for p in stream_order:
-        if p in excl:
-          streaming_excl.add(p)
-        try:
-          dec = choose_gpus(p, width, gpus, streaming_running, streaming_excl)
-          streaming_running.append(RunningPool(p, dec.choice))
-        except ValueError:
-          pass
+      streaming, streaming_excl = {}, set()
+      for pool in rnd.sample(sorted(active), len(active)):
+        streaming_excl |= {pool} & excl
+        streaming[pool] = (choose_gpu(pool, gpus, streaming, streaming_excl)[0],)
+      batched = {}
+      for pool in start_order(active, excl):
+        gpu, rule = choose_gpu(pool, gpus, batched, excl)
+        self.assertIn(
+          rule,
+          (
+            "reserved_exclusive",
+            "solo_in_zone",
+            "least_loaded_in_zone",
+            "timesliced_in_subzone",
+            "overflow_least_penalty",
+          ),
+        )
+        batched[pool] = (gpu,)
 
-      ordered = start_order(active, excl)
-      batched_running = []
-      for p in ordered:
-        try:
-          dec = choose_gpus(p, width, gpus, batched_running, excl)
-          json.dumps(dec.as_dict())
-          self.assertTrue(dec.rule)
-          self.assertTrue(dec.detail["candidates"])
-          self.assertEqual(len(dec.choice), width)
-          self.assertEqual(dec.choice, list(range(dec.choice[0], dec.choice[0] + width)))
-          batched_running.append(RunningPool(p, dec.choice))
-        except ValueError:
-          pass
-
-      for running, current_excl in [(batched_running, excl), (streaming_running, streaming_excl)]:
-        parsed = [(r, PoolName.parse(r.pool), set(r.gpus)) for r in running]
-        trainers = {
-          g
-          for p, _, gs in parsed
-          if p.pool not in current_excl and PoolName.parse(p.pool).role == "trainer"
-          for g in gs
-        }
-        samplers = {
-          g
-          for p, _, gs in parsed
-          if p.pool not in current_excl and PoolName.parse(p.pool).role == "sampler"
-          for g in gs
-        }
-
-        if gpus >= 2 * width:
-          for r1, p1, gs1 in parsed:
-            for r2, p2, gs2 in parsed:
-              if r1.pool != r2.pool and p1.pairs_with(p2):
-                self.assertTrue(gs1.isdisjoint(gs2))
-
-        z = gpu_zones(gpus, width)
-        if z.partitioned and not current_excl:
+      for running, current_excl in [(batched, excl), (streaming, streaming_excl)]:
+        gpu_of = {pool: gpus_[0] for pool, gpus_ in running.items()}
+        if gpus >= 2:
+          for a in running:
+            for b in running:
+              ka, kb = parse_pool(a), parse_pool(b)
+              if a != b and ka[0] != kb[0] and ka[1:] == kb[1:]:
+                self.assertNotEqual(gpu_of[a], gpu_of[b], (a, b))  # a pool's trainer and sampler never share
+        if gpus >= 2 and not current_excl:
+          trainers = {gpu_of[p] for p in running if parse_pool(p)[0] == "trainer"}
+          samplers = {gpu_of[p] for p in running if parse_pool(p)[0] == "sampler"}
           self.assertTrue(trainers.isdisjoint(samplers))
-          for role, z_bounds in [("trainer", z.trainer), ("sampler", z.sampler)]:
-            z0, z1 = z_bounds
-            if (z1 - z0) >= 3 * width:
-              split = z0 + max(width, ((2 * (z1 - z0)) // 3 // width) * width)
-              shared_pools = {p.pool for p, pool, _ in parsed if pool.role == role and pool.shared}
-              timesliced_pools = {
-                p.pool for p, pool, _ in parsed if pool.role == role and not pool.shared and p.pool not in current_excl
-              }
-              if len(shared_pools) <= (split - z0) // width:
-                shared_gpus = {g for p, pool, gs in parsed if p.pool in shared_pools for g in gs}
-                timesliced_gpus = {g for p, pool, gs in parsed if p.pool in timesliced_pools for g in gs}
-                self.assertTrue(shared_gpus.isdisjoint(timesliced_gpus))
+          for role in ("trainer", "sampler"):
+            z0, z1 = zone(role, gpus)
+            if z1 - z0 >= 3:
+              split = z0 + max(1, 2 * (z1 - z0) // 3)
+              shared = {p for p in running if parse_pool(p)[0] == role and parse_pool(p)[1]}
+              timesliced = {p for p in running if parse_pool(p)[0] == role and not parse_pool(p)[1]}
+              if len(shared) <= split - z0:
+                self.assertTrue({gpu_of[p] for p in shared}.isdisjoint({gpu_of[p] for p in timesliced}))
 
 
 if __name__ == "__main__":

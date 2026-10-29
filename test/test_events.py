@@ -2,6 +2,7 @@ import json
 from unittest.mock import patch
 
 from test.helpers import RedisTest, new_id, tiny
+from test.test_scheduler import check
 from tinyrl import scheduler
 from tinyrl.bus import Op, Run
 from tinyrl.sampler import Sampler
@@ -59,4 +60,4 @@ class TestEvents(RedisTest):
     s = scheduler.State()
     for e in events:
       s = scheduler.fold(s, e)
-    self.assertEqual(scheduler.check(s), [])
+    self.assertEqual(check(s), [])

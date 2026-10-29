@@ -85,7 +85,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     from tinyrl import scheduler
 
     await self.running(placed)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus, scheduler.Policy(quantum=quantum))))
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus, quantum)))
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:

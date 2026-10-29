@@ -80,13 +80,13 @@ async def pool_for(bus: Bus, run: str, base_model: str, rank: int, metadata: dic
   exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
   shards = [p for p in await bus.pools() if p.startswith(f"lora:{base_model}:")]
   loads = await bus.loads(shards)
-  shard_loads = [scheduler.ShardLoad(p, u, placed, runs) for p, (u, placed, runs) in zip(shards, loads)]
+  shard_loads = [(pool, *load) for pool, load in zip(shards, loads)]
   gpus = await bus.gpus()
   dec = scheduler.choose_pool(run, base_model, rank, exclusive, shard_loads, gpus, TARGET_UTIL, NEW_RUN_UTIL)
-  await bus.decide("run", run, dec.as_dict())
-  if dec.choice != run:
-    await bus.placed(dec.choice)
-  return dec.choice
+  await bus.decide("run", run, dec)
+  if dec["choice"] != run:
+    await bus.placed(dec["choice"])
+  return dec["choice"]
 
 
 def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
@@ -129,10 +129,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
     exclusive = train_run in await bus.exclusive() if train_run else False
     dec = scheduler.choose_sampler_pool(base, lora, train_run, exclusive)
-    await bus.warm_sampler(dec.choice, base, exclusive=exclusive)
+    await bus.warm_sampler(dec["choice"], base, exclusive=exclusive)
     sid = f"samp-{uuid.uuid4().hex[:12]}"
-    await bus.decide("run", sid, dec.as_dict())
-    await bus.create(Run(sid, dec.choice, base, int(lora), session_id, model_path=uri, exclusive=exclusive))
+    await bus.decide("run", sid, dec)
+    await bus.create(Run(sid, dec["choice"], base, int(lora), session_id, model_path=uri, exclusive=exclusive))
     return sid
 
   # ***** service *****
@@ -250,7 +250,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     if train["base"]:
       excl = req.model_id in await bus.exclusive()
       dec = scheduler.choose_sampler_pool(train["base"], train["rank"] > 0, req.model_id, excl)
-      await bus.warm_sampler(dec.choice, train["base"], exclusive=excl)
+      await bus.warm_sampler(dec["choice"], train["base"], exclusive=excl)
     return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri}, req.seq_id)
 
   @api.post("/api/v1/load_weights")

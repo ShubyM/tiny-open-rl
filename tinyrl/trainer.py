@@ -597,8 +597,8 @@ class Trainer:
 
   @contextlib.asynccontextmanager
   async def acquire(self, queued: int):
-    """Hold the GPU for a batch: wait for this trainer's turn and bring its tensors back, and after the batch give the
-    turn back if the scheduler revoked it."""
+    """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back
+    after the batch if the scheduler revoked it."""
     if await self.turn.take(queued):
       await asyncio.to_thread(self.model.resume)
     try:

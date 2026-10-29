@@ -105,7 +105,7 @@ class Event:
   """An entry of the log, tinyrl:events. See scheduler.py."""
 
   id: str  # the stream id, <ms>-<n>
-  t: float  # log time: the ms part of the id, in seconds
+  t: float  # seconds, from the ms part of the id
   kind: str
   body: dict
 
@@ -434,10 +434,9 @@ class Bus:
     ]
     return {"live": True, "queued": groups[0]["lag"], "in_flight": in_flight}
 
-  # ***** events: the log placement and GPU turns are decided from, see scheduler.py *****
+  # ***** events *****
 
   async def emit(self, _kind: str, **body) -> str:
-    """Append an entry to the log. Returns its stream id."""
     entry_id = await self.r.xadd(
       key("events"), {"kind": _kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
     )

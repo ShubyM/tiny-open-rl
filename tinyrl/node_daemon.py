@@ -59,7 +59,7 @@ class NodeDaemon:
 
   async def tick(self) -> None:
     await self.bus.heartbeat(self.id, self.gpus)
-    if await self.bus.log_size() < self.state.n:  # Redis was flushed: start over
+    if await self.bus.log_size() < self.state.n:  # the log shrank, so Redis was flushed
       self.state, self.after = scheduler.State(), "0-0"
     while events := await self.bus.events(self.after):
       for e in events:

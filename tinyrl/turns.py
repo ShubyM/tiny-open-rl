@@ -20,7 +20,7 @@ class GpuTurn:
   def __init__(self, bus: Bus, pool: str, shared: bool):
     self.bus, self.pool, self.shared = bus, pool, shared
     self.held = not shared  # with no GPU to share there is nothing to take turns on
-    self.idle = False  # reported idle since the last batch
+    self.idle = False
     self.after: str | None = None  # the last log entry read. None until its first ask, so it never reads older ones
 
   async def take(self, queued: int) -> bool:

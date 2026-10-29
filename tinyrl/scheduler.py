@@ -19,81 +19,23 @@ import json
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Generic, Literal, TypeVar
 
 from tinyrl.bus import Bus, Event, key
 from tinyrl.helpers import getenv
 
-# ***** pools: which pool a run joins, and which GPUs and settings a pool gets *****
-
-T = TypeVar("T")
+# ***** pools *****
 
 
-@dataclasses.dataclass(frozen=True)
-class PoolName:
-  name: str
-  role: Literal["trainer", "sampler"]
-  shared: bool
-  target: str
-
-  @classmethod
-  def parse(cls, name: str) -> PoolName:
-    if name.startswith("lora:"):
-      body = name.removeprefix("lora:")
-      target = body.rsplit(":", 1)[0] if ":" in body and body.rsplit(":", 1)[1].isdigit() else body
-      return cls(name, "trainer", True, target)
-    if name.startswith(("sampler:fft:", "sampler:lora:")):
-      return cls(name, "sampler", False, name.split(":", 2)[2])
-    if name.startswith("sampler:"):
-      return cls(name, "sampler", True, name.removeprefix("sampler:"))
-    return cls(name, "trainer", False, name)
-
-  def pairs_with(self, other: PoolName) -> bool:
-    return self.role != other.role and self.shared == other.shared and self.target == other.target
-
-
-@dataclasses.dataclass(frozen=True)
-class Decision(Generic[T]):
-  choice: T
-  rule: str
-  detail: dict[str, Any]
-
-  def as_dict(self) -> dict[str, Any]:
-    return {"choice": self.choice, "rule": self.rule, **self.detail}
-
-
-@dataclasses.dataclass(frozen=True)
-class ShardLoad:
-  pool: str
-  util: float | None
-  placed: int
-  runs: int
-
-
-@dataclasses.dataclass(frozen=True)
-class RunningPool:
-  pool: str
-  gpus: list[int]
-
-
-@dataclasses.dataclass(frozen=True)
-class Zones:
-  trainer: tuple[int, int]
-  sampler: tuple[int, int]
-  partitioned: bool
-
-
-@dataclasses.dataclass(frozen=True, order=True)
-class BlockRank:
-  paired_overlap: int
-  out_of_zone: bool
-  exclusive_overlap: int
-  in_reserved: bool
-  out_of_subzone: bool
-  cross_role_overlap: int
-  shared_overlap: int
-  gpu_load: int
-  tie: int
+def parse_pool(pool: str) -> tuple[str, bool, str]:
+  """A pool's role (trainer or sampler), whether it serves many runs, and the model it serves, read from its name."""
+  if pool.startswith("lora:"):
+    body = pool.removeprefix("lora:")
+    return "trainer", True, body.rsplit(":", 1)[0] if ":" in body and body.rsplit(":", 1)[1].isdigit() else body
+  if pool.startswith(("sampler:fft:", "sampler:lora:")):
+    return "sampler", False, pool.split(":", 2)[2]
+  if pool.startswith("sampler:"):
+    return "sampler", True, pool.removeprefix("sampler:")
+  return "trainer", False, pool
 
 
 def choose_pool(
@@ -101,78 +43,60 @@ def choose_pool(
   base_model: str,
   rank: int,
   exclusive: bool,
-  shards: list[ShardLoad],
+  shards: list[tuple[str, float | None, int, int]],
   gpus: int,
   target_util: float = 0.7,
   new_run_util: float = 0.04,
-) -> Decision[str]:
+) -> dict:
+  """The pool a new training run joins, with the rule and numbers behind it. A shard is (pool, its last reported busy
+  fraction or None, runs placed on it since, runs)."""
   if rank == 0:
-    return Decision(run, "dedicated_fft", {"base": base_model, "rank": rank})
+    return {"choice": run, "rule": "dedicated_fft", "base": base_model, "rank": rank}
   if exclusive:
-    return Decision(run, "dedicated_exclusive", {"base": base_model, "rank": rank})
-
-  ordered = sorted(shards, key=lambda s: int(s.pool.rsplit(":", 1)[1]))
-  measured = [(s.util, s.runs - s.placed) for s in ordered if s.util is not None and s.runs > s.placed]
+    return {"choice": run, "rule": "dedicated_exclusive", "base": base_model, "rank": rank}
+  ordered = sorted(shards, key=lambda shard: int(shard[0].rsplit(":", 1)[1]))
+  measured = [(util, runs - placed) for _, util, placed, runs in ordered if util is not None and runs > placed]
   per_run = sum(u for u, _ in measured) / sum(n for _, n in measured) if measured else new_run_util
-
-  scores = [(s.util or 0.0) + s.placed * per_run for s in ordered]
-  detail = {
-    "base": base_model,
-    "rank": rank,
-    "per_run": per_run,
-    "target_util": target_util,
-    "gpus": gpus,
-    "scores": {s.pool: round(sc, 4) for s, sc in zip(ordered, scores)},
-  }
-
+  scores = [(util or 0.0) + placed * per_run for _, util, placed, _ in ordered]
+  detail = {"base": base_model, "rank": rank, "per_run": per_run, "target_util": target_util, "gpus": gpus}
+  detail["scores"] = {shard[0]: round(score, 4) for shard, score in zip(ordered, scores)}
   if scores and min(scores) < target_util:
-    return Decision(ordered[scores.index(min(scores))].pool, "reuse_shard_under_target", detail)
-  elif len(ordered) >= max(1, gpus):
-    return Decision(ordered[scores.index(min(scores))].pool, "reuse_shard_at_gpu_cap", detail)
-  else:
-    return Decision(f"lora:{base_model}:{len(ordered)}", "open_new_shard", detail)
+    return {"choice": ordered[scores.index(min(scores))][0], "rule": "reuse_shard_under_target", **detail}
+  if len(ordered) >= max(1, gpus):
+    return {"choice": ordered[scores.index(min(scores))][0], "rule": "reuse_shard_at_gpu_cap", **detail}
+  return {"choice": f"lora:{base_model}:{len(ordered)}", "rule": "open_new_shard", **detail}
 
 
-def choose_sampler_pool(
-  base_model: str, lora: bool, train_run: str | None = None, exclusive: bool = False
-) -> Decision[str]:
+def choose_sampler_pool(base_model: str, lora: bool, train_run: str | None = None, exclusive: bool = False) -> dict:
   detail = {"base": base_model, "train_run": train_run, "exclusive": exclusive}
+  if not lora and (exclusive or not base_model):
+    return {"choice": f"sampler:fft:{train_run}", "rule": "dedicated_fft_sampler", **detail}
   if not lora:
-    if exclusive or not base_model:
-      return Decision(f"sampler:fft:{train_run}", "dedicated_fft_sampler", detail)
-    return Decision(f"sampler:fft:{base_model}", "shared_fft_sampler", detail)
+    return {"choice": f"sampler:fft:{base_model}", "rule": "shared_fft_sampler", **detail}
   if exclusive:
-    return Decision(f"sampler:lora:{train_run}", "dedicated_exclusive_sampler", detail)
-  return Decision(f"sampler:{base_model}", "shared_lora_sampler", detail)
+    return {"choice": f"sampler:lora:{train_run}", "rule": "dedicated_exclusive_sampler", **detail}
+  return {"choice": f"sampler:{base_model}", "rule": "shared_lora_sampler", **detail}
 
 
 def start_order(pools: Iterable[str], exclusive: set[str] = frozenset()) -> list[str]:
+  """Exclusive pools first, so they get their reserved GPUs, then pools that serve many runs, then trainers."""
   return sorted(
-    pools,
-    key=lambda name: (
-      name not in exclusive,
-      not PoolName.parse(name).shared,
-      PoolName.parse(name).role == "sampler",
-      name,
-    ),
+    pools, key=lambda pool: (pool not in exclusive, not parse_pool(pool)[1], parse_pool(pool)[0] == "sampler", pool)
   )
 
 
-def gpu_zones(gpus: int, width: int) -> Zones:
-  half = (gpus // 2 // width) * width
-  total = (gpus // width) * width
-  if half >= width:
-    return Zones((0, half), (half, total), True)
-  else:
-    return Zones((0, gpus), (0, gpus), False)
+def zone(role: str, gpus: int) -> tuple[int, int]:
+  """The GPUs a role prefers on a node: trainers the lower half, samplers the upper half, both the one GPU of a 1-GPU
+  node."""
+  half = gpus // 2
+  return (0, gpus) if half == 0 else (0, half) if role == "trainer" else (half, gpus)
 
 
 def settings(pool: str, gpus: int, gpu_mib: int, exclusive: set[str] = frozenset()) -> dict[str, str]:
-  """The environment a pool's process starts with, on a node with `gpus` GPUs of `gpu_mib` MiB each."""
   env = {}
-  if PoolName.parse(pool).role != "sampler":
+  if parse_pool(pool)[0] != "sampler":
     return env
-  if gpu_zones(gpus, 1).partitioned:
+  if gpus >= 2:  # samplers have GPUs of their own, so they start their engine before the first command
     env["TINYRL_WARM_SAMPLER"] = "1"
   if gpu_mib >= 65536 and pool.startswith("sampler:fft:") and pool not in exclusive:
     env.update(TINYRL_GPU_MEM="0.42", TINYRL_KV_BYTES=str(16 * 1024**3))
@@ -181,116 +105,63 @@ def settings(pool: str, gpus: int, gpu_mib: int, exclusive: set[str] = frozenset
   return env
 
 
-def choose_gpus(
-  pool: str, width: int, gpus: int, running: list[RunningPool], exclusive: set[str] = frozenset()
-) -> Decision[list[int]]:
-  if not (1 <= width <= gpus):
-    raise ValueError(f"invalid width {width} for {gpus} gpus")
-
-  target = PoolName.parse(pool)
-  zones = gpu_zones(gpus, width)
-  is_excl = pool in exclusive
-  z0, z1 = zones.trainer if target.role == "trainer" else zones.sampler
-  blocks = (z1 - z0) // width
-
-  excl_in_role = sum(1 for r in running if r.pool in exclusive and PoolName.parse(r.pool).role == target.role)
-  if is_excl and all(r.pool != pool for r in running):
-    excl_in_role += 1
-
-  if not zones.partitioned or blocks <= 1:
-    excl_range = (z1, z1)
-    sz = (z0, z1)
-  elif blocks == 2:
-    excl_range = (z1 - width, z1) if excl_in_role > 0 else (z1, z1)
-    sz = (z0, z0 + width) if (target.shared and not is_excl) else (z0 + width, z1)
-  elif blocks == 3:
-    excl_range = (z1 - width, z1) if excl_in_role > 0 else (z1, z1)
-    if is_excl:
-      sz = (z1 - width, z1)
-    elif target.shared:
-      sz = (z0, z0 + 2 * width)
+def choose_gpu(
+  pool: str, gpus: int, running: dict[str, tuple[int, ...]], exclusive: set[str] = frozenset()
+) -> tuple[int, str]:
+  """The GPU a pool runs on, given the pools already on the node, and the rule that chose it. Each GPU is ranked by a
+  tuple, most important first: sharing a GPU with this pool's own trainer or sampler, leaving its role's zone, sharing
+  with an exclusive pool, sitting in the exclusive reserve, leaving its subzone, sharing with the other role, sharing
+  with pools that serve many runs, and how many pools it already has."""
+  role, shared, target = parse_pool(pool)
+  excl = pool in exclusive
+  z0, z1 = zone(role, gpus)
+  blocks = z1 - z0
+  excl_in_role = sum(1 for p in running if p in exclusive and parse_pool(p)[0] == role) + (excl and pool not in running)
+  if blocks <= 1:
+    reserve, subzone = (z1, z1), (z0, z1)
+  elif blocks <= 3:
+    reserve = (z1 - 1, z1) if excl_in_role else (z1, z1)
+    if blocks == 2:
+      subzone = (z0, z0 + 1) if shared and not excl else (z0 + 1, z1)
     else:
-      sz = (z0 + 2 * width, z1)
+      subzone = (z1 - 1, z1) if excl else (z0, z0 + 2) if shared else (z0 + 2, z1)
   else:
-    eb = min(blocks, max(1, excl_in_role))
-    excl_range = (z1 - eb * width, z1)
-    rem = (z1 - width) - z0
-    shared_end = z0 + max(width, ((2 * rem) // 3 // width) * width)
-    if is_excl:
-      sz = excl_range
-    elif target.shared:
-      sz = (z0, shared_end)
-    else:
-      sz = (shared_end, z1 - width)
+    reserve = (z1 - min(blocks, max(1, excl_in_role)), z1)
+    shared_end = z0 + max(1, 2 * (z1 - 1 - z0) // 3)
+    subzone = reserve if excl else (z0, shared_end) if shared else (shared_end, z1 - 1)
 
-  parsed_running = [(r, PoolName.parse(r.pool), set(r.gpus)) for r in running]
-  ranks = []
-
-  for first in range(0, gpus - width + 1, width):
-    block = set(range(first, first + width))
-
-    def over(pred, b=block):
-      return sum(len(b & rg) for r, rp, rg in parsed_running if pred(r, rp))
-
-    in_reserved = (not is_excl) and (first < excl_range[1] and first + width > excl_range[0])
-    in_zone = z0 <= first and first + width <= z1
-    out_of_zone = not in_zone
-    out_of_subzone = not (sz[0] <= first and first + width <= sz[1])
-    tie = -first if is_excl else first
-
-    rank = BlockRank(
-      paired_overlap=over(lambda _, rp: target.pairs_with(rp)),
-      out_of_zone=out_of_zone,
-      exclusive_overlap=over(lambda r, _: r.pool in exclusive),
-      in_reserved=in_reserved,
-      out_of_subzone=out_of_subzone,
-      cross_role_overlap=over(lambda _, rp: rp.role != target.role),
-      shared_overlap=over(lambda _, rp: rp.shared),
-      gpu_load=over(lambda _, __: True),
-      tie=tie,
+  def rank(gpu: int) -> tuple:
+    on = [parse_pool(p) + (p,) for p, on_gpus in running.items() if gpu in on_gpus]
+    return (
+      sum(r != role and s == shared and t == target for r, s, t, _ in on),
+      not z0 <= gpu < z1,
+      sum(p in exclusive for *_, p in on),
+      not excl and reserve[0] <= gpu < reserve[1],
+      not subzone[0] <= gpu < subzone[1],
+      sum(r != role for r, *_ in on),
+      sum(s for _, s, *_ in on),
+      len(on),
+      -gpu if excl else gpu,
     )
-    ranks.append((rank, first))
 
-  winner_rank, winner_first = min(ranks, key=lambda x: x[0])
-
-  if (
-    is_excl and excl_range[1] > excl_range[0] and not winner_rank.out_of_subzone and winner_rank.exclusive_overlap == 0
-  ):
-    rule = "reserved_exclusive"
-  elif (
-    not winner_rank.in_reserved
-    and not winner_rank.out_of_zone
-    and not winner_rank.out_of_subzone
-    and winner_rank.gpu_load == 0
-  ):
-    rule = "solo_in_zone"
-  elif not winner_rank.in_reserved and not winner_rank.out_of_zone and not winner_rank.out_of_subzone:
-    rule = "timesliced_in_subzone" if not target.shared else "least_loaded_in_zone"
-  else:
-    rule = "overflow_least_penalty"
-
-  detail = {
-    "role": target.role,
-    "shared": target.shared,
-    "exclusive": is_excl,
-    "width": width,
-    "zones": dataclasses.asdict(zones),
-    "subzone": list(sz),
-    "reserved": list(excl_range),
-    "candidates": {
-      f"{f}..{f + width - 1}" if width > 1 else str(f): {**dataclasses.asdict(r), "first": f} for r, f in ranks
-    },
-  }
-  return Decision(list(range(winner_first, winner_first + width)), rule, detail)
+  gpu = min(range(gpus), key=rank)
+  _, out_of_zone, excl_overlap, in_reserve, out_of_subzone, _, _, load, _ = rank(gpu)
+  if excl and reserve[1] > reserve[0] and not out_of_subzone and not excl_overlap:
+    return gpu, "reserved_exclusive"
+  if not (in_reserve or out_of_zone or out_of_subzone):
+    return gpu, "solo_in_zone" if load == 0 else "least_loaded_in_zone" if shared else "timesliced_in_subzone"
+  return gpu, "overflow_least_penalty"
 
 
-# ***** state: what the log says *****
+# ***** state *****
 
 Key = tuple[str, int]  # (node, GPU index)
 
+QUANTUM = getenv("QUANTUM", 30.0)  # seconds a busy holder keeps its GPUs while others wait, engine boot aside
+
 RULES = {
   "place.least_loaded_node": "a pool with runs, or a warm sampler, goes to the node with the fewest pools per GPU, on "
-  "the GPUs choose_gpus picks and with settings",
+  "the GPU choose_gpu picks and with settings",
   "place.emptied": "a pool with no runs and no warm sampler is unplaced, which stops its process",
   "turn.granted": "a pool that asked gets its GPUs once it is first in line on each and fits next to their holders",
   "turn.idle_holder_yields": "a holder that found no commands gives its GPUs back as soon as someone waits for one",
@@ -298,21 +169,16 @@ RULES = {
 }
 
 
-@dataclass(frozen=True)
-class Policy:
-  quantum: float = getenv("QUANTUM", 30.0)  # seconds of its turn a busy holder keeps while others wait, boot aside
-
-
 @dataclass
 class Pool:
   runs: tuple[str, ...] = ()
   warm: bool = False  # a sampler kept running without runs, so a run's first sample doesn't wait for its engine
   exclusive: bool = False
-  node: str | None = None  # where it is placed, None until it is
+  node: str | None = None  # None until it is placed
   gpus: tuple[int, ...] = ()
   memory: int = 0  # bytes it uses on each of its GPUs while it holds them, 0 if unknown
-  env: dict[str, str] = field(default_factory=dict)  # settings its process starts with
-  running: bool = False  # its process started and has not exited
+  env: dict[str, str] = field(default_factory=dict)
+  running: bool = False
   asked: int = 0  # its place in line, the entry count when it asked. 0 while not waiting
   since: float | None = None  # when its turn started, pushed back by engine boot. None while it holds no GPU
   revoked: bool = False  # told to give its GPUs back
@@ -321,7 +187,7 @@ class Pool:
 
 @dataclass
 class State:
-  policy: Policy = Policy()
+  quantum: float = QUANTUM
   n: int = 0  # entries folded
   nodes: dict[str, tuple[int, int]] = field(default_factory=dict)  # node -> (GPUs, bytes per GPU)
   pools: dict[str, Pool] = field(default_factory=dict)
@@ -351,7 +217,7 @@ def stop(p: Pool) -> None:
   p.running, p.asked, p.since, p.revoked, p.idle = False, 0, None, False, False
 
 
-# ***** fold: what an entry changes *****
+# ***** fold *****
 
 
 def fold(state: State, e: Event) -> State:
@@ -411,7 +277,7 @@ def fold(state: State, e: Event) -> State:
   return s
 
 
-# ***** decide: what the scheduler appends next *****
+# ***** decide *****
 
 
 def decide(state: State, now: float) -> list[tuple[str, dict]]:
@@ -441,7 +307,7 @@ def next_decision(s: State, now: float) -> tuple[str, dict] | None:
       continue
     if p.idle:
       return "revoked", {"pool": name, "rule": "turn.idle_holder_yields"}
-    if now >= p.since + s.policy.quantum:
+    if now >= p.since + s.quantum:
       return "revoked", {"pool": name, "rule": "turn.quantum_expired"}
   return None
 
@@ -450,37 +316,11 @@ def place(s: State, name: str, exclusive: set[str]) -> dict:
   load = {n: sum(p.node == n for p in s.pools.values()) / gpus for n, (gpus, _) in s.nodes.items()}
   node = min(sorted(load), key=load.get)
   gpus, gpu_bytes = s.nodes[node]
-  running = [RunningPool(q, list(p.gpus)) for q, p in sorted(s.pools.items()) if p.node == node]
-  chosen = choose_gpus(name, 1, gpus, running, exclusive)
+  gpu, gpu_rule = choose_gpu(name, gpus, {q: p.gpus for q, p in s.pools.items() if p.node == node}, exclusive)
   env = settings(name, gpus, gpu_bytes // 2**20, exclusive)
   memory = int(float(env.get("TINYRL_GPU_MEM", 0)) * gpu_bytes)
-  body = {"pool": name, "node": node, "gpus": chosen.choice, "memory": memory, "env": env}
-  return {**body, "rule": "place.least_loaded_node", "gpu_rule": chosen.rule}
-
-
-def check(s: State) -> list[str]:
-  """Every broken invariant, as one message each. Empty means the state is sound."""
-  bad = []
-  for node, (gpus, gpu) in sorted(s.nodes.items()):
-    for k in [(node, i) for i in range(gpus)]:
-      held = holders(s, k)
-      memory = [s.pools[n].memory for n in held]
-      if len(held) > 1 and not (gpu and all(memory) and sum(memory) <= gpu):
-        bad.append(f"{k} has holders that do not fit together")
-  for name, p in sorted(s.pools.items()):
-    if p.node is not None and p.node not in s.nodes:
-      bad.append(f"{name} is placed on {p.node}, which is not up")
-    if p.running and p.node is None:
-      bad.append(f"{name} runs but is not placed")
-    if p.asked and p.since is not None:
-      bad.append(f"{name} holds its GPUs and waits for them")
-    if p.revoked and p.since is None:
-      bad.append(f"{name} is revoked but holds nothing")
-  return bad
-
-
-def to_json(s: State) -> str:
-  return json.dumps(dataclasses.asdict(s), sort_keys=True)
+  body = {"pool": name, "node": node, "gpus": [gpu], "memory": memory, "env": env}
+  return {**body, "rule": "place.least_loaded_node", "gpu_rule": gpu_rule}
 
 
 # ***** the loop *****
@@ -489,11 +329,11 @@ TICK_MS = getenv("TICK_MS", 100)  # how long it waits for an entry before it che
 BATCH = 10_000  # entries read at once. It decides only once a read comes back short, so never from half the log
 
 
-async def run(bus: Bus, policy: Policy = Policy()) -> None:
-  state, after = State(policy=policy), "0-0"
+async def run(bus: Bus, quantum: float = QUANTUM) -> None:
+  state, after = State(quantum=quantum), "0-0"
   while True:
-    if await bus.log_size() < state.n:  # Redis was flushed: start over
-      state, after = State(policy=policy), "0-0"
+    if await bus.log_size() < state.n:  # the log shrank, so Redis was flushed
+      state, after = State(quantum=quantum), "0-0"
     events = await bus.events(after, count=BATCH, block_ms=TICK_MS)
     for e in events:
       state = fold(state, e)
@@ -507,7 +347,7 @@ async def run(bus: Bus, policy: Policy = Policy()) -> None:
     for kind, body in decide(state, time.time()):
       await bus.emit(kind, **body)  # folded when it is read back on the next pass
     if events:
-      await bus.r.set(key("state"), to_json(state))
+      await bus.r.set(key("state"), json.dumps(dataclasses.asdict(state), sort_keys=True))
 
 
 if __name__ == "__main__":

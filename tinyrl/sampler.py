@@ -243,8 +243,8 @@ class Sampler:
 
   @contextlib.asynccontextmanager
   async def acquire(self, queued: int):
-    """Hold the GPU for a batch: wait for this sampler's turn and wake its engine, and after the batch give the turn
-    back if the scheduler revoked it."""
+    """Hold the GPU for one batch. Waits for this sampler's turn and wakes its engine, then gives the turn back after
+    the batch if the scheduler revoked it."""
     if await self.turn.take(queued) and self.engine:
       await self.engine.wake()
     try:
