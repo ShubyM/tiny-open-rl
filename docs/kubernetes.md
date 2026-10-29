@@ -93,10 +93,9 @@ change without touching scheduling. What's new, and who writes it:
 | `tinyrl:ckpt:<run>` | hash `{<kind>/<name>: ref}` mapping `tinker://` URIs to immutable `ref`s | `Bus.finish`, under the pool's lease | trainers, samplers |
 | `tinyrl:loc:<ref>` | string with TTL: peer address of a node daemon holding `<ref>` in `/dev/shm` | the node daemon that staged `<ref>` | any trainer or sampler calling `store.get` |
 | `tinyrl:owner:<pool>` | string with a 10 s TTL: the lease | the trainer that holds it | trainers, scheduler, gateway |
-| `tinyrl:place:<pool>` | string: a node daemon id and its GPU indexes, like `<node>/0,1` | scheduler | node daemons |
 | `tinyrl:node:<id>` | hash `{gpus, gpu_bytes, host_bytes, gpu_model, tier, addr, draining}` with a 30 s TTL; `tier` is `reserved` or `burst`, from a node label | that node daemon | scheduler, store |
-| `tinyrl:events` | stream: the log GPU turns are decided from. Facts like `wants_gpu` and `released`, and the scheduler's decisions, `granted` and `revoked` | node daemons, trainers and samplers append facts; the scheduler appends decisions | the scheduler, trainers, samplers |
-| `tinyrl:state` | JSON: the scheduler's current turn state | the scheduler | gateway |
+| `tinyrl:events` | stream: the log placement and GPU turns are decided from. Facts like `run_created`, `node_up` and `wants_gpu`, and the scheduler's decisions, `placed`, `unplaced`, `granted` and `revoked` | the gateway, node daemons, trainers and samplers append facts; the scheduler appends decisions | the scheduler, node daemons, trainers, samplers |
+| `tinyrl:state` | JSON: the scheduler's current state, placements and turns | the scheduler | gateway |
 | `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | counters (built): calls run, time queued, time running | `Bus.finish`, under the pool's lease | scheduler, `GET /metrics` |
 | `gpu_bytes`, `host_bytes` in `tinyrl:run:<run>` | measured state size, so a move's cost is known | the run's trainer | scheduler |
 

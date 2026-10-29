@@ -141,9 +141,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def scheduling():
     return {
       "nodes": await bus.nodes(),
-      "placements": await bus.placements(),
       "exclusive": sorted(await bus.exclusive()),
-      "turns": json.loads(await bus.r.get(key("state")) or "{}"),
+      "state": json.loads(await bus.r.get(key("state")) or "{}"),  # the scheduler's: placements and turns
       "decisions": await bus.decisions(),
     }
 

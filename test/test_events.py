@@ -53,11 +53,9 @@ class TestEvents(RedisTest):
       await sampler.step()
 
     events = await self.bus.events()
+    turns = ("wants_gpu", "granted", "batch_done", "idle")
     for pool in ("lora:tiny:1", "sampler:tiny"):
-      self.assertEqual(
-        [e.kind for e in events if e.body.get("pool") == pool],
-        ["started", "wants_gpu", "granted", "batch_done", "idle"],
-      )
+      self.assertEqual([e.kind for e in events if e.body.get("pool") == pool and e.kind in turns], list(turns))
     s = control.State()
     for e in events:
       s = control.fold(s, e)

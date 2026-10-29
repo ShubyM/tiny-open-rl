@@ -1,9 +1,9 @@
-"""Runs the trainers and samplers placed on this node, on its GPUs.
+"""Runs the trainers and samplers the scheduler placed on this node, on the GPUs it chose.
 
 python -m tinyrl.node_daemon replaces starting `python -m tinyrl.trainer <pool>` by hand. Every node daemon heartbeats
-into Redis. The one holding the scheduler lease places each pool that has runs on the live node daemon with the fewest
-pools per GPU, and moves a dead node daemon's pools to live ones. Each node daemon runs the pools placed on it, each on
-its least used GPU, and stops the ones placed elsewhere. A pool's lease still decides who serves it.
+into Redis and appends node_up when it starts. It folds tinyrl:events like the scheduler does, starts a process for each
+pool placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A
+pool's lease still decides who serves it.
 """
 
 from __future__ import annotations
@@ -17,14 +17,13 @@ import subprocess
 import sys
 import time
 
-from tinyrl import schedule
+from tinyrl import control
 from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
 
 GPUS = getenv("GPUS", 1)
 DRAIN_S = getenv("DRAIN_S", 20.0)  # how long a stopping node daemon waits for its trainers to save their runs
 TICK = getenv("TICK", 0.25)
-SCHEDULER = "scheduler"  # the lease whose holder places pools
 
 
 def gpu_memory_mib() -> int:
@@ -50,73 +49,44 @@ class NodeDaemon:
     self.bus = bus
     self.gpus = gpus
     self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # pool -> (its GPUs, process)
-    self.memory: dict[str, int] = {}  # pool -> GPU bytes it may use while it holds its GPU, 0 if all of it
-    self.decisions = {}
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
+    self.state, self.after = control.State(), "0-0"
+
+  async def up(self) -> None:
+    await self.bus.heartbeat(self.id, self.gpus)  # first, so the scheduler never finds it up without a heartbeat
+    await self.bus.emit("node_up", node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
 
   async def tick(self) -> None:
     await self.bus.heartbeat(self.id, self.gpus)
-    if await self.bus.renew(SCHEDULER, self.id):
-      await self.schedule()
-    else:  # a new scheduler waits a tick, so after a Redis restart every node daemon heartbeats before it judges them
-      await self.bus.own(SCHEDULER, self.id)
-    placed = await self.bus.placements()
-    for pool, (_, proc) in list(self.trainers.items()):
-      if proc.poll() is not None or placed.get(pool) != self.id:  # it exited, or its pool moved or emptied
+    if await self.bus.log_size() < self.state.n:  # Redis was flushed: start over
+      self.state, self.after = control.State(), "0-0"
+    while events := await self.bus.events(self.after):
+      for e in events:
+        self.state = control.fold(self.state, e)
+      self.after = events[-1].id
+    mine = {name: p for name, p in self.state.pools.items() if p.node == self.id and (p.runs or p.warm)}
+    for pool, (gpus, proc) in list(self.trainers.items()):
+      if proc.poll() is not None or pool not in mine or list(mine[pool].gpus) != gpus:
         proc.terminate()
         del self.trainers[pool]
-        self.memory.pop(pool, None)
-        if self.bus:
-          await self.bus.forget_decision("gpu", pool)
-          await self.bus.emit("exited", pool=pool)
-    excl = await self.bus.exclusive() if self.bus else set()
-    to_start = [p for p, n in placed.items() if n == self.id and p not in self.trainers]
-    for pool in schedule.start_order(to_start, excl):
-      width = await self.bus.width(pool) if self.bus else 1
-      self.trainers[pool] = self.start(pool, width, excl)
-      if self.bus:
-        await self.bus.decide("gpu", pool, self.decisions[pool].as_dict())
-        gpus, memory = self.trainers[pool][0], self.memory[pool]
-        await self.bus.emit("started", pool=pool, node=self.id, gpus=gpus, memory=memory)
+        await self.bus.emit("exited", pool=pool)
+    for pool in sorted(set(mine) - set(self.trainers)):
+      self.trainers[pool] = self.start(pool, mine[pool])
+      await self.bus.emit("started", pool=pool, node=self.id)
 
-  async def schedule(self) -> None:
-    nodes, placed = await self.bus.nodes(), await self.bus.placements()
-    pools = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)} | set(await self.bus.warm_samplers())
-    for pool in set(placed) - pools:
-      await self.bus.place(pool, None)
-
-    next_placed, decisions = schedule.place_pools(pools, nodes, placed)
-    for pool, dec in decisions.items():
-      await self.bus.place(pool, next_placed[pool])
-      await self.bus.decide("node", pool, dec.as_dict())
-
-  def start(self, pool: str, width: int = 1, exclusive: set[str] = frozenset()) -> tuple[list[int], subprocess.Popen]:
-    """Start a pool's process on `width` GPUs: the least used block of them, aligned so blocks never straddle."""
-    running = [schedule.RunningPool(p, gpus) for p, (gpus, _) in self.trainers.items()]
-    dec = schedule.choose_gpus(pool, width, self.gpus, running, exclusive)
-    self.decisions[pool] = dec
-    gpus = dec.choice
-    parsed = schedule.Pool.parse(pool)
-    leases = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
-    if parsed.role == "sampler" and schedule.gpu_zones(self.gpus, width).partitioned:
-      env.setdefault("TINYRL_WARM_SAMPLER", "1")
-    if self.gpu_mib >= 65536 and parsed.role == "sampler" and width == 1:
-      if pool.startswith("sampler:fft:") and pool not in exclusive:
-        env.setdefault("TINYRL_GPU_MEM", "0.42")
-        env.setdefault("TINYRL_KV_BYTES", str(16 * 1024**3))
-      else:
-        env.setdefault("TINYRL_KV_BYTES", str(24 * 1024**3))
-    env["GPU"] = leases
-    self.memory[pool] = int(float(env.get("TINYRL_GPU_MEM", 0)) * self.gpu_mib * 2**20)
-    mod = "tinyrl.sampler" if parsed.role == "sampler" else "tinyrl.trainer"
+  def start(self, pool: str, p: control.Pool) -> tuple[list[int], subprocess.Popen]:
+    """Start a pool's process on the GPUs and with the settings it was placed with. This node's environment wins."""
+    gpus = list(p.gpus)
+    env = {**p.env, **os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
+    env["GPU"] = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
+    mod = "tinyrl.sampler" if pool.startswith("sampler:") else "tinyrl.trainer"
     if mod == "tinyrl.trainer":
       env["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
 
   async def serve(self) -> None:
-    await self.bus.emit("node_up", node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
+    await self.up()
     try:
       while True:
         await self.tick()
@@ -128,7 +98,6 @@ class NodeDaemon:
       for _, proc in self.trainers.values():
         with contextlib.suppress(subprocess.TimeoutExpired):
           proc.wait(max(0.0, deadline - time.monotonic()))
-      await self.bus.release(SCHEDULER, self.id)
 
 
 if __name__ == "__main__":

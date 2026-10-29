@@ -1,11 +1,9 @@
-"""GPU turns, decided from one log: tinyrl:events.
+"""Where pools run and whose turn it is on each GPU, decided from one log: tinyrl:events.
 
-Node daemons and workers append facts to the log, what happened. The scheduler folds every entry into a State and
-appends what decide says back to the same log: granted and revoked. A decision changes the state only once it is folded
-from the log, so the state is always fold(log), and replaying the log rebuilds every state the scheduler saw. Each
-decision names the rule in RULES that made it.
-
-Pools are placed by schedule.py. The node daemon reports each process it starts in a started entry.
+The gateway, node daemons and workers append facts to the log, what happened. The scheduler folds every entry into a
+State and appends what decide says back to the same log: placed and unplaced, granted and revoked. A decision changes
+the state only once it is folded from the log, so the state is always fold(log), and replaying the log rebuilds every
+state the scheduler saw. Each decision names the rule in RULES that made it.
 """
 
 from __future__ import annotations
@@ -15,9 +13,14 @@ import dataclasses
 import json
 from dataclasses import dataclass, field
 
+from tinyrl import schedule
+
 Key = tuple[str, int]  # (node, GPU index)
 
 RULES = {
+  "place.least_loaded_node": "a pool with runs, or a warm sampler, goes to the node with the fewest pools per GPU, on "
+  "the GPUs schedule.choose_gpus picks and with schedule.settings",
+  "place.emptied": "a pool with no runs and no warm sampler is unplaced, which stops its process",
   "turn.granted": "a pool that asked gets its GPUs once it is first in line on each and fits next to their holders",
   "turn.idle_holder_yields": "a holder that found no commands gives its GPUs back as soon as someone waits for one",
   "turn.quantum_expired": "a busy holder gives its GPUs back QUANTUM seconds into its turn if someone waits for one",
@@ -39,9 +42,14 @@ class Policy:
 
 @dataclass
 class Pool:
-  node: str
-  gpus: tuple[int, ...]
+  runs: tuple[str, ...] = ()
+  warm: bool = False  # a sampler kept running without runs, so a run's first sample doesn't wait for its engine
+  exclusive: bool = False
+  node: str | None = None  # where it is placed, None until it is
+  gpus: tuple[int, ...] = ()
   memory: int = 0  # bytes it uses on each of its GPUs while it holds them, 0 if unknown
+  env: dict[str, str] = field(default_factory=dict)  # settings its process starts with
+  running: bool = False  # its process started and has not exited
   asked: int = 0  # its place in line, the entry count when it asked. 0 while not waiting
   since: float | None = None  # when its turn started, pushed back by engine boot. None while it holds no GPU
   revoked: bool = False  # told to give its GPUs back
@@ -52,12 +60,12 @@ class Pool:
 class State:
   policy: Policy = Policy()
   n: int = 0  # entries folded
-  gpus: dict[Key, int] = field(default_factory=dict)  # GPU -> bytes, 0 if unknown
-  pools: dict[str, Pool] = field(default_factory=dict)  # pools with a running process
+  nodes: dict[str, tuple[int, int]] = field(default_factory=dict)  # node -> (GPUs, bytes per GPU)
+  pools: dict[str, Pool] = field(default_factory=dict)
 
 
 def keys(p: Pool) -> list[Key]:
-  return [(p.node, i) for i in p.gpus]
+  return [(p.node, i) for i in p.gpus] if p.running else []
 
 
 def holders(s: State, k: Key) -> list[str]:
@@ -71,8 +79,13 @@ def first_in_line(s: State, k: Key) -> str | None:
 
 def fits(s: State, k: Key, name: str) -> bool:
   """A pool joins a GPU's holders if nobody holds it, or if its memory and every holder's are known and fit together."""
-  memory = [s.pools[n].memory for n in (*holders(s, k), name)]
-  return len(memory) == 1 or (s.gpus.get(k, 0) > 0 and all(memory) and sum(memory) <= s.gpus[k])
+  memory, gpu = [s.pools[n].memory for n in (*holders(s, k), name)], s.nodes[k[0]][1]
+  return len(memory) == 1 or (gpu > 0 and all(memory) and sum(memory) <= gpu)
+
+
+def stop(p: Pool) -> None:
+  """Its process is gone, and its turn with it."""
+  p.running, p.asked, p.since, p.revoked, p.idle = False, 0, None, False, False
 
 
 # ***** fold: what an entry changes *****
@@ -85,14 +98,38 @@ def fold(state: State, e: Event) -> State:
   b = e.body
   p = s.pools.get(b.get("pool", ""))
   match e.kind:
+    case "run_created":
+      q = s.pools.setdefault(b["pool"], Pool())
+      q.runs, q.exclusive = tuple(sorted({*q.runs, b["run"]})), q.exclusive or b.get("exclusive", False)
+    case "run_deleted":
+      for name, q in s.pools.items():
+        q.runs = tuple(r for r in q.runs if r != b["run"])
+        q.warm = q.warm and name not in (f"sampler:fft:{b['run']}", f"sampler:lora:{b['run']}")
+    case "sampler_warmed":
+      q = s.pools.setdefault(b["pool"], Pool())
+      q.warm, q.exclusive = True, q.exclusive or b.get("exclusive", False)
     case "node_up":  # a node daemon (re)started, and its processes died with the old one
-      s.pools = {name: q for name, q in s.pools.items() if q.node != b["node"]}
-      s.gpus.update({(b["node"], i): b.get("memory", 0) for i in range(b["gpus"])})
-    case "started":
-      s.pools[b["pool"]] = Pool(b["node"], tuple(b["gpus"]), b.get("memory", 0))
-    case "exited":
-      s.pools.pop(b["pool"], None)
-    case "wants_gpu" if p:
+      s.nodes[b["node"]] = (b["gpus"], b.get("memory", 0))
+      for q in s.pools.values():
+        if q.node == b["node"]:
+          stop(q)
+    case "node_lost":
+      s.nodes.pop(b["node"], None)
+      for q in s.pools.values():
+        if q.node == b["node"]:
+          stop(q)
+          q.node, q.gpus = None, ()
+    case "placed" if p:  # a new place means a new process, so whatever ran before has lost its turn
+      stop(p)
+      p.node, p.gpus, p.memory, p.env = b["node"], tuple(b["gpus"]), b["memory"], b["env"]
+    case "unplaced" if p:
+      del s.pools[b["pool"]]
+    case "started" if p and p.node == b["node"]:
+      stop(p)
+      p.running = True
+    case "exited" if p:
+      stop(p)
+    case "wants_gpu" if p and p.running:
       p.idle = False
       if p.since is None and not p.asked:
         p.asked = s.n
@@ -116,7 +153,8 @@ def fold(state: State, e: Event) -> State:
 
 def decide(state: State, now: float) -> list[tuple[str, dict]]:
   """The decisions to append now, in order. Each is folded into a copy before the next is chosen, so one call never
-  grants two pools that don't fit together. Once they are folded from the log, deciding again returns none."""
+  grants two pools that don't fit together, or places two pools blind to each other. Once they are folded from the
+  log, deciding again returns none."""
   s, out = state, []
   while d := next_decision(s, now):
     s = fold(s, Event("", now, *d))
@@ -125,6 +163,13 @@ def decide(state: State, now: float) -> list[tuple[str, dict]]:
 
 
 def next_decision(s: State, now: float) -> tuple[str, dict] | None:
+  for name, p in sorted(s.pools.items()):
+    if not (p.runs or p.warm):
+      return "unplaced", {"pool": name, "rule": "place.emptied"}
+  unplaced = [name for name, p in s.pools.items() if p.node is None]
+  if unplaced and s.nodes:
+    exclusive = {name for name, p in s.pools.items() if p.exclusive}
+    return "placed", place(s, schedule.start_order(unplaced, exclusive)[0], exclusive)
   for _, name in sorted((p.asked, name) for name, p in s.pools.items() if p.asked):
     if all(first_in_line(s, k) == name and fits(s, k, name) for k in keys(s.pools[name])):
       return "granted", {"pool": name, "rule": "turn.granted"}
@@ -138,15 +183,32 @@ def next_decision(s: State, now: float) -> tuple[str, dict] | None:
   return None
 
 
+def place(s: State, name: str, exclusive: set[str]) -> dict:
+  load = {n: sum(p.node == n for p in s.pools.values()) / gpus for n, (gpus, _) in s.nodes.items()}
+  node = min(sorted(load), key=load.get)
+  gpus, gpu_bytes = s.nodes[node]
+  running = [schedule.RunningPool(q, list(p.gpus)) for q, p in sorted(s.pools.items()) if p.node == node]
+  chosen = schedule.choose_gpus(name, 1, gpus, running, exclusive)
+  env = schedule.settings(name, gpus, gpu_bytes // 2**20, exclusive)
+  memory = int(float(env.get("TINYRL_GPU_MEM", 0)) * gpu_bytes)
+  body = {"pool": name, "node": node, "gpus": chosen.choice, "memory": memory, "env": env}
+  return {**body, "rule": "place.least_loaded_node", "gpu_rule": chosen.rule}
+
+
 def check(s: State) -> list[str]:
   """Every broken invariant, as one message each. Empty means the state is sound."""
   bad = []
-  for k in sorted(s.gpus):
-    held = holders(s, k)
-    memory = [s.pools[n].memory for n in held]
-    if len(held) > 1 and not (s.gpus[k] and all(memory) and sum(memory) <= s.gpus[k]):
-      bad.append(f"{k} has holders that do not fit together")
+  for node, (gpus, gpu) in sorted(s.nodes.items()):
+    for k in [(node, i) for i in range(gpus)]:
+      held = holders(s, k)
+      memory = [s.pools[n].memory for n in held]
+      if len(held) > 1 and not (gpu and all(memory) and sum(memory) <= gpu):
+        bad.append(f"{k} has holders that do not fit together")
   for name, p in sorted(s.pools.items()):
+    if p.node is not None and p.node not in s.nodes:
+      bad.append(f"{name} is placed on {p.node}, which is not up")
+    if p.running and p.node is None:
+      bad.append(f"{name} runs but is not placed")
     if p.asked and p.since is not None:
       bad.append(f"{name} holds its GPUs and waits for them")
     if p.revoked and p.since is None:
@@ -155,6 +217,4 @@ def check(s: State) -> list[str]:
 
 
 def to_json(s: State) -> str:
-  d = dataclasses.asdict(s)
-  d["gpus"] = [[*k, memory] for k, memory in sorted(s.gpus.items())]
-  return json.dumps(d, sort_keys=True)
+  return json.dumps(dataclasses.asdict(s), sort_keys=True)

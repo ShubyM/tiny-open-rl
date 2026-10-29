@@ -10,7 +10,6 @@ from tinyrl.schedule import (
   choose_pool,
   choose_sampler_pool,
   gpu_zones,
-  place_pools,
   start_order,
 )
 
@@ -86,20 +85,6 @@ class TestSchedule(unittest.TestCase):
     d = choose_sampler_pool("b", True, "r", False)
     self.assertEqual(d.choice, "sampler:b")
     self.assertEqual(d.rule, "shared_lora_sampler")
-
-  def test_place_pools(self):
-    active = {"p1", "p2", "p3"}
-    nodes = {"n1": 4, "n2": 4}
-    placed = {"p1": "n1"}
-    n, decs = place_pools(active, nodes, placed)
-    self.assertEqual(n["p1"], "n1")
-    self.assertEqual(n["p2"], "n2")
-    self.assertEqual(n["p3"], "n1")
-    self.assertEqual(decs["p2"].rule, "least_loaded_node")
-
-    n, decs = place_pools({"p1"}, {"n2": 4}, {"p1": "n1"})
-    self.assertEqual(n["p1"], "n2")
-    self.assertEqual(decs["p1"].rule, "reassigned_from_dead_node")
 
   def test_start_order(self):
     pools = ["lora:b:0", "sampler:b", "run", "sampler:fft:run"]

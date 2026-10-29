@@ -1,4 +1,3 @@
-import collections
 import dataclasses
 from collections.abc import Iterable
 from typing import Any, Generic, Literal, TypeVar
@@ -123,26 +122,6 @@ def choose_sampler_pool(
   return Decision(f"sampler:{base_model}", "shared_lora_sampler", detail)
 
 
-def place_pools(
-  active_pools: set[str], nodes: dict[str, int], placed: dict[str, str]
-) -> tuple[dict[str, str], dict[str, Decision[str]]]:
-  next_placed = {p: n for p, n in placed.items() if p in active_pools}
-  decisions = {}
-
-  for pool in sorted(active_pools):
-    if next_placed.get(pool) not in nodes and nodes:
-      load = collections.Counter(v for v in next_placed.values() if v in nodes)
-      ratios = {n: round(load[n] / g, 4) for n, g in nodes.items()}
-      winner = min(nodes, key=lambda n: load[n] / nodes[n])
-      next_placed[pool] = winner
-      rule = "reassigned_from_dead_node" if placed.get(pool) else "least_loaded_node"
-      decisions[pool] = Decision(
-        winner, rule, {"previous": placed.get(pool), "pools_per_gpu": ratios, "node_gpus": dict(nodes)}
-      )
-
-  return next_placed, decisions
-
-
 def start_order(pools: Iterable[str], exclusive: set[str] = frozenset()) -> list[str]:
   return sorted(
     pools,
@@ -157,6 +136,20 @@ def gpu_zones(gpus: int, width: int) -> Zones:
     return Zones((0, half), (half, total), True)
   else:
     return Zones((0, gpus), (0, gpus), False)
+
+
+def settings(pool: str, gpus: int, gpu_mib: int, exclusive: set[str] = frozenset()) -> dict[str, str]:
+  """The environment a pool's process starts with, on a node with `gpus` GPUs of `gpu_mib` MiB each."""
+  env = {}
+  if Pool.parse(pool).role != "sampler":
+    return env
+  if gpu_zones(gpus, 1).partitioned:
+    env["TINYRL_WARM_SAMPLER"] = "1"
+  if gpu_mib >= 65536 and pool.startswith("sampler:fft:") and pool not in exclusive:
+    env.update(TINYRL_GPU_MEM="0.42", TINYRL_KV_BYTES=str(16 * 1024**3))
+  elif gpu_mib >= 65536:
+    env["TINYRL_KV_BYTES"] = str(24 * 1024**3)
+  return env
 
 
 def choose_gpus(

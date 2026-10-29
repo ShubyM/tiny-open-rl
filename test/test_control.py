@@ -1,6 +1,7 @@
 import random
 import unittest
 
+from tinyrl import schedule
 from tinyrl.control import RULES, Event, Policy, State, check, decide, fold, to_json
 
 GIB = 1024**3
@@ -37,10 +38,87 @@ class Log:
     self("node_up", node=node, gpus=gpus, memory=memory)
 
   def pool(self, name: str, gpus: tuple[int, ...] = (0,), memory: int = 0, node: str = "n") -> None:
-    self("started", pool=name, node=node, gpus=list(gpus), memory=memory)
+    """A pool with a run, placed where the test says rather than where decide would, and its process started."""
+    self.append("run_created", {"run": f"{name}-run", "pool": name})
+    self.append("placed", {"pool": name, "node": node, "gpus": list(gpus), "memory": memory, "env": {}, "rule": "test"})
+    self("started", pool=name, node=node)
 
 
 GRANTED, IDLE, QUANTUM = "turn.granted", "turn.idle_holder_yields", "turn.quantum_expired"
+PLACED, EMPTIED = "place.least_loaded_node", "place.emptied"
+MIB = 2**20
+
+
+class TestPlacement(unittest.TestCase):
+  def test_a_pool_with_runs_is_placed_and_an_emptied_one_unplaced(self):
+    log = Log(self)
+    log.node(8)
+    self.assertEqual(log("run_created", run="r1", pool="lora:a:0"), [("placed", "lora:a:0", PLACED)])
+    self.assertEqual(log("run_created", run="r2", pool="lora:a:0"), [])
+    self.assertEqual(log("run_deleted", run="r1", pool="lora:a:0"), [])
+    self.assertEqual(log("run_deleted", run="r2", pool="lora:a:0"), [("unplaced", "lora:a:0", EMPTIED)])
+
+  def test_a_dedicated_sampler_cools_with_its_run(self):
+    log = Log(self)
+    log.node(8)
+    log("run_created", run="r", pool="r")
+    self.assertEqual(log("sampler_warmed", pool="sampler:fft:r"), [("placed", "sampler:fft:r", PLACED)])
+    self.assertEqual(
+      log("run_deleted", run="r", pool="r"), [("unplaced", "r", EMPTIED), ("unplaced", "sampler:fft:r", EMPTIED)]
+    )
+
+  def test_pools_go_to_the_node_with_the_fewest_pools_per_gpu(self):
+    log = Log(self)
+    log.node(1, node="a")
+    log.node(2, node="b")
+    for run in ("r1", "r2", "r3"):
+      log("run_created", run=run, pool=run)
+    self.assertEqual([log.s.pools[run].node for run in ("r1", "r2", "r3")], ["a", "b", "b"])
+
+  def test_a_lost_node_s_pools_move_to_a_live_one(self):
+    log = Log(self)
+    log.node(1, node="a")
+    log("run_created", run="r", pool="r")
+    log("started", pool="r", node="a")
+    log.node(1, node="b")
+    self.assertEqual(log("node_lost", node="a"), [("placed", "r", PLACED)])
+    self.assertEqual((log.s.pools["r"].node, log.s.pools["r"].running), ("b", False))
+
+  def test_each_trainer_gets_the_least_used_gpu(self):
+    log = Log(self)
+    log.node(8)
+    for name in ("lora:a:0", "lora:b:0", "lora:c:0"):
+      log("run_created", run=name, pool=name)
+    self.assertEqual([log.s.pools[n].gpus for n in ("lora:a:0", "lora:b:0", "lora:c:0")], [(0,), (1,), (0,)])
+
+  def test_a_wide_pool_gets_an_aligned_block_of_the_least_used_gpus(self):
+    running = []
+    for name in ("lora:a:0", "lora:tp:0", "lora:b:0"):
+      running.append(schedule.RunningPool(name, schedule.choose_gpus(name, 2, 16, running).choice))
+    self.assertEqual([r.gpus for r in running], [[0, 1], [2, 3], [0, 1]])
+
+  def test_shared_fft_samplers_get_a_memory_budget_on_large_gpus(self):
+    log = Log(self)
+    log.node(8, memory=81559 * MIB)
+    log("sampler_warmed", pool="sampler:fft:Qwen")
+    log("sampler_warmed", pool="sampler:fft:Gemma")
+    log("sampler_warmed", pool="sampler:Qwen")
+    log("sampler_warmed", pool="sampler:fft:Llama", exclusive=True)
+    budget = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}
+    alone = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_KV_BYTES": str(24 * 1024**3)}
+    placed = {name: (p.gpus, p.env) for name, p in log.s.pools.items()}
+    self.assertEqual(
+      placed,
+      {
+        "sampler:fft:Qwen": ((6,), budget),
+        "sampler:fft:Gemma": ((6,), budget),
+        "sampler:Qwen": ((4,), alone),
+        "sampler:fft:Llama": ((7,), alone),
+      },
+    )
+    self.assertEqual(log.s.pools["sampler:fft:Qwen"].memory, int(0.42 * 81559 * MIB))
+    self.assertEqual(schedule.settings("sampler:fft:Qwen", 8, 23034), {"TINYRL_WARM_SAMPLER": "1"})
+    self.assertEqual(schedule.settings("sampler:Qwen", 1, 81559), {"TINYRL_KV_BYTES": str(24 * 1024**3)})
 
 
 class TestTurns(unittest.TestCase):
@@ -132,12 +210,14 @@ class TestTurns(unittest.TestCase):
     log("wants_gpu", pool="a")
     log("wants_gpu", pool="b")
     log.node(1)
-    self.assertEqual(log.s.pools, {})
+    self.assertEqual([(p.running, p.since, p.asked) for p in log.s.pools.values()], [(False, None, 0)] * 2)
+    self.assertEqual({p.node for p in log.s.pools.values()}, {"n"})  # still placed, so its node daemon restarts them
 
 
 class TestLog(unittest.TestCase):
   def random_log(self, rng: random.Random) -> Log:
-    """Random facts, faults included: pools restarting elsewhere, dead workers that never release, node restarts."""
+    """Random facts, faults included: pools restarting elsewhere, dead workers that never release, nodes restarting
+    and lost, runs coming and going."""
     log = Log(self)
     nodes = {f"n{i}": rng.choice([1, 2, 4, 8]) for i in range(rng.choice([1, 1, 2, 4]))}
     for node, gpus in nodes.items():
@@ -145,8 +225,8 @@ class TestLog(unittest.TestCase):
     names = [f"p{i}" for i in range(rng.randint(1, 12))]
     for _ in range(rng.randint(20, 200)):
       name, roll = rng.choice(names), rng.random()
-      if roll < 0.15:
-        node = rng.choice(sorted(nodes))
+      if roll < 0.15 and log.s.nodes:
+        node = rng.choice(sorted(log.s.nodes))
         width = rng.choice([w for w in (1, 2, 4) if w <= nodes[node]])
         first = rng.randrange(0, nodes[node] - width + 1, width)
         log.pool(name, range(first, first + width), rng.choice([0, 20, 40, 90]) * GIB, node)
@@ -163,6 +243,16 @@ class TestLog(unittest.TestCase):
       elif roll < 0.82:
         node = rng.choice(sorted(nodes))
         log.node(nodes[node], node=node)
+      elif roll < 0.84:
+        log("node_lost", node=rng.choice(sorted(nodes)))
+      elif roll < 0.88:
+        log("run_created", run=f"r{rng.randint(0, 20)}", pool=name, exclusive=rng.random() < 0.2)
+      elif roll < 0.92:
+        log("run_deleted", run=f"r{rng.randint(0, 20)}", pool=name)
+      elif roll < 0.94:
+        log("sampler_warmed", pool=f"sampler:{name}")
+      elif roll < 0.97 and (p := log.s.pools.get(name)) and p.node:
+        log("started", pool=name, node=p.node)
       else:
         log("idle", pool=name)
     return log
