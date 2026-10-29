@@ -9,7 +9,6 @@ its least used GPU, and stops the ones placed elsewhere. A pool's lease still de
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextlib
 import os
 import signal
@@ -18,6 +17,7 @@ import subprocess
 import sys
 import time
 
+from tinyrl import schedule
 from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
 
@@ -32,6 +32,7 @@ class NodeDaemon:
     self.bus = bus
     self.gpus = gpus
     self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # pool -> (its GPUs, process)
+    self.decisions = {}
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
 
   async def tick(self) -> None:
@@ -45,31 +46,36 @@ class NodeDaemon:
       if proc.poll() is not None or placed.get(pool) != self.id:  # it exited, or its pool moved or emptied
         proc.terminate()
         del self.trainers[pool]
-    for pool, node in placed.items():
-      if node == self.id and pool not in self.trainers:
-        self.trainers[pool] = self.start(pool, await self.bus.width(pool))
+        if self.bus:
+          await self.bus.forget_decision("gpu", pool)
+    excl = await self.bus.exclusive() if self.bus else set()
+    to_start = [p for p, n in placed.items() if n == self.id and p not in self.trainers]
+    for pool in schedule.start_order(to_start, excl):
+      width = await self.bus.width(pool) if self.bus else 1
+      self.trainers[pool] = self.start(pool, width, excl)
+      if self.bus:
+        await self.bus.decide("gpu", pool, self.decisions[pool].as_dict())
 
   async def schedule(self) -> None:
     nodes, placed = await self.bus.nodes(), await self.bus.placements()
     pools = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)}
     for pool in set(placed) - pools:
       await self.bus.place(pool, None)
-      del placed[pool]
-    for pool in sorted(pools):
-      if placed.get(pool) not in nodes and nodes:
-        load = collections.Counter(placed.values())
-        placed[pool] = min(nodes, key=lambda node: load[node] / nodes[node])
-        await self.bus.place(pool, placed[pool])
 
-  def start(self, pool: str, width: int = 1) -> tuple[list[int], subprocess.Popen]:
+    next_placed, decisions = schedule.place_pools(pools, nodes, placed)
+    for pool, dec in decisions.items():
+      await self.bus.place(pool, next_placed[pool])
+      await self.bus.decide("node", pool, dec.as_dict())
+
+  def start(self, pool: str, width: int = 1, exclusive: set[str] = frozenset()) -> tuple[list[int], subprocess.Popen]:
     """Start a pool's process on `width` GPUs: the least used block of them, aligned so blocks never straddle."""
-    on = [gpu for gpus, _ in self.trainers.values() for gpu in gpus]
-    first = min(range(0, self.gpus - width + 1, width), key=lambda i: sum(map(on.count, range(i, i + width))))
-    gpus = list(range(first, first + width))
-    # processes on one GPU take turns on it, named by host so processes a restarted node daemon left running count too
+    running = [schedule.RunningPool(p, gpus) for p, (gpus, _) in self.trainers.items()]
+    dec = schedule.choose_gpus(pool, width, self.gpus, running, exclusive)
+    self.decisions[pool] = dec
+    gpus = dec.choice
     leases = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus)), "GPU": leases}
-    mod = "tinyrl.sampler" if pool.startswith("sampler:") else "tinyrl.trainer"
+    mod = "tinyrl.sampler" if schedule.Pool.parse(pool).role == "sampler" else "tinyrl.trainer"
     return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
 
   async def serve(self) -> None:

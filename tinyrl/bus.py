@@ -63,6 +63,7 @@ class Run:
   session: str = ""
   model_path: str | None = None
   lora: dict = field(default_factory=dict)  # the LoRA config it was created with, to create it again elsewhere
+  exclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,8 @@ class Bus:
     if run.session:
       p.sadd(key("sess", run.session, "runs"), run.id)
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
+    if run.exclusive:
+      p.sadd(key("excl"), run.id, run.pool)
     await p.execute()
 
   async def run(self, run_id: str) -> dict | None:
@@ -187,7 +190,38 @@ class Bus:
     p = self.r.pipeline(transaction=True)
     p.srem(key("pool", pool), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
+    p.hdel(key("decide", "run"), run_id)
     await p.execute()
+
+  async def exclusive(self) -> set[str]:
+    return {v.decode() for v in await self.r.smembers(key("excl"))}
+
+  async def decide(self, kind: str, subject: str, decision: dict) -> None:
+    await self.r.hset(key("decide", kind), subject, json.dumps(decision))
+
+  async def forget_decision(self, kind: str, subject: str) -> None:
+    await self.r.hdel(key("decide", kind), subject)
+
+  async def decisions(self) -> dict[str, dict[str, dict]]:
+    out = {"run": {}, "node": {}, "gpu": {}}
+    for kind in out:
+      raw = await self.r.hgetall(key("decide", kind))
+      out[kind] = {k.decode(): json.loads(v) for k, v in raw.items()}
+    return out
+
+  async def gpu_fairness(self) -> dict[str, dict]:
+    gpus: set[str] = set()
+    async for owner_key in self.r.scan_iter(key("owner", "gpu:*")):
+      gpus.add(owner_key.decode().removeprefix(key("owner", "gpu:")))
+    async for wait_key in self.r.scan_iter(key("wait", "*")):
+      gpus.add(wait_key.decode().removeprefix(key("wait", "")))
+    fair = {}
+    for gpu in sorted(gpus):
+      owner = await self.owner(f"gpu:{gpu}")
+      waiters = [w.decode() for w in await self.r.zrange(key("wait", gpu), 0, -1)]
+      if owner or waiters:
+        fair[gpu] = {"owner": owner, "waiters": waiters}
+    return fair
 
   # ***** commands *****
 
@@ -402,7 +436,14 @@ class Bus:
     return {k.decode(): v.decode() for k, v in (await self.r.hgetall(key("place"))).items()}
 
   async def place(self, pool: str, node: str | None) -> None:
-    await (self.r.hset(key("place"), pool, node) if node else self.r.hdel(key("place"), pool))
+    p = self.r.pipeline(transaction=True)
+    if node:
+      p.hset(key("place"), pool, node)
+    else:
+      p.hdel(key("place"), pool)
+      p.hdel(key("decide", "node"), pool)
+      p.hdel(key("decide", "gpu"), pool)
+    await p.execute()
 
   # ***** replies *****
 

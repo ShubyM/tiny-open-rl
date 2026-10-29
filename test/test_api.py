@@ -326,6 +326,48 @@ class TestAPI(RedisTest):
     )
     self.assertEqual((await self.post("telemetry", json={"events": []})).json(), {"status": "accepted"})
 
+  async def test_end_to_end_scheduling_inspection_and_cleanup(self):
+    run_id = await self.create_model()
+    excl_id = await self.create_model(user_metadata={"openrl.exclusive": "true"})
+    saved = await self.result(
+      await self.post("save_weights_for_sampler", json={"model_id": excl_id, "sampling_session_seq_id": 0})
+    )
+    samp_id = saved.json()["sampling_session_id"]
+
+    await self.bus.heartbeat("node-1", 8)
+    await self.bus.own("scheduler", "node-1")
+    nodes, placed = await self.bus.nodes(), await self.bus.placements()
+    from tinyrl import schedule
+
+    active = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)}
+    next_placed, decs = schedule.place_pools(active, nodes, placed)
+    for p, dec in decs.items():
+      await self.bus.place(p, next_placed[p])
+      await self.bus.decide("node", p, dec.as_dict())
+
+    res = await self.http.get("/api/v1/scheduling")
+    self.assertEqual(res.status_code, 200)
+    data = res.json()
+    self.assertIn(run_id, data["decisions"]["run"])
+    self.assertIn(excl_id, data["exclusive"])
+    self.assertIn(f"sampler:lora:{excl_id}", data["exclusive"])
+    self.assertEqual(data["decisions"]["run"][samp_id]["rule"], "dedicated_exclusive_sampler")
+    self.assertIn("lora:tiny:0", data["decisions"]["node"])
+    self.assertIn("node-1", data["placements"].values())
+    self.assertIn("node-1", data["nodes"])
+
+    await self.post("delete_model", json={"model_id": run_id})
+    await self.drain(run_id)
+    active = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)}
+    for p in set(data["placements"]) - active:
+      await self.bus.place(p, None)
+
+    res = await self.http.get("/api/v1/scheduling")
+    data = res.json()
+    self.assertNotIn(run_id, data["decisions"]["run"])
+    self.assertNotIn("lora:tiny:0", data["decisions"]["node"])
+    self.assertNotIn("lora:tiny:0", data["placements"])
+
 
 if __name__ == "__main__":
   unittest.main()
