@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import itertools
 import json
 import os
 import signal
@@ -94,8 +95,8 @@ class Sampler:
     self.lora = not pool.startswith("sampler:fft:")
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.names: dict[tuple[str, str], str] = {}  # (uri, version) -> the engine's name for that checkpoint
-    self.done = False
-    self.seated = 0.0  # when this sampler took its GPU's lease, or 0 while it doesn't hold it
+    self.loading = asyncio.Lock()
+    self.done, self.seated = False, 0.0  # seated: when this sampler took its GPU's lease, or 0 while unheld
 
   async def serve(self) -> None:
     await self.own()
@@ -132,21 +133,29 @@ class Sampler:
     for cmd in await self.bus.reclaim(self.pool, self.worker, min_idle_ms):
       await self.bus.finish(cmd, fail(RuntimeError("its sampler died, or lost the pool")), self.pool, self.worker)
 
-  async def step(self, count: int = 16, block_ms: int = 1000) -> int:
+  async def step(self, count: int = 64, block_ms: int = 1000) -> int:
     if self.done:
       return 0
     cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
     if not cmds:
       await self.yield_gpu(idle=True)
       return 0
+
+    async def one(cmd) -> None:
+      start = time.time()
+      first = await self.bus.first_reply(cmd)
+      reply = first or await self.run(cmd.run, json.loads(cmd.body))
+      if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
+        self.done = True
+
     async with self.acquire():
-      for cmd in cmds:
-        start = time.time()
-        first = await self.bus.first_reply(cmd)
-        reply = first or await self.run(cmd.run, json.loads(cmd.body))
-        if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
-          self.done = True
-          break
+      if block_ms:
+        await asyncio.sleep(0.02)
+        cmds += await self.bus.take(self.pool, self.worker, count, 0)
+      batches = [cmds] if self.lora else [list(g) for _, g in itertools.groupby(cmds, lambda c: c.run)]
+      for batch in batches:
+        if not self.done:
+          await asyncio.gather(*(one(c) for c in batch))
     return len(cmds)
 
   async def run(self, session: str, job: dict) -> Reply:
@@ -154,10 +163,11 @@ class Sampler:
       run = await self.bus.run(session)
       if run is None:
         raise ValueError(f"no sampling session {session}")
-      if self.engine is None:
-        self.engine = await self.engine_type.start(run["base"], self.lora)
-      out = await self.engine.sample(job, await self.load(run["model_path"]))
-      return Reply(True, wire.PROTO, encode(job, out))
+      async with self.loading:
+        if self.engine is None:
+          self.engine = await self.engine_type.start(run["base"], self.lora)
+        name = await self.load(run["model_path"])
+      return Reply(True, wire.PROTO, encode(job, await self.engine.sample(job, name)))
     except Exception as e:
       return fail(e)
 
@@ -166,9 +176,11 @@ class Sampler:
     if not uri:
       return None
     path, version = await asyncio.to_thread(self.store.local, uri)  # a checkpoint name can be saved again
-    name = self.names.setdefault((uri, version), f"c{len(self.names)}")
-    await self.engine.load(name, path)
-    return name
+    if (uri, version) not in self.names:
+      name = f"c{len(self.names)}"
+      await self.engine.load(name, path)
+      self.names[(uri, version)] = name
+    return self.names[(uri, version)]
 
   @contextlib.asynccontextmanager
   async def acquire(self):

@@ -143,8 +143,13 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   # ***** service *****
 
   @api.get("/api/v1/healthz")
-  async def healthz():
+  @api.post("/api/v1/sessions/{session_id}/finish")
+  async def healthz(session_id: str = ""):
     return {"status": "ok"}
+
+  @api.post("/api/v1/telemetry")
+  async def telemetry():
+    return {"status": "accepted"}
 
   @api.post("/api/v1/client/config")
   @api.post("/api/v1/client/dynamic_config")

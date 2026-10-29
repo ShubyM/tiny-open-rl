@@ -190,6 +190,77 @@ class TestSampler(RedisTest):
     self.assertIsNone(await self.bus.owner("gpu:node-a:0"))
     self.assertEqual(sampler.engine.calls[-1], ("close",))
 
+  async def test_a_sampler_batches_queued_commands_concurrently_and_loads_once(self):
+    store = Store(tempfile.mkdtemp())
+    store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
+    await self.bus.create(Run("samp-1", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+    active = peak = starts = loads = 0
+
+    class BatchEngine(FakeEngine):
+      @classmethod
+      async def start(cls, base: str, lora: bool):
+        nonlocal starts
+        await asyncio.sleep(0.01)
+        starts += 1
+        return await super().start(base, lora)
+
+      async def load(self, name: str, path: str) -> None:
+        nonlocal loads
+        await asyncio.sleep(0.01)
+        if ("load", name, path) not in self.calls:
+          loads += 1
+        await super().load(name, path)
+
+      async def sample(self, job: dict, name: str | None) -> Out:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return await super().sample(job, name)
+
+    sampler = Sampler(self.bus, "sampler:base", engine=BatchEngine, store=store)
+    await self.own(sampler)
+    ids = [await self.bus.submit("samp-1", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(8)]
+    self.assertEqual(await sampler.step(block_ms=0), 8)
+    self.assertEqual((starts, loads, peak), (1, 1, 8))
+    self.assertTrue(all([(await self.bus.result(i, 1)).ok for i in ids]))
+
+  async def test_vllm_retries_a_dropped_keepalive_socket(self):
+    import httpx
+
+    from tinyrl.vllm import VLLM
+
+    calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+      nonlocal calls
+      calls += 1
+      if calls == 1:
+        raise httpx.ReadError("", request=req)
+      body = {
+        "choices": [
+          {
+            "index": 0,
+            "token_ids": [9],
+            "finish_reason": "stop",
+            "logprobs": {"token_logprobs": [-0.2], "top_logprobs": [{"token_id:9": -0.2}]},
+          }
+        ]
+      }
+      return httpx.Response(200, json=body)
+
+    engine = VLLM(
+      "http://vllm",
+      "base",
+      True,
+      client=httpx.AsyncClient(base_url="http://vllm", transport=httpx.MockTransport(handler)),
+    )
+    out = await engine.sample(JOB, "c0")
+    await engine.close()
+    self.assertEqual(calls, 2)
+    self.assertEqual(out.seqs[0].tokens, [9])
+
 
 if __name__ == "__main__":
   unittest.main()

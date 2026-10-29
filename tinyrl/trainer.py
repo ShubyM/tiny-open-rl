@@ -178,7 +178,11 @@ def lora_targets(lm: PreTrainedModel, config: dict) -> list[str]:
   tied = getattr(lm.config.get_text_config(), "tie_word_embeddings", False)
   if config.get("train_unembed", True) and not tied:
     targets.append("lm_head")
-  return targets
+  return [
+    n
+    for n, m in lm.named_modules()
+    if n.rsplit(".", 1)[-1] in targets and isinstance(getattr(m, "base_layer", m), torch.nn.Linear)
+  ]
 
 
 class Model:
@@ -197,6 +201,10 @@ class Model:
   def create(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
       self.lm, self.base, self.lora = self.load(base), base, rank > 0
+      if hasattr(inner := getattr(self.lm, "model", None), "language_model"):
+        for child, _ in list(inner.named_children()):
+          if child != "language_model":
+            setattr(inner, child, None)
       self.dtype = self.lm.dtype
       if not self.lora:
         self.lm.float()  # a full fine-tune updates fp32 master weights. Its forward pass runs in bf16, under autocast
@@ -266,7 +274,8 @@ class Model:
 
   def optimizer(self, run: str) -> torch.optim.AdamW:
     if run not in self.optimizers:
-      self.optimizers[run] = torch.optim.AdamW(self.params[run].values())
+      params = list(self.params[run].values())
+      self.optimizers[run] = torch.optim.AdamW(params, fused=bool(params and params[0].is_cuda))
     return self.optimizers[run]
 
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
@@ -282,8 +291,12 @@ class Model:
 
     max_norm = adam.get("grad_clip_norm") or math.inf  # 0 means don't clip
     grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run].values(), max_norm).item()
+    if not self.lora:
+      self.move(self.moments(), "cuda")
     optimizer.step()
     optimizer.zero_grad()
+    if not self.lora:
+      self.move(self.moments(), "cpu")
     return {"grad_norm:mean": grad_norm}
 
   def state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
@@ -330,37 +343,42 @@ class Model:
         opt.state[p] = {
           "exp_avg": tensors[f"{name}.exp_avg"].to(p.device, torch.float32),
           "exp_avg_sq": tensors[f"{name}.exp_avg_sq"].to(p.device, torch.float32),
-          "step": tensors[f"{name}.step"].cpu().float(),
+          "step": tensors[f"{name}.step"].to(p.device if opt.defaults.get("fused") else "cpu", torch.float32),
         }
+      if not self.lora:
+        self.move(self.moments(), "cpu")
 
-  def tensors(self):
+  def moments(self):
+    return (v for opt in self.optimizers.values() for s in opt.state.values() for v in s.values() if torch.is_tensor(v))
+
+  def tensors(self, optim: bool = True):
     """Every tensor on the GPU: weights, buffers, gradients between forward_backward and optim_step, AdamW moments."""
     if self.lm is None:
       return
     yield from self.lm.parameters()
     yield from self.lm.buffers()
     yield from (p.grad for p in self.lm.parameters() if p.grad is not None)
-    yield from (
-      v for opt in self.optimizers.values() for s in opt.state.values() for v in s.values() if torch.is_tensor(v)
-    )
+    if optim:
+      yield from self.moments()
 
-  def park(self) -> None:
-    """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume() undoes it."""
-    for t in self.tensors():
-      if t.is_cuda:
-        host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-        t.data = host.copy_(t, non_blocking=True)
-    if torch.cuda.is_available():
-      torch.cuda.synchronize()
-      torch.cuda.empty_cache()
-    self.parked = True
-
-  def resume(self) -> None:
-    for t in self.tensors():
-      if t.is_pinned():  # what park moved. AdamW's step counts live on the cpu anyway
+  def move(self, tensors, device: str) -> None:
+    for t in tensors:
+      if device == "cpu" and t.is_cuda:
+        t.data = torch.empty(t.shape, dtype=t.dtype, pin_memory=True).copy_(t, non_blocking=True)
+      elif device == "cuda" and t.is_pinned():
         t.data = t.data.to("cuda", non_blocking=True)
     if torch.cuda.is_available():
       torch.cuda.synchronize()
+      if device == "cpu":
+        torch.cuda.empty_cache()
+
+  def park(self) -> None:
+    """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume() undoes it."""
+    self.move(self.tensors(), "cpu")
+    self.parked = True
+
+  def resume(self) -> None:
+    self.move(self.tensors(optim=self.lora), "cuda")
     self.parked = False
 
   def delete(self, run: str) -> None:

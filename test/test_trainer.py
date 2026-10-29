@@ -489,6 +489,35 @@ class TestCheckpointNames(unittest.TestCase):
       self.assertIn(f"{module}.weight", names)
     self.assertTrue(any(".language_model.layers." in key for key in tensors))
 
+  def test_gemma4_lora_skips_clippable_vision_and_audio_wrappers(self):
+    from transformers import Gemma4Config, Gemma4ForConditionalGeneration
+
+    cfg = Gemma4Config(
+      text_config={
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "vocab_size": 128,
+        "num_kv_shared_layers": 1,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "hidden_size_per_layer_input": 0,
+      },
+      vision_config={"hidden_size": 16, "intermediate_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2},
+      audio_config={"hidden_size": 16, "num_hidden_layers": 1, "num_attention_heads": 2, "conf_conv_kernel_size": 3},
+    )
+    path = tempfile.mkdtemp()
+    Gemma4ForConditionalGeneration(cfg).save_pretrained(path)
+
+    model, a, b = Model(trainer.load), new_id(), new_id()
+    model.create(a, path, 4, LORA)
+    model.create(b, path, 4, LORA)
+    tensors, _ = model.weights(b)
+    self.assertTrue(tensors)
+    self.assertTrue(all(".language_model." in k for k in tensors))
+
 
 if __name__ == "__main__":
   unittest.main()

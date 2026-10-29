@@ -319,6 +319,13 @@ class TestAPI(RedisTest):
     self.assertEqual(res.status_code, 404)
     self.assertEqual((await self.post("optim_step", json={"model_id": run_id})).status_code, 404)
 
+  async def test_session_finish_and_telemetry_succeed(self):
+    sid = (await self.post("create_session")).json()["session_id"]
+    self.assertEqual(
+      (await self.post(f"sessions/{sid}/finish", json={"reason": {"type": "complete"}})).status_code, 200
+    )
+    self.assertEqual((await self.post("telemetry", json={"events": []})).json(), {"status": "accepted"})
+
 
 if __name__ == "__main__":
   unittest.main()

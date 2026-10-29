@@ -37,7 +37,8 @@ class VLLM:
     server: subprocess.Popen | None = None,
     client: httpx.AsyncClient | None = None,
   ):
-    self.http = client or httpx.AsyncClient(base_url=url, timeout=None)
+    limits = httpx.Limits(max_connections=1024, max_keepalive_connections=256, keepalive_expiry=2.0)
+    self.http = client or httpx.AsyncClient(base_url=url, timeout=None, limits=limits)
     self.base = base
     self.lora = lora
     self.server = server
@@ -49,7 +50,9 @@ class VLLM:
       s.bind(("127.0.0.1", 0))
       port = s.getsockname()[1]
     args = ["vllm", "serve", base, "--host", "127.0.0.1", "--port", str(port), "--enable-sleep-mode"]
-    args += ["--enable-lora", "--max-lora-rank", "64"] if lora else []
+    args += ["--language-model-only"] + (
+      ["--enable-lora", "--max-lora-rank", "64", "--max-loras", "16", "--max-cpu-loras", "64"] if lora else []
+    )
     if (tp := len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))) > 1:
       args += ["--tensor-parallel-size", str(tp)]
     env = {**os.environ, "VLLM_SERVER_DEV_MODE": "1", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True"}
@@ -72,9 +75,15 @@ class VLLM:
     await self.http.aclose()
 
   async def post(self, path: str, **kwargs) -> httpx.Response:
-    res = await self.http.post(path, **kwargs)
-    res.raise_for_status()
-    return res
+    for attempt in range(3):
+      try:
+        res = await self.http.post(path, **kwargs)
+        res.raise_for_status()
+        return res
+      except httpx.TransportError:
+        if attempt == 2 or (self.server and self.server.poll() is not None):
+          raise
+    raise AssertionError
 
   async def load(self, name: str, path: str) -> None:
     if name in self.loaded:

@@ -211,7 +211,7 @@ class Bus:
 
     random.shuffle(runs)  # so no run always goes first
     streams = {key("q", run_id): ">" for run_id in runs}
-    got = await self.r.xreadgroup(GROUP, worker, streams, count=count, block=block_ms)
+    got = await self.r.xreadgroup(GROUP, worker, streams, count=count, block=block_ms or None)
 
     cmds = []
     for stream, entries in got:
