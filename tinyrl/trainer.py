@@ -316,7 +316,7 @@ class Model:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
     lm = self.use(run)
     prefix = "base_model.model." if self.lora else ""
-    tensors = {f"{prefix}{name}": p.detach().cpu().to(self.dtype) for name, p in self.params[run].items()}
+    tensors = {f"{prefix}{name}": p.detach().to(self.dtype).cpu() for name, p in self.params[run].items()}
     if self.lora:
       cfg = {k: sorted(v) if isinstance(v, set) else v for k, v in lm.peft_config[run].to_dict().items()}
     else:

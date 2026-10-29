@@ -46,6 +46,19 @@ class TestStore(unittest.TestCase):
     with self.assertRaises(ValueError):
       loader.get("tinker://run-1/weights/missing")
 
+  def test_roundtrips_contiguous_and_non_contiguous_tensors(self):
+    store = Store(root=tempfile.mkdtemp())
+    uri = "tinker://run-1/weights/shape-test"
+    base = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    want = {
+      "contiguous": base.clone(),
+      "transposed": base.T,
+    }
+    store.put(uri, want)
+    got, _ = store.get(uri)
+    self.assertTrue(torch.equal(got["contiguous"], want["contiguous"]), "roundtrips contiguous tensor")
+    self.assertTrue(torch.equal(got["transposed"], want["transposed"]), "roundtrips non-contiguous tensor")
+
 
 if __name__ == "__main__":
   unittest.main()

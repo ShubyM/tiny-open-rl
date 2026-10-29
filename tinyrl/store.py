@@ -41,7 +41,10 @@ class Store:
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
     info = dict(meta or {})
     folder = tempfile.mkdtemp(dir=self._mkdir(self.cache)) if self.remote else self._mkdir(self.path(uri))
-    cpu = {k: v.detach().cpu().contiguous() for k, v in tensors.items()}
+    cpu = {
+      k: v.detach() if v.device.type == "cpu" and v.is_contiguous() else v.detach().cpu().contiguous()
+      for k, v in tensors.items()
+    }
     names = ["state.safetensors"]
     if cfg := info.get("config"):
       prefix = "adapter_" if info.get("lora") else ""
