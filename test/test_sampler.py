@@ -388,7 +388,11 @@ class TestSampler(RedisTest):
     from tinyrl.vllm import VLLM
 
     with patch.dict(os.environ, {"TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}):
-      with patch("tinyrl.vllm.VLLM_ARGS", "--gpu-memory-utilization 0.8"):
+      with (
+        patch("tinyrl.vllm.VLLM_ARGS", "--gpu-memory-utilization 0.8"),
+        patch("tinyrl.vllm.GPU_MEM", "0.42"),
+        patch("tinyrl.vllm.KV_BYTES", str(16 * 1024**3)),
+      ):
         with self.assertRaises(RuntimeError):
           await VLLM.start("base", False)
         args = mock_popen.call_args[0][0]
@@ -402,7 +406,7 @@ class TestSampler(RedisTest):
 
     await self.bus.warm_sampler("sampler:base", "base")
     sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine)
-    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1"}):
+    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1"}), patch("tinyrl.sampler.WARM", 1):
       task = asyncio.create_task(sampler.serve())
       try:
         for _ in range(50):

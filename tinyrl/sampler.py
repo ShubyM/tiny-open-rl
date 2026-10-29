@@ -38,6 +38,7 @@ def fail(error: Exception) -> Reply:
 
 
 ENGINE = getenv("ENGINE", "tinyrl.vllm:VLLM")
+WARM = getenv("TINYRL_WARM_SAMPLER", 0)  # start the engine before the first command, from the scheduler's placement
 MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
 
 
@@ -132,7 +133,7 @@ class Sampler:
     renewing = asyncio.create_task(self.keep())
     try:
       await self.fail_stranded(0)
-      if os.environ.get("TINYRL_WARM_SAMPLER") == "1":
+      if WARM:
         await self.warm()
       while not self.done:
         await self.step()

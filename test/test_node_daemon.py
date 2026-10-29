@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from test.helpers import RedisTest, new_id, tiny
-from tinyrl import control, scheduler
+from tinyrl import scheduler
 from tinyrl.bus import Op, Run
 from tinyrl.node_daemon import NodeDaemon
 
@@ -90,7 +90,7 @@ class TestNodeDaemon(RedisTest):
   @patch("tinyrl.node_daemon.subprocess.Popen")
   def test_a_process_starts_on_its_placed_gpus_with_its_placed_settings(self, popen):
     daemon = NodeDaemon(None, gpus=8, node="n")
-    daemon.start("sampler:fft:a", control.Pool(gpus=(6,), env={"TINYRL_GPU_MEM": "0.42"}))
+    daemon.start("sampler:fft:a", scheduler.Pool(gpus=(6,), env={"TINYRL_GPU_MEM": "0.42"}))
     env = popen.call_args[1]["env"]
     self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["GPU"]), ("6", f"{socket.gethostname()}:6"))
     self.assertEqual(env["TINYRL_GPU_MEM"], "0.42")
@@ -99,10 +99,10 @@ class TestNodeDaemon(RedisTest):
   @patch("tinyrl.node_daemon.subprocess.Popen")
   def test_start_sets_cuda_alloc_conf_on_trainer(self, popen):
     daemon = NodeDaemon(None, gpus=2, node="n")
-    daemon.start("lora:base:0", control.Pool(gpus=(0,)))
+    daemon.start("lora:base:0", scheduler.Pool(gpus=(0,)))
     self.assertEqual(popen.call_args[1]["env"]["PYTORCH_CUDA_ALLOC_CONF"], "expandable_segments:True")
     with patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"}):
-      daemon.start("lora:base:1", control.Pool(gpus=(0,)))
+      daemon.start("lora:base:1", scheduler.Pool(gpus=(0,)))
       self.assertEqual(popen.call_args[1]["env"]["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
 
 

@@ -28,7 +28,6 @@ import redis.asyncio as redis
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialBackoff
 
-from tinyrl import control
 from tinyrl.helpers import getenv
 
 GROUP = "trainer"  # the consumer group every pool's trainer reads through
@@ -99,6 +98,16 @@ def connect(url: str) -> redis.Redis:
   # ("Too many connections" at 400 concurrent samples): allow as many as Redis itself does (maxclients 10000)
   retry = Retry(ExponentialBackoff(cap=2.0, base=0.1), 30)
   return redis.from_url(url, socket_timeout=None, retry=retry, max_connections=10_000)
+
+
+@dataclass(frozen=True)
+class Event:
+  """An entry of the log, tinyrl:events. See scheduler.py."""
+
+  id: str  # the stream id, <ms>-<n>
+  t: float  # log time: the ms part of the id, in seconds
+  kind: str
+  body: dict
 
 
 class Bus:
@@ -215,7 +224,7 @@ class Bus:
     await self.r.hset(key("decide", kind), subject, json.dumps(decision))
 
   async def decisions(self) -> dict[str, dict[str, dict]]:
-    """The gateway's pool choice for each run. Placement and turns are decided in the log, see control.py."""
+    """The gateway's pool choice for each run. Placement and turns are decided in the log, see scheduler.py."""
     raw = await self.r.hgetall(key("decide", "run"))
     return {"run": {k.decode(): json.loads(v) for k, v in raw.items()}}
 
@@ -425,7 +434,7 @@ class Bus:
     ]
     return {"live": True, "queued": groups[0]["lag"], "in_flight": in_flight}
 
-  # ***** events: the log GPU turns are decided from, see control.py *****
+  # ***** events: the log placement and GPU turns are decided from, see scheduler.py *****
 
   async def emit(self, _kind: str, **body) -> str:
     """Append an entry to the log. Returns its stream id."""
@@ -441,12 +450,12 @@ class Bus:
     except redis.ResponseError:  # no log yet
       return 0
 
-  async def events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[control.Event]:
+  async def events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[Event]:
     """The entries after stream id `after`, waiting up to block_ms for one, or not at all if it is 0."""
     got = await self.r.xread({key("events"): after}, count=count, block=block_ms or None)
     out = []
     for entry_id, fields in got[0][1] if got else []:
       entry_id = entry_id.decode()
       t = int(entry_id.split("-")[0]) / 1000
-      out.append(control.Event(entry_id, t, fields[b"kind"].decode(), json.loads(fields[b"body"])))
+      out.append(Event(entry_id, t, fields[b"kind"].decode(), json.loads(fields[b"body"])))
     return out

@@ -82,10 +82,10 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
   async def run_scheduler(self, placed: dict[str, list[int]], quantum: float = 30.0) -> None:
     """Run the scheduler over these running pools, so workers that share a GPU get turns."""
-    from tinyrl import control, scheduler
+    from tinyrl import scheduler
 
     await self.running(placed)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus, control.Policy(quantum=quantum))))
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus, scheduler.Policy(quantum=quantum))))
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:

@@ -20,6 +20,8 @@ from tinyrl.helpers import getenv
 from tinyrl.sampler import Out, Seq
 
 VLLM_ARGS = getenv("VLLM_ARGS", "")  # more `vllm serve` flags, like --gpu-memory-utilization 0.4
+GPU_MEM = getenv("TINYRL_GPU_MEM", "")  # the share of GPU memory vLLM may use, from the scheduler's placement
+KV_BYTES = getenv("TINYRL_KV_BYTES", "")  # bytes for vLLM's KV cache, from the scheduler's placement
 CUDAGRAPH_CONFIG = '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128,256]}'
 KERNEL_CONFIG = '{"enable_flashinfer_autotune":false}'
 
@@ -73,12 +75,10 @@ class VLLM:
       extra += ["--compilation-config", CUDAGRAPH_CONFIG]
     if not any(a == "--kernel-config" or a.startswith("--kernel-config=") for a in extra):
       extra += ["--kernel-config", KERNEL_CONFIG]
-    if mem := os.environ.get("TINYRL_GPU_MEM"):
-      extra += ["--gpu-memory-utilization", mem]
-    if (kv := os.environ.get("TINYRL_KV_BYTES")) and not any(
-      a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra
-    ):
-      extra += ["--kv-cache-memory-bytes", kv]
+    if GPU_MEM:
+      extra += ["--gpu-memory-utilization", GPU_MEM]
+    if KV_BYTES and not any(a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra):
+      extra += ["--kv-cache-memory-bytes", KV_BYTES]
     server = subprocess.Popen([*args, *extra], env=env)
     engine = cls(f"http://127.0.0.1:{port}", base, lora, server)
     while server.poll() is None:

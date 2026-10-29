@@ -1,7 +1,7 @@
 """A worker's turn on its GPUs, when it shares them with other pools' workers.
 
 The worker appends facts to tinyrl:events: wants_gpu, batch_done, idle, released. It reads the scheduler's decisions
-about its pool, granted and revoked, from the same log. See control.py for the rules.
+about its pool, granted and revoked, from the same log. See scheduler.py for the rules.
 """
 
 from __future__ import annotations
@@ -9,8 +9,11 @@ from __future__ import annotations
 import time
 
 from tinyrl.bus import LEASE_MS, Bus
+from tinyrl.helpers import getenv
 
-IDLE_MS = 150  # how long a worker holding its GPU waits for commands before it reports idle, so waiters don't wait
+IDLE_MS = getenv(
+  "IDLE_MS", 150
+)  # how long a worker holding its GPU waits for commands before it reports idle, so waiters don't wait
 
 
 class GpuTurn:

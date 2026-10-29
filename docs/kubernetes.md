@@ -362,7 +362,7 @@ above `TARGET_UTIL` for a while, before work queues.
 **When everything fits, nothing parks.** Processes whose memory fits together hold a GPU at once and CUDA interleaves
 their kernels. When they don't fit, they take turns, decided by one scheduler process, `python -m tinyrl.scheduler`.
 Node daemons and workers append facts to one log, `tinyrl:events`. The scheduler folds the log into its state with
-`control.fold` and appends what `control.decide` says, `granted` or `revoked`, to the same log, where workers read them.
+`scheduler.fold` and appends what `scheduler.decide` says, `granted` or `revoked`, to the same log, where workers read them.
 A process on several GPUs is granted all of them at once, so two processes never deadlock:
 
 1. A process with queued work and no turn appends `wants_gpu` and waits for `granted`, asking again every 2.5 s.
@@ -375,7 +375,7 @@ Measured on an H100: parking 16 GB takes 0.60 s, resuming takes 0.64 s, and 725â
 CUDA context, about 210 MiB of cuBLAS, and allocator slack). vLLM's level 1 sleep leaves 808 MiB on an L4. That leftover
 caps how many processes one GPU can host, at about 0.8 GB each.
 
-Waiters are granted in the order they first asked. Every grant and revoke names the rule in `control.RULES` that made
+Waiters are granted in the order they first asked. Every grant and revoke names the rule in `scheduler.RULES` that made
 it, and replaying the log rebuilds every decision.
 
 **LoRA pools park like any other, and so do their runs.** An active LoRA pool stays resident while it has queued work; an

@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-from tinyrl import control
+from tinyrl import scheduler
 from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
 
@@ -51,7 +51,7 @@ class NodeDaemon:
     self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # pool -> (its GPUs, process)
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
-    self.state, self.after = control.State(), "0-0"
+    self.state, self.after = scheduler.State(), "0-0"
 
   async def up(self) -> None:
     await self.bus.heartbeat(self.id, self.gpus)  # first, so the scheduler never finds it up without a heartbeat
@@ -60,10 +60,10 @@ class NodeDaemon:
   async def tick(self) -> None:
     await self.bus.heartbeat(self.id, self.gpus)
     if await self.bus.log_size() < self.state.n:  # Redis was flushed: start over
-      self.state, self.after = control.State(), "0-0"
+      self.state, self.after = scheduler.State(), "0-0"
     while events := await self.bus.events(self.after):
       for e in events:
-        self.state = control.fold(self.state, e)
+        self.state = scheduler.fold(self.state, e)
       self.after = events[-1].id
     mine = {name: p for name, p in self.state.pools.items() if p.node == self.id and (p.runs or p.warm)}
     for pool, (gpus, proc) in list(self.trainers.items()):
@@ -75,14 +75,14 @@ class NodeDaemon:
       self.trainers[pool] = self.start(pool, mine[pool])
       await self.bus.emit("started", pool=pool, node=self.id)
 
-  def start(self, pool: str, p: control.Pool) -> tuple[list[int], subprocess.Popen]:
+  def start(self, pool: str, p: scheduler.Pool) -> tuple[list[int], subprocess.Popen]:
     """Start a pool's process on the GPUs and with the settings it was placed with. This node's environment wins."""
     gpus = list(p.gpus)
     env = {**p.env, **os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
     env["GPU"] = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
     mod = "tinyrl.sampler" if pool.startswith("sampler:") else "tinyrl.trainer"
     if mod == "tinyrl.trainer":
-      env["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+      env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
 
   async def serve(self) -> None:

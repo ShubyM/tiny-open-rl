@@ -103,7 +103,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps checkpoints it downloaded), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `TARGET_UTIL`,
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`, `TARGET_UTIL`,
 `UTIL_MS`, `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
 
 ## Telemetry
