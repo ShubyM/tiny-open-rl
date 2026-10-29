@@ -72,6 +72,16 @@ LOSSES = {"cross_entropy": cross_entropy, "importance_sampling": importance_samp
 # ***** forward pass *****
 
 
+def should_checkpoint_layers(lm: PreTrainedModel, lora: bool) -> bool:
+  if "GRAD_CKPT" in os.environ:
+    return bool(int(os.environ["GRAD_CKPT"]))
+  if not GRAD_CKPT:
+    return False
+  if lora and lm.device.type == "cuda" and torch.cuda.get_device_properties(lm.device).total_memory >= 64 * 1024**3:
+    return False
+  return True
+
+
 def token_budget(lm: PreTrainedModel) -> int:
   """How many padded tokens one forward/backward pass can hold: TOKEN_BUDGET if it's set, otherwise as many as fit in
   half of the free GPU memory. It's measured on every call, since memory use changes as runs come and go, and an
@@ -87,7 +97,12 @@ def token_budget(lm: PreTrainedModel) -> int:
   # with gradient checkpointing, a token keeps about one hidden vector per layer. 6x that covers the layer being
   # recomputed in the backward pass, and leaves a margin.
   config = lm.config.get_text_config()
-  bytes_per_token = 6 * config.num_hidden_layers * config.hidden_size * lm.dtype.itemsize
+  bytes_per_token = (
+    (6 if getattr(lm, "is_gradient_checkpointing", False) else 64)
+    * config.num_hidden_layers
+    * config.hidden_size
+    * lm.dtype.itemsize
+  )
   return min(MAX_TOKEN_BUDGET, int(free / 2 / bytes_per_token))
 
 
@@ -197,6 +212,7 @@ class Model:
     self.dtype = torch.float32
     self.params: dict[str, dict[str, torch.nn.Parameter]] = {}  # canonical name -> trainable parameter
     self.optimizers: dict[str, torch.optim.AdamW] = {}
+    self.pinned: dict[int, torch.Tensor] = {}
     self.parked = False
     self.dirty: set[str] = set()
 
@@ -210,7 +226,7 @@ class Model:
       self.dtype = self.lm.dtype
       if not self.lora:
         self.lm.float()  # a full fine-tune updates fp32 master weights. Its forward pass runs in bf16, under autocast
-      if GRAD_CKPT:
+      if should_checkpoint_layers(self.lm, self.lora):
         self.lm.gradient_checkpointing_enable()
         if self.lora:
           self.lm.enable_input_require_grads()  # with the embeddings frozen, checkpointed layers need a gradient path
@@ -348,6 +364,7 @@ class Model:
     for name, p in self.params[run].items():
       p.data.copy_(weights[name])
 
+    self.pinned.clear()
     self.optimizers.pop(run, None)
     if optimizer and any(k.endswith(".step") for k in tensors):
       opt = self.optimizer(run)
@@ -377,13 +394,23 @@ class Model:
   def move(self, tensors, device: str) -> None:
     for t in tensors:
       if device == "cpu" and t.is_cuda:
-        t.data = torch.empty(t.shape, dtype=t.dtype, pin_memory=True).copy_(t, non_blocking=True)
-      elif device == "cuda" and t.is_pinned():
+        buf = self.pinned.get(id(t))
+        if buf is None or buf.shape != t.shape or buf.dtype != t.dtype:
+          buf = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+          self.pinned[id(t)] = buf
+        buf.copy_(t, non_blocking=True)
+        t.data = buf
+      elif device == "cuda" and (t.is_pinned() or id(t) in self.pinned):
         t.data = t.data.to("cuda", non_blocking=True)
+
     if torch.cuda.is_available():
       torch.cuda.synchronize()
       if device == "cpu":
         torch.cuda.empty_cache()
+        active = {id(x) for x in self.tensors()}
+        for k in list(self.pinned.keys()):
+          if k not in active:
+            del self.pinned[k]
 
   def park(self) -> None:
     """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume() undoes it."""
@@ -400,6 +427,7 @@ class Model:
     if self.lora:
       lm.delete_adapter(run)
     del self.params[run]
+    self.pinned.clear()
     self.optimizers.pop(run, None)
 
 

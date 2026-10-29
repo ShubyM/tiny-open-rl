@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -67,9 +68,9 @@ class TestForwardPass(unittest.TestCase):
     gpu = SimpleNamespace(
       device=torch.device("cuda", 0), dtype=torch.bfloat16, config=LlamaConfig(num_hidden_layers=32, hidden_size=4096)
     )
-    bytes_per_token = 6 * 32 * 4096 * 2
 
-    def budget(free_gib: int) -> int:
+    def budget(free_gib: int, ckpt: bool = True) -> int:
+      gpu.is_gradient_checkpointing = ckpt
       with (
         patch.object(torch.cuda, "mem_get_info", return_value=(free_gib * 2**30, 0)),
         patch.object(torch.cuda, "memory_reserved", return_value=2**30),  # 1 GiB cached by torch but unused
@@ -77,11 +78,62 @@ class TestForwardPass(unittest.TestCase):
       ):
         return token_budget(gpu)
 
-    self.assertEqual(budget(7), 8 * 2**30 // 2 // bytes_per_token)
+    self.assertEqual(budget(7, True), 8 * 2**30 // 2 // (6 * 32 * 4096 * 2))
+    self.assertEqual(budget(7, False), 8 * 2**30 // 2 // (64 * 32 * 4096 * 2))
     self.assertEqual(budget(80), trainer.MAX_TOKEN_BUDGET)
     self.assertEqual(token_budget(tiny()), trainer.MAX_TOKEN_BUDGET)  # on the cpu
     with patch.object(trainer, "TOKEN_BUDGET", 512):
       self.assertEqual(token_budget(gpu), 512)
+
+  @patch("os.environ", {})
+  def test_should_checkpoint_layers(self):
+    from tinyrl.trainer import should_checkpoint_layers
+
+    class MockProps:
+      def __init__(self, mem):
+        self.total_memory = mem
+
+    def mock_get_device_properties(dev):
+      if str(dev) == "cuda:0":
+        return MockProps(80 * 1024**3)
+      return MockProps(40 * 1024**3)
+
+    gpu_80 = SimpleNamespace(device=torch.device("cuda", 0), config=SimpleNamespace())
+    gpu_40 = SimpleNamespace(device=torch.device("cuda", 1), config=SimpleNamespace())
+
+    with patch("torch.cuda.get_device_properties", mock_get_device_properties):
+      import tinyrl.trainer
+
+      old_grad = tinyrl.trainer.GRAD_CKPT
+      tinyrl.trainer.GRAD_CKPT = 1
+      self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
+      self.assertTrue(should_checkpoint_layers(gpu_80, lora=False))
+      self.assertTrue(should_checkpoint_layers(gpu_40, lora=True))
+
+      os.environ["GRAD_CKPT"] = "1"
+      self.assertTrue(should_checkpoint_layers(gpu_80, lora=True))
+
+      os.environ["GRAD_CKPT"] = "0"
+      self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
+      self.assertFalse(should_checkpoint_layers(gpu_80, lora=False))
+
+      del os.environ["GRAD_CKPT"]
+      tinyrl.trainer.GRAD_CKPT = 0
+      self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
+      tinyrl.trainer.GRAD_CKPT = old_grad
+
+  @patch("os.environ", {"GRAD_CKPT": "0"})
+  def test_cpu_lora_without_gradient_checkpointing(self):
+    model, runs = lora_runs(1)
+    run = runs[0]
+    weights_before = [p.clone() for p in model.lm.parameters()]
+    _, metrics = model.forward_backward(run, [counting(12)], "cross_entropy", {}, False)
+    step_metrics = model.optim_step(run, {"learning_rate": 1e-2})
+
+    self.assertGreater(step_metrics["grad_norm:mean"], 0)
+    weights_after = [p.clone() for p in model.lm.parameters()]
+    changed = any(not torch.equal(b, a) for b, a in zip(weights_before, weights_after))
+    self.assertTrue(changed)
 
   def test_chunked_logprobs_are_the_full_softmax(self):
     lm = tiny().eval()
@@ -112,7 +164,85 @@ class TestForwardPass(unittest.TestCase):
     torch.testing.assert_close(loss("ppo", kl_coeff=0.5) - loss("ppo"), 0.5 * kl * weights)
 
 
+class CudaMock(torch.Tensor):
+  @property
+  def is_cuda(self):
+    return getattr(self, "_is_cuda", False)
+
+  def is_pinned(self):
+    return getattr(self, "_is_pinned", False)
+
+  def to(self, *args, **kwargs):
+    device = args[0] if args else kwargs.get("device")
+    if device == "cuda":
+      ret = torch.Tensor.to(self, "cpu", **kwargs).as_subclass(CudaMock)
+      ret._is_cuda = True
+      ret._is_pinned = False
+      return ret
+    return super().to(*args, **kwargs)
+
+
 class TestModel(unittest.TestCase):
+  @patch("torch.cuda.is_available", return_value=True)
+  @patch("torch.cuda.synchronize")
+  @patch("torch.cuda.empty_cache")
+  @patch("torch.empty")
+  def test_move_buffer_reuse_and_cleanup(self, mock_empty, mock_empty_cache, mock_sync, mock_is_avail):
+    def fake_empty(*args, **kwargs):
+      kwargs.pop("pin_memory", None)
+      return torch.zeros(*args, **kwargs)
+
+    mock_empty.side_effect = fake_empty
+
+    model = Model(tiny)
+    model.create("run", "tiny", 4, LORA)
+
+    t = torch.randn(10, 10).as_subclass(CudaMock)
+    t._is_cuda = True
+    t._is_pinned = False
+
+    id_t = id(t)
+    original_tensors = model.tensors
+    model.tensors = lambda optim=True: iter([t])
+    model.move([t], "cpu")
+    self.assertIn(id_t, model.pinned)
+    buf_id = id(model.pinned[id_t])
+
+    t.data = t.data.as_subclass(CudaMock)
+    t._is_pinned = True
+    t.data._is_pinned = True
+    t.data._is_cuda = False
+    model.move([t], "cuda")
+
+    t.data = t.data.as_subclass(CudaMock)
+    t.data._is_cuda = True
+    t.data._is_pinned = False
+    t._is_cuda = True
+    model.move([t], "cpu")
+    self.assertEqual(id(model.pinned[id_t]), buf_id)
+
+    def fake_tensors(optim=True):
+      return iter([])
+
+    model.tensors = fake_tensors
+
+    model.move([], "cpu")
+    self.assertNotIn(id_t, model.pinned)
+    model.tensors = original_tensors
+    model.pinned["fake"] = torch.zeros(1)
+    t_opt = torch.randn(5, 5)
+    model.optimizers["run"] = torch.optim.Adam([torch.nn.Parameter(t_opt)])
+    model.optimizers["run"].state[model.optimizers["run"].param_groups[0]["params"][0]] = {"step": t_opt}
+
+    meta = {"optimizer": True}
+    state = model.state("run")[0]
+    model.restore("run", state, meta, True)
+    self.assertNotIn("fake", model.pinned)
+
+    model.pinned["fake"] = torch.zeros(1)
+    model.delete("run")
+    self.assertNotIn("fake", model.pinned)
+
   def test_lora_runs_share_a_frozen_base_and_train_apart(self):
     model, (a, b) = lora_runs(2)
     base = {name: p.detach().clone() for name, p in model.lm.named_parameters() if "lora" not in name}

@@ -31,6 +31,7 @@ CKPT = getenv("CKPT", "/tmp/tinyrl")
 CKPT_CACHE = getenv("CKPT_CACHE", "/tmp/tinyrl-cache")
 SHARD_BYTES = getenv("SHARD_BYTES", 256 * 1024 * 1024)
 MAX_SHARDS = 16
+MAX_PIN_BYTES = getenv("MAX_PIN_BYTES", 10 * 1024 * 1024 * 1024)
 
 
 class Store:
@@ -42,42 +43,83 @@ class Store:
     self._pin: Any = None
     self._pin_lock = threading.Lock()
 
+  def _stage(
+    self, tensors: dict[str, torch.Tensor], is_cuda=lambda t: t.device.type == "cuda", sync=None
+  ) -> dict[str, torch.Tensor]:
+    import torch
+
+    if sync is None:
+      sync = torch.cuda.synchronize
+
+    cuda_bytes = sum(((v.numel() * v.element_size() + 7) & ~7) for v in tensors.values() if is_cuda(v))
+    if cuda_bytes == 0:
+      return {
+        k: v.detach() if v.device.type == "cpu" and v.is_contiguous() else v.detach().cpu().contiguous()
+        for k, v in tensors.items()
+      }
+
+    has_cuda = torch.cuda.is_available()
+    if 0 < cuda_bytes <= MAX_PIN_BYTES:
+      if self._pin is None or self._pin.numel() < cuda_bytes:
+        self._pin = None
+        self._pin = torch.empty(cuda_bytes, dtype=torch.uint8, pin_memory=has_cuda)
+      cpu = {}
+      off = 0
+      for k, v in tensors.items():
+        if is_cuda(v):
+          src = v.detach().contiguous()
+          nb = src.numel() * src.element_size()
+          dst = self._pin[off : off + nb].view(src.dtype).reshape(src.shape)
+          dst.copy_(src, non_blocking=True)
+          cpu[k] = dst
+          off = (off + nb + 7) & ~7
+        else:
+          cpu[k] = v.detach() if v.is_contiguous() else v.detach().contiguous()
+      if has_cuda:
+        sync()
+      return cpu
+
+    max_elem_bytes = max((v.element_size() for v in tensors.values() if is_cuda(v)), default=1)
+    pin_bytes = max(MAX_PIN_BYTES, max_elem_bytes)
+    if self._pin is None or self._pin.numel() < pin_bytes:
+      self._pin = None
+      self._pin = torch.empty(pin_bytes, dtype=torch.uint8, pin_memory=has_cuda)
+
+    cpu = {}
+    for k, v in tensors.items():
+      if not is_cuda(v):
+        cpu[k] = v.detach() if v.is_contiguous() else v.detach().contiguous()
+      else:
+        src = v.detach().contiguous()
+        dst = torch.empty(src.shape, dtype=src.dtype)
+        src_flat = src.view(-1)
+        dst_flat = dst.view(-1)
+        chunk_elems = max(1, MAX_PIN_BYTES // src.element_size())
+
+        for start in range(0, src.numel(), chunk_elems):
+          end = min(src.numel(), start + chunk_elems)
+          chunk = src_flat[start:end]
+          nb = chunk.numel() * src.element_size()
+          pin_view = self._pin[:nb].view(src.dtype)
+          pin_view.copy_(chunk, non_blocking=True)
+          if has_cuda:
+            sync()
+          dst_flat[start:end].copy_(pin_view)
+        cpu[k] = dst
+    return cpu
+
   def path(self, uri: str) -> str:
     return f"{self.base}/{uri.removeprefix('tinker://')}"
 
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
     import safetensors
     import safetensors.torch
-    import torch
 
     info = dict(meta or {})
     dest = self.path(uri)
     folder = tempfile.mkdtemp(dir=self._mkdir(self.cache if self.remote else os.path.dirname(dest)))
     with self._pin_lock:
-      cuda_bytes = sum(((v.numel() * v.element_size() + 7) & ~7) for v in tensors.values() if v.device.type == "cuda")
-      if cuda_bytes:
-        if self._pin is None or self._pin.numel() < cuda_bytes:
-          self._pin = None
-          self._pin = torch.empty(cuda_bytes, dtype=torch.uint8, pin_memory=True)
-        cpu: dict[str, torch.Tensor] = {}
-        off = 0
-        for k, v in tensors.items():
-          if v.device.type == "cuda":
-            src = v.detach().contiguous()
-            nb = src.numel() * src.element_size()
-            dst = self._pin[off : off + nb].view(src.dtype).reshape(src.shape)
-            dst.copy_(src, non_blocking=True)
-            cpu[k] = dst
-            off = (off + nb + 7) & ~7
-          else:
-            cpu[k] = v.detach() if v.is_contiguous() else v.detach().contiguous()
-        torch.cuda.synchronize()
-      else:
-        cpu = {
-          k: v.detach() if v.device.type == "cpu" and v.is_contiguous() else v.detach().cpu().contiguous()
-          for k, v in tensors.items()
-        }
-
+      cpu = self._stage(tensors)
       total_bytes = sum(v.numel() * v.element_size() for v in cpu.values())
       meta_hdr = {"meta": json.dumps(info)}
 

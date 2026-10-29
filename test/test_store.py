@@ -89,6 +89,37 @@ class TestStore(unittest.TestCase):
     self.assertIn("model.safetensors.index.json", sampler_files)
     self.assertTrue(any("model-00001-of-" in f for f in sampler_files))
 
+  def test_stage_below_and_above_max_pin_bytes(self):
+    import tinyrl.store
+
+    old_max = tinyrl.store.MAX_PIN_BYTES
+    tinyrl.store.MAX_PIN_BYTES = 64
+    try:
+      store = Store(root=tempfile.mkdtemp())
+      tensors = {
+        "scalar": torch.tensor(3.0, dtype=torch.float32),
+        "f32": torch.arange(10, dtype=torch.float32),
+        "i64": torch.arange(20, dtype=torch.int64),
+        "bf16": torch.arange(30, dtype=torch.bfloat16),
+      }
+      cpu = store._stage(tensors, is_cuda=lambda _: True, sync=lambda: None)
+      for k, v in tensors.items():
+        self.assertEqual(cpu[k].shape, v.shape)
+        self.assertTrue(torch.equal(cpu[k], v))
+      store.put("tinker://r/weights/chunked", cpu, {"optimizer": True})
+      got, _ = store.get("tinker://r/weights/chunked")
+      for k, v in tensors.items():
+        self.assertEqual(got[k].shape, v.shape)
+        self.assertTrue(torch.equal(got[k], v))
+
+      tinyrl.store.MAX_PIN_BYTES = 1000000
+      cpu = store._stage(tensors, is_cuda=lambda _: True, sync=lambda: None)
+      for k, v in tensors.items():
+        self.assertEqual(cpu[k].shape, v.shape)
+        self.assertTrue(torch.equal(cpu[k], v))
+    finally:
+      tinyrl.store.MAX_PIN_BYTES = old_max
+
 
 if __name__ == "__main__":
   unittest.main()
