@@ -60,12 +60,22 @@ class VLLM:
     )
     if (tp := len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))) > 1:
       args += ["--tensor-parallel-size", str(tp)]
-    env = {**os.environ, "VLLM_SERVER_DEV_MODE": "1", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True"}
+    env = {
+      **{k: v for k, v in os.environ.items() if k not in {"TINYRL_GPU_MEM", "TINYRL_KV_BYTES"}},
+      "VLLM_SERVER_DEV_MODE": "1",
+      "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
+    }
     extra = shlex.split(VLLM_ARGS)
     if not any(
       a == "--compilation-config" or a.startswith("--compilation-config=") or a.startswith("-O") for a in extra
     ):
       extra += ["--compilation-config", CUDAGRAPH_CONFIG]
+    if mem := os.environ.get("TINYRL_GPU_MEM"):
+      extra += ["--gpu-memory-utilization", mem]
+    if (kv := os.environ.get("TINYRL_KV_BYTES")) and not any(
+      a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra
+    ):
+      extra += ["--kv-cache-memory-bytes", kv]
     server = subprocess.Popen([*args, *extra], env=env)
     engine = cls(f"http://127.0.0.1:{port}", base, lora, server)
     while server.poll() is None:

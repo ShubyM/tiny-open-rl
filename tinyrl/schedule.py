@@ -57,21 +57,20 @@ class RunningPool:
 class Zones:
   trainer: tuple[int, int]
   sampler: tuple[int, int]
-  reserved: tuple[int, int]
   partitioned: bool
 
 
 @dataclasses.dataclass(frozen=True, order=True)
 class BlockRank:
-  in_reserved: bool
   paired_overlap: int
+  exclusive_overlap: int
+  in_reserved: bool
   out_of_zone: bool
   out_of_subzone: bool
-  exclusive_overlap: int
   cross_role_overlap: int
-  gpu_load: int
   shared_overlap: int
-  first: int
+  gpu_load: int
+  tie: int
 
 
 def choose_pool(
@@ -151,40 +150,13 @@ def start_order(pools: Iterable[str], exclusive: set[str] = frozenset()) -> list
   )
 
 
-def gpu_zones(gpus: int, width: int, running: list[RunningPool], pool: str, exclusive: set[str] = frozenset()) -> Zones:
-  et = sum(len(r.gpus) for r in running if r.pool in exclusive and Pool.parse(r.pool).role == "trainer")
-  es = sum(len(r.gpus) for r in running if r.pool in exclusive and Pool.parse(r.pool).role == "sampler")
-
-  if pool in exclusive and all(r.pool != pool for r in running):
-    target = Pool.parse(pool)
-    if target.role == "trainer":
-      et += width
-    else:
-      es += width
-
-  has_non_excl = any(r.pool not in exclusive for r in running) or (pool not in exclusive)
-  cap_limit = max(0, gpus - width) if has_non_excl else gpus
-  excl_cap = (min(cap_limit, et + max(es, et)) // width) * width
-  res0 = gpus - excl_cap
-  reserved = (res0, gpus)
-  free = res0
-
-  if free > 4 * width:
-    t_cap = max(width, (free // 2 // width) * width)
-    return Zones((0, t_cap), (t_cap, res0), reserved, True)
+def gpu_zones(gpus: int, width: int) -> Zones:
+  half = (gpus // 2 // width) * width
+  total = (gpus // width) * width
+  if half >= width:
+    return Zones((0, half), (half, total), True)
   else:
-    return Zones((0, res0), (0, res0), reserved, False)
-
-
-def subzone(zones: Zones, width: int, target: Pool, is_exclusive: bool) -> tuple[int, int]:
-  if is_exclusive:
-    return zones.reserved if zones.reserved[1] > zones.reserved[0] else (0, zones.reserved[1])
-  z0, z1 = zones.trainer if target.role == "trainer" else zones.sampler
-  if zones.partitioned and (z1 - z0) >= 3 * width:
-    split = z0 + max(width, ((2 * (z1 - z0)) // 3 // width) * width)
-    if not target.shared:
-      return (split, z1)
-  return (z0, z1)
+    return Zones((0, gpus), (0, gpus), False)
 
 
 def choose_gpus(
@@ -194,48 +166,83 @@ def choose_gpus(
     raise ValueError(f"invalid width {width} for {gpus} gpus")
 
   target = Pool.parse(pool)
-  zones = gpu_zones(gpus, width, running, pool, exclusive)
+  zones = gpu_zones(gpus, width)
   is_excl = pool in exclusive
-  sz = subzone(zones, width, target, is_excl)
-  res0 = zones.reserved[0]
-  excl_cap = zones.reserved[1] - res0
+  z0, z1 = zones.trainer if target.role == "trainer" else zones.sampler
+  blocks = (z1 - z0) // width
+
+  excl_in_role = sum(1 for r in running if r.pool in exclusive and Pool.parse(r.pool).role == target.role)
+  if is_excl and all(r.pool != pool for r in running):
+    excl_in_role += 1
+
+  if not zones.partitioned or blocks <= 1:
+    excl_range = (z1, z1)
+    sz = (z0, z1)
+  elif blocks == 2:
+    excl_range = (z1 - width, z1) if excl_in_role > 0 else (z1, z1)
+    sz = (z0, z0 + width) if (target.shared and not is_excl) else (z0 + width, z1)
+  elif blocks == 3:
+    excl_range = (z1 - width, z1) if excl_in_role > 0 else (z1, z1)
+    if is_excl:
+      sz = (z1 - width, z1)
+    elif target.shared:
+      sz = (z0, z0 + 2 * width)
+    else:
+      sz = (z0 + 2 * width, z1)
+  else:
+    eb = min(blocks, max(1, excl_in_role))
+    excl_range = (z1 - eb * width, z1)
+    rem = (z1 - width) - z0
+    shared_end = z0 + max(width, ((2 * rem) // 3 // width) * width)
+    if is_excl:
+      sz = excl_range
+    elif target.shared:
+      sz = (z0, shared_end)
+    else:
+      sz = (shared_end, z1 - width)
 
   parsed_running = [(r, Pool.parse(r.pool), set(r.gpus)) for r in running]
-
   ranks = []
+
   for first in range(0, gpus - width + 1, width):
     block = set(range(first, first + width))
 
     def over(pred, b=block):
       return sum(len(b & rg) for r, rp, rg in parsed_running if pred(r, rp))
 
-    if is_excl:
-      in_zone = (first >= res0) if excl_cap > 0 else True
-    elif target.role == "trainer":
-      in_zone = zones.trainer[0] <= first and first + width <= zones.trainer[1]
-    else:
-      in_zone = zones.sampler[0] <= first and first + width <= zones.sampler[1]
+    in_reserved = (not is_excl) and (first < excl_range[1] and first + width > excl_range[0])
+    in_zone = z0 <= first and first + width <= z1
+    out_of_zone = not in_zone
+    out_of_subzone = not (sz[0] <= first and first + width <= sz[1])
+    tie = -first if is_excl else first
 
     rank = BlockRank(
-      in_reserved=(first + width > res0) if not is_excl else False,
       paired_overlap=over(lambda _, rp: target.pairs_with(rp)),
-      out_of_zone=not in_zone,
-      out_of_subzone=not (sz[0] <= first and first + width <= sz[1]),
       exclusive_overlap=over(lambda r, _: r.pool in exclusive),
+      in_reserved=in_reserved,
+      out_of_zone=out_of_zone,
+      out_of_subzone=out_of_subzone,
       cross_role_overlap=over(lambda _, rp: rp.role != target.role),
-      gpu_load=over(lambda _, __: True),
       shared_overlap=over(lambda _, rp: rp.shared),
-      first=first,
+      gpu_load=over(lambda _, __: True),
+      tie=tie,
     )
-    ranks.append(rank)
+    ranks.append((rank, first))
 
-  winner = min(ranks)
+  winner_rank, winner_first = min(ranks, key=lambda x: x[0])
 
-  if is_excl and excl_cap > 0 and winner.first >= res0:
+  if (
+    is_excl and excl_range[1] > excl_range[0] and not winner_rank.out_of_subzone and winner_rank.exclusive_overlap == 0
+  ):
     rule = "reserved_exclusive"
-  elif not winner.in_reserved and not winner.out_of_zone and not winner.out_of_subzone and winner.gpu_load == 0:
+  elif (
+    not winner_rank.in_reserved
+    and not winner_rank.out_of_zone
+    and not winner_rank.out_of_subzone
+    and winner_rank.gpu_load == 0
+  ):
     rule = "solo_in_zone"
-  elif not winner.in_reserved and not winner.out_of_zone and not winner.out_of_subzone:
+  elif not winner_rank.in_reserved and not winner_rank.out_of_zone and not winner_rank.out_of_subzone:
     rule = "timesliced_in_subzone" if not target.shared else "least_loaded_in_zone"
   else:
     rule = "overflow_least_penalty"
@@ -247,8 +254,9 @@ def choose_gpus(
     "width": width,
     "zones": dataclasses.asdict(zones),
     "subzone": list(sz),
+    "reserved": list(excl_range),
     "candidates": {
-      f"{r.first}..{r.first + width - 1}" if width > 1 else str(r.first): dataclasses.asdict(r) for r in ranks
+      f"{f}..{f + width - 1}" if width > 1 else str(f): {**dataclasses.asdict(r), "first": f} for r, f in ranks
     },
   }
-  return Decision(list(range(winner.first, winner.first + width)), rule, detail)
+  return Decision(list(range(winner_first, winner_first + width)), rule, detail)

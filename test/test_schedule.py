@@ -108,29 +108,50 @@ class TestSchedule(unittest.TestCase):
     self.assertEqual(ordered, ["run", "sampler:fft:run", "lora:b:0", "sampler:b"])
 
   def test_8gpu_23job_adversarial_arrival_order(self):
-    running = []
-    excl = set()
+    pools = [
+      "lora:google/gemma-4-E2B:0",
+      "lora:Qwen/Qwen3-0.6B-Base:0",
+      "qwen-ts-1",
+      "qwen-ts-2",
+      "gemma-ts",
+      "gemma-x",
+      "sampler:google/gemma-4-E2B",
+      "sampler:Qwen/Qwen3-0.6B-Base",
+      "sampler:fft:Qwen/Qwen3-0.6B-Base",
+      "sampler:fft:google/gemma-4-E2B",
+      "sampler:fft:gemma-x",
+    ]
+    rnd = random.Random(42)
 
-    def add(pool, expected_gpu):
-      nonlocal excl
-      if pool in ["eaee77a1", "sampler:fft:eaee77a1"]:
-        excl.add(pool)
-      d = choose_gpus(pool, 1, 8, running, excl)
-      running.append(RunningPool(pool, d.choice))
-      self.assertEqual(d.choice[0], expected_gpu, f"Pool {pool} got {d.choice[0]}, expected {expected_gpu}")
+    for _ in range(1000):
+      rnd.shuffle(pools)
+      running = []
+      excl = set()
 
-    add("118a1fe1", 2)
-    add("eaee77a1", 6)
-    add("c11d32ac", 2)
-    add("7108bf7b", 2)
-    add("sampler:fft:c11d32ac", 5)
-    add("sampler:fft:7108bf7b", 5)
-    add("sampler:fft:118a1fe1", 5)
-    add("sampler:fft:eaee77a1", 7)
-    add("lora:google/gemma-4-E2B:0", 0)
-    add("lora:Qwen/Qwen3-0.6B-Base:0", 1)
-    add("sampler:google/gemma-4-E2B", 3)
-    add("sampler:Qwen/Qwen3-0.6B-Base", 4)
+      for p in pools:
+        if p in ("gemma-x", "sampler:fft:gemma-x"):
+          excl.add(p)
+        dec = choose_gpus(p, 1, 8, running, excl)
+        running.append(RunningPool(p, dec.choice))
+
+      placements = {r.pool: r.gpus[0] for r in running}
+
+      st_gpus = {placements["lora:google/gemma-4-E2B:0"], placements["lora:Qwen/Qwen3-0.6B-Base:0"]}
+      self.assertEqual(st_gpus, {0, 1})
+
+      self.assertEqual(placements["qwen-ts-1"], 2)
+      self.assertEqual(placements["qwen-ts-2"], 2)
+      self.assertEqual(placements["gemma-ts"], 2)
+
+      self.assertEqual(placements["gemma-x"], 3)
+
+      ss_gpus = {placements["sampler:google/gemma-4-E2B"], placements["sampler:Qwen/Qwen3-0.6B-Base"]}
+      self.assertEqual(ss_gpus, {4, 5})
+
+      self.assertEqual(placements["sampler:fft:Qwen/Qwen3-0.6B-Base"], 6)
+      self.assertEqual(placements["sampler:fft:google/gemma-4-E2B"], 6)
+
+      self.assertEqual(placements["sampler:fft:gemma-x"], 7)
 
   def test_2gpu_exclusive_node(self):
     excl = {"qwen-lora-x", "sampler:lora:qwen-lora-x"}
@@ -145,7 +166,6 @@ class TestSchedule(unittest.TestCase):
     self.assertEqual(d2.choice, [1])
 
   def test_fuzzer(self):
-
     rnd = random.Random(42)
     for _ in range(500):
       gpus = rnd.choice([1, 2, 4, 8, 16])
@@ -181,39 +201,61 @@ class TestSchedule(unittest.TestCase):
           p = rnd.choice(list(active))
           active.remove(p)
 
+      streaming_running = []
+      streaming_excl = set()
+      for p in list(active):
+        if p in excl:
+          streaming_excl.add(p)
+        try:
+          dec = choose_gpus(p, width, gpus, streaming_running, streaming_excl)
+          streaming_running.append(RunningPool(p, dec.choice))
+        except ValueError:
+          pass
+
       ordered = start_order(active, excl)
-      running = []
+      batched_running = []
       for p in ordered:
         try:
-          dec = choose_gpus(p, width, gpus, running, excl)
+          dec = choose_gpus(p, width, gpus, batched_running, excl)
           json.dumps(dec.as_dict())
           self.assertTrue(dec.rule)
           self.assertTrue(dec.detail["candidates"])
           self.assertEqual(len(dec.choice), width)
           self.assertEqual(dec.choice, list(range(dec.choice[0], dec.choice[0] + width)))
-          running.append(RunningPool(p, dec.choice))
+          batched_running.append(RunningPool(p, dec.choice))
         except ValueError:
           pass
 
-      parsed = [(r, Pool.parse(r.pool), set(r.gpus)) for r in running]
-      trainers = {g for p, _, gs in parsed if p.pool not in excl and Pool.parse(p.pool).role == "trainer" for g in gs}
-      samplers = {g for p, _, gs in parsed if p.pool not in excl and Pool.parse(p.pool).role == "sampler" for g in gs}
+      for running, current_excl in [(batched_running, excl), (streaming_running, streaming_excl)]:
+        parsed = [(r, Pool.parse(r.pool), set(r.gpus)) for r in running]
+        trainers = {
+          g for p, _, gs in parsed if p.pool not in current_excl and Pool.parse(p.pool).role == "trainer" for g in gs
+        }
+        samplers = {
+          g for p, _, gs in parsed if p.pool not in current_excl and Pool.parse(p.pool).role == "sampler" for g in gs
+        }
 
-      z = gpu_zones(gpus, width, running, list(active)[0] if active else "", excl)
-      if z.partitioned and not excl:
-        self.assertTrue(trainers.isdisjoint(samplers))
-        for role, z_bounds in [("trainer", z.trainer), ("sampler", z.sampler)]:
-          z0, z1 = z_bounds
-          if (z1 - z0) >= 3 * width:
-            split = z0 + max(width, ((2 * (z1 - z0)) // 3 // width) * width)
-            shared_pools = {p.pool for p, pool, _ in parsed if pool.role == role and pool.shared}
-            timesliced_pools = {
-              p.pool for p, pool, _ in parsed if pool.role == role and not pool.shared and p.pool not in excl
-            }
-            if len(shared_pools) <= (split - z0) // width:
-              shared_gpus = {g for p, pool, gs in parsed if p.pool in shared_pools for g in gs}
-              timesliced_gpus = {g for p, pool, gs in parsed if p.pool in timesliced_pools for g in gs}
-              self.assertTrue(shared_gpus.isdisjoint(timesliced_gpus))
+        if gpus >= 2 * width:
+          for r1, p1, gs1 in parsed:
+            for r2, p2, gs2 in parsed:
+              if r1.pool != r2.pool and p1.pairs_with(p2):
+                self.assertTrue(gs1.isdisjoint(gs2))
+
+        z = gpu_zones(gpus, width)
+        if z.partitioned and not current_excl:
+          self.assertTrue(trainers.isdisjoint(samplers))
+          for role, z_bounds in [("trainer", z.trainer), ("sampler", z.sampler)]:
+            z0, z1 = z_bounds
+            if (z1 - z0) >= 3 * width:
+              split = z0 + max(width, ((2 * (z1 - z0)) // 3 // width) * width)
+              shared_pools = {p.pool for p, pool, _ in parsed if pool.role == role and pool.shared}
+              timesliced_pools = {
+                p.pool for p, pool, _ in parsed if pool.role == role and not pool.shared and p.pool not in current_excl
+              }
+              if len(shared_pools) <= (split - z0) // width:
+                shared_gpus = {g for p, pool, gs in parsed if p.pool in shared_pools for g in gs}
+                timesliced_gpus = {g for p, pool, gs in parsed if p.pool in timesliced_pools for g in gs}
+                self.assertTrue(shared_gpus.isdisjoint(timesliced_gpus))
 
 
 if __name__ == "__main__":

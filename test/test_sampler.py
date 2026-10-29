@@ -389,6 +389,23 @@ class TestSampler(RedisTest):
     self.assertEqual(handled, 1)
     self.assertEqual([n for n, _ in loads], ["c0"])
 
+  @patch("subprocess.Popen")
+  async def test_vllm_start_appends_memory_and_kv_args_from_environ(self, mock_popen):
+    mock_popen.return_value.poll.return_value = 0
+    import os
+
+    from tinyrl.vllm import VLLM
+
+    with patch.dict(os.environ, {"TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}):
+      with patch("tinyrl.vllm.VLLM_ARGS", "--gpu-memory-utilization 0.8"):
+        with self.assertRaises(RuntimeError):
+          await VLLM.start("base", False)
+        args = mock_popen.call_args[0][0]
+        child_env = mock_popen.call_args[1]["env"]
+        self.assertEqual(args[-4:], ["--gpu-memory-utilization", "0.42", "--kv-cache-memory-bytes", str(16 * 1024**3)])
+        self.assertNotIn("TINYRL_GPU_MEM", child_env)
+        self.assertNotIn("TINYRL_KV_BYTES", child_env)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -27,13 +27,33 @@ TICK = 1.0
 SCHEDULER = "scheduler"  # the lease whose holder places pools
 
 
+def gpu_memory_mib() -> int:
+  if override := getenv("GPU_MEMORY_MIB", 0):
+    return int(override)
+  try:
+    res = subprocess.run(
+      ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits", "-i", "0"],
+      capture_output=True,
+      text=True,
+      timeout=2,
+      check=False,
+    )
+    if res.returncode == 0:
+      return int(res.stdout.strip())
+  except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+    pass
+  return 0
+
+
 class NodeDaemon:
-  def __init__(self, bus: Bus, gpus: int = GPUS, node: str = ""):
+  def __init__(self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None):
     self.bus = bus
     self.gpus = gpus
     self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # pool -> (its GPUs, process)
+    self.slots: dict[str, int] = {}
     self.decisions = {}
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
+    self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
 
   async def tick(self) -> None:
     await self.bus.heartbeat(self.id, self.gpus)
@@ -46,6 +66,7 @@ class NodeDaemon:
       if proc.poll() is not None or placed.get(pool) != self.id:  # it exited, or its pool moved or emptied
         proc.terminate()
         del self.trainers[pool]
+        self.slots.pop(pool, None)
         if self.bus:
           await self.bus.forget_decision("gpu", pool)
     excl = await self.bus.exclusive() if self.bus else set()
@@ -73,9 +94,23 @@ class NodeDaemon:
     dec = schedule.choose_gpus(pool, width, self.gpus, running, exclusive)
     self.decisions[pool] = dec
     gpus = dec.choice
+    parsed = schedule.Pool.parse(pool)
     leases = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus)), "GPU": leases}
-    mod = "tinyrl.sampler" if schedule.Pool.parse(pool).role == "sampler" else "tinyrl.trainer"
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
+    if self.gpu_mib >= 65536 and parsed.role == "sampler" and width == 1:
+      if pool.startswith("sampler:fft:") and pool not in exclusive:
+        slot = min(
+          (0, 1),
+          key=lambda s: sum(1 for p, (g, _) in self.trainers.items() if g == gpus and self.slots.get(p) == s),
+        )
+        self.slots[pool] = slot
+        leases = f"{socket.gethostname()}:{gpus[0]}:{slot}"
+        env.setdefault("TINYRL_GPU_MEM", "0.42")
+        env.setdefault("TINYRL_KV_BYTES", str(16 * 1024**3))
+      else:
+        env.setdefault("TINYRL_KV_BYTES", str(24 * 1024**3))
+    env["GPU"] = leases
+    mod = "tinyrl.sampler" if parsed.role == "sampler" else "tinyrl.trainer"
     if mod == "tinyrl.trainer":
       env["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
