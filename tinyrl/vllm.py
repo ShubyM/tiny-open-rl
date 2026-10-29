@@ -47,6 +47,7 @@ class VLLM:
     self.lora = lora
     self.server = server
     self.loaded: set[str] = set()  # adapters, or the one full fine-tune checkpoint whose weights are in place
+    self.clean: bool = True
 
   @classmethod
   async def start(cls, base: str, lora: bool) -> VLLM:
@@ -71,7 +72,7 @@ class VLLM:
       with contextlib.suppress(httpx.HTTPError):
         if (await engine.http.get("/health")).is_success:
           return engine
-      await asyncio.sleep(1)
+      await asyncio.sleep(0.2)
     raise RuntimeError(f"vllm serve exited with {server.returncode}")
 
   async def close(self) -> None:
@@ -97,7 +98,7 @@ class VLLM:
   async def load(self, name: str, path: str) -> None:
     if name in self.loaded:
       return
-    if not self.lora and not self.loaded and os.path.isdir(path):
+    if not self.lora and self.clean and os.path.isdir(path):
       files = sorted(glob.glob(f"{path}/*.safetensors"))
       if files:
         with safetensors.safe_open(files[0], framework="pt", device="cpu") as f:
@@ -111,6 +112,7 @@ class VLLM:
     else:
       await self.post("/collective_rpc", json={"method": "reload_weights", "kwargs": {"weights_path": path}})
       await self.post("/reset_prefix_cache")
+      self.clean = False
       self.loaded = {name}
 
   async def sleep(self) -> None:

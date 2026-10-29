@@ -68,6 +68,14 @@ class TestSchedule(unittest.TestCase):
 
   def test_choose_sampler_pool(self):
     d = choose_sampler_pool("b", False, "r")
+    self.assertEqual(d.choice, "sampler:fft:b")
+    self.assertEqual(d.rule, "shared_fft_sampler")
+
+    d = choose_sampler_pool("b", False, "r", True)
+    self.assertEqual(d.choice, "sampler:fft:r")
+    self.assertEqual(d.rule, "dedicated_fft_sampler")
+
+    d = choose_sampler_pool("", False, "r")
     self.assertEqual(d.choice, "sampler:fft:r")
     self.assertEqual(d.rule, "dedicated_fft_sampler")
 

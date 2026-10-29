@@ -76,6 +76,8 @@ class NodeDaemon:
     leases = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus)), "GPU": leases}
     mod = "tinyrl.sampler" if schedule.Pool.parse(pool).role == "sampler" else "tinyrl.trainer"
+    if mod == "tinyrl.trainer":
+      env["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
 
   async def serve(self) -> None:

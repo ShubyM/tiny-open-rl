@@ -294,6 +294,8 @@ class Model:
     max_norm = adam.get("grad_clip_norm") or math.inf  # 0 means don't clip
     grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run].values(), max_norm).item()
     if not self.lora:
+      if torch.cuda.is_available():
+        torch.cuda.empty_cache()
       self.move(self.moments(), "cuda")
     optimizer.step()
     optimizer.zero_grad()
@@ -513,7 +515,8 @@ class Trainer:
     """Take the next commands from the pool and run them. Returns how many there were."""
     if self.done:
       return 0
-    cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
+    take_block = 150 if self.seated and block_ms > 150 else block_ms
+    cmds = await self.bus.take(self.pool, self.worker, count, take_block)
     if not cmds:
       await self.yield_gpu(GPU, idle=True)  # nothing to run: hand the GPU over now if another trainer asked for it
       return 0

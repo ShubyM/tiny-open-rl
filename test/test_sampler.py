@@ -142,8 +142,8 @@ class TestSampler(RedisTest):
     await self.own(fft_trainer)
     await fft_trainer.step(block_ms=0)
     fft_sid = await save_for_sampler(fft_trainer, fft)
-    self.assertEqual((await self.bus.run(fft_sid))["pool"], f"sampler:fft:{fft}")
-    fft_sampler = Sampler(self.bus, f"sampler:fft:{fft}", engine=FakeEngine, store=store)
+    self.assertEqual((await self.bus.run(fft_sid))["pool"], f"sampler:fft:{base}")
+    fft_sampler = Sampler(self.bus, f"sampler:fft:{base}", engine=FakeEngine, store=store)
     await self.own(fft_sampler)
     request_id = (await call("asample", {"sampling_session_id": fft_sid, "prompt": tokens([1, 2])}))["request_id"]
     await fft_sampler.step(block_ms=0)
@@ -304,14 +304,90 @@ class TestSampler(RedisTest):
 
     dir2 = tempfile.mkdtemp()
     safetensors.torch.save_file(
-      {"w": torch.ones(1)}, f"{dir2}/model.safetensors", metadata={"meta": json.dumps({"untouched": False})}
+      {"w": torch.ones(1)}, f"{dir2}/model.safetensors", metadata={"meta": json.dumps({"untouched": True})}
+    )
+
+    dir3 = tempfile.mkdtemp()
+    safetensors.torch.save_file(
+      {"w": torch.ones(1)}, f"{dir3}/model.safetensors", metadata={"meta": json.dumps({"untouched": False})}
     )
 
     await full.load("c0", dir1)
     self.assertEqual(calls, [])
 
     await full.load("c1", dir2)
+    self.assertEqual(calls, [])
+
+    await full.load("c2", dir3)
     self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache"])
+
+    await full.load("c0", dir1)
+    self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache", "/collective_rpc", "/reset_prefix_cache"])
+
+  async def test_sampler_step_post_boot_drain_and_refresh(self):
+    import time
+
+    store = Store(tempfile.mkdtemp())
+    store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
+    await self.bus.create(Run("sess", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+
+    class SlowStartEngine(FakeEngine):
+      @classmethod
+      async def start(cls, base: str, lora: bool):
+        await asyncio.sleep(0.05)
+        return await super().start(base, lora)
+
+    sampler = Sampler(self.bus, "sampler:base", engine=SlowStartEngine, store=store)
+    await self.own(sampler)
+    sampler.seated = time.time() - 20.0
+
+    await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+
+    async def push_more():
+      await asyncio.sleep(0.01)
+      await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+
+    asyncio.create_task(push_more())
+
+    old_seated = sampler.seated
+    handled = await sampler.step(block_ms=200)
+    self.assertEqual(handled, 3)
+    self.assertGreater(sampler.seated, old_seated + 10.0)
+
+  async def test_sampler_step_groups_non_exclusive_fft_interleaved(self):
+    store = Store(tempfile.mkdtemp())
+    store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": False, "config": {}})
+    store.put("tinker://r2/sampler_weights/s0", {}, {"base": "base", "lora": False, "config": {}})
+    await self.bus.create(Run("s1", "sampler:fft:base", "base", 0, model_path="tinker://r1/sampler_weights/s0"))
+    await self.bus.create(Run("s2", "sampler:fft:base", "base", 0, model_path="tinker://r2/sampler_weights/s0"))
+
+    loads = []
+
+    class RecordEngine(FakeEngine):
+      async def load(self, name: str, path: str) -> None:
+        loads.append((name, path))
+        await super().load(name, path)
+
+    sampler = Sampler(self.bus, "sampler:fft:base", engine=RecordEngine, store=store)
+    await self.own(sampler)
+
+    await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit("s2", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit("s2", Op.SAMPLE, json.dumps(JOB).encode())
+
+    handled = await sampler.step(block_ms=10)
+    self.assertEqual(handled, 4)
+
+    self.assertEqual([n for n, _ in loads], ["c0", "c1"])
+    first_sess = "s1" if "/r1/" in loads[0][1] else "s2"
+    loads.clear()
+
+    await self.bus.submit(first_sess, Op.SAMPLE, json.dumps(JOB).encode())
+    handled = await sampler.step(block_ms=10)
+    self.assertEqual(handled, 1)
+    self.assertEqual([n for n, _ in loads], ["c0"])
 
 
 if __name__ == "__main__":

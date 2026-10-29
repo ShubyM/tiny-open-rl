@@ -116,7 +116,9 @@ def choose_sampler_pool(
 ) -> Decision[str]:
   detail = {"base": base_model, "train_run": train_run, "exclusive": exclusive}
   if not lora:
-    return Decision(f"sampler:fft:{train_run}", "dedicated_fft_sampler", detail)
+    if exclusive or not base_model:
+      return Decision(f"sampler:fft:{train_run}", "dedicated_fft_sampler", detail)
+    return Decision(f"sampler:fft:{base_model}", "shared_fft_sampler", detail)
   if exclusive:
     return Decision(f"sampler:lora:{train_run}", "dedicated_exclusive_sampler", detail)
   return Decision(f"sampler:{base_model}", "shared_lora_sampler", detail)

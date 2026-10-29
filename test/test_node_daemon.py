@@ -99,6 +99,24 @@ class TestNodeDaemon(RedisTest):
     self.assertEqual([env["CUDA_VISIBLE_DEVICES"] for env in envs], ["0", "2,3", "1"])
     self.assertEqual(envs[1]["GPU"].split(","), [f"{socket.gethostname()}:2", f"{socket.gethostname()}:3"])
 
+  @patch("tinyrl.node_daemon.subprocess.Popen")
+  def test_start_sets_cuda_alloc_conf_on_trainer(self, mock_popen):
+    import os
+
+    daemon = NodeDaemon(self.bus, 2)
+    daemon.start("lora:base:0", 1)
+    env1 = mock_popen.call_args[1]["env"]
+    self.assertEqual(env1["PYTORCH_CUDA_ALLOC_CONF"], "expandable_segments:True")
+
+    daemon.start("sampler:base", 1)
+    env2 = mock_popen.call_args[1]["env"]
+    self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", env2)
+
+    with patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"}):
+      daemon.start("lora:base:1", 1)
+      env3 = mock_popen.call_args[1]["env"]
+      self.assertEqual(env3["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
+
 
 if __name__ == "__main__":
   unittest.main()
