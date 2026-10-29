@@ -50,7 +50,7 @@ class NodeDaemon:
     self.bus = bus
     self.gpus = gpus
     self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # pool -> (its GPUs, process)
-    self.slots: dict[str, int] = {}
+    self.memory: dict[str, int] = {}  # pool -> GPU bytes it may use while it holds its GPU, 0 if all of it
     self.decisions = {}
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
@@ -66,9 +66,10 @@ class NodeDaemon:
       if proc.poll() is not None or placed.get(pool) != self.id:  # it exited, or its pool moved or emptied
         proc.terminate()
         del self.trainers[pool]
-        self.slots.pop(pool, None)
+        self.memory.pop(pool, None)
         if self.bus:
           await self.bus.forget_decision("gpu", pool)
+          await self.bus.emit("exited", pool=pool)
     excl = await self.bus.exclusive() if self.bus else set()
     to_start = [p for p, n in placed.items() if n == self.id and p not in self.trainers]
     for pool in schedule.start_order(to_start, excl):
@@ -76,6 +77,8 @@ class NodeDaemon:
       self.trainers[pool] = self.start(pool, width, excl)
       if self.bus:
         await self.bus.decide("gpu", pool, self.decisions[pool].as_dict())
+        gpus, memory = self.trainers[pool][0], self.memory[pool]
+        await self.bus.emit("started", pool=pool, node=self.id, gpus=gpus, memory=memory)
 
   async def schedule(self) -> None:
     nodes, placed = await self.bus.nodes(), await self.bus.placements()
@@ -101,23 +104,19 @@ class NodeDaemon:
       env.setdefault("TINYRL_WARM_SAMPLER", "1")
     if self.gpu_mib >= 65536 and parsed.role == "sampler" and width == 1:
       if pool.startswith("sampler:fft:") and pool not in exclusive:
-        slot = min(
-          (0, 1),
-          key=lambda s: sum(1 for p, (g, _) in self.trainers.items() if g == gpus and self.slots.get(p) == s),
-        )
-        self.slots[pool] = slot
-        leases = f"{socket.gethostname()}:{gpus[0]}:{slot}"
         env.setdefault("TINYRL_GPU_MEM", "0.42")
         env.setdefault("TINYRL_KV_BYTES", str(16 * 1024**3))
       else:
         env.setdefault("TINYRL_KV_BYTES", str(24 * 1024**3))
     env["GPU"] = leases
+    self.memory[pool] = int(float(env.get("TINYRL_GPU_MEM", 0)) * self.gpu_mib * 2**20)
     mod = "tinyrl.sampler" if parsed.role == "sampler" else "tinyrl.trainer"
     if mod == "tinyrl.trainer":
       env["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
 
   async def serve(self) -> None:
+    await self.bus.emit("node_up", node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
     try:
       while True:
         await self.tick()

@@ -95,7 +95,8 @@ change without touching scheduling. What's new, and who writes it:
 | `tinyrl:owner:<pool>` | string with a 10 s TTL: the lease | the trainer that holds it | trainers, scheduler, gateway |
 | `tinyrl:place:<pool>` | string: a node daemon id and its GPU indexes, like `<node>/0,1` | scheduler | node daemons |
 | `tinyrl:node:<id>` | hash `{gpus, gpu_bytes, host_bytes, gpu_model, tier, addr, draining}` with a 30 s TTL; `tier` is `reserved` or `burst`, from a node label | that node daemon | scheduler, store |
-| `tinyrl:gpu:<node>:<i>` | string with a TTL: the process holding GPU `i`, a lease like `tinyrl:owner:<pool>` | the process holding it | processes on that node daemon |
+| `tinyrl:events` | stream: the log GPU turns are decided from. Facts like `wants_gpu` and `released`, and the scheduler's decisions, `granted` and `revoked` | node daemons, trainers and samplers append facts; the scheduler appends decisions | the scheduler, trainers, samplers |
+| `tinyrl:state` | JSON: the scheduler's current turn state | the scheduler | gateway |
 | `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | counters (built): calls run, time queued, time running | `Bus.finish`, under the pool's lease | scheduler, `GET /metrics` |
 | `gpu_bytes`, `host_bytes` in `tinyrl:run:<run>` | measured state size, so a move's cost is known | the run's trainer | scheduler |
 
@@ -122,7 +123,7 @@ sequenceDiagram
   T->>R: SET owner:pool NX PX 10000, fail what a dead owner left
   T->>R: XREADGROUP, run create_model, finish
   C->>G: retrieve_future, "paused_capacity" until a trainer owns the run's pool
-  Note over T,ST: time-slicing: T yields tinyrl:gpu:<node> between batches when another process waits, parking its state to /dev/shm
+  Note over T,ST: time-slicing: T gives its GPU back between batches when the scheduler revokes its turn, parking its state to /dev/shm
   C->>G: save_weights_for_sampler
   T->>ST: store.put(weights(run), durable=False) -> ref
   T->>R: fenced finish publishes tinker://.../sampler_weights/step-k -> ref
@@ -359,14 +360,15 @@ above `TARGET_UTIL` for a while, before work queues.
 
 ## Taking turns on a node daemon's GPUs
 
-**When everything fits, nothing parks.** All processes on the node daemon stay resident and CUDA interleaves their kernels.
-When they don't fit, they take turns through one Redis lease per GPU, `tinyrl:gpu:<node>:<i>`, using the same `SET NX PX`,
-`SET IFEQ` and `DELEX IFEQ` calls as the pool lease. A process on several GPUs takes their leases in index order, so two
-processes never deadlock:
+**When everything fits, nothing parks.** Processes whose memory fits together hold a GPU at once and CUDA interleaves
+their kernels. When they don't fit, they take turns, decided by one scheduler process, `python -m tinyrl.scheduler`.
+Node daemons and workers append facts to one log, `tinyrl:events`. The scheduler folds the log into its state with
+`control.fold` and appends what `control.decide` says, `granted` or `revoked`, to the same log, where workers read them.
+A process on several GPUs is granted all of them at once, so two processes never deadlock:
 
-1. A process with queued work and no seat sets `wait` on the lease's key and retries `SET NX`.
-2. Between batches, the holder checks for a waiter. If one waits and the holder has held the seat for 30 s, or its own
-   queue is empty, it parks and releases the lease.
+1. A process with queued work and no turn appends `wants_gpu` and waits for `granted`, asking again every 2.5 s.
+2. With someone waiting, an idle holder is revoked at once and a busy one after a 30 s quantum. Engine boot doesn't
+   count toward the quantum. A revoked holder parks and emits `released`.
 3. Parking is in the application, not the driver. A trainer calls `store.put(..., durable=False)` and
    `torch.cuda.empty_cache()`. A sampler puts its engine to sleep.
 
@@ -374,8 +376,8 @@ Measured on an H100: parking 16 GB takes 0.60 s, resuming takes 0.64 s, and 725â
 CUDA context, about 210 MiB of cuBLAS, and allocator slack). vLLM's level 1 sleep leaves 808 MiB on an L4. That leftover
 caps how many processes one GPU can host, at about 0.8 GB each.
 
-There's no queue for the lease: whoever retries first after a release wins. Jain's index in `/metrics` shows whether
-that's fair enough, and a queue gets added only if it isn't.
+Waiters are granted in the order they first asked. Every grant and revoke names the rule in `control.RULES` that made
+it, and replaying the log rebuilds every decision.
 
 **LoRA pools park like any other, and so do their runs.** An active LoRA pool stays resident while it has queued work; an
 idle 8B LoRA base parks 16.4 GB of bf16 to `/dev/shm` in 0.62 s. A run inside a busy pool that sits idle for 30 minutes

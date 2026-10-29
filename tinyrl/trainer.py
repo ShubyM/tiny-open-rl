@@ -28,16 +28,14 @@ from tinyrl import wire
 from tinyrl.bus import LEASE_MS, UTIL_MS, Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.store import Store
+from tinyrl.turns import IDLE_MS, GpuTurn
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
 CHUNK = getenv("CHUNK", 1024)  # positions per output head chunk when computing logprobs
 GRAD_CKPT = getenv("GRAD_CKPT", 1)  # gradient checkpointing
 STRANDED_MS = 5000  # a command in flight this long while its pool's owner has nothing in flight was stranded
-GPU = getenv(
-  "GPU", ""
-)  # the lease of the GPU this trainer takes turns on, set by the node daemon. Unset, it never yields
-HOLD_S = getenv("HOLD_S", 30.0)  # a busy trainer keeps its GPU this long before yielding to one that waits
+GPU = getenv("GPU", "")  # the GPU this trainer takes turns on, set by the node daemon. Unset, it never takes turns
 
 # ***** losses *****
 #
@@ -471,7 +469,7 @@ class Trainer:
     self.done = False
     self.draining = False
     self.busy = 0.0  # seconds spent running commands since the last load report
-    self.seated = 0.0  # when this trainer took its GPU's lease, or 0 while it doesn't hold it
+    self.turn = GpuTurn(bus, pool, bool(GPU))
 
   async def serve(self) -> None:
     await self.own()
@@ -485,9 +483,7 @@ class Trainer:
         await self.drain()
     finally:
       renewing.cancel()
-      if GPU:
-        await self.bus.release(f"gpu:{GPU}", self.worker)
-        self.seated = 0.0
+      await self.turn.give_back()
       await self.bus.release(self.pool, self.worker)
 
   async def own(self) -> None:
@@ -503,8 +499,6 @@ class Trainer:
       if not await self.bus.renew(self.pool, self.worker) and not await self.reown():
         self.done = True
         return
-      if self.seated and not await self.bus.renew(f"gpu:{GPU}", self.worker):
-        self.seated = 0.0  # paused past the GPU lease: take it again before the next batch
       if (now := time.time()) - reported >= UTIL_MS / 1000:
         await self.bus.report(self.pool, min(1.0, self.busy / (now - reported)))
         self.busy, reported = 0.0, now
@@ -560,20 +554,25 @@ class Trainer:
     """Take the next commands from the pool and run them. Returns how many there were."""
     if self.done:
       return 0
-    take_block = 150 if self.seated and block_ms > 150 else block_ms
+    take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
     cmds = await self.bus.take(self.pool, self.worker, count, take_block)
     if not cmds:
-      await self.yield_gpu(GPU, idle=True)  # nothing to run: hand the GPU over now if another trainer asked for it
+      await self.turn.went_idle()
+      await self.yield_gpu()
       return 0
     queue: collections.deque[Cmd] = collections.deque()
     enqueue_cmds(queue, cmds, self.model.lora)
     processed = 0
-    async with self.acquire(GPU):
+    async with self.acquire(len(cmds)):
+      batch_start = time.time()
+      ops = []
       while queue:
         cmd = queue.popleft()
         start = time.time()
         first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
         reply = first or await self.answer(cmd)
+        ms = (time.time() - start) * 1000
+        ops.append([cmd.op, ms])
         self.busy += time.time() - start
         if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
           self.done = True  # another trainer owns the pool now
@@ -584,7 +583,6 @@ class Trainer:
           self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
 
         if DEBUG:
-          ms = (time.time() - start) * 1000
           error = "" if reply.ok else f"  {reply.body.decode()}"
           print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
 
@@ -594,32 +592,24 @@ class Trainer:
             await asyncio.sleep(0.015)
           more = await self.bus.take(self.pool, self.worker, count, 0)
           enqueue_cmds(queue, more, True)
+      await self.turn.batch_done(queued=len(queue), seconds=time.time() - batch_start, ops=ops)
     return processed
 
   @contextlib.asynccontextmanager
-  async def acquire(self, gpu: str):
-    """Hold the GPU for a batch: wait for this trainer's turn and bring its tensors back. After the batch, yield it if
-    another trainer asked for it and this one has had it HOLD_S. With no GPU to share, it does nothing."""
-    if gpu and not self.seated:
-      try:
-        while not await self.bus.take_gpu(gpu, self.worker):
-          await asyncio.sleep(0.05)
-      finally:
-        await self.bus.withdraw_request(gpu, self.worker)
+  async def acquire(self, queued: int):
+    """Hold the GPU for a batch: wait for this trainer's turn and bring its tensors back, and after the batch give the
+    turn back if the scheduler revoked it."""
+    if await self.turn.take(queued):
       await asyncio.to_thread(self.model.resume)
-      self.seated = time.time()
     try:
       yield
     finally:
-      await self.yield_gpu(gpu, idle=False)
+      await self.yield_gpu()
 
-  async def yield_gpu(self, gpu: str, idle: bool) -> None:
-    """Park and release the GPU if another trainer asked for it, once this one is idle or has had it HOLD_S."""
-    held = self.seated and (idle or time.time() - self.seated >= HOLD_S)
-    if held and await self.bus.others_requested(gpu, self.worker):
+  async def yield_gpu(self) -> None:
+    if await self.turn.revoked():
       await asyncio.to_thread(self.model.park)
-      await self.bus.release(f"gpu:{gpu}", self.worker)
-      self.seated = 0.0
+      await self.turn.give_back()
 
   def run(self, cmd: Cmd) -> Reply:
     """Run one command on the model. A failure becomes the reply, never an exception."""

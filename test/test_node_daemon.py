@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from test.helpers import RedisTest, new_id, tiny
+from tinyrl import scheduler
 from tinyrl.bus import Op, Run
 from tinyrl.node_daemon import NodeDaemon
 
@@ -25,6 +26,8 @@ class TestNodeDaemon(RedisTest):
 
     with patch.dict(os.environ, {"REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS)}):
       daemon = NodeDaemon(self.bus, gpus=2)
+      await self.bus.emit("node_up", node=daemon.id, gpus=2, memory=0)
+      scheduling = asyncio.create_task(scheduler.run(self.bus))  # so its trainers get GPU turns
       try:
         await daemon.tick()  # it takes the scheduler lease
         await daemon.tick()  # and places the pool on itself
@@ -49,6 +52,7 @@ class TestNodeDaemon(RedisTest):
         )
         self.assertTrue((await self.bus.result(request_id, 60)).ok)
       finally:
+        scheduling.cancel()
         for _, proc in daemon.trainers.values():
           proc.terminate()
           proc.wait()
@@ -118,26 +122,21 @@ class TestNodeDaemon(RedisTest):
       self.assertEqual(env3["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
 
   @patch("tinyrl.node_daemon.subprocess.Popen")
-  def test_sampler_gpu_memory_and_lease_slots(self, mock_popen):
+  def test_shared_fft_samplers_get_a_memory_budget_on_large_gpus(self, mock_popen):
     daemon = NodeDaemon(None, gpus=8, gpu_mib=81559)
     host = socket.gethostname()
 
     daemon.trainers["sampler:fft:Qwen"] = daemon.start("sampler:fft:Qwen")
     env1 = mock_popen.call_args[1]["env"]
-    self.assertEqual(env1["GPU"], f"{host}:6:0")
+    self.assertEqual(env1["GPU"], f"{host}:6")
     self.assertEqual(env1["TINYRL_GPU_MEM"], "0.42")
     self.assertEqual(env1["TINYRL_KV_BYTES"], str(16 * 1024**3))
 
     daemon.trainers["sampler:fft:Gemma"] = daemon.start("sampler:fft:Gemma")
     env2 = mock_popen.call_args[1]["env"]
-    self.assertEqual(env2["GPU"], f"{host}:6:1")
+    self.assertEqual(env2["GPU"], f"{host}:6")
     self.assertEqual(env2["TINYRL_GPU_MEM"], "0.42")
     self.assertEqual(env2["TINYRL_KV_BYTES"], str(16 * 1024**3))
-
-    del daemon.trainers["sampler:fft:Qwen"]
-    daemon.trainers["sampler:fft:Mistral"] = daemon.start("sampler:fft:Mistral")
-    env3 = mock_popen.call_args[1]["env"]
-    self.assertEqual(env3["GPU"], f"{host}:6:0")
 
     daemon.trainers["sampler:Qwen"] = daemon.start("sampler:Qwen")
     env4 = mock_popen.call_args[1]["env"]

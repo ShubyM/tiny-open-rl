@@ -152,20 +152,17 @@ class TestSampler(RedisTest):
     self.assertIn(("load", "c0", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.engine.calls)
     await client.aclose()
 
-  @patch("tinyrl.trainer.HOLD_S", 0.0)
-  @patch("tinyrl.sampler.HOLD_S", 0.0)
   @patch("tinyrl.trainer.GPU", "node-a:0")
-  @patch("tinyrl.sampler.GPUS", ["node-a:0"])
+  @patch("tinyrl.sampler.GPU", "node-a:0")
   async def test_a_trainer_and_a_sampler_take_turns_on_one_gpu(self):
+    await self.run_scheduler({"t1": [0], "sampler:base": [0]})
     await self.take_turns()
 
-  @patch("tinyrl.trainer.HOLD_S", 0.0)
-  @patch("tinyrl.sampler.HOLD_S", 0.0)
   @patch("tinyrl.trainer.GPU", "node-a:1")
-  @patch("tinyrl.sampler.GPUS", ["node-a:0", "node-a:1"])
+  @patch("tinyrl.sampler.GPU", "node-a:0,node-a:1")
   async def test_a_tensor_parallel_sampler_takes_turns_on_both_its_gpus(self):
+    await self.run_scheduler({"t1": [1], "sampler:base": [0, 1]})
     await self.take_turns()
-    self.assertIsNone(await self.bus.owner("gpu:node-a:1"))
 
   async def take_turns(self):
     await self.bus.create(Run("t1", "t1", "base", 0))
@@ -189,7 +186,6 @@ class TestSampler(RedisTest):
     finally:
       trainer.done = sampler.done = True
       await asyncio.gather(*tasks)
-    self.assertIsNone(await self.bus.owner("gpu:node-a:0"))
     self.assertEqual(sampler.engine.calls[-1], ("close",))
 
   async def test_a_sampler_batches_queued_commands_concurrently_and_loads_once(self):
@@ -324,9 +320,7 @@ class TestSampler(RedisTest):
     await full.load("c0", dir1)
     self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache", "/collective_rpc", "/reset_prefix_cache"])
 
-  async def test_sampler_step_post_boot_drain_and_refresh(self):
-    import time
-
+  async def test_a_sampler_takes_the_commands_that_arrive_while_its_engine_boots(self):
     store = Store(tempfile.mkdtemp())
     store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
     await self.bus.create(Run("sess", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
@@ -339,7 +333,6 @@ class TestSampler(RedisTest):
 
     sampler = Sampler(self.bus, "sampler:base", engine=SlowStartEngine, store=store)
     await self.own(sampler)
-    sampler.seated = time.time() - 20.0
 
     await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
 
@@ -350,10 +343,8 @@ class TestSampler(RedisTest):
 
     asyncio.create_task(push_more())
 
-    old_seated = sampler.seated
     handled = await sampler.step(block_ms=200)
     self.assertEqual(handled, 3)
-    self.assertGreater(sampler.seated, old_seated + 10.0)
 
   async def test_sampler_step_groups_non_exclusive_fft_interleaved(self):
     store = Store(tempfile.mkdtemp())

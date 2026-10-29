@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import json
 import unittest
 from unittest.mock import patch
@@ -16,7 +15,7 @@ LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
 class TestTakingTurns(RedisTest):
-  """Two trainers whose pools the node daemon put on one GPU: only the one holding the GPU's lease runs commands."""
+  """Two trainers whose pools the node daemon put on one GPU: the scheduler decides whose turn it is."""
 
   async def trainer(self, pool: str) -> tuple[Trainer, str]:
     t = Trainer(self.bus, pool, Model(tiny), worker=pool)
@@ -29,67 +28,61 @@ class TestTakingTurns(RedisTest):
   async def submit(self, run: str, op: Op, body: dict) -> str:
     return await self.bus.submit(run, op, json.dumps(body).encode())
 
+  async def until_it_yields(self, t: Trainer) -> None:
+    for _ in range(100):
+      await t.step(block_ms=10)
+      if not t.turn.held:
+        return
+    self.fail(f"{t.pool} kept its GPU")
+
   async def test_an_idle_trainer_yields_its_gpu_to_one_that_waits(self):
     with patch.object(trainer, "GPU", "node-a:0"):
+      await self.run_scheduler({"a": [0], "b": [0]})
       a, _ = await self.trainer("a")
-      await a.step(block_ms=10)  # takes the GPU, creates its model
+      await a.step(block_ms=10)
       b, run_b = await self.trainer("b")
       waiting = asyncio.create_task(b.step(block_ms=10))
       await asyncio.sleep(0.3)
       self.assertFalse(waiting.done())  # b took its command, but a holds the GPU
       self.assertEqual(len((await self.bus.queue(run_b))["in_flight"]), 1)
 
-      await a.step(block_ms=10)  # a has nothing to do, and b waits
-      self.assertEqual(await waiting, 1)
+      await self.until_it_yields(a)
+      self.assertEqual(await asyncio.wait_for(waiting, 5), 1)
       self.assertTrue(a.model.parked)
-      self.assertEqual((a.seated > 0, b.seated > 0), (False, True))
+      self.assertEqual((a.turn.held, b.turn.held), (False, True))
 
-  async def test_a_busy_trainer_keeps_its_gpu_for_hold_s(self):
-    with patch.object(trainer, "GPU", "node-a:0"), patch.object(trainer, "HOLD_S", 1.0):
+  async def test_a_busy_trainer_keeps_its_gpu_for_its_quantum(self):
+    with patch.object(trainer, "GPU", "node-a:0"):
+      await self.run_scheduler({"a": [0], "b": [0]}, quantum=1.0)
       a, run_a = await self.trainer("a")
       await a.step(block_ms=10)
       b, _ = await self.trainer("b")
       waiting = asyncio.create_task(b.step(block_ms=10))
-      await asyncio.sleep(0.2)
 
-      await self.submit(run_a, Op.OPTIM_STEP, {"adam_params": {}})
-      await a.step(block_ms=10)  # busy, and it has held the GPU under HOLD_S
+      for _ in range(3):  # busy for well under its quantum
+        await self.submit(run_a, Op.OPTIM_STEP, {"adam_params": {}})
+        await a.step(block_ms=10)
+        await asyncio.sleep(0.1)
       self.assertFalse(waiting.done())
 
       await asyncio.sleep(1.0)
       await self.submit(run_a, Op.OPTIM_STEP, {"adam_params": {}})
-      await a.step(block_ms=10)  # past HOLD_S, so it yields after this batch
-      self.assertEqual(await waiting, 1)
+      await a.step(block_ms=10)  # its quantum ran out, so it yields after this batch
+      self.assertEqual(await asyncio.wait_for(waiting, 5), 1)
       self.assertTrue(a.model.parked)
 
-  async def test_full_finetune_releases_gpu_on_exit(self):
+  async def test_a_trainer_that_exits_gives_its_turn_to_the_next(self):
     with patch.object(trainer, "GPU", "node-a:0"):
+      await self.run_scheduler({"a": [0], "b": [0]})
       t = Trainer(self.bus, "a", Model(tiny), worker="a")
       run = new_id()
       await self.bus.create(Run(run, "a", "tiny", 0))
       await self.submit(run, Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}})
       await self.submit(run, Op.DELETE_MODEL, {})
+      b, _ = await self.trainer("b")
 
       await t.serve()
-
-      self.assertIsNone(await self.bus.owner("gpu:node-a:0"))
-
-  async def test_cancelled_step_withdraws_gpu_request(self):
-    with patch.object(trainer, "GPU", "node-a:0"):
-      a, _ = await self.trainer("a")
-      await a.step(block_ms=10)
-
-      b, _ = await self.trainer("b")
-      waiting = asyncio.create_task(b.step(block_ms=10))
-      await asyncio.sleep(0.3)
-
-      self.assertTrue(await self.bus.others_requested("node-a:0", "a"))
-
-      waiting.cancel()
-      with contextlib.suppress(asyncio.CancelledError):
-        await waiting
-
-      self.assertFalse(await self.bus.others_requested("node-a:0", "a"))
+      self.assertEqual(await asyncio.wait_for(b.step(block_ms=10), 5), 1)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")

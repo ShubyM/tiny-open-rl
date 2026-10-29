@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from tinyrl import schedule, wire
-from tinyrl.bus import Bus, Op, Run
+from tinyrl.bus import Bus, Op, Run, key
 from tinyrl.helpers import getenv
 from tinyrl.store import Store
 
@@ -143,7 +143,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       "nodes": await bus.nodes(),
       "placements": await bus.placements(),
       "exclusive": sorted(await bus.exclusive()),
-      "gpu_leases": await bus.gpu_fairness(),
+      "turns": json.loads(await bus.r.get(key("state")) or "{}"),
       "decisions": await bus.decisions(),
     }
 

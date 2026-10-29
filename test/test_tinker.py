@@ -49,6 +49,7 @@ class TestTinkerSDK(unittest.TestCase):
     procs = [start_redis(f"{tmp}/redis.sock")]
     try:
       procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.gateway"], env=env))
+      procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.scheduler"], env=env))
       procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.node_daemon"], env=env))  # starts the trainer
       wait_until_up(f"http://127.0.0.1:{port}/api/v1/healthz")
 

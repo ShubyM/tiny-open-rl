@@ -70,6 +70,15 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     await trainer.own()
     self.renewal_tasks.append(asyncio.create_task(trainer.keep()))
 
+  async def run_scheduler(self, placed: dict[str, list[int]], quantum: float = 30.0) -> None:
+    """Start one node daemon's facts and the scheduler, so workers on these pools and GPUs get turns."""
+    from tinyrl import control, scheduler
+
+    await self.bus.emit("node_up", node="n", gpus=1 + max(i for gpus in placed.values() for i in gpus), memory=0)
+    for pool, gpus in placed.items():
+      await self.bus.emit("started", pool=pool, node="n", gpus=gpus)
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus, control.Policy(quantum=quantum))))
+
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
       task.cancel()

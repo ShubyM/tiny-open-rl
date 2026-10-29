@@ -28,6 +28,7 @@ import redis.asyncio as redis
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialBackoff
 
+from tinyrl import control
 from tinyrl.helpers import getenv
 
 GROUP = "trainer"  # the consumer group every pool's trainer reads through
@@ -220,20 +221,6 @@ class Bus:
       out[kind] = {k.decode(): json.loads(v) for k, v in raw.items()}
     return out
 
-  async def gpu_fairness(self) -> dict[str, dict]:
-    gpus: set[str] = set()
-    async for owner_key in self.r.scan_iter(key("owner", "gpu:*")):
-      gpus.add(owner_key.decode().removeprefix(key("owner", "gpu:")))
-    async for wait_key in self.r.scan_iter(key("wait", "*")):
-      gpus.add(wait_key.decode().removeprefix(key("wait", "")))
-    fair = {}
-    for gpu in sorted(gpus):
-      owner = await self.owner(f"gpu:{gpu}")
-      waiters = [w.decode() for w in await self.r.zrange(key("wait", gpu), 0, -1)]
-      if owner or waiters:
-        fair[gpu] = {"owner": owner, "waiters": waiters}
-    return fair
-
   # ***** commands *****
 
   async def submit(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
@@ -369,7 +356,7 @@ class Bus:
     worker = await self.r.get(key("owner", pool))
     return worker.decode() if worker else None
 
-  # ***** taking turns on a GPU, whose lease is own("gpu:<node>:<i>") *****
+  # ***** GPU width *****
 
   async def width(self, pool: str) -> int:
     """How many GPUs the pool's process runs on, 1 unless set_width said otherwise."""
@@ -377,31 +364,6 @@ class Bus:
 
   async def set_width(self, pool: str, width: int) -> None:
     await self.r.set(key("width", pool), width)
-
-  async def take_gpu(self, gpu: str, worker: str) -> bool:
-    """Take the GPU's lease if it's free and `worker` has waited longest for it, so whoever polls fastest can't jump
-    the line. A wait counts from the first ask; a waiter that hasn't asked for LEASE_MS drops out of the line. Only
-    the lease's SET NX has to be atomic: the line just decides who may try it."""
-    now = time.time()
-    p = self.r.pipeline(transaction=False)
-    p.zadd(key("wait", gpu), {worker: now}, nx=True)  # in line since its first ask
-    p.zadd(key("alive", gpu), {worker: now + LEASE_MS / 1000})  # still asking until then
-    p.zrangebyscore(key("alive", gpu), "-inf", now)
-    if dead := (await p.execute())[-1]:
-      await self.r.zrem(key("wait", gpu), *dead)
-      await self.r.zrem(key("alive", gpu), *dead)
-    if await self.r.zrange(key("wait", gpu), 0, 0) != [worker.encode()] or not await self.own(f"gpu:{gpu}", worker):
-      return False
-    await self.withdraw_request(gpu, worker)
-    return True
-
-  async def withdraw_request(self, gpu: str, worker: str) -> None:
-    await self.r.zrem(key("wait", gpu), worker)
-    await self.r.zrem(key("alive", gpu), worker)
-
-  async def others_requested(self, gpu: str, worker: str) -> bool:
-    """Whether another trainer has asked for the GPU within the last LEASE_MS."""
-    return any(w.decode() != worker for w in await self.r.zrangebyscore(key("alive", gpu), time.time(), "+inf"))
 
   # ***** load *****
 
@@ -488,3 +450,22 @@ class Bus:
       for entry in pending
     ]
     return {"live": True, "queued": groups[0]["lag"], "in_flight": in_flight}
+
+  # ***** events: the log GPU turns are decided from, see control.py *****
+
+  async def emit(self, _kind: str, **body) -> str:
+    """Append an entry to the log. Returns its stream id."""
+    entry_id = await self.r.xadd(
+      key("events"), {"kind": _kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
+    )
+    return entry_id.decode()
+
+  async def events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[control.Event]:
+    """The entries after stream id `after`, waiting up to block_ms for one, or not at all if it is 0."""
+    got = await self.r.xread({key("events"): after}, count=count, block=block_ms or None)
+    out = []
+    for entry_id, fields in got[0][1] if got else []:
+      entry_id = entry_id.decode()
+      t = int(entry_id.split("-")[0]) / 1000
+      out.append(control.Event(entry_id, t, fields[b"kind"].decode(), json.loads(fields[b"body"])))
+    return out
