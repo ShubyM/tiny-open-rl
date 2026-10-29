@@ -6,12 +6,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import glob
+import json
 import os
 import shlex
 import socket
 import subprocess
 
 import httpx
+import safetensors
 
 from tinyrl.helpers import getenv
 from tinyrl.sampler import Out, Seq
@@ -94,6 +97,14 @@ class VLLM:
   async def load(self, name: str, path: str) -> None:
     if name in self.loaded:
       return
+    if not self.lora and not self.loaded and os.path.isdir(path):
+      files = sorted(glob.glob(f"{path}/*.safetensors"))
+      if files:
+        with safetensors.safe_open(files[0], framework="pt", device="cpu") as f:
+          meta = json.loads((f.metadata() or {}).get("meta", "{}"))
+        if meta.get("untouched"):
+          self.loaded = {name}
+          return
     if self.lora:
       await self.post("/v1/load_lora_adapter", json={"lora_name": name, "lora_path": path})
       self.loaded.add(name)

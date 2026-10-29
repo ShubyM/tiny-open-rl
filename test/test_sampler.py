@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import httpx
+import safetensors.torch
+import torch
 
 from test.helpers import FakeEngine, RedisTest, tiny
 from tinyrl import wire
@@ -284,6 +286,32 @@ class TestSampler(RedisTest):
       self.assertEqual(args[idx + 1], "{}")
       self.assertEqual(args.count("--compilation-config"), 1)
       self.assertNotIn(CUDAGRAPH_CONFIG, args)
+
+  async def test_vllm_load_skips_untouched_fft_checkpoint(self):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+      calls.append(request.url.path)
+      return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://vllm")
+    full = VLLM("http://vllm", "base", lora=False, client=client)
+
+    dir1 = tempfile.mkdtemp()
+    safetensors.torch.save_file(
+      {"w": torch.ones(1)}, f"{dir1}/model.safetensors", metadata={"meta": json.dumps({"untouched": True})}
+    )
+
+    dir2 = tempfile.mkdtemp()
+    safetensors.torch.save_file(
+      {"w": torch.ones(1)}, f"{dir2}/model.safetensors", metadata={"meta": json.dumps({"untouched": False})}
+    )
+
+    await full.load("c0", dir1)
+    self.assertEqual(calls, [])
+
+    await full.load("c1", dir2)
+    self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache"])
 
 
 if __name__ == "__main__":

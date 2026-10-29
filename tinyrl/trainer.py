@@ -197,6 +197,7 @@ class Model:
     self.params: dict[str, dict[str, torch.nn.Parameter]] = {}  # canonical name -> trainable parameter
     self.optimizers: dict[str, torch.optim.AdamW] = {}
     self.parked = False
+    self.dirty: set[str] = set()
 
   def create(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
@@ -218,6 +219,7 @@ class Model:
     if config.get("seed") is not None:
       torch.manual_seed(config["seed"])
 
+    self.dirty.discard(run)
     if not self.lora:
       if self.params:
         raise ValueError(f"a full fine-tune has its trainer to itself, and {next(iter(self.params))} is on this one")
@@ -297,6 +299,7 @@ class Model:
     optimizer.zero_grad()
     if not self.lora:
       self.move(self.moments(), "cpu")
+    self.dirty.add(run)
     return {"grad_norm:mean": grad_norm}
 
   def state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
@@ -316,12 +319,18 @@ class Model:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
     lm = self.use(run)
     prefix = "base_model.model." if self.lora else ""
-    tensors = {f"{prefix}{name}": p.detach().to(self.dtype).cpu() for name, p in self.params[run].items()}
+    tensors = {f"{prefix}{name}": p.detach().to(self.dtype) for name, p in self.params[run].items()}
     if self.lora:
       cfg = {k: sorted(v) if isinstance(v, set) else v for k, v in lm.peft_config[run].to_dict().items()}
     else:
       cfg = lm.config.to_dict()
-    return tensors, {"base": self.base, "lora": self.lora, "optimizer": False, "config": cfg}
+    return tensors, {
+      "base": self.base,
+      "lora": self.lora,
+      "optimizer": False,
+      "untouched": not self.lora and run not in self.dirty,
+      "config": cfg,
+    }
 
   def restore(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
     self.use(run)
@@ -347,6 +356,7 @@ class Model:
         }
       if not self.lora:
         self.move(self.moments(), "cpu")
+    self.dirty.add(run)
 
   def moments(self):
     return (v for opt in self.optimizers.values() for s in opt.state.values() for v in s.values() if torch.is_tensor(v))
@@ -383,6 +393,7 @@ class Model:
 
   def delete(self, run: str) -> None:
     lm = self.use(run)
+    self.dirty.discard(run)
     if self.lora:
       lm.delete_adapter(run)
     del self.params[run]
