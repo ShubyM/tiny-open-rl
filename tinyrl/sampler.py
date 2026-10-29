@@ -25,7 +25,17 @@ from tinyrl import wire
 from tinyrl.bus import LEASE_MS, Bus, Reply
 from tinyrl.helpers import getenv
 from tinyrl.store import Store
-from tinyrl.trainer import GPU, HOLD_S, STRANDED_MS, fail
+
+STRANDED_MS = 5000
+GPU = getenv("GPU", "")
+HOLD_S = getenv("HOLD_S", 30.0)
+
+
+def fail(error: Exception) -> Reply:
+  category = "user" if isinstance(error, (ValueError, KeyError)) else "server"
+  body = {"error": f"{type(error).__name__}: {error}", "category": category}
+  return Reply(False, wire.JSON, json.dumps(body).encode())
+
 
 GPUS = GPU.split(",") if GPU else []  # the leases of every GPU this sampler runs on, as tensor parallel ranks
 

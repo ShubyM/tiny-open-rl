@@ -11,16 +11,17 @@ import json
 import os
 import shlex
 import socket
+import struct
 import subprocess
 
 import httpx
-import safetensors
 
 from tinyrl.helpers import getenv
 from tinyrl.sampler import Out, Seq
 
 VLLM_ARGS = getenv("VLLM_ARGS", "")  # more `vllm serve` flags, like --gpu-memory-utilization 0.4
 CUDAGRAPH_CONFIG = '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128,256]}'
+KERNEL_CONFIG = '{"enable_flashinfer_autotune":false}'
 
 
 def split_stop(stop: str | list | None) -> tuple[list[str], list[int]]:
@@ -70,6 +71,8 @@ class VLLM:
       a == "--compilation-config" or a.startswith("--compilation-config=") or a.startswith("-O") for a in extra
     ):
       extra += ["--compilation-config", CUDAGRAPH_CONFIG]
+    if not any(a == "--kernel-config" or a.startswith("--kernel-config=") for a in extra):
+      extra += ["--kernel-config", KERNEL_CONFIG]
     if mem := os.environ.get("TINYRL_GPU_MEM"):
       extra += ["--gpu-memory-utilization", mem]
     if (kv := os.environ.get("TINYRL_KV_BYTES")) and not any(
@@ -111,8 +114,9 @@ class VLLM:
     if not self.lora and self.clean and os.path.isdir(path):
       files = sorted(glob.glob(f"{path}/*.safetensors"))
       if files:
-        with safetensors.safe_open(files[0], framework="pt", device="cpu") as f:
-          meta = json.loads((f.metadata() or {}).get("meta", "{}"))
+        with open(files[0], "rb") as f:
+          n = struct.unpack("<Q", f.read(8))[0]
+          meta = json.loads(json.loads(f.read(n)).get("__metadata__", {}).get("meta", "{}"))
         if meta.get("untouched"):
           self.loaded = {name}
           return

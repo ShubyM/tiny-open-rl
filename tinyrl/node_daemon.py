@@ -23,7 +23,7 @@ from tinyrl.helpers import getenv
 
 GPUS = getenv("GPUS", 1)
 DRAIN_S = getenv("DRAIN_S", 20.0)  # how long a stopping node daemon waits for its trainers to save their runs
-TICK = 1.0
+TICK = getenv("TICK", 0.25)
 SCHEDULER = "scheduler"  # the lease whose holder places pools
 
 

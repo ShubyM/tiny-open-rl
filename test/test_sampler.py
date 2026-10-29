@@ -430,6 +430,46 @@ class TestSampler(RedisTest):
           await VLLM.start("base", False)
         self.assertNotIn("TINYRL_WARM_SAMPLER", mock_popen.call_args[1]["env"])
 
+  def test_sampler_imports_are_clean(self):
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+      [
+        sys.executable,
+        "-c",
+        "import sys, tinyrl.sampler, tinyrl.vllm; "
+        "assert not ({'torch', 'transformers', 'peft', 'safetensors'} & set(sys.modules))",
+      ],
+      capture_output=True,
+      text=True,
+    )
+    self.assertEqual(out.returncode, 0, out.stderr)
+
+  @patch("tinyrl.vllm.subprocess.Popen")
+  @patch("tinyrl.vllm.httpx.AsyncClient.get")
+  async def test_vllm_start_kernel_config(self, mock_get, mock_popen):
+    mock_popen.return_value.poll.return_value = None
+    mock_get.return_value.is_success = True
+
+    from tinyrl.vllm import KERNEL_CONFIG, VLLM
+
+    with patch("tinyrl.vllm.VLLM_ARGS", ""):
+      await (await VLLM.start("base", False)).http.aclose()
+      args = mock_popen.call_args[0][0]
+      self.assertIn("--kernel-config", args)
+      idx = args.index("--kernel-config")
+      self.assertEqual(args[idx + 1], KERNEL_CONFIG)
+
+    with patch("tinyrl.vllm.VLLM_ARGS", "--kernel-config '{\"enable_flashinfer_autotune\":true}'"):
+      await (await VLLM.start("base", False)).http.aclose()
+      args = mock_popen.call_args[0][0]
+      self.assertIn("--kernel-config", args)
+      idx = args.index("--kernel-config")
+      self.assertEqual(args[idx + 1], '{"enable_flashinfer_autotune":true}')
+      self.assertEqual(args.count("--kernel-config"), 1)
+      self.assertNotIn(KERNEL_CONFIG, args)
+
 
 if __name__ == "__main__":
   unittest.main()

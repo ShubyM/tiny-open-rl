@@ -18,11 +18,12 @@ import pathlib
 import shutil
 import tempfile
 import threading
+from typing import TYPE_CHECKING, Any
 
 import fsspec
-import safetensors
-import safetensors.torch
-import torch
+
+if TYPE_CHECKING:
+  import torch
 
 from tinyrl.helpers import getenv
 
@@ -38,13 +39,17 @@ class Store:
     self.remote = "://" in self.root
     self.fs, self.base = fsspec.core.url_to_fs(self.root, auto_mkdir=True)  # a file:// URL makes folders as it writes
     self.cache = CKPT_CACHE if cache is None else cache
-    self._pin: torch.Tensor | None = None
+    self._pin: Any = None
     self._pin_lock = threading.Lock()
 
   def path(self, uri: str) -> str:
     return f"{self.base}/{uri.removeprefix('tinker://')}"
 
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
+    import safetensors
+    import safetensors.torch
+    import torch
+
     info = dict(meta or {})
     dest = self.path(uri)
     folder = tempfile.mkdtemp(dir=self._mkdir(self.cache if self.remote else os.path.dirname(dest)))
@@ -150,6 +155,8 @@ class Store:
     return folder, version
 
   def get(self, uri: str, *, device: str = "cpu") -> tuple[dict[str, torch.Tensor], dict]:
+    import safetensors
+
     paths = sorted(glob.glob(f"{self.local(uri)[0]}/*.safetensors"))
     if not paths:
       raise ValueError(f"no checkpoint at {uri}")
@@ -172,6 +179,8 @@ class Store:
     return tensors, meta
 
   def meta(self, uri: str) -> dict:
+    import safetensors
+
     with safetensors.safe_open(self._weights(uri), framework="pt", device="cpu") as f:
       return json.loads((f.metadata() or {}).get("meta", "{}"))
 
