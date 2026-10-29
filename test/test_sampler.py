@@ -261,6 +261,30 @@ class TestSampler(RedisTest):
     self.assertEqual(calls, 2)
     self.assertEqual(out.seqs[0].tokens, [9])
 
+  @patch("tinyrl.vllm.subprocess.Popen")
+  @patch("tinyrl.vllm.httpx.AsyncClient.get")
+  async def test_vllm_start_compilation_config(self, mock_get, mock_popen):
+    mock_popen.return_value.poll.return_value = None
+    mock_get.return_value.is_success = True
+
+    from tinyrl.vllm import CUDAGRAPH_CONFIG, VLLM
+
+    with patch("tinyrl.vllm.VLLM_ARGS", ""):
+      await (await VLLM.start("base", False)).http.aclose()
+      args = mock_popen.call_args[0][0]
+      self.assertIn("--compilation-config", args)
+      idx = args.index("--compilation-config")
+      self.assertEqual(args[idx + 1], CUDAGRAPH_CONFIG)
+
+    with patch("tinyrl.vllm.VLLM_ARGS", "--compilation-config '{}'"):
+      await (await VLLM.start("base", False)).http.aclose()
+      args = mock_popen.call_args[0][0]
+      self.assertIn("--compilation-config", args)
+      idx = args.index("--compilation-config")
+      self.assertEqual(args[idx + 1], "{}")
+      self.assertEqual(args.count("--compilation-config"), 1)
+      self.assertNotIn(CUDAGRAPH_CONFIG, args)
+
 
 if __name__ == "__main__":
   unittest.main()

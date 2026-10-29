@@ -17,6 +17,7 @@ from tinyrl.helpers import getenv
 from tinyrl.sampler import Out, Seq
 
 VLLM_ARGS = getenv("VLLM_ARGS", "")  # more `vllm serve` flags, like --gpu-memory-utilization 0.4
+CUDAGRAPH_CONFIG = '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128,256]}'
 
 
 def split_stop(stop: str | list | None) -> tuple[list[str], list[int]]:
@@ -56,7 +57,12 @@ class VLLM:
     if (tp := len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))) > 1:
       args += ["--tensor-parallel-size", str(tp)]
     env = {**os.environ, "VLLM_SERVER_DEV_MODE": "1", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True"}
-    server = subprocess.Popen([*args, *shlex.split(VLLM_ARGS)], env=env)
+    extra = shlex.split(VLLM_ARGS)
+    if not any(
+      a == "--compilation-config" or a.startswith("--compilation-config=") or a.startswith("-O") for a in extra
+    ):
+      extra += ["--compilation-config", CUDAGRAPH_CONFIG]
+    server = subprocess.Popen([*args, *extra], env=env)
     engine = cls(f"http://127.0.0.1:{port}", base, lora, server)
     while server.poll() is None:
       with contextlib.suppress(httpx.HTTPError):
