@@ -98,11 +98,32 @@ class Sampler:
     self.done, self.seated = False, 0.0  # seated: when this sampler took its GPU's lease, or 0 while unheld
     self.loaded: str | None = None
 
+  async def warm(self) -> None:
+    if self.engine is not None:
+      return
+    base = (await self.bus.warm_samplers()).get(self.pool)
+    if not base:
+      for run_id in await self.bus.runs(self.pool):
+        if (run := await self.bus.run(run_id)) and run.get("base"):
+          base = run["base"]
+          break
+    if not base:
+      return
+    async with self.acquire():
+      async with self.loading:
+        if self.engine is None:
+          with contextlib.suppress(Exception):
+            self.engine = await self.engine_type.start(base, self.lora)
+            if self.seated:
+              self.seated = time.time()
+
   async def serve(self) -> None:
     await self.own()
     renewing = asyncio.create_task(self.keep())
     try:
       await self.fail_stranded(0)
+      if os.environ.get("TINYRL_WARM_SAMPLER") == "1":
+        await self.warm()
       while not self.done:
         await self.step()
         await self.fail_stranded(STRANDED_MS)

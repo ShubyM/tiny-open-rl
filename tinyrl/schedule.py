@@ -63,9 +63,9 @@ class Zones:
 @dataclasses.dataclass(frozen=True, order=True)
 class BlockRank:
   paired_overlap: int
+  out_of_zone: bool
   exclusive_overlap: int
   in_reserved: bool
-  out_of_zone: bool
   out_of_subzone: bool
   cross_role_overlap: int
   shared_overlap: int
@@ -218,9 +218,9 @@ def choose_gpus(
 
     rank = BlockRank(
       paired_overlap=over(lambda _, rp: target.pairs_with(rp)),
+      out_of_zone=out_of_zone,
       exclusive_overlap=over(lambda r, _: r.pool in exclusive),
       in_reserved=in_reserved,
-      out_of_zone=out_of_zone,
       out_of_subzone=out_of_subzone,
       cross_role_overlap=over(lambda _, rp: rp.role != target.role),
       shared_overlap=over(lambda _, rp: rp.shared),

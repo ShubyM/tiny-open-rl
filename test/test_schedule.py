@@ -198,12 +198,14 @@ class TestSchedule(unittest.TestCase):
             name = f"sampler:b-{rnd.randint(1, 5)}"
           active.add(name)
         elif action == "remove" and active:
-          p = rnd.choice(list(active))
+          p = rnd.choice(sorted(active))
           active.remove(p)
 
+      stream_order = sorted(active)
+      rnd.shuffle(stream_order)
       streaming_running = []
       streaming_excl = set()
-      for p in list(active):
+      for p in stream_order:
         if p in excl:
           streaming_excl.add(p)
         try:

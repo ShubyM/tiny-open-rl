@@ -6,6 +6,7 @@ It takes commands from its pool's streams on the bus, runs each one on the model
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import math
@@ -416,6 +417,22 @@ def fail(error: Exception) -> Reply:
   return Reply(False, wire.JSON, json.dumps(body).encode())
 
 
+def enqueue_cmds(queue: collections.deque[Cmd], cmds: list[Cmd], lora: bool) -> None:
+  if not lora:
+    queue.extend(cmds)
+    return
+  blocked = {x.run for x in queue}
+  front, back = [], []
+  for c in cmds:
+    if c.op == Op.SAVE_WEIGHTS_FOR_SAMPLER and c.run not in blocked:
+      front.append(c)
+    else:
+      blocked.add(c.run)
+      back.append(c)
+  queue.extendleft(reversed(front))
+  queue.extend(back)
+
+
 class Trainer:
   def __init__(self, bus: Bus, pool: str, model: Model | None = None, worker: str = "", store: Store | None = None):
     self.bus = bus
@@ -520,8 +537,12 @@ class Trainer:
     if not cmds:
       await self.yield_gpu(GPU, idle=True)  # nothing to run: hand the GPU over now if another trainer asked for it
       return 0
+    queue: collections.deque[Cmd] = collections.deque()
+    enqueue_cmds(queue, cmds, self.model.lora)
+    processed = 0
     async with self.acquire(GPU):
-      for cmd in cmds:
+      while queue:
+        cmd = queue.popleft()
         start = time.time()
         first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
         reply = first or await self.answer(cmd)
@@ -538,7 +559,14 @@ class Trainer:
           ms = (time.time() - start) * 1000
           error = "" if reply.ok else f"  {reply.body.decode()}"
           print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
-    return len(cmds)
+
+        processed += 1
+        if self.model.lora and queue and (cmd.op == Op.OPTIM_STEP or queue[0].run != cmd.run):
+          if cmd.op == Op.OPTIM_STEP:
+            await asyncio.sleep(0.015)
+          more = await self.bus.take(self.pool, self.worker, count, 0)
+          enqueue_cmds(queue, more, True)
+    return processed
 
   @contextlib.asynccontextmanager
   async def acquire(self, gpu: str):

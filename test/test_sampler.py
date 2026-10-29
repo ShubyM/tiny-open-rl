@@ -406,6 +406,30 @@ class TestSampler(RedisTest):
         self.assertNotIn("TINYRL_GPU_MEM", child_env)
         self.assertNotIn("TINYRL_KV_BYTES", child_env)
 
+  async def test_warm_sampler_starts_engine_before_sample_and_strips_env_var(self):
+    import os
+
+    await self.bus.warm_sampler("sampler:base", "base")
+    sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine)
+    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1"}):
+      task = asyncio.create_task(sampler.serve())
+      try:
+        for _ in range(50):
+          if sampler.engine is not None:
+            break
+          await asyncio.sleep(0.02)
+        self.assertIsNotNone(sampler.engine)
+        self.assertEqual(sampler.engine.calls[0], ("start", "base", True))
+      finally:
+        sampler.done = True
+        await task
+
+      with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.poll.return_value = 0
+        with self.assertRaises(RuntimeError):
+          await VLLM.start("base", False)
+        self.assertNotIn("TINYRL_WARM_SAMPLER", mock_popen.call_args[1]["env"])
+
 
 if __name__ == "__main__":
   unittest.main()

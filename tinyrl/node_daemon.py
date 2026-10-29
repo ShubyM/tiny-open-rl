@@ -79,7 +79,7 @@ class NodeDaemon:
 
   async def schedule(self) -> None:
     nodes, placed = await self.bus.nodes(), await self.bus.placements()
-    pools = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)}
+    pools = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)} | set(await self.bus.warm_samplers())
     for pool in set(placed) - pools:
       await self.bus.place(pool, None)
 
@@ -97,6 +97,8 @@ class NodeDaemon:
     parsed = schedule.Pool.parse(pool)
     leases = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
+    if parsed.role == "sampler" and schedule.gpu_zones(self.gpus, width).partitioned:
+      env.setdefault("TINYRL_WARM_SAMPLER", "1")
     if self.gpu_mib >= 65536 and parsed.role == "sampler" and width == 1:
       if pool.startswith("sampler:fft:") and pool not in exclusive:
         slot = min(

@@ -368,6 +368,41 @@ class TestAPI(RedisTest):
     self.assertNotIn("lora:tiny:0", data["decisions"]["node"])
     self.assertNotIn("lora:tiny:0", data["placements"])
 
+  async def test_sft_never_warms_samplers_while_save_weights_for_sampler_does(self):
+    from tinyrl.node_daemon import NodeDaemon
+
+    sft = await self.create_model()
+    await self.result(await self.post("forward_backward", content=proto_body(sft), headers=PROTO))
+    await self.result(await self.post("optim_step", json={"model_id": sft, "adam_params": {}}))
+    await self.result(await self.post("save_weights", json={"model_id": sft, "path": "sft-ckpt"}))
+    self.assertEqual(await self.bus.warm_samplers(), {})
+
+    self.assertEqual(
+      (await self.post("save_weights_for_sampler", json={"model_id": sft, "path": "../bad"})).status_code, 400
+    )
+    self.assertEqual(await self.bus.warm_samplers(), {})
+
+    await self.post("save_weights_for_sampler", json={"model_id": sft, "path": "000000"})
+    self.assertEqual(await self.bus.warm_samplers(), {"sampler:tiny": "tiny"})
+
+    daemon8 = NodeDaemon(self.bus, gpus=8, node="n8")
+    await self.bus.heartbeat("n8", 8)
+    await daemon8.schedule()
+    self.assertEqual((await self.bus.placements()).get("sampler:tiny"), "n8")
+
+    with patch("subprocess.Popen") as popen:
+      daemon8.start("sampler:tiny", 1)
+      self.assertEqual(popen.call_args[1]["env"].get("TINYRL_WARM_SAMPLER"), "1")
+      NodeDaemon(self.bus, gpus=1, node="n1").start("sampler:tiny", 1)
+      self.assertNotIn("TINYRL_WARM_SAMPLER", popen.call_args[1]["env"])
+
+    excl = await self.create_model(user_metadata={"openrl.exclusive": "true"})
+    await self.post("save_weights_for_sampler", json={"model_id": excl, "sampling_session_seq_id": 0})
+    self.assertIn(f"sampler:lora:{excl}", await self.bus.warm_samplers())
+    await self.post("delete_model", json={"model_id": excl})
+    await self.drain(excl)
+    self.assertNotIn(f"sampler:lora:{excl}", await self.bus.warm_samplers())
+
 
 if __name__ == "__main__":
   unittest.main()

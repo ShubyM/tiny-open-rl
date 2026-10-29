@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -451,6 +452,60 @@ class TestTrainer(RedisTest):
     replies = [await self.bus.result(request_id, 1) for request_id in ids]
     self.assertEqual([reply.ok for reply in replies], [False, True, True])
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
+
+  async def test_sampler_save_is_processed_before_other_runs_finish(self):
+    store = Store(root=tempfile.mkdtemp())
+    t = Trainer(self.bus, "p", Model(tiny), store=store)
+    await self.own(t)
+
+    runs = [new_id() for _ in range(3)]
+    for r in runs:
+      await self.bus.create(Run(r, "p", "tiny", 4, lora=LORA))
+      await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    await t.step(count=16, block_ms=10)
+
+    opt_ids = {}
+    for r in runs:
+      ids = await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {}}))
+      opt_ids[r] = ids[-1]
+
+    done_at: dict[str, float] = {}
+
+    async def watch(name: str, req_id: str):
+      reply = await self.bus.result(req_id, 5)
+      done_at[name] = time.monotonic()
+      return reply
+
+    opt_tasks = {r: asyncio.create_task(watch(r, req_id)) for r, req_id in opt_ids.items()}
+
+    async def submit_first_save():
+      finished, _ = await asyncio.wait(opt_tasks.values(), return_when=asyncio.FIRST_COMPLETED)
+      first_run = next(r for r, task in opt_tasks.items() if task in finished)
+      [save_id] = await self.submit(first_run, (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": "tinker://r/sampler_weights/s0"}))
+      reply = await watch("save", save_id)
+      return first_run, reply
+
+    save_task = asyncio.create_task(submit_first_save())
+    n = await t.step(count=16, block_ms=10)
+    first_run, save_reply = await save_task
+    for task in opt_tasks.values():
+      await task
+
+    self.assertEqual(n, 7)
+    self.assertTrue(save_reply.ok)
+    other_times = [ts for name, ts in done_at.items() if name not in (first_run, "save")]
+    self.assertLess(done_at["save"], max(other_times))
+
+    causal = runs[0]
+    pipelined = await self.submit(
+      causal,
+      (Op.FORWARD_BACKWARD, proto_body(causal)),
+      (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.1}}),
+      (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{causal}/sampler_weights/s1"}),
+    )
+    self.assertEqual(await t.step(count=16, block_ms=10), 3)
+    self.assertTrue(all([(await self.bus.result(rid, 1)).ok for rid in pipelined]))
+    self.assertEqual((await self.bus.run(causal))["steps"], 2)
 
 
 class TestCheckpointNames(unittest.TestCase):

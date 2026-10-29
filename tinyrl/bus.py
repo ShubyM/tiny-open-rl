@@ -185,12 +185,23 @@ class Bus:
       p.hgetall(key("run", run_id))
     return {at: {k.decode(): int(v) for k, v in f.items() if k != b"record"} for at, f in zip(runs, await p.execute())}
 
+  async def warm_sampler(self, pool: str, base: str, exclusive: bool = False) -> None:
+    p = self.r.pipeline(transaction=True)
+    p.hset(key("warm"), pool, base)
+    if exclusive:
+      p.sadd(key("excl"), pool)
+    await p.execute()
+
+  async def warm_samplers(self) -> dict[str, str]:
+    return {k.decode(): v.decode() for k, v in (await self.r.hgetall(key("warm"))).items()}
+
   async def drop(self, run_id: str, pool: str) -> None:
     """Take a deleted run out of its pool and delete its stream, in one transaction."""
     p = self.r.pipeline(transaction=True)
     p.srem(key("pool", pool), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
     p.hdel(key("decide", "run"), run_id)
+    p.hdel(key("warm"), f"sampler:fft:{run_id}", f"sampler:lora:{run_id}")
     await p.execute()
 
   async def exclusive(self) -> set[str]:

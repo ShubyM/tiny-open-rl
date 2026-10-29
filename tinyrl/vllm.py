@@ -61,7 +61,7 @@ class VLLM:
     if (tp := len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))) > 1:
       args += ["--tensor-parallel-size", str(tp)]
     env = {
-      **{k: v for k, v in os.environ.items() if k not in {"TINYRL_GPU_MEM", "TINYRL_KV_BYTES"}},
+      **{k: v for k, v in os.environ.items() if k not in {"TINYRL_GPU_MEM", "TINYRL_KV_BYTES", "TINYRL_WARM_SAMPLER"}},
       "VLLM_SERVER_DEV_MODE": "1",
       "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
     }

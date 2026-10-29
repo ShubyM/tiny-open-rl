@@ -129,6 +129,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
     exclusive = train_run in await bus.exclusive() if train_run else False
     dec = schedule.choose_sampler_pool(base, lora, train_run, exclusive)
+    await bus.warm_sampler(dec.choice, base, exclusive=exclusive)
     sid = f"samp-{uuid.uuid4().hex[:12]}"
     await bus.decide("run", sid, dec.as_dict())
     await bus.create(Run(sid, dec.choice, base, int(lora), session_id, model_path=uri, exclusive=exclusive))
@@ -236,18 +237,22 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveRequest):
+    train = await bus.run(req.model_id)
+    if not train:
+      raise HTTPException(404, f"no model {req.model_id}")
+    seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
+    name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
+    uri = checkpoint_uri(req.model_id, "sampler_weights", name)
     if req.path is None or req.sampling_session_seq_id is not None:
-      train = await bus.run(req.model_id)
-      if not train:
-        raise HTTPException(404, f"no model {req.model_id}")
-      seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
-      name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-      uri = checkpoint_uri(req.model_id, "sampler_weights", name)
       sid = await open_sampler(train["base"], uri, train.get("session", ""))
       return await submit(
         req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri, "sampling_session_id": sid}, req.seq_id
       )
-    return await save(req, Op.SAVE_WEIGHTS_FOR_SAMPLER, "sampler_weights")
+    if train["base"]:
+      excl = req.model_id in await bus.exclusive()
+      dec = schedule.choose_sampler_pool(train["base"], train["rank"] > 0, req.model_id, excl)
+      await bus.warm_sampler(dec.choice, train["base"], exclusive=excl)
+    return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri}, req.seq_id)
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):
