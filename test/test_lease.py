@@ -43,13 +43,12 @@ class TestLease(RedisTest):
       consumers = await self.bus.r.xinfo_consumers(key("q", run), GROUP)
       self.assertEqual(len(consumers), 1)  # the second never read from the pool
 
-      # Freeze the owner and reproduce delivery just before the pause. Dispatch now polls with a
-      # fenced transaction, so waiting for a blocking XREADGROUP client would never terminate.
-      owner = await self.bus.owner(pool)
+      # pause the first while it's blocked reading the pool, so Redis hands it the next command, and past its lease
+      while not any(c["cmd"] == "xreadgroup" and "b" in c["flags"] for c in await self.bus.r.client_list()):
+        await asyncio.sleep(0.01)
       first.send_signal(signal.SIGSTOP)
       request_id = await self.bus.submit(run, Op.OPTIM_STEP, b'{"adam_params": {}}')
-      [claimed] = await self.bus.take(pool, owner, count=1, block_ms=0)
-      self.assertEqual(claimed.request_id, request_id)
+      await asyncio.sleep(0.2)
       [stranded] = (await self.bus.queue(run))["in_flight"]
       self.assertEqual(stranded["request_id"], request_id)
 

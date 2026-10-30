@@ -124,7 +124,9 @@ class TestNodeDaemon(RedisTest):
   @patch("tinyrl.node_daemon.subprocess.Popen")
   def test_start_uses_explicit_role_identity_and_scheduler_resources(self, popen):
     daemon = NodeDaemon(None, gpus=8, node="n", gpu_mib=0)
-    daemon.start("opaque-worker", scheduler.Worker(gpus=(6,), role="sampler", rank=4, env={"TINYRL_GPU_MEM": "0.42"}))
+    daemon.start(
+      "opaque-worker", scheduler.Worker(gpus=(6,), role="sampler", lora=True, env={"TINYRL_GPU_MEM": "0.42"})
+    )
     env = popen.call_args.kwargs["env"]
     self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["GPU"]), ("6", f"{socket.gethostname()}:6"))
     self.assertEqual(

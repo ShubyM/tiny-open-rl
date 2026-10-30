@@ -100,9 +100,7 @@ class Sampler:
     self.engine_type = engine or getattr(importlib.import_module(module), name)
     self.engine: Engine | None = None  # started by the first command, which says which base model
     self.store = store if store is not None else Store()
-    self.lora = (
-      bool(int(os.environ["TINYRL_LORA"])) if "TINYRL_LORA" in os.environ else not pool.startswith("sampler:fft:")
-    )
+    self.lora = os.getenv("TINYRL_LORA", "1") != "0"
     self.worker = (
       os.getenv("TINYRL_WORKER_ID") or worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     )
@@ -115,12 +113,11 @@ class Sampler:
   async def warm(self) -> None:
     if self.engine is not None:
       return
-    base = (await self.bus.warm_samplers()).get(self.pool)
-    if not base:
-      for run_id in await self.bus.runs(self.pool):
-        if (run := await self.bus.run(run_id)) and run.get("base"):
-          base = run["base"]
-          break
+    base = ""
+    for run_id in await self.bus.runs(self.pool):
+      if (run := await self.bus.run(run_id)) and run.get("base"):
+        base = run["base"]
+        break
     if not base:
       return
     async with self.acquire(0):
@@ -174,14 +171,9 @@ class Sampler:
     for cmd in await self.bus.reclaim(self.pool, self.worker, min_idle_ms):
       await self.bus.finish(cmd, fail(RuntimeError("its sampler died, or lost the pool")), self.pool, self.worker)
 
-  async def handoff(self) -> None:
-    for run, move in (await self.bus.moves(self.pool, self.worker)).items():
-      await self.bus.release_run(run, self.pool, self.worker, move["token"])
-
   async def step(self, count: int = 128, block_ms: int = 1000) -> int:
     if self.done:
       return 0
-    await self.handoff()
     take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
     cmds = await self.bus.take(self.pool, self.worker, count, take_block)
     if not cmds:
@@ -189,49 +181,38 @@ class Sampler:
       await self.yield_gpu()
       return 0
 
-    async def one(cmd):
+    async def one(cmd) -> list:
       start = time.time()
       first = await self.bus.first_reply(cmd)
       reply = first or await self.run(cmd.run, json.loads(cmd.body))
-      return cmd, reply, first is not None, start
+      ms = (time.time() - start) * 1000
+      if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
+        self.done = True
+      return [cmd.op, ms]
 
-    async with self.acquire(len(cmds)) as occupied:
-      batch_start, boot = time.time(), 0.0
+    async with self.acquire(len(cmds)):
+      batch_start = time.time()
+      boot = 0.0
       if self.engine is None:
         with contextlib.suppress(Exception):
           await self.ensure_engine(cmds[0].run)
           boot = time.time() - batch_start
-      if block_ms and len(cmds) < count:
+      if block_ms:
         await asyncio.sleep(0.02)
-        cmds += await self.bus.take(self.pool, self.worker, count - len(cmds), 0)  # one bounded coalescing read
+        cmds += await self.bus.take(self.pool, self.worker, count, 0)
       if self.lora:
         batches = [cmds]
       else:
-        by_run = {}
-        for cmd in cmds:
-          by_run.setdefault(cmd.run, []).append(cmd)
+        by_run: dict[str, list] = {}
+        [by_run.setdefault(c.run, []).append(c) for c in cmds]
         batches = list(by_run.values())
-      responses = []
+      ops = []
       for batch in batches:
-        if self.done:
-          break
-        responses.extend(await asyncio.gather(*(one(cmd) for cmd in batch)))
-      elapsed = time.time() - batch_start
-      await self.turn.batch_done(
-        queued=len(cmds) - len(responses),
-        seconds=elapsed,
-        boot=boot,
-        ops=[[cmd.op, elapsed * 1000 / len(responses)] for cmd, *_ in responses],
-      )
-    # Concurrent requests share the entire reservation, including engine boot, wake and sleep.
-    for cmd, reply, repeated, start in responses:
-      if not await self.bus.finish(
-        cmd, reply, self.pool, self.worker, repeat=repeated, started=start, service_seconds=occupied[0] / len(responses)
-      ):
-        self.done = True
-    if not self.done:
-      await self.handoff()
-    return len(responses)
+        if not self.done:
+          ops.extend(await asyncio.gather(*(one(c) for c in batch)))
+
+      await self.turn.batch_done(queued=len(cmds) - len(ops), seconds=time.time() - batch_start, boot=boot, ops=ops)
+    return len(cmds)
 
   async def run(self, session: str, job: dict) -> Reply:
     try:
@@ -263,15 +244,14 @@ class Sampler:
 
   @contextlib.asynccontextmanager
   async def acquire(self, queued: int):
-    taken = await self.turn.take(queued)
-    start, occupied = time.monotonic(), []
-    if taken and self.engine:
+    """Hold the GPU for one batch. Waits for this sampler's turn and wakes its engine, then gives the turn back after
+    the batch if the scheduler revoked it."""
+    if await self.turn.take(queued) and self.engine:
       await self.engine.wake()
     try:
-      yield occupied
+      yield
     finally:
       await self.yield_gpu()
-      occupied.append(time.monotonic() - start)
 
   async def yield_gpu(self) -> None:
     if await self.turn.revoked():

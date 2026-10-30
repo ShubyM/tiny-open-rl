@@ -111,66 +111,30 @@ class TestBus(RedisTest):
     self.assertEqual({entry["trainer"] for entry in (await self.bus.queue(run_id))["in_flight"]}, {"new"})
     self.assertEqual(await self.bus.take("p", "new", block_ms=10), [])
 
-  async def test_take_is_a_global_bound_and_prioritizes_least_weighted_virtual_service(self):
+  async def test_every_run_in_a_pool_is_served_each_take(self):
     a, b, other = await self.new_run(), await self.new_run(), await self.new_run("other")
     for run_id in (a, a, a, b, other):
       await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
 
-    await self.bus.r.set(
-      key("state"), json.dumps({"runs": {a: {"owed": 100, "vruntime": 10}, b: {"owed": 0, "vruntime": 0}}})
-    )
     first = await self.bus.take("p", "w0", count=2, block_ms=10)
-    self.assertEqual([cmd.run for cmd in first], [b])
+    self.assertEqual(sorted(cmd.run for cmd in first), sorted([a, a, b]))
     second = await self.bus.take("p", "w0", count=2, block_ms=10)
-    self.assertEqual([cmd.run for cmd in second], [a, a])
-    self.assertEqual([cmd.run for cmd in await self.bus.take("p", "w0", count=2, block_ms=0)], [a])
+    self.assertEqual([cmd.run for cmd in second], [a])
 
   async def test_run_facts_commit_with_metadata_without_a_second_emit(self):
     with patch.object(self.bus, "emit", side_effect=RuntimeError("separate emission is unavailable")):
-      await self.bus.create(Run("new", "", "base", 4, role="trainer", weight=2, memory=123))
-      await self.bus.warm_sampler("sampler:base", "base")
+      await self.bus.create(Run("new", "", "base", 4, role="trainer", exclusive=True))
       await self.bus.drop("new", "")
     events = await self.bus.events()
-    self.assertEqual([e.kind for e in events], ["run_created", "sampler_warmed", "run_deleted"])
-    self.assertEqual((events[0].body["base"], events[0].body["weight"], events[0].body["memory"]), ("base", 2, 123))
+    self.assertEqual([e.kind for e in events], ["run_created", "run_deleted"])
+    self.assertEqual((events[0].body["base"], events[0].body["rank"], events[0].body["exclusive"]), ("base", 4, True))
     self.assertFalse(await self.bus.r.exists(key("q", "new")))
 
   async def test_invalid_requirements_do_not_create_partial_runs(self):
-    for fields in (
-      {"weight": 0},
-      {"weight": float("inf")},
-      {"weight": float("nan")},
-      {"memory": -1},
-      {"role": "unknown"},
-    ):
-      with self.assertRaises(ValueError):
-        await self.bus.create(Run("invalid", "", "base", 4, **fields))
+    with self.assertRaises(ValueError):
+      await self.bus.create(Run("invalid", "", "base", 4, role="unknown"))
     self.assertIsNone(await self.bus.run("invalid"))
     self.assertEqual(await self.bus.events(), [])
-
-  async def test_move_waits_for_source_ack_and_keeps_run_stream_and_future_identity(self):
-    run = await self.new_run()
-    first = await self.bus.submit(run, Op.OPTIM_STEP, b"first")
-    second = await self.bus.submit(run, Op.OPTIM_STEP, b"second")
-    [cmd] = await self.bus.take("p", "w0", count=1, block_ms=0)
-    self.assertTrue(await self.bus.request_move(run, "target", "move1"))
-    self.assertEqual(await self.bus.take("p", "w0", block_ms=0), [])
-    self.assertFalse(await self.bus.assign(run, "target"))
-    self.assertFalse(await self.bus.release_run(run, "p", "w0", "move1", "tinker://snapshot"))
-    self.assertTrue(await self.bus.finish(cmd, ok(n=1), "p", "w0", service_seconds=0.25))
-    self.assertTrue(await self.bus.release_run(run, "p", "w0", "move1", "tinker://snapshot"))
-    self.assertEqual((await self.bus.run(run))["pool"], "")
-    self.assertTrue(await self.bus.assign(run, "target"))
-    self.assertTrue(await self.bus.release_run(run, "p", "w0", "move1", "tinker://snapshot"))
-    self.assertFalse(await self.bus.release_run(run, "p", "w0", "move1", "tinker://different"))
-    self.assertFalse(await self.bus.park(run, "stale", "p", "w0"))
-    await self.bus.own("target", "w1")
-    [next_cmd] = await self.bus.take("target", "w1", block_ms=0)
-    self.assertEqual(next_cmd.request_id, second)
-    self.assertEqual(await self.bus.result(first, 0), ok(n=1))
-    self.assertEqual(await self.bus.parked(run), "tinker://snapshot")
-    self.assertEqual(await self.bus.runs("p"), [])
-    self.assertEqual(await self.bus.runs("target"), [run])
 
   async def test_assignment_and_reply_fence_late_source_actions_after_exit(self):
     run = await self.new_run()
@@ -183,18 +147,6 @@ class TestBus(RedisTest):
     await self.bus.own("target", "w1")
     [stranded] = await self.bus.reclaim("target", "w1")
     self.assertEqual(stranded.request_id, cmd.request_id)
-
-  async def test_released_run_can_use_a_replacement_after_its_planned_target_dies(self):
-    run = await self.new_run()
-    await self.bus.submit(run, Op.OPTIM_STEP, b"queued")
-    self.assertTrue(await self.bus.request_move(run, "target", "move"))
-    self.assertTrue(await self.bus.release_run(run, "p", "w0", "move", "tinker://snapshot"))
-    after = await self.bus.emit("exited", worker="target", node="n")
-    self.assertTrue(await self.bus.assign(run, "replacement", after=after))
-    self.assertEqual((await self.bus.run(run))["pool"], "replacement")
-    self.assertEqual(await self.bus.parked(run), "tinker://snapshot")
-    self.assertEqual((await self.bus.queue(run))["queued"], 1)
-    self.assertFalse(await self.bus.r.hexists(key("moves"), run))
 
   async def test_retirement_waits_for_lease_expiry_and_prevents_reacquisition(self):
     run = await self.new_run()
@@ -228,17 +180,6 @@ class TestBus(RedisTest):
       self.assertFalse(await self.bus.own("p", "w0"))
     self.assertIsNone(await self.bus.owner("p"))
 
-  async def test_finish_updates_readiness_and_service_exactly_once(self):
-    run = await self.new_run()
-    await self.bus.submit(run, Op.OPTIM_STEP, b"")
-    [cmd] = await self.bus.take("p", "w0", block_ms=0)
-    await self.bus.submit(run, Op.OPTIM_STEP, b"more")
-    self.assertTrue(await self.bus.finish(cmd, ok(), "p", "w0", service_seconds=0.5))
-    self.assertTrue(await self.bus.finish(cmd, ok(), "p", "w0", service_seconds=0.5))
-    events = await self.bus.events()
-    self.assertEqual([e.body["count"] for e in events if e.kind == "run_queued"], [1, 2, 1])
-    self.assertEqual([e.body for e in events if e.kind == "service"], [{"worker": "p", "run": run, "seconds": 0.5}])
-
   async def test_decision_tail_cas_rejects_an_intervening_fact_without_projecting_assignment(self):
     await self.bus.create(Run("new", "", "base", 4))
     after = (await self.bus.events())[-1].id
@@ -249,26 +190,6 @@ class TestBus(RedisTest):
     self.assertEqual(await self.bus.runs("target"), [])
     tail = (await self.bus.events())[-1].id
     self.assertTrue(await self.bus.assign("new", "other", after=tail))
-    self.assertFalse(await self.bus.request_move("new", "target", "move", after=tail))
-
-  async def test_a_move_between_claim_read_and_commit_cannot_leave_source_pending_work(self):
-    run = await self.new_run()
-    await self.bus.submit(run, Op.OPTIM_STEP, b"")
-    pipeline_type = type(self.bus.r.pipeline())
-    execute, inserted = pipeline_type.execute, False
-
-    async def race(pipeline, *args, **kwargs):
-      nonlocal inserted
-      if not inserted and any(str(command[0][0]).upper() == "XREADGROUP" for command in pipeline.command_stack):
-        inserted = True
-        await self.bus.request_move(run, "target", "move")
-      return await execute(pipeline, *args, **kwargs)
-
-    with patch.object(pipeline_type, "execute", race):
-      self.assertEqual(await self.bus.take("p", "w0", block_ms=0), [])
-    self.assertTrue(inserted)
-    self.assertEqual((await self.bus.queue(run))["in_flight"], [])
-    self.assertTrue(await self.bus.release_run(run, "p", "w0", "move"))
 
   async def test_a_fact_during_decision_commit_invalidates_its_watch(self):
     after = await self.bus.emit("wants_gpu", worker="w")

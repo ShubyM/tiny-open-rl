@@ -169,13 +169,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
     run = str(uuid.uuid4())
-    try:
-      weight = float(metadata.get("openrl.weight", 1.0))
-    except (TypeError, ValueError) as error:
-      raise ValueError("openrl.weight must be positive and finite") from error
-    if not 0 < weight < float("inf"):
-      raise ValueError("openrl.weight must be positive and finite")
-    await bus.create(Run(run, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive, weight=weight))
+    await bus.create(Run(run, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive))
     return await submit(run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora})
 
   @api.post("/api/v1/get_info")
@@ -354,16 +348,6 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       for name, n in counters.items():
         name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
         lines.append(f'tinyrl_{name}_total{{pool="{pool}",run="{run}"}} {n}')
-    state = json.loads(await bus.r.get(key("state")) or "{}")
-    for run, record in state.get("runs", {}).items():
-      labels = f"run={json.dumps(run)}"
-      for metric, field in (
-        ("service_seconds_total", "served"),
-        ("entitled_seconds_total", "entitled"),
-        ("pending", "pending"),
-        ("owed_seconds", "owed"),
-      ):
-        lines.append(f"tinyrl_{metric}{{{labels}}} {record.get(field, 0)}")
     return PlainTextResponse("\n".join(lines) + "\n")
 
   return api

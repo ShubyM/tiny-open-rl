@@ -2,7 +2,6 @@ import asyncio
 from unittest.mock import patch
 
 from test.helpers import RedisTest, new_id
-from tinyrl import trainer
 from tinyrl.bus import Run
 
 
@@ -27,16 +26,6 @@ class TestAssignments(RedisTest):
     self.assertFalse(await self.bus.assign(run, "w2"))
     self.assertEqual([e.body["worker"] for e in await self.bus.events() if e.kind == "run_assigned"], ["w1"])
 
-  async def test_a_move_token_cannot_be_changed_while_source_is_draining(self):
-    run = new_id()
-    await self.bus.create(Run(run, "w1", "tiny", 4))
-    await self.bus.own("w1", "process1")
-    self.assertTrue(await self.bus.request_move(run, "w2", "one"))
-    self.assertTrue(await self.bus.request_move(run, "w2", "one"))
-    self.assertFalse(await self.bus.request_move(run, "w3", "two"))
-    self.assertEqual(await self.bus.moves("w1", "other-process"), {})
-    self.assertFalse(await self.bus.release_run(run, "w1", "process1", "two"))
-
   async def test_a_dead_node_daemons_gpus_stop_counting(self):
     await self.bus.heartbeat("node-a", 2)
     with patch("tinyrl.bus.NODE_MS", 5):
@@ -52,15 +41,3 @@ class TestAssignments(RedisTest):
     await asyncio.sleep(0.02)
     with patch("tinyrl.bus.time.time", return_value=1e12):
       self.assertEqual(await self.bus.nodes(), {"node": 4})
-
-  async def test_a_trainer_reports_how_busy_it_was(self):
-    t = trainer.Trainer(self.bus, "lora:tiny:0", trainer.Model())
-    await t.own()
-    with patch.object(trainer, "LEASE_MS", 40), patch.object(trainer, "UTIL_MS", 100):
-      keeping = asyncio.create_task(t.keep())
-      t.busy = 0.05  # 50 ms of commands in a 100 ms window
-      while (await self.bus.loads(["lora:tiny:0"]))[0][0] is None:
-        await asyncio.sleep(0.01)
-      keeping.cancel()  # keep() renews until serve() cancels it
-    util = (await self.bus.loads(["lora:tiny:0"]))[0][0]
-    self.assertTrue(0.2 < util <= 0.5, util)

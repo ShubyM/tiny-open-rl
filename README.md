@@ -25,27 +25,22 @@ python -m tinyrl.scheduler &                    # decides whose turn it is on ea
 python -m tinyrl.node_daemon                    # executes worker placements and confirms process exits
 ```
 
-A **run** owns its command queue and training state. A **worker** is one trainer or sampler process on fixed GPUs;
-every replacement gets a fresh ID. The gateway records the run's model, role and requirements. The scheduler chooses
-its worker, spreads runnable work onto available GPUs, and reuses a compatible worker when measured memory headroom
-allows it. Unknown memory starts a separate process; GPU turns remain exclusive between processes.
+A **run** is a training model or a sampling session, with its own command queue. A **worker** is one trainer or sampler
+process on fixed GPUs, serving one or more runs; every replacement gets a fresh ID. The gateway records what a run
+needs (role, base model, LoRA or full, exclusive), and the scheduler decides the rest with three rules:
 
-Run one node daemon per GPU machine (`GPUS`, default 1) and one scheduler. A full fine-tune
-(`user_metadata={"openrl.fine_tuning_type": "full"}`) or exclusive LoRA (`"openrl.exclusive": "true"`) gets a worker
-of its own. Samplers use vLLM unless `ENGINE` names another engine. Worker names and GPU indices encode no policy.
+* **Which worker.** A LoRA run joins the trainer for its base model, and a sampling session joins the vLLM worker for
+  its base model and kind. A full fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive run
+  (`"openrl.exclusive": "true"`) gets a worker of its own.
+* **Which GPU.** A trainer needs a whole GPU while it computes, a sampler `SAMPLER_MEM` of one (0.4). A new worker goes
+  on the least used GPU it fits on, else the least used one.
+* **Whose turn.** A worker computes when it fits next to the workers already computing on its GPU, so two samplers
+  run at once and trainers take turns. Waiters are served first come first served. A holder gives way when it goes
+  idle or after `QUANTUM` (30 seconds) while a waiter doesn't fit; trainers park their tensors in host memory and
+  samplers put vLLM to sleep.
 
-Fairness belongs to runnable runs. The scheduler integrates weighted GPU-time entitlement and subtracts measured
-service, including command-associated switching. Idle runs earn no additional entitlement. Turn selection uses
-weighted attained service, aligning newly runnable runs with the active cohort so historical overhead does not
-penalize newcomers. It checks revocation between trainer commands, and rotates crowded runs between workers when needed.
-`QUANTUM` (30 seconds) bounds a turn before a waiting worker can request its release; an executing command or sampler
-batch must finish before the GPU is parked. There is no unconditional wall-clock waiting bound.
-
-Moves block new source claims, finish the finite batch already fetched, save weights, pending gradients and optimizer
-state, then publish a fenced release. Only then can the destination claim the same run queue. Measured handoff and boot
-costs discourage optional moves; persistent unfairness can override that preference. The scheduler and simulator use
-the same `fold` and `decide` functions. See [the scheduling experiment](simulator/README.md#gpu-turn-reference-benchmark)
-for the exact-reference comparison and its limits.
+Run one node daemon per GPU machine (`GPUS`, default 1) and one scheduler. Samplers use vLLM unless `ENGINE` names
+another engine. Worker names and GPU indices encode no policy.
 
 ### On Kubernetes
 
@@ -102,15 +97,15 @@ Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains t
 to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to see how checkpoints are stored, and
 [trainer.py](tinyrl/trainer.py) to see how a command runs on the model.
 
-The scheduling code is [scheduler.py](tinyrl/scheduler.py): plain run/worker records, event folding, fair shares,
-placement and one decision loop. [turns.py](tinyrl/turns.py) implements the worker side of a GPU turn, and
+The scheduling code is [scheduler.py](tinyrl/scheduler.py): plain run/worker records, event folding, the three rules
+and one decision loop. [turns.py](tinyrl/turns.py) implements the worker side of a GPU turn, and
 [node_daemon.py](tinyrl/node_daemon.py) executes placements. The Redis key/record field `pool` remains a dispatch-format
 compatibility name for a worker ID; there is no separate pool object or pool placement policy.
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps checkpoints it downloaded), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`,
-`UTIL_MS`, `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `SAMPLER_MEM`,
+`IDLE_MS`, `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
 
 ## Telemetry
 
@@ -128,19 +123,6 @@ format, as `tinyrl_<counter>_total{pool, run}` in seconds. These command counter
 | failure rate | `sum by (pool) (rate(tinyrl_failed_total[5m])) / sum by (pool) (rate(tinyrl_cmds_total[5m]))` |
 
 A run's wait includes waiting on its own earlier calls, since a run's calls run in order.
-
-The scheduler additionally exports `tinyrl_service_seconds_total`, `tinyrl_entitled_seconds_total`, `tinyrl_pending`
-and `tinyrl_owed_seconds` with stable `run` labels, including unassigned and zero-service runs. For a measurement
-window, compare service increments to entitlement increments for runs with **positive entitlement**; keep zero-service
-runs in that population. Report the minimum ratio, worst debt/wait, useful work and switching time alongside Jain's
-index. A Jain score of 1 can mean everybody is equally slow. The service counter includes execution plus
-command-associated restore/park time; it is not a hardware GPU-utilization measurement. Idle parking and handoff
-serialization are additional overhead, so report those separately in hardware benchmarks.
-
-## Throughput simulator
-
-The [interactive simulator](simulator/README.md) explores GPU switching, arrival rates, queue growth, and data-transfer bottlenecks.
-Open `simulator/index.html` in a browser; it runs locally without installing dependencies.
 
 ## Test
 

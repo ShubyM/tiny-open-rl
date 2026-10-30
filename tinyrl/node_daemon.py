@@ -117,7 +117,7 @@ class NodeDaemon:
       "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus)),
       "TINYRL_WORKER_ID": worker,
       "TINYRL_ROLE": w.role,
-      "TINYRL_LORA": str(int(w.rank > 0)),
+      "TINYRL_LORA": str(int(w.lora)),
     }
     env["GPU"] = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
     if w.role == "trainer":

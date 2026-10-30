@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -346,30 +346,6 @@ class TestModel(unittest.TestCase):
     model.restore(b, *store.get(uri), optimizer=False)  # a run can start from another run's checkpoint
     self.assertTrue(same(saved_weights, model.params[b]))
 
-  def test_pending_gradients_survive_a_snapshot_and_invalid_shapes_do_not_mutate_live_state(self):
-    for rank in (0, 4):
-      model, run = Model(tiny), new_id()
-      model.create(run, "tiny", rank, LORA)
-      train(model, run, steps=1)
-      model.forward_backward(run, [counting(8)], "cross_entropy", {}, False)
-      tensors, meta = model.state(run)
-      tensors = {k: v.clone() for k, v in tensors.items()}
-      restored = Model(tiny)
-      restored.create(run, "tiny", rank, LORA)
-      restored.restore(run, tensors, meta, True)
-      self.assertTrue(
-        same([p.grad for p in model.params[run].values()], [p.grad for p in restored.params[run].values()])
-      )
-      before = {k: v.clone() for k, v in restored.state(run)[0].items()}
-      invalid = dict(tensors)
-      invalid[next(reversed(restored.params[run]))] = torch.ones(1)
-      with self.assertRaises(ValueError):
-        restored.restore(run, invalid, meta, True)
-      self.assertTrue(same(before, restored.state(run)[0]))
-      model.optim_step(run, {"learning_rate": 0.01})
-      restored.optim_step(run, {"learning_rate": 0.01})
-      self.assertTrue(same(model.params[run], restored.params[run]))
-
   def test_loading_a_checkpoint_that_does_not_fit_fails(self):
     store = Store(root=tempfile.mkdtemp())
     model, (a,) = lora_runs()
@@ -459,9 +435,7 @@ class TestTrainer(RedisTest):
     run = new_id()
     await self.bus.create(Run(run, "p", "tiny", 4))
     [request_id] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}}))
-    await self.bus.own("p", "dead")
     await self.bus.take("p", "dead", block_ms=10)  # taken, and never answered
-    await self.bus.release("p", "dead")
 
     t = Trainer(self.bus, "p", Model(tiny), worker="new")
     t.done = True  # so serve() stops right after reclaiming
@@ -609,99 +583,59 @@ class TestTrainer(RedisTest):
     self.assertEqual([reply.ok for reply in replies], [False, True, True])
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
 
-  async def test_a_batch_is_finite_and_new_commands_wait_for_the_next_take(self):
-    run = new_id()
-    await self.bus.create(Run(run, "p", "tiny", 4, lora=LORA))
-    t = Trainer(self.bus, "p", Model(tiny))
-    await self.own(t)
-    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-    await t.step(block_ms=10)
-    ids = await self.submit(run, *((Op.OPTIM_STEP, {"adam_params": {}}),) * 3)
-    answer = t.answer
-    added = []
-
-    async def more_work(cmd):
-      added.extend(await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}})))
-      return await answer(cmd)
-
-    with patch.object(t, "answer", more_work):
-      self.assertEqual(await t.step(count=2, block_ms=10), 2)
-    self.assertTrue(all([(await self.bus.result(i, 0)).ok for i in ids[:2]]))
-    self.assertIsNone(await self.bus.result(ids[2], 0))
-    self.assertEqual(len(added), 2)
-    self.assertEqual(await t.step(count=16, block_ms=10), 3)
-
-  async def test_every_command_yields_and_switch_time_is_charged_to_the_run(self):
-    run = new_id()
-    await self.bus.create(Run(run, "p", "tiny", 4, lora=LORA))
-    t = Trainer(self.bus, "p", Model(tiny))
-    await self.own(t)
-    t.model.create(run, "tiny", 4, LORA)
-    await self.submit(run, *((Op.OPTIM_STEP, {"adam_params": {}}),) * 2)
-    order = []
-
-    def resume():
-      order.append("resume")
-      time.sleep(0.01)
-
-    def park():
-      order.append("park")
-      time.sleep(0.01)
-
-    original = t.answer
-
-    async def answer(cmd):
-      order.append("execute")
-      return await original(cmd)
-
-    with (
-      patch.object(t.turn, "take", AsyncMock(return_value=True)),
-      patch.object(t.turn, "revoked", AsyncMock(return_value=True)),
-      patch.object(t.turn, "give_back", AsyncMock()),
-      patch.object(t.model, "resume", resume),
-      patch.object(t.model, "park", park),
-      patch.object(t, "answer", answer),
-    ):
-      self.assertEqual(await t.step(count=2, block_ms=0), 2)
-    self.assertEqual(order, ["resume", "execute", "park"] * 2)
-    service = [e.body["seconds"] for e in await self.bus.events() if e.kind == "service"]
-    self.assertEqual(len(service), 2)
-    self.assertTrue(all(seconds >= 0.02 for seconds in service))
-
-  async def test_a_live_handoff_preserves_pending_gradients_and_adam_without_replaying_source(self):
+  async def test_sampler_save_is_processed_before_other_runs_finish(self):
     store = Store(root=tempfile.mkdtemp())
-    for rank in (0, 4):
-      run = new_id()
-      await self.bus.create(Run(run, f"a{rank}", "tiny", rank, lora=LORA))
-      source = Trainer(self.bus, f"a{rank}", Model(tiny), store=store)
-      target = Trainer(self.bus, f"b{rank}", Model(tiny), store=store)
-      await self.own(source)
-      await self.own(target)
-      await self.submit(
-        run,
-        (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": LORA}),
-        (Op.FORWARD_BACKWARD, proto_body(run)),
-        (Op.OPTIM_STEP, {"adam_params": {}}),
-        (Op.FORWARD_BACKWARD, proto_body(run)),
-      )
-      self.assertEqual(await source.step(count=16, block_ms=10), 4)
-      control = Model(tiny)
-      control.create(run, "tiny", rank, LORA)
-      state, meta = source.model.state(run)
-      control.restore(run, {k: v.clone() for k, v in state.items()}, meta, True)
-      await self.bus.request_move(run, target.pool, f"move{rank}")
-      [step_id] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.01}}))
-      self.assertEqual(await source.step(block_ms=10), 0)
-      self.assertNotIn(run, source.model.params)
-      self.assertEqual((await self.bus.run(run))["pool"], "")
-      self.assertIsNotNone(await self.bus.parked(run))
-      await self.bus.assign(run, target.pool)
-      self.assertEqual(await target.step(block_ms=10), 1)
-      self.assertTrue((await self.bus.result(step_id, 0)).ok)
-      control.optim_step(run, {"learning_rate": 0.01})
-      self.assertTrue(same(control.params[run], target.model.params[run]), f"rank {rank}")
-      self.assertIsNone(await self.bus.parked(run))
-      self.assertEqual(await source.step(block_ms=10), 0)
+    t = Trainer(self.bus, "p", Model(tiny), store=store)
+    await self.own(t)
+
+    runs = [new_id() for _ in range(3)]
+    for r in runs:
+      await self.bus.create(Run(r, "p", "tiny", 4, lora=LORA))
+      await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    await t.step(count=16, block_ms=10)
+
+    opt_ids = {}
+    for r in runs:
+      ids = await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {}}))
+      opt_ids[r] = ids[-1]
+
+    done_at: dict[str, float] = {}
+
+    async def watch(name: str, req_id: str):
+      reply = await self.bus.result(req_id, 5)
+      done_at[name] = time.monotonic()
+      return reply
+
+    opt_tasks = {r: asyncio.create_task(watch(r, req_id)) for r, req_id in opt_ids.items()}
+
+    async def submit_first_save():
+      finished, _ = await asyncio.wait(opt_tasks.values(), return_when=asyncio.FIRST_COMPLETED)
+      first_run = next(r for r, task in opt_tasks.items() if task in finished)
+      [save_id] = await self.submit(first_run, (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": "tinker://r/sampler_weights/s0"}))
+      reply = await watch("save", save_id)
+      return first_run, reply
+
+    save_task = asyncio.create_task(submit_first_save())
+    n = await t.step(count=16, block_ms=10)
+    first_run, save_reply = await save_task
+    for task in opt_tasks.values():
+      await task
+
+    self.assertEqual(n, 7)
+    self.assertTrue(save_reply.ok)
+    other_times = [ts for name, ts in done_at.items() if name not in (first_run, "save")]
+    self.assertLess(done_at["save"], max(other_times))
+
+    causal = runs[0]
+    pipelined = await self.submit(
+      causal,
+      (Op.FORWARD_BACKWARD, proto_body(causal)),
+      (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.1}}),
+      (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{causal}/sampler_weights/s1"}),
+    )
+    self.assertEqual(await t.step(count=16, block_ms=10), 3)
+    self.assertTrue(all([(await self.bus.result(rid, 1)).ok for rid in pipelined]))
+    self.assertEqual((await self.bus.run(causal))["steps"], 2)
 
 
 class TestCheckpointNames(unittest.TestCase):

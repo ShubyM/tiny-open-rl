@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -369,7 +370,8 @@ class TestSampler(RedisTest):
         loads.append((name, path))
         await super().load(name, path)
 
-    sampler = Sampler(self.bus, "sampler:fft:base", engine=RecordEngine, store=store)
+    with patch.dict(os.environ, {"TINYRL_LORA": "0"}):
+      sampler = Sampler(self.bus, "sampler:fft:base", engine=RecordEngine, store=store)
     await self.own(sampler)
 
     await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
@@ -413,7 +415,7 @@ class TestSampler(RedisTest):
   async def test_warm_sampler_starts_engine_before_sample_and_strips_env_var(self):
     import os
 
-    await self.bus.warm_sampler("sampler:base", "base")
+    await self.bus.create(Run("s", "sampler:base", "base", 1, role="sampler"))
     sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine)
     with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1"}), patch("tinyrl.sampler.WARM", 1):
       task = asyncio.create_task(sampler.serve())

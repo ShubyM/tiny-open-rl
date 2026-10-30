@@ -192,36 +192,15 @@ class TestAPI(RedisTest):
       json={
         "base_model": "tiny",
         "lora_config": {"rank": 4},
-        "user_metadata": {"openrl.exclusive": "true", "openrl.weight": 2},
+        "user_metadata": {"openrl.exclusive": "true"},
       },
     )
     run_id = response.json()["model_id"]
     run = await self.bus.run(run_id)
-    self.assertEqual(
-      (run["pool"], run["rank"], run["role"], run["weight"], run["exclusive"]), ("", 4, "trainer", 2, True)
-    )
+    self.assertEqual((run["pool"], run["rank"], run["role"], run["exclusive"]), ("", 4, "trainer", True))
     self.assertEqual(await self.bus.pools(), [])
     self.assertEqual((await self.bus.decisions())["run"], {})
     self.assertEqual((await self.bus.queue(run_id))["queued"], 1)
-
-  async def test_fairness_metrics_include_eligible_runs_with_no_service_and_no_worker(self):
-    await self.bus.r.set(
-      "tinyrl:state",
-      json.dumps(
-        {
-          "runs": {
-            "waiting": {"worker": "", "served": 0, "entitled": 12, "owed": 12, "pending": 1},
-            "served": {"worker": "w1", "served": 10, "entitled": 12, "owed": 2, "pending": 0},
-          }
-        }
-      ),
-    )
-    metrics = (await self.http.get("/metrics")).text
-    self.assertIn('tinyrl_service_seconds_total{run="waiting"} 0\n', metrics)
-    self.assertIn('tinyrl_entitled_seconds_total{run="waiting"} 12\n', metrics)
-    self.assertIn('tinyrl_pending{run="waiting"} 1\n', metrics)
-    self.assertIn('tinyrl_pending{run="served"} 0\n', metrics)
-    self.assertIn('tinyrl_owed_seconds{run="waiting"} 12\n', metrics)
 
   async def test_session_tags_apply_to_its_models(self):
     """TINKER_TAGS reach the server on create_session, which is how open-rl clients ask for a full fine-tune."""
@@ -391,20 +370,23 @@ class TestAPI(RedisTest):
       await asyncio.sleep(0.05)
     self.fail(f"never: {data}")
 
+  async def sampler_runs(self):
+    return [e.body["run"] for e in await self.bus.events() if e.kind == "run_created" and e.body["role"] == "sampler"]
+
   async def test_only_actual_sampling_sessions_request_sampler_workers(self):
     sft = await self.create_model()
     await self.result(await self.post("forward_backward", content=proto_body(sft), headers=PROTO))
     await self.result(await self.post("optim_step", json={"model_id": sft, "adam_params": {}}))
     await self.result(await self.post("save_weights", json={"model_id": sft, "path": "sft-ckpt"}))
-    self.assertEqual(await self.bus.warm_samplers(), {})
+    self.assertEqual(await self.sampler_runs(), [])
 
     self.assertEqual(
       (await self.post("save_weights_for_sampler", json={"model_id": sft, "path": "../bad"})).status_code, 400
     )
-    self.assertEqual(await self.bus.warm_samplers(), {})
+    self.assertEqual(await self.sampler_runs(), [])
 
     await self.post("save_weights_for_sampler", json={"model_id": sft, "path": "000000"})
-    self.assertEqual(await self.bus.warm_samplers(), {})
+    self.assertEqual(await self.sampler_runs(), [])
 
     excl = await self.create_model(user_metadata={"openrl.exclusive": "true"})
     response = await self.result(
