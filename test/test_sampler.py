@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -103,13 +104,13 @@ class TestSampler(RedisTest):
       return json.loads((await self.bus.result(request_id, 1)).body)["sampling_session_id"]
 
     run = (await call("create_model", {"base_model": base, "lora_config": {"rank": 4}}))["model_id"]
-    trainer = Trainer(self.bus, f"lora:{base}:0", store=store)
+    trainer = Trainer(self.bus, await self.pool(run), store=store)
     await self.own(trainer)
     await trainer.step(block_ms=0)
-    sampler = Sampler(self.bus, f"sampler:{base}", engine=FakeEngine, store=store)
-    await self.own(sampler)
 
     sid = await save_for_sampler(trainer, run)
+    sampler = Sampler(self.bus, await self.pool(sid), engine=FakeEngine, store=store)
+    await self.own(sampler)
     self.assertTrue((await client.get(f"/api/v1/samplers/{sid}")).json()["model_path"].startswith("tinker://"))
     first = await call("join_sampling_session", {"sampling_session_id": sid})
     second = await call("join_sampling_session", {"sampling_session_id": sid})
@@ -125,6 +126,7 @@ class TestSampler(RedisTest):
     self.assertEqual(replies[0]["prompt_logprobs"], [None, -1.0, -1.0])
 
     request_id = (await call("asample", {"base_model": base, "prompt": tokens([1, 2])}))["request_id"]
+    self.assertEqual(await self.pool(request_id.split("/")[0]), sampler.pool)  # base sampling joins the same sampler
     await sampler.step(block_ms=0)
     self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
     calls = sampler.engine.calls
@@ -138,12 +140,13 @@ class TestSampler(RedisTest):
     fft = (await call("create_model", {"base_model": base, "user_metadata": {"openrl.fine_tuning_type": "full"}}))[
       "model_id"
     ]
-    fft_trainer = Trainer(self.bus, fft, store=store)
+    fft_trainer = Trainer(self.bus, await self.pool(fft), store=store)
     await self.own(fft_trainer)
     await fft_trainer.step(block_ms=0)
     fft_sid = await save_for_sampler(fft_trainer, fft)
-    self.assertEqual((await self.bus.run(fft_sid))["pool"], f"sampler:fft:{base}")
-    fft_sampler = Sampler(self.bus, f"sampler:fft:{base}", engine=FakeEngine, store=store)
+    self.assertNotEqual(await self.pool(fft_sid), await self.pool(sid))
+    with patch.dict(os.environ, {"TINYRL_LORA": "0"}):
+      fft_sampler = Sampler(self.bus, await self.pool(fft_sid), engine=FakeEngine, store=store)
     await self.own(fft_sampler)
     request_id = (await call("asample", {"sampling_session_id": fft_sid, "prompt": tokens([1, 2])}))["request_id"]
     await fft_sampler.step(block_ms=0)
@@ -360,7 +363,8 @@ class TestSampler(RedisTest):
         loads.append((name, path))
         await super().load(name, path)
 
-    sampler = Sampler(self.bus, "sampler:fft:base", engine=RecordEngine, store=store)
+    with patch.dict(os.environ, {"TINYRL_LORA": "0"}):
+      sampler = Sampler(self.bus, "sampler:fft:base", engine=RecordEngine, store=store)
     await self.own(sampler)
 
     await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
@@ -404,9 +408,8 @@ class TestSampler(RedisTest):
   async def test_warm_sampler_starts_engine_before_sample_and_strips_env_var(self):
     import os
 
-    await self.bus.warm_sampler("sampler:base", "base")
     sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine)
-    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1"}), patch("tinyrl.sampler.WARM", 1):
+    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1", "TINYRL_BASE": "base"}), patch("tinyrl.sampler.WARM", 1):
       task = asyncio.create_task(sampler.serve())
       try:
         for _ in range(50):

@@ -66,7 +66,7 @@ class NodeDaemon:
       for e in events:
         self.state = scheduler.fold(self.state, e)
       self.after = events[-1].id
-    mine = {name: p for name, p in self.state.pools.items() if p.node == self.id and (p.runs or p.warm)}
+    mine = {name: p for name, p in self.state.pools.items() if p.node == self.id and p.runs}
     for pool, (gpus, proc) in list(self.trainers.items()):
       if proc.poll() is not None or pool not in mine or list(mine[pool].gpus) != gpus:
         proc.terminate()
@@ -84,7 +84,8 @@ class NodeDaemon:
     gpus = list(p.gpus)
     env = {**p.env, **os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
     env["GPU"] = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
-    mod = "tinyrl.sampler" if pool.startswith("sampler:") else "tinyrl.trainer"
+    env["TINYRL_LORA"], env["TINYRL_BASE"] = str(int(p.lora)), p.base
+    mod = f"tinyrl.{p.role}"
     if mod == "tinyrl.trainer":
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)

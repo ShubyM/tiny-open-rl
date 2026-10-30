@@ -6,8 +6,8 @@ revoked. A decision changes the state only once it is folded from the log, so th
 replaying the log rebuilds every state the scheduler saw. Each decision names the rule in RULES that made it. Run
 exactly one. A restarted scheduler folds the whole log again and carries on, since its earlier decisions are in it.
 
-Everything here but run is a pure function. The gateway calls choose_pool and choose_sampler_pool to pick a run's pool,
-and node daemons fold the log to learn what to run.
+Everything here but run is a pure function. The gateway records what a run needs, choose_pool picks its pool, and node
+daemons fold the log to learn what to run.
 """
 
 from __future__ import annotations
@@ -25,65 +25,25 @@ from tinyrl.helpers import getenv
 # ***** pools *****
 
 
-def parse_pool(pool: str) -> tuple[str, bool, str]:
-  """A pool's role (trainer or sampler), whether it serves many runs, and the model it serves, read from its name."""
-  if pool.startswith("lora:"):
-    body = pool.removeprefix("lora:")
-    return "trainer", True, body.rsplit(":", 1)[0] if ":" in body and body.rsplit(":", 1)[1].isdigit() else body
-  if pool.startswith(("sampler:fft:", "sampler:lora:")):
-    return "sampler", False, pool.split(":", 2)[2]
-  if pool.startswith("sampler:"):
-    return "sampler", True, pool.removeprefix("sampler:")
-  return "trainer", False, pool
+def kind(x: Run | Pool) -> tuple:
+  return x.role, x.base, x.lora, x.exclusive and x.train_run
 
 
-def choose_pool(
-  run: str,
-  base_model: str,
-  rank: int,
-  exclusive: bool,
-  shards: list[tuple[str, float | None, int, int]],
-  gpus: int,
-  target_util: float = 0.7,
-  new_run_util: float = 0.04,
-) -> dict:
-  """The pool a new training run joins, with the rule and numbers behind it. A shard is (pool, its last reported busy
-  fraction or None, runs placed on it since, runs)."""
-  if rank == 0:
-    return {"choice": run, "rule": "dedicated_fft", "base": base_model, "rank": rank}
-  if exclusive:
-    return {"choice": run, "rule": "dedicated_exclusive", "base": base_model, "rank": rank}
-  ordered = sorted(shards, key=lambda shard: int(shard[0].rsplit(":", 1)[1]))
-  measured = [(util, runs - placed) for _, util, placed, runs in ordered if util is not None and runs > placed]
-  per_run = sum(u for u, _ in measured) / sum(n for _, n in measured) if measured else new_run_util
-  scores = [(util or 0.0) + placed * per_run for _, util, placed, _ in ordered]
-  detail = {"base": base_model, "rank": rank, "per_run": per_run, "target_util": target_util, "gpus": gpus}
-  detail["scores"] = {shard[0]: round(score, 4) for shard, score in zip(ordered, scores)}
-  if scores and min(scores) < target_util:
-    return {"choice": ordered[scores.index(min(scores))][0], "rule": "reuse_shard_under_target", **detail}
-  if len(ordered) >= max(1, gpus):
-    return {"choice": ordered[scores.index(min(scores))][0], "rule": "reuse_shard_at_gpu_cap", **detail}
-  return {"choice": f"lora:{base_model}:{len(ordered)}", "rule": "open_new_shard", **detail}
+def choose_pool(s: State, run: Run) -> str | None:
+  """The pool a new run joins: the one serving its kind of run. A full fine-tune or exclusive training run is alone,
+  and an exclusive run's sampling sessions share only with each other."""
+  if run.role == "trainer" and (not run.lora or run.exclusive):
+    return None
+  return next((name for name, p in s.pools.items() if kind(p) == kind(run)), None)
 
 
-def choose_sampler_pool(base_model: str, lora: bool, train_run: str | None = None, exclusive: bool = False) -> dict:
-  detail = {"base": base_model, "train_run": train_run, "exclusive": exclusive}
-  if not lora and (exclusive or not base_model):
-    return {"choice": f"sampler:fft:{train_run}", "rule": "dedicated_fft_sampler", **detail}
-  if not lora:
-    return {"choice": f"sampler:fft:{base_model}", "rule": "shared_fft_sampler", **detail}
-  if exclusive:
-    return {"choice": f"sampler:lora:{train_run}", "rule": "dedicated_exclusive_sampler", **detail}
-  return {"choice": f"sampler:{base_model}", "rule": "shared_lora_sampler", **detail}
-
-
-def settings(pool: str, gpus: int, gpu_mib: int, exclusive: set[str] = frozenset()) -> dict[str, str]:
+def settings(p: Pool, gpus: int, gpu_mib: int) -> dict[str, str]:
   env = {}
-  if parse_pool(pool)[0] != "sampler":
+  if p.role != "sampler":
     return env
   if gpus >= 2:  # samplers have GPUs of their own, so they start their engine before the first command
     env["TINYRL_WARM_SAMPLER"] = "1"
-  if gpu_mib >= 65536 and pool.startswith("sampler:fft:") and pool not in exclusive:
+  if gpu_mib >= 65536 and not p.lora and not p.exclusive:
     env.update(TINYRL_GPU_MEM="0.42", TINYRL_KV_BYTES=str(16 * 1024**3))
   elif gpu_mib >= 65536:
     env["TINYRL_KV_BYTES"] = str(24 * 1024**3)
@@ -113,10 +73,23 @@ RULES = {
 
 
 @dataclass
+class Run:
+  role: str
+  base: str
+  lora: bool
+  exclusive: bool
+  train_run: str | None
+  pool: str = ""
+
+
+@dataclass
 class Pool:
-  runs: tuple[str, ...] = ()
-  warm: bool = False  # a sampler kept running without runs, so a run's first sample doesn't wait for its engine
+  role: str = "trainer"
+  base: str = ""
+  lora: bool = False
   exclusive: bool = False
+  train_run: str | None = None
+  runs: tuple[str, ...] = ()
   node: str | None = None  # None until it is placed
   gpus: tuple[int, ...] = ()
   memory: int = 0  # bytes a process placed now may use on each of its GPUs, 0 if unknown
@@ -136,6 +109,7 @@ class State:
   n: int = 0  # entries folded
   nodes: dict[str, tuple[int, int]] = field(default_factory=dict)  # node -> (GPUs, bytes per GPU)
   pools: dict[str, Pool] = field(default_factory=dict)
+  runs: dict[str, Run] = field(default_factory=dict)
 
 
 def keys(p: Pool) -> tuple[Key, ...]:
@@ -156,6 +130,14 @@ def fits(s: State, k: Key, name: str) -> bool:
   return fit([s.pools[n].uses for n in (*holders(s, k), name)], s.nodes[k[0]][1])
 
 
+def join(s: State, run: str, pool: str) -> None:
+  """A run joins a pool. Its first run makes the pool, of its kind."""
+  r = s.runs[run]
+  r.pool = pool
+  q = s.pools.setdefault(pool, Pool(r.role, r.base, r.lora, r.exclusive, r.train_run))
+  q.runs = tuple(sorted({*q.runs, run}))
+
+
 def stop(p: Pool) -> None:
   """Its process is gone, and its turn with it."""
   p.on, p.uses, p.asked, p.since, p.revoked, p.idle = (), 0, 0, None, False, False
@@ -172,15 +154,19 @@ def fold(state: State, e: Event) -> State:
   p = s.pools.get(b.get("pool", ""))
   match e.kind:
     case "run_created":
-      q = s.pools.setdefault(b["pool"], Pool())
-      q.runs, q.exclusive = tuple(sorted({*q.runs, b["run"]})), q.exclusive or b.get("exclusive", False)
-    case "run_deleted":
-      for name, q in s.pools.items():
-        q.runs = tuple(r for r in q.runs if r != b["run"])
-        q.warm = q.warm and name not in (f"sampler:fft:{b['run']}", f"sampler:lora:{b['run']}")
-    case "sampler_warmed":
-      q = s.pools.setdefault(b["pool"], Pool())
-      q.warm, q.exclusive = True, q.exclusive or b.get("exclusive", False)
+      lora = b.get("rank", 0) > 0
+      s.runs[b["run"]] = Run(
+        b.get("role", "trainer"), b.get("base", ""), lora, b.get("exclusive", False), b.get("train_run")
+      )
+      if b.get("pool"):  # created in a pool already, as tests do
+        join(s, b["run"], b["pool"])
+    case "assigned" if b["run"] in s.runs:
+      join(s, b["run"], b["pool"])
+    case "run_deleted":  # a training run's sampling sessions end with it
+      gone = {b["run"], *(r for r, x in s.runs.items() if x.train_run == b["run"])}
+      s.runs = {r: x for r, x in s.runs.items() if r not in gone}
+      for q in s.pools.values():
+        q.runs = tuple(r for r in q.runs if r not in gone)
     case "node_up":  # a node daemon (re)started, and its processes died with the old one
       s.nodes[b["node"]] = (b["gpus"], b.get("memory", 0))
       for q in s.pools.values():
@@ -218,7 +204,7 @@ def fold(state: State, e: Event) -> State:
       p.asked, p.since = 0, e.t
     case "revoked" if p:
       p.revoked = True
-  s.pools = {name: q for name, q in s.pools.items() if q.runs or q.warm or q.node or q.on}
+  s.pools = {name: q for name, q in s.pools.items() if q.runs or q.node or q.on}
   return s
 
 
@@ -237,10 +223,13 @@ def decide(state: State, now: float) -> list[tuple[str, dict]]:
 
 
 def next_decision(s: State, now: float) -> tuple[str, dict] | None:
+  for run_id, r in sorted(s.runs.items()):
+    if not r.pool:
+      return "assigned", {"run": run_id, "pool": choose_pool(s, r) or f"p{s.n + 1}"}
   for name, p in sorted(s.pools.items()):
-    if p.node and not (p.runs or p.warm):
+    if p.node and not p.runs:
       return "unplaced", {"pool": name, "rule": "place.emptied"}
-  unplaced = [name for name, p in s.pools.items() if p.node is None and (p.runs or p.warm)]
+  unplaced = [name for name, p in s.pools.items() if p.node is None and p.runs]
   if unplaced and s.nodes:
     return "placed", place(s, min(unplaced, key=lambda name: (not s.pools[name].exclusive, name)))
   for _, name in sorted((p.asked, name) for name, p in s.pools.items() if p.asked):
@@ -262,7 +251,7 @@ def place(s: State, name: str) -> dict:
   load = {n: sum(p.node == n for p in s.pools.values()) / gpus for n, (gpus, _) in s.nodes.items()}
   node = min(sorted(load), key=load.get)
   gpus, gpu_bytes = s.nodes[node]
-  env = settings(name, gpus, gpu_bytes // 2**20, {q for q, p in s.pools.items() if p.exclusive})
+  env = settings(s.pools[name], gpus, gpu_bytes // 2**20)
   memory = int(float(env.get("TINYRL_GPU_MEM", 0)) * gpu_bytes)
   gpu, why, aside = choose(s, node, name, memory)
   if aside:
@@ -274,10 +263,10 @@ def place(s: State, name: str) -> dict:
   return {**body, "rule": "place.least_loaded_node", "gpu_rule": why}
 
 
-def takes_turns(name: str, p: Pool) -> bool:
+def takes_turns(p: Pool) -> bool:
   """Whether a pool may share a GPU it doesn't fit on. A trainer parks and resumes in about a second. A sampler wakes
   its engine slowly, and an exclusive pool is alone by definition."""
-  return parse_pool(name)[0] == "trainer" and not p.exclusive
+  return p.role == "trainer" and not p.exclusive
 
 
 def choose(s: State, node: str, name: str, memory: int, avoid: int = -1) -> tuple[int, str, list[str]]:
@@ -300,14 +289,14 @@ def choose(s: State, node: str, name: str, memory: int, avoid: int = -1) -> tupl
     )
 
   def trainers_only(g: int) -> bool:
-    return bool(there[g]) and all(takes_turns(q, p) for q, p in there[g])
+    return bool(there[g]) and all(takes_turns(p) for q, p in there[g])
 
   options = [g for g in range(gpus) if g != avoid]
   if fitting := [g for g in options if fits_on(g)]:
     g = min(fitting, key=lambda g: (bool(there[g]) != bool(memory), g))
     return g, "fits_next_to_others" if there[g] else "empty_gpu", []
   busy = {g: sum(p.busy for _, p in there[g]) for g in options}
-  if takes_turns(name, me) or len(options) == 1:  # with one GPU there is nowhere to move to
+  if takes_turns(me) or len(options) == 1:  # with one GPU there is nowhere to move to
     g = min(options, key=lambda g: (not trainers_only(g), busy[g], g))
     return g, "takes_turns", []
   g = min(options, key=lambda g: (not trainers_only(g), len(there[g]), busy[g], g))  # as few moves as it can
@@ -335,8 +324,11 @@ async def run(bus: Bus, quantum: float = QUANTUM) -> None:
       for node in lost:
         await bus.emit("node_lost", node=node)
       continue  # decide once they are folded, so nothing is placed on them
-    for kind, body in decide(state, time.time()):
-      await bus.emit(kind, **body)  # folded when it is read back on the next pass
+    for decision, body in decide(state, time.time()):  # folded when it is read back on the next pass
+      if decision == "assigned":
+        await bus.assign(body["run"], body["pool"])
+      else:
+        await bus.emit(decision, **body)
     if events:
       await bus.r.set(key("state"), json.dumps(dataclasses.asdict(state), sort_keys=True))
 

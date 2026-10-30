@@ -51,7 +51,7 @@ class TestAPI(RedisTest):
 
   async def drain(self, run_id: str):
     """Let the trainer for the run's pool do all of the pool's queued work."""
-    pool = (await self.bus.run(run_id))["pool"]
+    pool = await self.pool(run_id)
     if pool not in self.trainers:
       self.trainers[pool] = Trainer(self.bus, pool, Model(tiny), store=self.store)
       await self.own(self.trainers[pool])
@@ -92,9 +92,9 @@ class TestAPI(RedisTest):
     self.assertEqual((run["steps"], run["failed"], run["session"]), (8, 0, session_id))
     self.assertEqual((run["live"], run["queued"], run["in_flight"]), (True, 0, []))
     self.assertEqual(run["cmds"], 17)
-    metrics = (await self.http.get("/metrics")).text
-    self.assertIn(f'tinyrl_steps_total{{pool="lora:tiny:0",run="{run_id}"}} 8\n', metrics)
-    self.assertIn(f'tinyrl_busy_seconds_total{{pool="lora:tiny:0",run="{run_id}"}} {run["busy_ms"] / 1000}\n', metrics)
+    metrics, pool = (await self.http.get("/metrics")).text, run["pool"]
+    self.assertIn(f'tinyrl_steps_total{{pool="{pool}",run="{run_id}"}} 8\n', metrics)
+    self.assertIn(f'tinyrl_busy_seconds_total{{pool="{pool}",run="{run_id}"}} {run["busy_ms"] / 1000}\n', metrics)
 
     session = (await self.http.get(f"/api/v1/sessions/{session_id}")).json()
     self.assertEqual((session["runs"], session["live"]), ([run_id], True))
@@ -183,7 +183,8 @@ class TestAPI(RedisTest):
     exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})
 
     pools = [(await self.bus.run(run_id))["pool"] for run_id in (shared, also_shared, full, exclusive)]
-    self.assertEqual(pools, ["lora:tiny:0", "lora:tiny:0", full, exclusive])
+    self.assertEqual(pools[0], pools[1])
+    self.assertEqual(len(set(pools)), 3)
     self.assertEqual((await self.bus.run(full))["rank"], 0)
     self.assertEqual((await self.post("get_info", json={"model_id": full})).json()["lora_rank"], 16)
 
@@ -192,7 +193,8 @@ class TestAPI(RedisTest):
     tags = ["openrl.fine_tuning_type=full", "openrl.recipe=rl"]
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
-    self.assertEqual(((await self.bus.run(full))["rank"], (await self.bus.run(full))["pool"]), (0, full))
+    self.assertEqual((await self.bus.run(full))["rank"], 0)
+    self.assertEqual(await self.bus.runs(await self.pool(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -225,7 +227,7 @@ class TestAPI(RedisTest):
 
   async def test_sampler_weights_preserve_base_model_dtype(self):
     async def drain_bf16(run_id: str):
-      pool = (await self.bus.run(run_id))["pool"]
+      pool = await self.pool(run_id)
       if pool not in self.trainers:
 
         def bf16(name: str):
@@ -337,18 +339,17 @@ class TestAPI(RedisTest):
     await self.bus.heartbeat("node-1", 8)
     await self.bus.emit("node_up", node="node-1", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    data = await self.scheduling_until(lambda d: "lora:tiny:0" in d["state"]["pools"])
-    self.assertIn(run_id, data["decisions"]["run"])
-    self.assertIn(excl_id, data["exclusive"])
-    self.assertIn(f"sampler:lora:{excl_id}", data["exclusive"])
-    self.assertEqual(data["decisions"]["run"][samp_id]["rule"], "dedicated_exclusive_sampler")
-    self.assertEqual(data["state"]["pools"]["lora:tiny:0"]["node"], "node-1")
+    pool = await self.pool(run_id)
+    data = await self.scheduling_until(lambda d: d["state"]["pools"].get(pool, {}).get("node"))
+    self.assertEqual(data["state"]["pools"][pool]["node"], "node-1")
+    sampler = data["state"]["pools"][await self.pool(samp_id)]
+    self.assertEqual((sampler["role"], sampler["exclusive"], sampler["train_run"]), ("sampler", True, excl_id))
     self.assertIn("node-1", data["nodes"])
 
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
-    data = await self.scheduling_until(lambda d: "lora:tiny:0" not in d["state"]["pools"])
-    self.assertNotIn(run_id, data["decisions"]["run"])
+    data = await self.scheduling_until(lambda d: pool not in d["state"]["pools"])
+    self.assertNotIn(run_id, data["state"]["runs"])
 
   async def scheduling_until(self, done, tries: int = 100) -> dict:
     """GET /api/v1/scheduling until `done` says yes about it."""
@@ -359,34 +360,34 @@ class TestAPI(RedisTest):
       await asyncio.sleep(0.05)
     self.fail(f"never: {data}")
 
-  async def test_sft_never_warms_samplers_while_save_weights_for_sampler_does(self):
+  async def sampler_runs(self) -> list[str]:
+    return [e.body["run"] for e in await self.bus.events() if e.kind == "run_created" and e.body["role"] == "sampler"]
+
+  async def test_only_sampling_sessions_get_a_sampler_and_it_ends_with_its_training_run(self):
     sft = await self.create_model()
     await self.result(await self.post("forward_backward", content=proto_body(sft), headers=PROTO))
     await self.result(await self.post("optim_step", json={"model_id": sft, "adam_params": {}}))
     await self.result(await self.post("save_weights", json={"model_id": sft, "path": "sft-ckpt"}))
-    self.assertEqual(await self.bus.warm_samplers(), {})
-
     self.assertEqual(
       (await self.post("save_weights_for_sampler", json={"model_id": sft, "path": "../bad"})).status_code, 400
     )
-    self.assertEqual(await self.bus.warm_samplers(), {})
-
     await self.post("save_weights_for_sampler", json={"model_id": sft, "path": "000000"})
-    self.assertEqual(await self.bus.warm_samplers(), {"sampler:tiny": "tiny"})
+    self.assertEqual(await self.sampler_runs(), [])
+
+    excl = await self.create_model(user_metadata={"openrl.exclusive": "true"})
+    saved = await self.post("save_weights_for_sampler", json={"model_id": excl, "sampling_session_seq_id": 0})
+    sid = (await self.result(saved)).json()["sampling_session_id"]
+    self.assertEqual(await self.sampler_runs(), [sid])
+    sampler = await self.pool(sid)
 
     await self.bus.heartbeat("n8", 8)
     await self.bus.emit("node_up", node="n8", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    data = await self.scheduling_until(lambda d: "sampler:tiny" in d["state"]["pools"])
-    self.assertEqual(data["state"]["pools"]["sampler:tiny"]["node"], "n8")
-    self.assertEqual(data["state"]["pools"]["sampler:tiny"]["env"].get("TINYRL_WARM_SAMPLER"), "1")
-
-    excl = await self.create_model(user_metadata={"openrl.exclusive": "true"})
-    await self.post("save_weights_for_sampler", json={"model_id": excl, "sampling_session_seq_id": 0})
-    self.assertIn(f"sampler:lora:{excl}", await self.bus.warm_samplers())
+    data = await self.scheduling_until(lambda d: d["state"]["pools"].get(sampler, {}).get("node"))
+    self.assertEqual(data["state"]["pools"][sampler]["env"].get("TINYRL_WARM_SAMPLER"), "1")
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)
-    self.assertNotIn(f"sampler:lora:{excl}", await self.bus.warm_samplers())
+    await self.scheduling_until(lambda d: sampler not in d["state"]["pools"])
 
 
 if __name__ == "__main__":

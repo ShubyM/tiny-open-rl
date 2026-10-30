@@ -100,7 +100,7 @@ class Sampler:
     self.engine_type = engine or getattr(importlib.import_module(module), name)
     self.engine: Engine | None = None  # started by the first command, which says which base model
     self.store = store if store is not None else Store()
-    self.lora = not pool.startswith("sampler:fft:")
+    self.lora = os.getenv("TINYRL_LORA", "1") != "0"
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.names: dict[tuple[str, str], str] = {}  # (uri, version) -> the engine's name for that checkpoint
     self.loading = asyncio.Lock()
@@ -111,12 +111,7 @@ class Sampler:
   async def warm(self) -> None:
     if self.engine is not None:
       return
-    base = (await self.bus.warm_samplers()).get(self.pool)
-    if not base:
-      for run_id in await self.bus.runs(self.pool):
-        if (run := await self.bus.run(run_id)) and run.get("base"):
-          base = run["base"]
-          break
+    base = os.getenv("TINYRL_BASE")
     if not base:
       return
     async with self.acquire(0):
