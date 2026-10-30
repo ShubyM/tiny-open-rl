@@ -35,7 +35,6 @@ LIVE_SECONDS = 120  # a session is live this long after its last heartbeat
 REPLY_TTL = getenv("REPLY_TTL", 3600)
 SESSION_TTL = getenv("SESSION_TTL", 7 * 24 * 3600)
 LEASE_MS = getenv("LEASE_MS", 10000)  # a trainer owns its pool this long after its last renewal
-UTIL_MS = getenv("UTIL_MS", 10000)  # a trainer reports how busy it was over this window
 NODE_MS = 30000  # a node daemon is live this long after its last heartbeat
 
 
@@ -57,13 +56,15 @@ class Op(StrEnum):
 @dataclass(frozen=True)
 class Run:
   id: str
-  pool: str
+  pool: str  # "" until the scheduler assigns one
   base: str
   rank: int
   session: str = ""
   model_path: str | None = None
   lora: dict = field(default_factory=dict)  # the LoRA config it was created with, to create it again elsewhere
   exclusive: bool = False
+  role: str = "trainer"
+  train_run: str | None = None  # the training run a sampling session samples
 
 
 @dataclass(frozen=True)
@@ -153,18 +154,28 @@ class Bus:
     record = json.dumps({**asdict(run), "created": time.time()})
     p = self.r.pipeline(transaction=True)
     p.xgroup_create(key("q", run.id), GROUP, id="0", mkstream=True)
-    p.sadd(key("pools"), run.pool)
-    p.sadd(key("pool", run.pool), run.id)
+    if run.pool:
+      p.sadd(key("pools"), run.pool)
+      p.sadd(key("pool", run.pool), run.id)
     p.hset(
       key("run", run.id), mapping={"record": record, "steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0}
     )
     if run.session:
       p.sadd(key("sess", run.session, "runs"), run.id)
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
-    if run.exclusive:
-      p.sadd(key("excl"), run.id, run.pool)
+    body = {"run": run.id, "role": run.role, "base": run.base, "rank": run.rank, "exclusive": run.exclusive}
+    body |= {"train_run": run.train_run} | ({"pool": run.pool} if run.pool else {})
+    p.xadd(key("events"), {"kind": "run_created", "body": json.dumps(body)})
     await p.execute()
-    await self.emit("run_created", run=run.id, pool=run.pool, exclusive=run.exclusive)
+
+  async def assign(self, run: str, pool: str) -> None:
+    """The scheduler's assignment of a run to a pool, with its log entry, at once. Only the scheduler writes it."""
+    p = self.r.pipeline(transaction=True)
+    p.hset(key("run", run), "pool", pool)
+    p.sadd(key("pools"), pool)
+    p.sadd(key("pool", pool), run)
+    p.xadd(key("events"), {"kind": "assigned", "body": json.dumps({"run": run, "pool": pool})})
+    await p.execute()
 
   async def run(self, run_id: str) -> dict | None:
     fields = await self.r.hgetall(key("run", run_id))
@@ -172,6 +183,8 @@ class Bus:
       return None
 
     record = json.loads(fields.pop(b"record"))
+    if pool := fields.pop(b"pool", None):
+      record["pool"] = pool.decode()
     counters = {name.decode(): int(value) for name, value in fields.items()}  # steps, failed, cmds, busy_ms, wait_ms
     return {**record, **counters}
 
@@ -194,39 +207,16 @@ class Bus:
     p = self.r.pipeline()
     for _, run_id in runs:
       p.hgetall(key("run", run_id))
-    return {at: {k.decode(): int(v) for k, v in f.items() if k != b"record"} for at, f in zip(runs, await p.execute())}
-
-  async def warm_sampler(self, pool: str, base: str, exclusive: bool = False) -> None:
-    p = self.r.pipeline(transaction=True)
-    p.hset(key("warm"), pool, base)
-    if exclusive:
-      p.sadd(key("excl"), pool)
-    await p.execute()
-    await self.emit("sampler_warmed", pool=pool, exclusive=exclusive)
-
-  async def warm_samplers(self) -> dict[str, str]:
-    return {k.decode(): v.decode() for k, v in (await self.r.hgetall(key("warm"))).items()}
+    counters = [{k.decode(): int(v) for k, v in f.items() if k not in (b"record", b"pool")} for f in await p.execute()]
+    return dict(zip(runs, counters))
 
   async def drop(self, run_id: str, pool: str) -> None:
     """Take a deleted run out of its pool and delete its stream, in one transaction."""
     p = self.r.pipeline(transaction=True)
     p.srem(key("pool", pool), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
-    p.hdel(key("decide", "run"), run_id)
-    p.hdel(key("warm"), f"sampler:fft:{run_id}", f"sampler:lora:{run_id}")
     await p.execute()
     await self.emit("run_deleted", run=run_id, pool=pool)
-
-  async def exclusive(self) -> set[str]:
-    return {v.decode() for v in await self.r.smembers(key("excl"))}
-
-  async def decide(self, kind: str, subject: str, decision: dict) -> None:
-    await self.r.hset(key("decide", kind), subject, json.dumps(decision))
-
-  async def decisions(self) -> dict[str, dict[str, dict]]:
-    """The gateway's pool choice for each run. Placement and turns are decided in the log, see scheduler.py."""
-    raw = await self.r.hgetall(key("decide", "run"))
-    return {"run": {k.decode(): json.loads(v) for k, v in raw.items()}}
 
   # ***** commands *****
 
@@ -363,30 +353,7 @@ class Bus:
     worker = await self.r.get(key("owner", pool))
     return worker.decode() if worker else None
 
-  # ***** load *****
-
-  async def report(self, pool: str, util: float) -> None:
-    """A trainer's busy fraction over the last UTIL_MS. It now counts the runs placed since the last report."""
-    p = self.r.pipeline(transaction=True)
-    p.set(key("util", pool), util, px=3 * UTIL_MS)
-    p.delete(key("placed", pool))
-    await p.execute()
-
-  async def placed(self, pool: str) -> None:
-    p = self.r.pipeline(transaction=True)
-    p.incr(key("placed", pool))
-    p.pexpire(key("placed", pool), 3 * UTIL_MS)
-    await p.execute()
-
-  async def loads(self, pools: list[str]) -> list[tuple[float | None, int, int]]:
-    """Each pool's last reported busy fraction (None if it has none), runs placed since, and runs."""
-    p = self.r.pipeline()
-    for pool in pools:
-      p.get(key("util", pool))
-      p.get(key("placed", pool))
-      p.scard(key("pool", pool))
-    got = await p.execute()
-    return [(None if u is None else float(u), int(n or 0), runs) for u, n, runs in zip(got[::3], got[1::3], got[2::3])]
+  # ***** nodes *****
 
   async def heartbeat(self, node: str, gpus: int) -> None:
     await self.r.hset(key("nodes"), node, json.dumps({"gpus": gpus, "until": time.time() + NODE_MS / 1000}))
@@ -397,9 +364,6 @@ class Bus:
     if dead := [k for k, v in nodes.items() if v["until"] < time.time()]:
       await self.r.hdel(key("nodes"), *dead)
     return {k: v["gpus"] for k, v in nodes.items() if k not in dead}
-
-  async def gpus(self) -> int:
-    return sum((await self.nodes()).values())
 
   # ***** replies *****
 

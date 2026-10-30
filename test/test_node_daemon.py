@@ -109,7 +109,7 @@ class TestNodeDaemon(RedisTest):
   @patch("tinyrl.node_daemon.subprocess.Popen")
   def test_a_process_starts_on_its_placed_gpus_with_its_placed_settings(self, popen):
     daemon = NodeDaemon(None, gpus=8, node="n")
-    daemon.start("sampler:fft:a", scheduler.Pool(gpus=(6,), env={"TINYRL_GPU_MEM": "0.42"}))
+    daemon.start("sampler:fft:a", scheduler.Pool("sampler", gpus=(6,), env={"TINYRL_GPU_MEM": "0.42"}))
     env = popen.call_args[1]["env"]
     self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["GPU"]), ("6", f"{socket.gethostname()}:6"))
     self.assertEqual(env["TINYRL_GPU_MEM"], "0.42")

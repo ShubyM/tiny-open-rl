@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import patch
 
@@ -18,6 +19,21 @@ class TestEvents(RedisTest):
     self.assertEqual(events[0].body, {"pool": "p", "node": "n", "gpus": [0], "memory": 0})
     self.assertLessEqual(events[0].t, events[1].t)
     self.assertEqual([e.id for e in await self.bus.events(first)], [second])
+
+  async def test_the_scheduler_assigns_new_runs_and_workers_find_them_in_redis(self):
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    for run in ("a", "b"):
+      await self.bus.create(Run(run, "", "tiny", 4))
+    await self.bus.create(Run("f", "", "tiny", 0))
+    for _ in range(100):
+      runs = {r: (await self.bus.run(r))["pool"] for r in ("a", "b", "f")}
+      if all(runs.values()):
+        break
+      await asyncio.sleep(0.02)
+    self.assertEqual(runs["a"], runs["b"])
+    self.assertNotEqual(runs["a"], runs["f"])
+    self.assertEqual(sorted(await self.bus.runs(runs["a"])), ["a", "b"])
+    self.assertEqual(await self.bus.runs(runs["f"]), ["f"])
 
   async def test_each_worker_appends_its_facts_in_order_and_the_log_folds_soundly(self):
     run_id = new_id()

@@ -70,6 +70,18 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     await trainer.own()
     self.renewal_tasks.append(asyncio.create_task(trainer.keep()))
 
+  async def pool(self, run: str) -> str:
+    """The run's pool, once every new run is assigned the way the scheduler assigns it."""
+    from tinyrl import scheduler
+
+    s = scheduler.State()
+    for e in await self.bus.events():
+      s = scheduler.fold(s, e)
+    for kind, body in scheduler.decide(s, 0.0):
+      if kind == "assigned":
+        await self.bus.assign(body["run"], body["pool"])
+    return (await self.bus.run(run))["pool"]
+
   async def running(self, placed: dict[str, list[int]]) -> None:
     """Node n is up with these pools placed on these GPUs and their processes started, each kept by a held run."""
     gpus = 1 + max(i for pool_gpus in placed.values() for i in pool_gpus)

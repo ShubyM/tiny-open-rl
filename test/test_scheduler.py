@@ -2,18 +2,7 @@ import random
 import unittest
 
 from tinyrl.bus import Event
-from tinyrl.scheduler import (
-  QUANTUM,
-  RULES,
-  State,
-  choose_pool,
-  choose_sampler_pool,
-  decide,
-  fold,
-  holders,
-  parse_pool,
-  settings,
-)
+from tinyrl.scheduler import QUANTUM, RULES, Pool, State, decide, fold, holders, settings
 
 GIB = 1024**3
 
@@ -47,6 +36,13 @@ class Log:
     self.test, self.s, self.t, self.entries = test, State(quantum=quantum), 0.0, []
 
   def append(self, kind: str, body: dict) -> None:
+    if (
+      kind in ("run_created", "sampler_warmed") and "role" not in body
+    ):  # name the pool's kind the way main's names did
+      pool = body["pool"]
+      role = "sampler" if pool.startswith("sampler:") else "trainer"
+      rank = 0 if pool.startswith("sampler:fft:") or (role == "trainer" and not pool.startswith("lora:")) else 8
+      kind, body = "run_created", {"run": f"{pool}-session", "role": role, "base": pool, "rank": rank} | body
     self.entries.append(Event(str(len(self.entries)), self.t, kind, body))
     self.s = fold(self.s, self.entries[-1])
     self.test.assertEqual(check(self.s), [])
@@ -94,7 +90,7 @@ class TestPlacement(unittest.TestCase):
     log = Log(self)
     log.node(8)
     log("run_created", run="r", pool="r")
-    self.assertEqual(log("sampler_warmed", pool="sampler:fft:r"), [("placed", "sampler:fft:r", PLACED)])
+    self.assertEqual(log("sampler_warmed", pool="sampler:fft:r", train_run="r"), [("placed", "sampler:fft:r", PLACED)])
     self.assertEqual(
       log("run_deleted", run="r", pool="r"), [("unplaced", "r", EMPTIED), ("unplaced", "sampler:fft:r", EMPTIED)]
     )
@@ -143,8 +139,8 @@ class TestPlacement(unittest.TestCase):
       },
     )
     self.assertEqual(log.s.pools["sampler:fft:Qwen"].memory, int(0.42 * 81559 * MIB))
-    self.assertEqual(settings("sampler:fft:Qwen", 8, 23034), {"TINYRL_WARM_SAMPLER": "1"})
-    self.assertEqual(settings("sampler:Qwen", 1, 81559), {"TINYRL_KV_BYTES": str(24 * 1024**3)})
+    self.assertEqual(settings(Pool("sampler", lora=False), 8, 23034), {"TINYRL_WARM_SAMPLER": "1"})
+    self.assertEqual(settings(Pool("sampler", lora=True), 1, 81559), {"TINYRL_KV_BYTES": str(24 * 1024**3)})
 
 
 class TestTurns(unittest.TestCase):
@@ -339,59 +335,6 @@ class TestLog(unittest.TestCase):
 
 
 class TestPoolsAndGpus(unittest.TestCase):
-  def test_a_pool_s_role_and_model_come_from_its_name(self):
-    self.assertEqual(parse_pool("lora:base:0"), ("trainer", True, "base"))
-    self.assertEqual(parse_pool("lora:org/model"), ("trainer", True, "org/model"))
-    self.assertEqual(parse_pool("sampler:base"), ("sampler", True, "base"))
-    self.assertEqual(parse_pool("run"), ("trainer", False, "run"))
-    self.assertEqual(parse_pool("sampler:fft:run"), ("sampler", False, "run"))
-    self.assertEqual(parse_pool("sampler:lora:run"), ("sampler", False, "run"))
-
-  def test_choose_pool(self):
-    shards = [("lora:b:0", None, 0, 13)]
-    d = choose_pool("r", "b", 1, False, shards, 8, target_util=0.7, new_run_util=0.04)
-    self.assertEqual(d["choice"], "lora:b:0")
-    self.assertEqual(d["rule"], "reuse_shard_under_target")
-
-    shards[0] = ("lora:b:0", None, 18, 18)
-    d = choose_pool("r", "b", 1, False, shards, 8, target_util=0.7, new_run_util=0.04)
-    self.assertEqual(d["choice"], "lora:b:1")
-    self.assertEqual(d["rule"], "open_new_shard")
-
-    shards = [("lora:b:0", 0.1, 5, 10)]
-    d = choose_pool("r", "b", 1, False, shards, 8, target_util=0.7, new_run_util=0.04)
-    self.assertEqual(d["choice"], "lora:b:0")
-    self.assertEqual(d["per_run"], 0.02)
-
-    d = choose_pool("r", "b", 0, False, shards, 8)
-    self.assertEqual(d["choice"], "r")
-    self.assertEqual(d["rule"], "dedicated_fft")
-
-    d = choose_pool("r", "b", 1, True, shards, 8)
-    self.assertEqual(d["choice"], "r")
-    self.assertEqual(d["rule"], "dedicated_exclusive")
-
-  def test_choose_sampler_pool(self):
-    d = choose_sampler_pool("b", False, "r")
-    self.assertEqual(d["choice"], "sampler:fft:b")
-    self.assertEqual(d["rule"], "shared_fft_sampler")
-
-    d = choose_sampler_pool("b", False, "r", True)
-    self.assertEqual(d["choice"], "sampler:fft:r")
-    self.assertEqual(d["rule"], "dedicated_fft_sampler")
-
-    d = choose_sampler_pool("", False, "r")
-    self.assertEqual(d["choice"], "sampler:fft:r")
-    self.assertEqual(d["rule"], "dedicated_fft_sampler")
-
-    d = choose_sampler_pool("b", True, "r", True)
-    self.assertEqual(d["choice"], "sampler:lora:r")
-    self.assertEqual(d["rule"], "dedicated_exclusive_sampler")
-
-    d = choose_sampler_pool("b", True, "r", False)
-    self.assertEqual(d["choice"], "sampler:b")
-    self.assertEqual(d["rule"], "shared_lora_sampler")
-
   def test_a_trainer_takes_turns_with_the_least_busy_trainers(self):
     log = Log(self)
     log.node(2)
@@ -478,6 +421,39 @@ class TestPoolsAndGpus(unittest.TestCase):
         [mine] = [e for e in log.entries[before:] if e.kind == "placed" and e.body["pool"] == name]
         if name.startswith("sampler:") and movable:
           self.assertIn(mine.body["gpu_rule"], ("empty_gpu", "fits_next_to_others"), name)
+
+
+def pools_after(*runs: dict) -> dict[str, str]:
+  """Each run's pool once the scheduler has decided, for runs created with these requirements."""
+  s, n = State(), 0
+  for r in runs:
+    body = {"role": "trainer", "base": "a", "rank": 8, "exclusive": False, "train_run": None} | r
+    s, n = fold(s, Event(str(n), 0.0, "run_created", body)), n + 1
+  for kind, body in decide(s, 0.0):
+    s = fold(s, Event("", 0.0, kind, body))
+  return {name: r.pool for name, r in s.runs.items()}
+
+
+class TestChoosePool(unittest.TestCase):
+  def test_lora_runs_of_one_base_share_a_pool_and_full_or_exclusive_runs_get_their_own(self):
+    pool = pools_after(
+      {"run": "A"}, {"run": "B"}, {"run": "C", "base": "b"}, {"run": "F", "rank": 0}, {"run": "X", "exclusive": True}
+    )
+    self.assertEqual(pool["A"], pool["B"])
+    self.assertEqual(len(set(pool.values())), 4)
+
+  def test_sampling_sessions_share_their_base_and_kinds_sampler(self):
+    sampler = {"role": "sampler", "rank": 1}
+    pool = pools_after(
+      sampler | {"run": "s1", "train_run": "A"},
+      sampler | {"run": "s2", "train_run": "B"},
+      sampler | {"run": "f", "rank": 0, "train_run": "A"},
+      sampler | {"run": "x1", "exclusive": True, "train_run": "X"},
+      sampler | {"run": "x2", "exclusive": True, "train_run": "X"},
+    )
+    self.assertEqual(pool["s1"], pool["s2"])
+    self.assertEqual(pool["x1"], pool["x2"])
+    self.assertEqual(len(set(pool.values())), 3)
 
 
 if __name__ == "__main__":

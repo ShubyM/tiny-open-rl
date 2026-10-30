@@ -19,7 +19,7 @@ class TestBus(RedisTest):
 
   async def new_run(self, pool: str = "p", session: str = "") -> str:
     run_id = new_id()
-    await self.bus.create(Run(run_id, pool, "base", 8, session))
+    await self.bus.create(Run(id=run_id, pool=pool, base="base", rank=8, session=session))
     return run_id
 
   async def test_a_command_goes_through_the_stream_and_its_reply_comes_back(self):
@@ -143,6 +143,11 @@ class TestBus(RedisTest):
     await self.bus.release("p", "w0")
     self.assertTrue(await self.bus.own("p", "next"))
 
+  async def test_a_dead_node_daemon_stops_counting(self):
+    await self.bus.heartbeat("node-a", 2)
+    await self.bus.r.hset("tinyrl:nodes", "node-b", '{"gpus": 8, "until": 0}')
+    self.assertEqual(await self.bus.nodes(), {"node-a": 2})
+
   async def test_sessions(self):
     await self.bus.session("s")
     run_id = await self.new_run(session="s")
@@ -170,7 +175,7 @@ class TestRedisRestart(unittest.IsolatedAsyncioTestCase):
       restarting = asyncio.create_task(restart())
       await bus.heartbeat("node-a", 1)  # retried until Redis is back, instead of raising
       proc = await restarting
-      self.assertEqual(await bus.gpus(), 1)
+      self.assertEqual(await bus.nodes(), {"node-a": 1})
     finally:
       await bus.r.aclose()
       proc.terminate()

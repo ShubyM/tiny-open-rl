@@ -25,7 +25,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl import wire
-from tinyrl.bus import LEASE_MS, UTIL_MS, Bus, Cmd, Op, Reply
+from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.store import Store
 from tinyrl.turns import IDLE_MS, GpuTurn
@@ -468,7 +468,6 @@ class Trainer:
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.done = False
     self.draining = False
-    self.busy = 0.0  # seconds spent running commands since the last load report
     self.turn = GpuTurn(bus, pool, bool(GPU))
 
   async def serve(self) -> None:
@@ -498,16 +497,12 @@ class Trainer:
       await asyncio.sleep(LEASE_MS / 4000)
 
   async def keep(self) -> None:
-    """Renew the pool's lease until another trainer has it, and report how busy the trainer was every UTIL_MS."""
-    reported = time.time()
+    """Renew the pool's lease until another trainer has it."""
     while True:  # until serve() cancels it, so the lease holds while a stopping trainer saves its runs
       await asyncio.sleep(LEASE_MS / 4000)
       if not await self.bus.renew(self.pool, self.worker) and not await self.reown():
         self.done = True
         return
-      if (now := time.time()) - reported >= UTIL_MS / 1000:
-        await self.bus.report(self.pool, min(1.0, self.busy / (now - reported)))
-        self.busy, reported = 0.0, now
 
   async def reown(self) -> bool:
     """Take the pool's lease again if it ran out with nobody taking it, as it does while Redis restarts. Not if another
@@ -579,7 +574,6 @@ class Trainer:
         reply = first or await self.answer(cmd)
         ms = (time.time() - start) * 1000
         ops.append([cmd.op, ms])
-        self.busy += time.time() - start
         if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
           self.done = True  # another trainer owns the pool now
           break
