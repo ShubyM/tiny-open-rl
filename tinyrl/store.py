@@ -2,7 +2,7 @@
 
 Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write
 the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors +
-config.json).
+config.json, sharded with a model.safetensors.index.json when large).
 
 CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, a checkpoint is
 written locally and uploaded, and read by downloading it once into CKPT_CACHE, since engines load from a local path.
@@ -14,11 +14,10 @@ import concurrent.futures
 import glob
 import json
 import os
-import pathlib
 import shutil
 import tempfile
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import fsspec
 
@@ -29,9 +28,30 @@ from tinyrl.helpers import getenv
 
 CKPT = getenv("CKPT", "/tmp/tinyrl")
 CKPT_CACHE = getenv("CKPT_CACHE", "/tmp/tinyrl-cache")
-SHARD_BYTES = getenv("SHARD_BYTES", 256 * 1024 * 1024)
+SHARD_BYTES = getenv("SHARD_BYTES", 256 * 1024 * 1024)  # a full checkpoint this big is written as parallel shards
 MAX_SHARDS = 16
-MAX_PIN_BYTES = getenv("MAX_PIN_BYTES", 10 * 1024 * 1024 * 1024)
+MAX_PIN_BYTES = getenv("MAX_PIN_BYTES", 10 * 1024 * 1024 * 1024)  # the most pinned host memory a save holds
+
+
+def nbytes(t: torch.Tensor) -> int:
+  return t.numel() * t.element_size()
+
+
+def aligned(n: int) -> int:
+  return (n + 7) & ~7  # so a view of the pinned buffer can start any dtype
+
+
+def as_bytes(t: torch.Tensor) -> torch.Tensor:
+  import torch
+
+  return t.detach().contiguous().reshape(-1).view(torch.uint8)
+
+
+def header(path: str) -> dict:
+  import safetensors
+
+  with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+    return json.loads((f.metadata() or {}).get("meta", "{}"))
 
 
 class Store:
@@ -40,119 +60,80 @@ class Store:
     self.remote = "://" in self.root
     self.fs, self.base = fsspec.core.url_to_fs(self.root, auto_mkdir=True)  # a file:// URL makes folders as it writes
     self.cache = CKPT_CACHE if cache is None else cache
-    self._pin: Any = None
-    self._pin_lock = threading.Lock()
-
-  def _stage(
-    self, tensors: dict[str, torch.Tensor], is_cuda=lambda t: t.device.type == "cuda", sync=None
-  ) -> dict[str, torch.Tensor]:
-    import torch
-
-    if sync is None:
-      sync = torch.cuda.synchronize
-
-    cuda_bytes = sum(((v.numel() * v.element_size() + 7) & ~7) for v in tensors.values() if is_cuda(v))
-    if cuda_bytes == 0:
-      return {
-        k: v.detach() if v.device.type == "cpu" and v.is_contiguous() else v.detach().cpu().contiguous()
-        for k, v in tensors.items()
-      }
-
-    has_cuda = torch.cuda.is_available()
-    if 0 < cuda_bytes <= MAX_PIN_BYTES:
-      if self._pin is None or self._pin.numel() < cuda_bytes:
-        self._pin = None
-        self._pin = torch.empty(cuda_bytes, dtype=torch.uint8, pin_memory=has_cuda)
-      cpu = {}
-      off = 0
-      for k, v in tensors.items():
-        if is_cuda(v):
-          src = v.detach().contiguous()
-          nb = src.numel() * src.element_size()
-          dst = self._pin[off : off + nb].view(src.dtype).reshape(src.shape)
-          dst.copy_(src, non_blocking=True)
-          cpu[k] = dst
-          off = (off + nb + 7) & ~7
-        else:
-          cpu[k] = v.detach() if v.is_contiguous() else v.detach().contiguous()
-      if has_cuda:
-        sync()
-      return cpu
-
-    max_elem_bytes = max((v.element_size() for v in tensors.values() if is_cuda(v)), default=1)
-    pin_bytes = max(MAX_PIN_BYTES, max_elem_bytes)
-    if self._pin is None or self._pin.numel() < pin_bytes:
-      self._pin = None
-      self._pin = torch.empty(pin_bytes, dtype=torch.uint8, pin_memory=has_cuda)
-
-    cpu = {}
-    for k, v in tensors.items():
-      if not is_cuda(v):
-        cpu[k] = v.detach() if v.is_contiguous() else v.detach().contiguous()
-      else:
-        src = v.detach().contiguous()
-        dst = torch.empty(src.shape, dtype=src.dtype)
-        src_flat = src.view(-1)
-        dst_flat = dst.view(-1)
-        chunk_elems = max(1, MAX_PIN_BYTES // src.element_size())
-
-        for start in range(0, src.numel(), chunk_elems):
-          end = min(src.numel(), start + chunk_elems)
-          chunk = src_flat[start:end]
-          nb = chunk.numel() * src.element_size()
-          pin_view = self._pin[:nb].view(src.dtype)
-          pin_view.copy_(chunk, non_blocking=True)
-          if has_cuda:
-            sync()
-          dst_flat[start:end].copy_(pin_view)
-        cpu[k] = dst
-    return cpu
+    self.pinned: torch.Tensor | None = None  # reused by every save, since pinning host memory is slow
+    self.lock = threading.Lock()  # a save's tensors can be views of self.pinned until it is written
 
   def path(self, uri: str) -> str:
     return f"{self.base}/{uri.removeprefix('tinker://')}"
 
-  def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
-    import safetensors
+  # ***** put *****
+
+  def stage(self, tensors: dict[str, torch.Tensor], is_cuda=lambda t: t.is_cuda) -> dict[str, torch.Tensor]:
+    """The tensors on the CPU. GPU tensors go through one pinned buffer, so the copy runs at DMA speed. When they all
+    fit, they are views of it, else each streams through it in pieces into its own host tensor."""
+    import torch
+
+    gpu = {k for k, v in tensors.items() if is_cuda(v)}
+    out = {k: v.detach().contiguous() for k, v in tensors.items() if k not in gpu}
+    total = sum(aligned(nbytes(tensors[k])) for k in gpu)
+    if not total:
+      return out
+    size = min(total, MAX_PIN_BYTES)
+    if self.pinned is None or self.pinned.numel() < size:
+      self.pinned = None  # free the old buffer before pinning a bigger one
+      self.pinned = torch.empty(size, dtype=torch.uint8, pin_memory=torch.cuda.is_available())
+    sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
+    at = 0
+    for k in gpu:
+      src, v = as_bytes(tensors[k]), tensors[k]
+      if total <= MAX_PIN_BYTES:
+        self.pinned[at : at + len(src)].copy_(src, non_blocking=True)
+        out[k] = self.pinned[at : at + len(src)].view(v.dtype).view(v.shape)
+        at += aligned(len(src))
+        continue
+      dst = torch.empty(len(src), dtype=torch.uint8)
+      for i in range(0, len(src), size):
+        piece = src[i : i + size]
+        self.pinned[: len(piece)].copy_(piece, non_blocking=True)
+        sync()
+        dst[i : i + len(piece)].copy_(self.pinned[: len(piece)])
+      out[k] = dst.view(v.dtype).view(v.shape)
+    sync()
+    return {k: out[k] for k in tensors}
+
+  def write(self, folder: str, tensors: dict[str, torch.Tensor], info: dict) -> list[str]:
+    """Write a checkpoint into folder, and return its file names, with the weights last."""
     import safetensors.torch
 
-    info = dict(meta or {})
-    dest = self.path(uri)
-    folder = tempfile.mkdtemp(dir=self._mkdir(self.cache if self.remote else os.path.dirname(dest)))
-    with self._pin_lock:
-      cpu = self._stage(tensors)
-      total_bytes = sum(v.numel() * v.element_size() for v in cpu.values())
-      meta_hdr = {"meta": json.dumps(info)}
+    lora, cfg, total = info.get("lora"), info.get("config"), sum(map(nbytes, tensors.values()))
+    n = min(MAX_SHARDS, len(tensors)) if not lora and total >= SHARD_BYTES else 1
+    stem = ("adapter_model" if lora else "model") if cfg else "state"
+    weights = [f"{stem}.safetensors"] if n == 1 else [f"{stem}-{i + 1:05d}-of-{n:05d}.safetensors" for i in range(n)]
+    shards = [dict(list(tensors.items())[i::n]) for i in range(n)]
+    files = {}
+    if cfg:
+      files["adapter_config.json" if lora else "config.json"] = cfg
+    if cfg and n > 1:
+      weight_map = {k: w for w, shard in zip(weights, shards) for k in shard}
+      files["model.safetensors.index.json"] = {"metadata": {"total_size": total}, "weight_map": weight_map}
+    for name, obj in files.items():
+      with open(f"{folder}/{name}", "w") as f:
+        json.dump(obj, f)
 
-      if not info.get("lora") and total_bytes >= SHARD_BYTES and len(cpu) > 1:
-        stem = "model" if info.get("config") else "state"
-        n_shards = min(MAX_SHARDS, len(cpu))
-        items = list(cpu.items())
-        shards = [dict(items[s::n_shards]) for s in range(n_shards)]
-        shard_names = [f"{stem}-{s + 1:05d}-of-{n_shards:05d}.safetensors" for s in range(n_shards)]
-        names = []
-        if cfg := info.get("config"):
-          pathlib.Path(f"{folder}/config.json").write_text(json.dumps(cfg))
-          index = {
-            "metadata": {"total_size": total_bytes},
-            "weight_map": {k: shard_names[s] for s, sh in enumerate(shards) for k in sh},
-          }
-          pathlib.Path(f"{folder}/model.safetensors.index.json").write_text(json.dumps(index))
-          names += ["config.json", "model.safetensors.index.json"]
-        names += shard_names
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_shards) as ex:
-          list(
-            ex.map(
-              lambda s: safetensors.torch.save_file(shards[s], f"{folder}/{shard_names[s]}", metadata=meta_hdr),
-              range(n_shards),
-            )
-          )
-      else:
-        names = ["state.safetensors"]
-        if cfg := info.get("config"):
-          prefix = "adapter_" if info.get("lora") else ""
-          names = [f"{prefix}config.json", f"{prefix}model.safetensors"]
-          pathlib.Path(f"{folder}/{names[0]}").write_text(json.dumps(cfg))
-        safetensors.torch.save_file(cpu, f"{folder}/{names[-1]}", metadata=meta_hdr)
+    def save(name: str, shard: dict[str, torch.Tensor]) -> None:
+      safetensors.torch.save_file(shard, f"{folder}/{name}", metadata={"meta": json.dumps(info)})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+      list(pool.map(save, weights, shards))
+    return [*files, *weights]
+
+  def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
+    dest = self.path(uri)
+    parent = self.cache if self.remote else os.path.dirname(dest)
+    os.makedirs(parent, exist_ok=True)
+    folder = tempfile.mkdtemp(dir=parent)
+    with self.lock:
+      names = self.write(folder, self.stage(tensors), dict(meta or {}))
     if self.remote:
       try:
         stale = {f["name"].rsplit("/", 1)[-1]: f["name"] for f in self.fs.ls(dest, detail=True, refresh=True)}
@@ -165,13 +146,14 @@ class Store:
         self.fs.rm_file(path)
       shutil.rmtree(folder)
     elif os.path.exists(dest):
-      old = f"{folder}.old"
-      os.rename(dest, old)
+      os.rename(dest, f"{folder}.old")
       os.rename(folder, dest)
-      shutil.rmtree(old)
+      shutil.rmtree(f"{folder}.old")
     else:
       os.rename(folder, dest)
     return dest
+
+  # ***** get *****
 
   def local(self, uri: str) -> tuple[str, str]:
     """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again."""
@@ -187,7 +169,8 @@ class Store:
       return self.path(uri), version
     folder = f"{self.cache}/{version}"
     if not os.path.isdir(folder):
-      download = tempfile.mkdtemp(dir=self._mkdir(self.cache))
+      os.makedirs(self.cache, exist_ok=True)
+      download = tempfile.mkdtemp(dir=self.cache)
       for name, f in files.items():
         self.fs.get_file(f["name"], f"{download}/{name}")
       try:
@@ -196,40 +179,20 @@ class Store:
         shutil.rmtree(download)  # another process got it here first
     return folder, version
 
-  def get(self, uri: str, *, device: str = "cpu") -> tuple[dict[str, torch.Tensor], dict]:
+  def weights(self, uri: str) -> list[str]:
+    return sorted(glob.glob(f"{self.local(uri)[0]}/*.safetensors"))
+
+  def get(self, uri: str) -> tuple[dict[str, torch.Tensor], dict]:
     import safetensors
 
-    paths = sorted(glob.glob(f"{self.local(uri)[0]}/*.safetensors"))
-    if not paths:
-      raise ValueError(f"no checkpoint at {uri}")
-
-    def load_shard(p):
-      with safetensors.safe_open(p, framework="pt", device=device) as f:
+    def load(path: str) -> dict[str, torch.Tensor]:
+      with safetensors.safe_open(path, framework="pt", device="cpu") as f:
         return {k: f.get_tensor(k) for k in f.keys()}
 
-    tensors = {}
-    if len(paths) > 1 and device == "cpu":
-      with concurrent.futures.ThreadPoolExecutor() as ex:
-        for t in ex.map(load_shard, paths):
-          tensors.update(t)
-    else:
-      for p in paths:
-        tensors.update(load_shard(p))
-
-    with safetensors.safe_open(paths[0], framework="pt", device=device) as f:
-      meta = json.loads((f.metadata() or {}).get("meta", "{}"))
-    return tensors, meta
+    paths = self.weights(uri)
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+      tensors = {k: v for shard in pool.map(load, paths) for k, v in shard.items()}
+    return tensors, header(paths[0])
 
   def meta(self, uri: str) -> dict:
-    import safetensors
-
-    with safetensors.safe_open(self._weights(uri), framework="pt", device="cpu") as f:
-      return json.loads((f.metadata() or {}).get("meta", "{}"))
-
-  def _weights(self, uri: str) -> str:
-    return sorted(glob.glob(f"{self.local(uri)[0]}/*.safetensors"))[0]
-
-  @staticmethod
-  def _mkdir(folder: str) -> str:
-    os.makedirs(folder, exist_ok=True)
-    return folder
+    return header(self.weights(uri)[0])

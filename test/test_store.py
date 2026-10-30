@@ -102,7 +102,7 @@ class TestStore(unittest.TestCase):
         "i64": torch.arange(20, dtype=torch.int64),
         "bf16": torch.arange(30, dtype=torch.bfloat16),
       }
-      cpu = store._stage(tensors, is_cuda=lambda _: True, sync=lambda: None)
+      cpu = store.stage(tensors, is_cuda=lambda _: True)
       for k, v in tensors.items():
         self.assertEqual(cpu[k].shape, v.shape)
         self.assertTrue(torch.equal(cpu[k], v))
@@ -113,7 +113,7 @@ class TestStore(unittest.TestCase):
         self.assertTrue(torch.equal(got[k], v))
 
       tinyrl.store.MAX_PIN_BYTES = 1000000
-      cpu = store._stage(tensors, is_cuda=lambda _: True, sync=lambda: None)
+      cpu = store.stage(tensors, is_cuda=lambda _: True)
       for k, v in tensors.items():
         self.assertEqual(cpu[k].shape, v.shape)
         self.assertTrue(torch.equal(cpu[k], v))
