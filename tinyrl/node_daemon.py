@@ -46,6 +46,13 @@ def gpu_memory_mib() -> int:
   return 0
 
 
+def reap(proc: subprocess.Popen) -> None:
+  """Kill what is left of a process's group, like the engine a sampler started, which outlives its parent."""
+  if isinstance(proc.pid, int) and proc.pid > 1:
+    with contextlib.suppress(ProcessLookupError):
+      os.killpg(proc.pid, signal.SIGKILL)
+
+
 class NodeDaemon:
   def __init__(self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None):
     self.bus = bus
@@ -75,6 +82,7 @@ class NodeDaemon:
         self.stopping[worker] = self.procs.pop(worker)[1]
     for worker, proc in list(self.stopping.items()):
       if proc.poll() is not None:  # only now is the GPU free, so only now does its turn end
+        reap(proc)
         del self.stopping[worker]
         await self.bus.emit("exited", worker=worker)
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
@@ -93,7 +101,7 @@ class NodeDaemon:
     mod = f"tinyrl.{k.role}"
     if mod == "tinyrl.trainer":
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    return gpus, subprocess.Popen([sys.executable, "-m", mod, worker], env=env)
+    return gpus, subprocess.Popen([sys.executable, "-m", mod, worker], env=env, start_new_session=True)
 
   async def serve(self) -> None:
     await self.up()
@@ -105,9 +113,10 @@ class NodeDaemon:
       for _, proc in self.procs.values():
         proc.terminate()  # a trainer saves its runs, then exits
       deadline = time.monotonic() + DRAIN_S
-      for _, proc in self.procs.values():
+      for proc in [*(p for _, p in self.procs.values()), *self.stopping.values()]:
         with contextlib.suppress(subprocess.TimeoutExpired):
           proc.wait(max(0.0, deadline - time.monotonic()))
+        reap(proc)
 
 
 if __name__ == "__main__":
