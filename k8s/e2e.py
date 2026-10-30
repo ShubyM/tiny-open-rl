@@ -59,10 +59,14 @@ def daemons() -> dict[str, str]:
   return {p["metadata"]["name"]: p["spec"].get("nodeName", "") for p in pods if p["status"].get("phase") == "Running"}
 
 
+def placements() -> dict[str, str]:
+  """Pool -> the node daemon pod the scheduler placed it on. A node daemon's id is its pod name and pid."""
+  pools = json.loads(redis("GET", "tinyrl:state") or "{}").get("pools", {})
+  return {pool: p["node"].rsplit("-", 1)[0] for pool, p in pools.items() if p["node"]}
+
+
 def serving(pool: str) -> str | None:
-  """The node daemon pod a pool is placed on. A node daemon's id is its pod name and pid."""
-  node = redis("HGET", "tinyrl:place", pool)
-  return node.rsplit("-", 1)[0] if node else None
+  return placements().get(pool)
 
 
 def trainers(pod: str) -> list[str]:
@@ -205,7 +209,7 @@ def main() -> None:
 
   def no_leaks():
     time.sleep(10)
-    placed = {pool: node.rsplit("-", 1)[0] for pool, node in zip(*[iter(redis("HGETALL", "tinyrl:place").split())] * 2)}
+    placed = placements()
     procs = {pod: trainers(pod) for pod in daemons()}
     extra = {
       pod: [p for p in ps if not any(pool in p for pool, at in placed.items() if at == pod)]

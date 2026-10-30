@@ -2,7 +2,8 @@ import json
 from unittest.mock import patch
 
 from test.helpers import RedisTest, new_id, tiny
-from tinyrl import control
+from test.test_scheduler import check
+from tinyrl import scheduler
 from tinyrl.bus import Op, Run
 from tinyrl.sampler import Sampler
 from tinyrl.trainer import Trainer
@@ -53,12 +54,10 @@ class TestEvents(RedisTest):
       await sampler.step()
 
     events = await self.bus.events()
+    turns = ("wants_gpu", "granted", "batch_done", "idle")
     for pool in ("lora:tiny:1", "sampler:tiny"):
-      self.assertEqual(
-        [e.kind for e in events if e.body.get("pool") == pool],
-        ["started", "wants_gpu", "granted", "batch_done", "idle"],
-      )
-    s = control.State()
+      self.assertEqual([e.kind for e in events if e.body.get("pool") == pool and e.kind in turns], list(turns))
+    s = scheduler.State()
     for e in events:
-      s = control.fold(s, e)
-    self.assertEqual(control.check(s), [])
+      s = scheduler.fold(s, e)
+    self.assertEqual(check(s), [])

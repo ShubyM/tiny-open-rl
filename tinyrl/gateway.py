@@ -15,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from tinyrl import schedule, wire
+from tinyrl import scheduler, wire
 from tinyrl.bus import Bus, Op, Run, key
 from tinyrl.helpers import getenv
 from tinyrl.store import Store
@@ -80,13 +80,13 @@ async def pool_for(bus: Bus, run: str, base_model: str, rank: int, metadata: dic
   exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
   shards = [p for p in await bus.pools() if p.startswith(f"lora:{base_model}:")]
   loads = await bus.loads(shards)
-  shard_loads = [schedule.ShardLoad(p, u, placed, runs) for p, (u, placed, runs) in zip(shards, loads)]
+  shard_loads = [(pool, *load) for pool, load in zip(shards, loads)]
   gpus = await bus.gpus()
-  dec = schedule.choose_pool(run, base_model, rank, exclusive, shard_loads, gpus, TARGET_UTIL, NEW_RUN_UTIL)
-  await bus.decide("run", run, dec.as_dict())
-  if dec.choice != run:
-    await bus.placed(dec.choice)
-  return dec.choice
+  dec = scheduler.choose_pool(run, base_model, rank, exclusive, shard_loads, gpus, TARGET_UTIL, NEW_RUN_UTIL)
+  await bus.decide("run", run, dec)
+  if dec["choice"] != run:
+    await bus.placed(dec["choice"])
+  return dec["choice"]
 
 
 def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
@@ -128,11 +128,11 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       base, lora, uri, train_run = base_model, True, None, None
 
     exclusive = train_run in await bus.exclusive() if train_run else False
-    dec = schedule.choose_sampler_pool(base, lora, train_run, exclusive)
-    await bus.warm_sampler(dec.choice, base, exclusive=exclusive)
+    dec = scheduler.choose_sampler_pool(base, lora, train_run, exclusive)
+    await bus.warm_sampler(dec["choice"], base, exclusive=exclusive)
     sid = f"samp-{uuid.uuid4().hex[:12]}"
-    await bus.decide("run", sid, dec.as_dict())
-    await bus.create(Run(sid, dec.choice, base, int(lora), session_id, model_path=uri, exclusive=exclusive))
+    await bus.decide("run", sid, dec)
+    await bus.create(Run(sid, dec["choice"], base, int(lora), session_id, model_path=uri, exclusive=exclusive))
     return sid
 
   # ***** service *****
@@ -141,9 +141,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def scheduling():
     return {
       "nodes": await bus.nodes(),
-      "placements": await bus.placements(),
       "exclusive": sorted(await bus.exclusive()),
-      "turns": json.loads(await bus.r.get(key("state")) or "{}"),
+      "state": json.loads(await bus.r.get(key("state")) or "{}"),  # the scheduler's: placements and turns
       "decisions": await bus.decisions(),
     }
 
@@ -250,8 +249,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       )
     if train["base"]:
       excl = req.model_id in await bus.exclusive()
-      dec = schedule.choose_sampler_pool(train["base"], train["rank"] > 0, req.model_id, excl)
-      await bus.warm_sampler(dec.choice, train["base"], exclusive=excl)
+      dec = scheduler.choose_sampler_pool(train["base"], train["rank"] > 0, req.model_id, excl)
+      await bus.warm_sampler(dec["choice"], train["base"], exclusive=excl)
     return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri}, req.seq_id)
 
   @api.post("/api/v1/load_weights")

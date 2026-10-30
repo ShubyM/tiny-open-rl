@@ -10,6 +10,7 @@ from test.test_api import proto_body
 from tinyrl import trainer, wire
 from tinyrl.bus import Op, Run
 from tinyrl.trainer import Model, Trainer
+from tinyrl.turns import GpuTurn
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -69,6 +70,21 @@ class TestTakingTurns(RedisTest):
       await self.submit(run_a, Op.OPTIM_STEP, {"adam_params": {}})
       await a.step(block_ms=10)  # its quantum ran out, so it yields after this batch
       self.assertEqual(await asyncio.wait_for(waiting, 5), 1)
+      self.assertTrue(a.model.parked)
+
+  async def test_a_stopping_trainer_parks_before_it_gives_its_gpu_back(self):
+    with patch.object(trainer, "GPU", "node-a:0"):
+      await self.run_scheduler({"a": [0], "b": [0]})
+      a, _ = await self.trainer("a")
+      await a.step(block_ms=10)
+      b = GpuTurn(self.bus, "b", shared=True)
+      waiting = asyncio.create_task(b.take(1))
+      await asyncio.sleep(0.3)
+      self.assertFalse(waiting.done())
+      a.stop()  # what SIGTERM calls, after which serve drains and leaves
+      await a.drain()
+      await a.leave()
+      self.assertTrue(await asyncio.wait_for(waiting, 5))
       self.assertTrue(a.model.parked)
 
   async def test_a_trainer_that_exits_gives_its_turn_to_the_next(self):

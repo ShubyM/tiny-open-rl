@@ -1,16 +1,14 @@
 import asyncio
 
 from test.helpers import RedisTest
-from tinyrl import control, scheduler
+from tinyrl import scheduler
 from tinyrl.turns import GpuTurn
 
 
 class TestScheduler(RedisTest):
   async def start(self, *pools: str, quantum: float = 30.0) -> asyncio.Task:
-    await self.bus.emit("node_up", node="n", gpus=1, memory=0)
-    for pool in pools:
-      await self.bus.emit("started", pool=pool, node="n", gpus=[0])
-    return asyncio.create_task(scheduler.run(self.bus, control.Policy(quantum=quantum)))
+    await self.running({pool: [0] for pool in pools})
+    return asyncio.create_task(scheduler.run(self.bus, quantum))
 
   async def decisions(self) -> list[tuple[str, str, str]]:
     return [

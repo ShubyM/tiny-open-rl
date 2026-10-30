@@ -33,10 +33,10 @@ placed on it since.
 A full fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive LoRA (`"openrl.exclusive": "true"`) gets a pool
 of its own, named by its model id. Its trainer exits when the run is deleted.
 
-Run one node daemon per GPU machine. One of them, whichever holds the scheduler lease, places each pool that has runs on
-the node daemon with the fewest pools per GPU, and moves a dead node daemon's pools to live ones. Each node daemon runs
-`python -m tinyrl.trainer <pool>` or `python -m tinyrl.sampler <pool>` for the pools placed on it, on its GPU with the
-fewest workers (`GPUS`, default 1), and starts them again if they die. A sampler starts its engine on its first command.
+Run one node daemon per GPU machine (`GPUS`, default 1) and one scheduler. The scheduler places each pool that has runs
+on the node daemon with the fewest pools per GPU, on GPUs it picks, and moves a dead node daemon's pools to live ones.
+Each node daemon runs `python -m tinyrl.trainer <pool>` or `python -m tinyrl.sampler <pool>` for the pools placed on it,
+and starts them again if they die. A sampler starts its engine on its first command.
 The engine is vLLM, `vllm serve` on a local port, unless `ENGINE` names another.
 
 Trainers on one GPU take turns, granted by the scheduler. Between batches, a trainer with nothing to do, or
@@ -103,7 +103,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps checkpoints it downloaded), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `TARGET_UTIL`,
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`, `TARGET_UTIL`,
 `UTIL_MS`, `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
 
 ## Telemetry

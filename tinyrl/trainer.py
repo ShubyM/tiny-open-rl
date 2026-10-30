@@ -483,8 +483,14 @@ class Trainer:
         await self.drain()
     finally:
       renewing.cancel()
-      await self.turn.give_back()
-      await self.bus.release(self.pool, self.worker)
+      await self.leave()
+
+  async def leave(self) -> None:
+    """Hand the GPU back with nothing of ours left on it, then the pool to its next trainer."""
+    if self.turn.held and self.turn.shared:
+      await asyncio.to_thread(self.model.park)
+    await self.turn.give_back()
+    await self.bus.release(self.pool, self.worker)
 
   async def own(self) -> None:
     """Wait until this trainer owns its pool. Only the owner's replies land, see Bus.finish."""
@@ -597,8 +603,8 @@ class Trainer:
 
   @contextlib.asynccontextmanager
   async def acquire(self, queued: int):
-    """Hold the GPU for a batch: wait for this trainer's turn and bring its tensors back, and after the batch give the
-    turn back if the scheduler revoked it."""
+    """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back
+    after the batch if the scheduler revoked it."""
     if await self.turn.take(queued):
       await asyncio.to_thread(self.model.resume)
     try:

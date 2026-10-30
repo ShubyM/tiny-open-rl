@@ -13,7 +13,7 @@ import torch
 
 from test.helpers import RedisTest, tiny
 from test.test_wire import json_body
-from tinyrl import gateway, wire
+from tinyrl import gateway, scheduler, wire
 from tinyrl.proto import tinker_public_pb2 as pb
 from tinyrl.store import Store
 from tinyrl.trainer import Model, Trainer
@@ -335,42 +335,31 @@ class TestAPI(RedisTest):
     samp_id = saved.json()["sampling_session_id"]
 
     await self.bus.heartbeat("node-1", 8)
-    await self.bus.own("scheduler", "node-1")
-    nodes, placed = await self.bus.nodes(), await self.bus.placements()
-    from tinyrl import schedule
-
-    active = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)}
-    next_placed, decs = schedule.place_pools(active, nodes, placed)
-    for p, dec in decs.items():
-      await self.bus.place(p, next_placed[p])
-      await self.bus.decide("node", p, dec.as_dict())
-
-    res = await self.http.get("/api/v1/scheduling")
-    self.assertEqual(res.status_code, 200)
-    data = res.json()
+    await self.bus.emit("node_up", node="node-1", gpus=8, memory=0)
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    data = await self.scheduling_until(lambda d: "lora:tiny:0" in d["state"]["pools"])
     self.assertIn(run_id, data["decisions"]["run"])
     self.assertIn(excl_id, data["exclusive"])
     self.assertIn(f"sampler:lora:{excl_id}", data["exclusive"])
     self.assertEqual(data["decisions"]["run"][samp_id]["rule"], "dedicated_exclusive_sampler")
-    self.assertIn("lora:tiny:0", data["decisions"]["node"])
-    self.assertIn("node-1", data["placements"].values())
+    self.assertEqual(data["state"]["pools"]["lora:tiny:0"]["node"], "node-1")
     self.assertIn("node-1", data["nodes"])
 
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
-    active = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)}
-    for p in set(data["placements"]) - active:
-      await self.bus.place(p, None)
-
-    res = await self.http.get("/api/v1/scheduling")
-    data = res.json()
+    data = await self.scheduling_until(lambda d: "lora:tiny:0" not in d["state"]["pools"])
     self.assertNotIn(run_id, data["decisions"]["run"])
-    self.assertNotIn("lora:tiny:0", data["decisions"]["node"])
-    self.assertNotIn("lora:tiny:0", data["placements"])
+
+  async def scheduling_until(self, done, tries: int = 100) -> dict:
+    """GET /api/v1/scheduling until `done` says yes about it."""
+    for _ in range(tries):
+      data = (await self.http.get("/api/v1/scheduling")).json()
+      if data["state"] and done(data):
+        return data
+      await asyncio.sleep(0.05)
+    self.fail(f"never: {data}")
 
   async def test_sft_never_warms_samplers_while_save_weights_for_sampler_does(self):
-    from tinyrl.node_daemon import NodeDaemon
-
     sft = await self.create_model()
     await self.result(await self.post("forward_backward", content=proto_body(sft), headers=PROTO))
     await self.result(await self.post("optim_step", json={"model_id": sft, "adam_params": {}}))
@@ -385,16 +374,12 @@ class TestAPI(RedisTest):
     await self.post("save_weights_for_sampler", json={"model_id": sft, "path": "000000"})
     self.assertEqual(await self.bus.warm_samplers(), {"sampler:tiny": "tiny"})
 
-    daemon8 = NodeDaemon(self.bus, gpus=8, node="n8")
     await self.bus.heartbeat("n8", 8)
-    await daemon8.schedule()
-    self.assertEqual((await self.bus.placements()).get("sampler:tiny"), "n8")
-
-    with patch("subprocess.Popen") as popen:
-      daemon8.start("sampler:tiny", 1)
-      self.assertEqual(popen.call_args[1]["env"].get("TINYRL_WARM_SAMPLER"), "1")
-      NodeDaemon(self.bus, gpus=1, node="n1").start("sampler:tiny", 1)
-      self.assertNotIn("TINYRL_WARM_SAMPLER", popen.call_args[1]["env"])
+    await self.bus.emit("node_up", node="n8", gpus=8, memory=0)
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    data = await self.scheduling_until(lambda d: "sampler:tiny" in d["state"]["pools"])
+    self.assertEqual(data["state"]["pools"]["sampler:tiny"]["node"], "n8")
+    self.assertEqual(data["state"]["pools"]["sampler:tiny"]["env"].get("TINYRL_WARM_SAMPLER"), "1")
 
     excl = await self.create_model(user_metadata={"openrl.exclusive": "true"})
     await self.post("save_weights_for_sampler", json={"model_id": excl, "sampling_session_seq_id": 0})

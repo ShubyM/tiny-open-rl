@@ -28,7 +28,6 @@ import redis.asyncio as redis
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialBackoff
 
-from tinyrl import control
 from tinyrl.helpers import getenv
 
 GROUP = "trainer"  # the consumer group every pool's trainer reads through
@@ -101,6 +100,16 @@ def connect(url: str) -> redis.Redis:
   return redis.from_url(url, socket_timeout=None, retry=retry, max_connections=10_000)
 
 
+@dataclass(frozen=True)
+class Event:
+  """An entry of the log, tinyrl:events. See scheduler.py."""
+
+  id: str  # the stream id, <ms>-<n>
+  t: float  # seconds, from the ms part of the id
+  kind: str
+  body: dict
+
+
 class Bus:
   def __init__(self, r: redis.Redis | None = None):
     self.r = r if r is not None else connect(getenv("REDIS_URL", "redis://localhost:6379"))
@@ -155,6 +164,7 @@ class Bus:
     if run.exclusive:
       p.sadd(key("excl"), run.id, run.pool)
     await p.execute()
+    await self.emit("run_created", run=run.id, pool=run.pool, exclusive=run.exclusive)
 
   async def run(self, run_id: str) -> dict | None:
     fields = await self.r.hgetall(key("run", run_id))
@@ -192,6 +202,7 @@ class Bus:
     if exclusive:
       p.sadd(key("excl"), pool)
     await p.execute()
+    await self.emit("sampler_warmed", pool=pool, exclusive=exclusive)
 
   async def warm_samplers(self) -> dict[str, str]:
     return {k.decode(): v.decode() for k, v in (await self.r.hgetall(key("warm"))).items()}
@@ -204,6 +215,7 @@ class Bus:
     p.hdel(key("decide", "run"), run_id)
     p.hdel(key("warm"), f"sampler:fft:{run_id}", f"sampler:lora:{run_id}")
     await p.execute()
+    await self.emit("run_deleted", run=run_id, pool=pool)
 
   async def exclusive(self) -> set[str]:
     return {v.decode() for v in await self.r.smembers(key("excl"))}
@@ -211,15 +223,10 @@ class Bus:
   async def decide(self, kind: str, subject: str, decision: dict) -> None:
     await self.r.hset(key("decide", kind), subject, json.dumps(decision))
 
-  async def forget_decision(self, kind: str, subject: str) -> None:
-    await self.r.hdel(key("decide", kind), subject)
-
   async def decisions(self) -> dict[str, dict[str, dict]]:
-    out = {"run": {}, "node": {}, "gpu": {}}
-    for kind in out:
-      raw = await self.r.hgetall(key("decide", kind))
-      out[kind] = {k.decode(): json.loads(v) for k, v in raw.items()}
-    return out
+    """The gateway's pool choice for each run. Placement and turns are decided in the log, see scheduler.py."""
+    raw = await self.r.hgetall(key("decide", "run"))
+    return {"run": {k.decode(): json.loads(v) for k, v in raw.items()}}
 
   # ***** commands *****
 
@@ -356,15 +363,6 @@ class Bus:
     worker = await self.r.get(key("owner", pool))
     return worker.decode() if worker else None
 
-  # ***** GPU width *****
-
-  async def width(self, pool: str) -> int:
-    """How many GPUs the pool's process runs on, 1 unless set_width said otherwise."""
-    return int(await self.r.get(key("width", pool)) or 1)
-
-  async def set_width(self, pool: str, width: int) -> None:
-    await self.r.set(key("width", pool), width)
-
   # ***** load *****
 
   async def report(self, pool: str, util: float) -> None:
@@ -403,21 +401,6 @@ class Bus:
   async def gpus(self) -> int:
     return sum((await self.nodes()).values())
 
-  # ***** placement: which node daemon runs each pool's trainer or sampler *****
-
-  async def placements(self) -> dict[str, str]:
-    return {k.decode(): v.decode() for k, v in (await self.r.hgetall(key("place"))).items()}
-
-  async def place(self, pool: str, node: str | None) -> None:
-    p = self.r.pipeline(transaction=True)
-    if node:
-      p.hset(key("place"), pool, node)
-    else:
-      p.hdel(key("place"), pool)
-      p.hdel(key("decide", "node"), pool)
-      p.hdel(key("decide", "gpu"), pool)
-    await p.execute()
-
   # ***** replies *****
 
   async def result(self, request_id: str, timeout: float) -> Reply | None:
@@ -451,21 +434,27 @@ class Bus:
     ]
     return {"live": True, "queued": groups[0]["lag"], "in_flight": in_flight}
 
-  # ***** events: the log GPU turns are decided from, see control.py *****
+  # ***** events *****
 
   async def emit(self, _kind: str, **body) -> str:
-    """Append an entry to the log. Returns its stream id."""
     entry_id = await self.r.xadd(
       key("events"), {"kind": _kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
     )
     return entry_id.decode()
 
-  async def events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[control.Event]:
+  async def log_size(self) -> int:
+    """How many entries were ever appended to the log. It drops below what a reader folded only if Redis was flushed."""
+    try:
+      return (await self.r.xinfo_stream(key("events")))["entries-added"]
+    except redis.ResponseError:  # no log yet
+      return 0
+
+  async def events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[Event]:
     """The entries after stream id `after`, waiting up to block_ms for one, or not at all if it is 0."""
     got = await self.r.xread({key("events"): after}, count=count, block=block_ms or None)
     out = []
     for entry_id, fields in got[0][1] if got else []:
       entry_id = entry_id.decode()
       t = int(entry_id.split("-")[0]) / 1000
-      out.append(control.Event(entry_id, t, fields[b"kind"].decode(), json.loads(fields[b"body"])))
+      out.append(Event(entry_id, t, fields[b"kind"].decode(), json.loads(fields[b"body"])))
     return out

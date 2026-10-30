@@ -93,10 +93,9 @@ change without touching scheduling. What's new, and who writes it:
 | `tinyrl:ckpt:<run>` | hash `{<kind>/<name>: ref}` mapping `tinker://` URIs to immutable `ref`s | `Bus.finish`, under the pool's lease | trainers, samplers |
 | `tinyrl:loc:<ref>` | string with TTL: peer address of a node daemon holding `<ref>` in `/dev/shm` | the node daemon that staged `<ref>` | any trainer or sampler calling `store.get` |
 | `tinyrl:owner:<pool>` | string with a 10 s TTL: the lease | the trainer that holds it | trainers, scheduler, gateway |
-| `tinyrl:place:<pool>` | string: a node daemon id and its GPU indexes, like `<node>/0,1` | scheduler | node daemons |
 | `tinyrl:node:<id>` | hash `{gpus, gpu_bytes, host_bytes, gpu_model, tier, addr, draining}` with a 30 s TTL; `tier` is `reserved` or `burst`, from a node label | that node daemon | scheduler, store |
-| `tinyrl:events` | stream: the log GPU turns are decided from. Facts like `wants_gpu` and `released`, and the scheduler's decisions, `granted` and `revoked` | node daemons, trainers and samplers append facts; the scheduler appends decisions | the scheduler, trainers, samplers |
-| `tinyrl:state` | JSON: the scheduler's current turn state | the scheduler | gateway |
+| `tinyrl:events` | stream: the log placement and GPU turns are decided from. Facts like `run_created`, `node_up` and `wants_gpu`, and the scheduler's decisions, `placed`, `unplaced`, `granted` and `revoked` | the gateway, node daemons, trainers and samplers append facts; the scheduler appends decisions | the scheduler, node daemons, trainers, samplers |
+| `tinyrl:state` | JSON: the scheduler's current state, placements and turns | the scheduler | gateway |
 | `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | counters (built): calls run, time queued, time running | `Bus.finish`, under the pool's lease | scheduler, `GET /metrics` |
 | `gpu_bytes`, `host_bytes` in `tinyrl:run:<run>` | measured state size, so a move's cost is known | the run's trainer | scheduler |
 
@@ -363,7 +362,7 @@ above `TARGET_UTIL` for a while, before work queues.
 **When everything fits, nothing parks.** Processes whose memory fits together hold a GPU at once and CUDA interleaves
 their kernels. When they don't fit, they take turns, decided by one scheduler process, `python -m tinyrl.scheduler`.
 Node daemons and workers append facts to one log, `tinyrl:events`. The scheduler folds the log into its state with
-`control.fold` and appends what `control.decide` says, `granted` or `revoked`, to the same log, where workers read them.
+`scheduler.fold` and appends what `scheduler.decide` says, `granted` or `revoked`, to the same log, where workers read them.
 A process on several GPUs is granted all of them at once, so two processes never deadlock:
 
 1. A process with queued work and no turn appends `wants_gpu` and waits for `granted`, asking again every 2.5 s.
@@ -376,7 +375,7 @@ Measured on an H100: parking 16 GB takes 0.60 s, resuming takes 0.64 s, and 725â
 CUDA context, about 210 MiB of cuBLAS, and allocator slack). vLLM's level 1 sleep leaves 808 MiB on an L4. That leftover
 caps how many processes one GPU can host, at about 0.8 GB each.
 
-Waiters are granted in the order they first asked. Every grant and revoke names the rule in `control.RULES` that made
+Waiters are granted in the order they first asked. Every grant and revoke names the rule in `scheduler.RULES` that made
 it, and replaying the log rebuilds every decision.
 
 **LoRA pools park like any other, and so do their runs.** An active LoRA pool stays resident while it has queued work; an
