@@ -1,15 +1,19 @@
 import asyncio
 import json
 import os
+import pathlib
 import socket
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 from test.helpers import RedisTest, new_id, tiny
 from tinyrl import scheduler
 from tinyrl.bus import Op, Run
-from tinyrl.node_daemon import NodeDaemon
+from tinyrl.node_daemon import NodeDaemon, reap
 
 LEASE_MS = 2000
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
@@ -75,7 +79,8 @@ class TestNodeDaemon(RedisTest):
     await b.up()
     scheduling = asyncio.create_task(scheduler.run(self.bus))
     try:
-      with patch("subprocess.Popen", side_effect=lambda *_, **__: MagicMock(**{"poll.return_value": None})):
+      popen = patch("subprocess.Popen", side_effect=lambda *_, **__: MagicMock(**{"poll.return_value": None}))
+      with popen, patch("tinyrl.node_daemon.reap"):
         await self.until(lambda: len(a.trainers) == len(b.trainers) == 1, a, b)  # one pool on each node
 
         await self.until(lambda: sorted(b.trainers) == ["pool-r1", "pool-r2"], b)  # a stops ticking, so it dies
@@ -93,7 +98,7 @@ class TestNodeDaemon(RedisTest):
     await daemon.up()
     scheduling = asyncio.create_task(scheduler.run(self.bus))
     try:
-      with patch("subprocess.Popen", return_value=proc):
+      with patch("subprocess.Popen", return_value=proc), patch("tinyrl.node_daemon.reap"):
         await self.until(lambda: daemon.trainers, daemon)
         await self.bus.drop("ra", "a")
         await self.until(lambda: proc.terminate.called, daemon)
@@ -105,6 +110,22 @@ class TestNodeDaemon(RedisTest):
         self.assertIn("exited", [e.kind for e in await self.bus.events()])
     finally:
       scheduling.cancel()
+
+  def test_reaping_a_process_kills_what_it_started(self):
+    spawn = "import subprocess, sys; print(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']).pid)"
+    proc = subprocess.Popen([sys.executable, "-c", spawn], stdout=subprocess.PIPE, text=True, start_new_session=True)
+    child = int(proc.stdout.readline())
+    proc.wait()
+    reap(proc)
+    for _ in range(100):  # gone, or a zombie waiting for init, which holds nothing
+      try:
+        if pathlib.Path(f"/proc/{child}/stat").read_text().rsplit(") ", 1)[1][0] == "Z":
+          break
+      except FileNotFoundError:
+        break
+      time.sleep(0.01)
+    else:
+      self.fail("the process a worker started outlived it")
 
   @patch("tinyrl.node_daemon.subprocess.Popen")
   def test_a_process_starts_on_its_placed_gpus_with_its_placed_settings(self, popen):
