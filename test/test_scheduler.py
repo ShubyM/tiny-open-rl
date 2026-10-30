@@ -6,7 +6,6 @@ from tinyrl.scheduler import (
   QUANTUM,
   RULES,
   State,
-  choose_gpu,
   choose_pool,
   choose_sampler_pool,
   decide,
@@ -14,8 +13,6 @@ from tinyrl.scheduler import (
   holders,
   parse_pool,
   settings,
-  start_order,
-  zone,
 )
 
 GIB = 1024**3
@@ -119,12 +116,12 @@ class TestPlacement(unittest.TestCase):
     self.assertEqual(log("node_lost", node="a"), [("placed", "r", PLACED)])
     self.assertEqual((log.s.pools["r"].node, log.s.pools["r"].on), ("b", ()))
 
-  def test_each_trainer_gets_the_least_used_gpu(self):
+  def test_each_pool_gets_an_empty_gpu_while_there_is_one(self):
     log = Log(self)
     log.node(8)
     for name in ("lora:a:0", "lora:b:0", "lora:c:0"):
       log("run_created", run=name, pool=name)
-    self.assertEqual([log.s.pools[n].gpus for n in ("lora:a:0", "lora:b:0", "lora:c:0")], [(0,), (1,), (0,)])
+    self.assertEqual([log.s.pools[n].gpus for n in ("lora:a:0", "lora:b:0", "lora:c:0")], [(0,), (1,), (2,)])
 
   def test_shared_fft_samplers_get_a_memory_budget_on_large_gpus(self):
     log = Log(self)
@@ -139,10 +136,10 @@ class TestPlacement(unittest.TestCase):
     self.assertEqual(
       placed,
       {
-        "sampler:fft:Qwen": ((6,), budget),
-        "sampler:fft:Gemma": ((6,), budget),
-        "sampler:Qwen": ((4,), alone),
-        "sampler:fft:Llama": ((7,), alone),
+        "sampler:fft:Qwen": ((0,), budget),
+        "sampler:fft:Gemma": ((0,), budget),
+        "sampler:Qwen": ((1,), alone),
+        "sampler:fft:Llama": ((2,), alone),
       },
     )
     self.assertEqual(log.s.pools["sampler:fft:Qwen"].memory, int(0.42 * 81559 * MIB))
@@ -395,120 +392,92 @@ class TestPoolsAndGpus(unittest.TestCase):
     self.assertEqual(d["choice"], "sampler:b")
     self.assertEqual(d["rule"], "shared_lora_sampler")
 
-  def test_start_order(self):
-    pools = ["lora:b:0", "sampler:b", "run", "sampler:fft:run"]
-    excl = {"run", "sampler:fft:run"}
-    ordered = start_order(pools, excl)
-    self.assertEqual(ordered, ["run", "sampler:fft:run", "lora:b:0", "sampler:b"])
+  def test_a_trainer_takes_turns_with_the_least_busy_trainers(self):
+    log = Log(self)
+    log.node(2)
+    for pool, busy in (("busy", 50.0), ("light", 5.0)):
+      log("run_created", run=pool, pool=pool)
+      log("batch_done", pool=pool, seconds=busy)
+    log("run_created", run="t", pool="t")
+    self.assertEqual(log.s.pools["t"].gpus, log.s.pools["light"].gpus)
 
-  def test_8gpu_23job_adversarial_arrival_order(self):
-    pools = [
-      "lora:google/gemma-4-E2B:0",
-      "lora:Qwen/Qwen3-0.6B-Base:0",
-      "qwen-ts-1",
-      "qwen-ts-2",
-      "gemma-ts",
-      "gemma-x",
-      "sampler:google/gemma-4-E2B",
-      "sampler:Qwen/Qwen3-0.6B-Base",
-      "sampler:fft:Qwen/Qwen3-0.6B-Base",
-      "sampler:fft:google/gemma-4-E2B",
-      "sampler:fft:gemma-x",
-    ]
+  def test_a_sampler_moves_the_least_busy_trainers_aside_and_never_takes_turns(self):
+    log = Log(self)
+    log.node(2)
+    for pool, busy in (("busy", 50.0), ("light", 5.0)):
+      log("run_created", run=pool, pool=pool)
+      log("batch_done", pool=pool, seconds=busy)
+    decided = log("sampler_warmed", pool="sampler:b")
+    self.assertEqual([(k, p) for k, p, _ in decided], [("placed", "light"), ("placed", "sampler:b")])
+    self.assertEqual(log.s.pools["light"].gpus, log.s.pools["busy"].gpus)
+    self.assertNotEqual(log.s.pools["sampler:b"].gpus, log.s.pools["busy"].gpus)
+
+  def test_a_pool_with_a_memory_budget_fills_a_gpu_it_fits_on_before_an_empty_one(self):
+    log = Log(self)
+    log.node(2, memory=80 * GIB)
+    log("run_created", run="t", pool="t")
+    log("sampler_warmed", pool="sampler:fft:a")
+    log("run_deleted", run="t", pool="t")
+    log("exited", pool="t")
+    log("sampler_warmed", pool="sampler:fft:b")
+    self.assertEqual(log.s.pools["sampler:fft:b"].gpus, log.s.pools["sampler:fft:a"].gpus)
+
+  def test_no_pool_fits_next_to_an_exclusive_one_whatever_their_budgets(self):
+    log = Log(self)
+    log.node(2, memory=80 * GIB)
+    log.append("run_created", {"run": "x", "pool": "x", "exclusive": True})
+    log.append("placed", {"pool": "x", "node": "n", "gpus": [1], "memory": 30 * GIB, "env": {}, "rule": "test"})
+    log("sampler_warmed", pool="sampler:fft:a")
+    self.assertEqual(log.s.pools["sampler:fft:a"].gpus, (0,))
+
+  def test_a_sampler_moves_as_few_trainers_as_it_can(self):
+    log = Log(self)
+    log.node(2)
+    for pool, gpu, busy in (("a", 0, 1.0), ("b", 0, 1.0), ("c", 1, 5.0)):
+      log.pool(pool, gpus=(gpu,))
+      log("batch_done", pool=pool, seconds=busy)
+    log("sampler_warmed", pool="sampler:s")
+    self.assertEqual((log.s.pools["sampler:s"].gpus, log.s.pools["c"].gpus), ((1,), (0,)))
+
+  def test_an_exclusive_pool_gets_a_gpu_to_itself_and_others_stay_off_it(self):
+    log = Log(self)
+    log.node(2)
+    log("run_created", run="x", pool="x", exclusive=True)
+    log("run_created", run="a", pool="a")
+    log("run_created", run="b", pool="b")
+    self.assertEqual([log.s.pools[n].gpus for n in ("x", "a", "b")], [(0,), (1,), (1,)])
+
+  def test_the_benchmark_s_arrivals_end_with_light_trainers_together_and_samplers_alone(self):
+    log = Log(self)
+    log.node(8, memory=81559 * MIB)
+    trainers = {"x": 4.0, "lora:g:0": 7.0, "lora:q:0": 7.7, "q1": 1.7, "q2": 2.4, "g1": 4.8}
+    for pool, busy in trainers.items():
+      log("run_created", run=pool, pool=pool, exclusive=pool == "x")
+      log("batch_done", pool=pool, seconds=busy)
+    for pool in ("sampler:fft:q", "sampler:q", "sampler:fft:g", "sampler:fft:x", "sampler:g"):
+      log("sampler_warmed", pool=pool, exclusive=pool == "sampler:fft:x")
+    gpu = {name: p.gpus[0] for name, p in log.s.pools.items()}
+    self.assertEqual(gpu["q1"], gpu["q2"])
+    self.assertEqual(gpu["q1"], gpu["g1"])
+    self.assertEqual(gpu["sampler:fft:q"], gpu["sampler:fft:g"])
+    alone = [gpu[n] for n in ("x", "lora:g:0", "lora:q:0", "sampler:q", "sampler:fft:x", "sampler:g")]
+    self.assertEqual(sorted(alone + [gpu["q1"], gpu["sampler:fft:q"]]), list(range(8)))
+
+  def test_random_arrivals_never_make_a_sampler_take_turns_while_trainers_could_move(self):
     rnd = random.Random(42)
-
-    for _ in range(1000):
-      rnd.shuffle(pools)
-      running, excl = {}, set()
-      for p in pools:
-        if p in ("gemma-x", "sampler:fft:gemma-x"):
-          excl.add(p)
-        running[p] = (choose_gpu(p, 8, running, excl)[0],)
-      placements = {p: gpus[0] for p, gpus in running.items()}
-
-      st_gpus = {placements["lora:google/gemma-4-E2B:0"], placements["lora:Qwen/Qwen3-0.6B-Base:0"]}
-      self.assertEqual(st_gpus, {0, 1})
-
-      self.assertEqual(placements["qwen-ts-1"], 2)
-      self.assertEqual(placements["qwen-ts-2"], 2)
-      self.assertEqual(placements["gemma-ts"], 2)
-
-      self.assertEqual(placements["gemma-x"], 3)
-
-      ss_gpus = {placements["sampler:google/gemma-4-E2B"], placements["sampler:Qwen/Qwen3-0.6B-Base"]}
-      self.assertEqual(ss_gpus, {4, 5})
-
-      self.assertEqual(placements["sampler:fft:Qwen/Qwen3-0.6B-Base"], 6)
-      self.assertEqual(placements["sampler:fft:google/gemma-4-E2B"], 6)
-
-      self.assertEqual(placements["sampler:fft:gemma-x"], 7)
-
-  def test_2gpu_exclusive_node(self):
-    excl = {"qwen-lora-x", "sampler:lora:qwen-lora-x"}
-    self.assertEqual(choose_gpu("qwen-lora-x", 2, {}, excl)[0], 0)
-    self.assertEqual(choose_gpu("sampler:lora:qwen-lora-x", 2, {"qwen-lora-x": (0,)}, excl)[0], 1)
-
-  def test_fuzzer(self):
-    rnd = random.Random(42)
-    for _ in range(500):
-      gpus = rnd.choice([1, 2, 4, 8, 16])
-      active, excl = set(), set()
-      for _ in range(20):
-        action, r = rnd.choice(["add_trainer", "add_sampler", "remove"]), rnd.random()
-        if action == "add_trainer":
-          name = f"excl-{rnd.randint(1, 20)}" if r < 0.2 else f"ts-{rnd.randint(1, 20)}" if r < 0.5 else None
-          name = name or f"lora:b-{rnd.randint(1, 5)}:{rnd.randint(0, 2)}"
-          excl |= {name} if r < 0.2 else set()
-          active.add(name)
-        elif action == "add_sampler":
-          if excl and r < 0.25:
-            name = f"sampler:fft:{rnd.choice(sorted(excl))}"
-            excl.add(name)
-          else:
-            name = f"sampler:fft:ts-{rnd.randint(1, 20)}" if r < 0.55 else f"sampler:b-{rnd.randint(1, 5)}"
-          active.add(name)
-        elif active:
-          active.remove(rnd.choice(sorted(active)))
-
-      streaming, streaming_excl = {}, set()
-      for pool in rnd.sample(sorted(active), len(active)):
-        streaming_excl |= {pool} & excl
-        streaming[pool] = (choose_gpu(pool, gpus, streaming, streaming_excl)[0],)
-      batched = {}
-      for pool in start_order(active, excl):
-        gpu, rule = choose_gpu(pool, gpus, batched, excl)
-        self.assertIn(
-          rule,
-          (
-            "reserved_exclusive",
-            "solo_in_zone",
-            "least_loaded_in_zone",
-            "timesliced_in_subzone",
-            "overflow_least_penalty",
-          ),
-        )
-        batched[pool] = (gpu,)
-
-      for running, current_excl in [(batched, excl), (streaming, streaming_excl)]:
-        gpu_of = {pool: gpus_[0] for pool, gpus_ in running.items()}
-        if gpus >= 2:
-          for a in running:
-            for b in running:
-              ka, kb = parse_pool(a), parse_pool(b)
-              if a != b and ka[0] != kb[0] and ka[1:] == kb[1:]:
-                self.assertNotEqual(gpu_of[a], gpu_of[b], (a, b))  # a pool's trainer and sampler never share
-        if gpus >= 2 and not current_excl:
-          trainers = {gpu_of[p] for p in running if parse_pool(p)[0] == "trainer"}
-          samplers = {gpu_of[p] for p in running if parse_pool(p)[0] == "sampler"}
-          self.assertTrue(trainers.isdisjoint(samplers))
-          for role in ("trainer", "sampler"):
-            home = zone(role, gpus)
-            if len(home) >= 3:
-              z0, split = home.start, home.start + max(1, 2 * len(home) // 3)
-              shared = {p for p in running if parse_pool(p)[0] == role and parse_pool(p)[1]}
-              timesliced = {p for p in running if parse_pool(p)[0] == role and not parse_pool(p)[1]}
-              if len(shared) <= split - z0:
-                self.assertTrue({gpu_of[p] for p in shared}.isdisjoint({gpu_of[p] for p in timesliced}))
+    for _ in range(200):
+      log, gpus = Log(self), rnd.choice([2, 4, 8])
+      log.node(gpus)
+      names = [f"lora:b-{i}:0" for i in range(3)] + [f"ts-{i}" for i in range(4)] + ["sampler:b-0", "sampler:c-0"]
+      for name in rnd.sample(names, rnd.randint(1, len(names))):
+        on = {g: [(q, p) for q, p in log.s.pools.items() if p.gpus == (g,)] for g in range(gpus)}
+        movable = [g for g, ps in on.items() if ps and all(q.startswith(("lora:", "ts-")) for q, _ in ps)]
+        before = len(log.entries)
+        log("run_created" if not name.startswith("sampler:") else "sampler_warmed", run=name, pool=name)
+        log("batch_done", pool=name, seconds=rnd.random() * 10)
+        [mine] = [e for e in log.entries[before:] if e.kind == "placed" and e.body["pool"] == name]
+        if name.startswith("sampler:") and movable:
+          self.assertIn(mine.body["gpu_rule"], ("empty_gpu", "fits_next_to_others"), name)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ import copy
 import dataclasses
 import json
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from tinyrl.bus import Bus, Event, key
@@ -78,37 +77,6 @@ def choose_sampler_pool(base_model: str, lora: bool, train_run: str | None = Non
   return {"choice": f"sampler:{base_model}", "rule": "shared_lora_sampler", **detail}
 
 
-def start_order(pools: Iterable[str], exclusive: set[str] = frozenset()) -> list[str]:
-  """Exclusive pools first, so they get their reserved GPUs, then pools that serve many runs, then trainers."""
-  return sorted(
-    pools, key=lambda pool: (pool not in exclusive, not parse_pool(pool)[1], parse_pool(pool)[0] == "sampler", pool)
-  )
-
-
-def zone(role: str, gpus: int) -> range:
-  """The GPUs a role keeps to, since trainers and samplers are busy at once: trainers the lower half, samplers the upper
-  half, both the one GPU of a 1-GPU node."""
-  half = gpus // 2
-  return range(gpus) if half == 0 else range(half) if role == "trainer" else range(half, gpus)
-
-
-def lanes(zone: range, shared: bool, exclusive: bool, exclusives: int) -> tuple[range, range]:
-  """The GPUs a pool prefers within its role's zone, and the reserve at the top of the zone kept for exclusive pools.
-  Pools that serve many runs get the bottom, pools that serve one run the middle, exclusive pools the reserve. Zones of
-  two and three GPUs split by hand."""
-  lo, hi, n = zone.start, zone.stop, len(zone)
-  if n == 1:
-    return zone, range(hi, hi)
-  if n <= 3:
-    reserve = range(hi - 1, hi) if exclusives else range(hi, hi)
-    if n == 2:
-      return (range(lo, lo + 1) if shared and not exclusive else range(lo + 1, hi)), reserve
-    return (range(hi - 1, hi) if exclusive else range(lo, lo + 2) if shared else range(lo + 2, hi)), reserve
-  reserve = range(hi - min(n, max(1, exclusives)), hi)
-  split = lo + max(1, 2 * (n - 1) // 3)
-  return (reserve if exclusive else range(lo, split) if shared else range(split, hi - 1)), reserve
-
-
 def settings(pool: str, gpus: int, gpu_mib: int, exclusive: set[str] = frozenset()) -> dict[str, str]:
   env = {}
   if parse_pool(pool)[0] != "sampler":
@@ -122,36 +90,9 @@ def settings(pool: str, gpus: int, gpu_mib: int, exclusive: set[str] = frozenset
   return env
 
 
-def choose_gpu(pool: str, gpus: int, running: dict[str, tuple[int, ...]], exclusive: set[str]) -> tuple[int, str]:
-  """The GPU a pool runs on, given the pools already on the node, and the rule that chose it. Each GPU is ranked by
-  what the pool would share it with, most important first."""
-  role, shared, model = parse_pool(pool)
-  excl = pool in exclusive
-  home = zone(role, gpus)
-  exclusives = sum(p in exclusive and parse_pool(p)[0] == role for p in running) + (excl and pool not in running)
-  lane, reserve = lanes(home, shared, excl, exclusives)
-
-  def rank(gpu: int) -> tuple:
-    on = [(*parse_pool(p), p) for p, on_gpus in running.items() if gpu in on_gpus]
-    return (
-      sum(r != role and s == shared and m == model for r, s, m, _ in on),  # its own trainer or sampler, busy with it
-      gpu not in home,
-      sum(p in exclusive for *_, p in on),
-      not excl and gpu in reserve,
-      gpu not in lane,
-      sum(r != role for r, *_ in on),
-      sum(s for _, s, *_ in on),  # pools that serve many runs are always busy
-      len(on),
-      -gpu if excl else gpu,  # exclusive pools fill the zone from the top
-    )
-
-  gpu = min(range(gpus), key=rank)
-  _, out_of_zone, excl_overlap, in_reserve, out_of_lane, _, _, load, _ = rank(gpu)
-  if excl and reserve and not out_of_lane and not excl_overlap:
-    return gpu, "reserved_exclusive"
-  if not (in_reserve or out_of_zone or out_of_lane):
-    return gpu, "solo_in_zone" if load == 0 else "least_loaded_in_zone" if shared else "timesliced_in_subzone"
-  return gpu, "overflow_least_penalty"
+def fit(memory: list[int], gpu_bytes: int) -> bool:
+  """Whether pools with these memory budgets can share a GPU. Every budget has to be known, and 0 means unknown."""
+  return len(memory) == 1 or (gpu_bytes > 0 and all(memory) and sum(memory) <= gpu_bytes)
 
 
 # ***** state *****
@@ -162,7 +103,8 @@ QUANTUM = getenv("QUANTUM", 30.0)  # seconds a busy holder keeps its GPUs while 
 
 RULES = {
   "place.least_loaded_node": "a pool with runs, or a warm sampler, goes to the node with the fewest pools per GPU, on "
-  "the GPU choose_gpu picks and with settings",
+  "the GPU choose picks and with settings",
+  "place.moved_aside": "a trainer moves to take turns with other trainers, so a sampler or exclusive pool gets its GPU",
   "place.emptied": "a pool with no runs and no warm sampler is unplaced, which stops its process",
   "turn.granted": "a pool that asked gets its GPUs once it is first in line on each and fits next to their holders",
   "turn.idle_holder_yields": "a holder that found no commands gives its GPUs back as soon as someone waits for one",
@@ -185,6 +127,7 @@ class Pool:
   since: float | None = None  # when its turn started, pushed back by engine boot. None while it holds no GPU
   revoked: bool = False  # told to give its GPUs back
   idle: bool = False  # its worker found no commands since its last batch
+  busy: float = 0.0  # seconds its batches took, so far
 
 
 @dataclass
@@ -210,8 +153,7 @@ def first_in_line(s: State, k: Key) -> str | None:
 
 def fits(s: State, k: Key, name: str) -> bool:
   """A pool joins a GPU's holders if nobody holds it, or if its memory and every holder's are known and fit together."""
-  memory, gpu = [s.pools[n].uses for n in (*holders(s, k), name)], s.nodes[k[0]][1]
-  return len(memory) == 1 or (gpu > 0 and all(memory) and sum(memory) <= gpu)
+  return fit([s.pools[n].uses for n in (*holders(s, k), name)], s.nodes[k[0]][1])
 
 
 def stop(p: Pool) -> None:
@@ -265,7 +207,7 @@ def fold(state: State, e: Event) -> State:
       if p.since is None and not p.asked:
         p.asked = s.n
     case "batch_done" if p:
-      p.idle = False
+      p.idle, p.busy = False, p.busy + b.get("seconds", 0.0)
       if p.since is not None:
         p.since += b.get("boot", 0.0)
     case "idle" if p:
@@ -300,8 +242,7 @@ def next_decision(s: State, now: float) -> tuple[str, dict] | None:
       return "unplaced", {"pool": name, "rule": "place.emptied"}
   unplaced = [name for name, p in s.pools.items() if p.node is None and (p.runs or p.warm)]
   if unplaced and s.nodes:
-    exclusive = {name for name, p in s.pools.items() if p.exclusive}
-    return "placed", place(s, start_order(unplaced, exclusive)[0], exclusive)
+    return "placed", place(s, min(unplaced, key=lambda name: (not s.pools[name].exclusive, name)))
   for _, name in sorted((p.asked, name) for name, p in s.pools.items() if p.asked):
     if all(first_in_line(s, k) == name and fits(s, k, name) for k in keys(s.pools[name])):
       return "granted", {"pool": name, "rule": "turn.granted"}
@@ -315,15 +256,62 @@ def next_decision(s: State, now: float) -> tuple[str, dict] | None:
   return None
 
 
-def place(s: State, name: str, exclusive: set[str]) -> dict:
+def place(s: State, name: str) -> dict:
+  """Where a pool goes: the node with the fewest pools per GPU, and the GPU choose picks there. When trainers have to
+  move out of the way first, the decision is the move of one of them, and the pool is placed once its GPU is clear."""
   load = {n: sum(p.node == n for p in s.pools.values()) / gpus for n, (gpus, _) in s.nodes.items()}
   node = min(sorted(load), key=load.get)
   gpus, gpu_bytes = s.nodes[node]
-  gpu, gpu_rule = choose_gpu(name, gpus, {q: p.gpus for q, p in s.pools.items() if p.node == node}, exclusive)
-  env = settings(name, gpus, gpu_bytes // 2**20, exclusive)
+  env = settings(name, gpus, gpu_bytes // 2**20, {q for q, p in s.pools.items() if p.exclusive})
   memory = int(float(env.get("TINYRL_GPU_MEM", 0)) * gpu_bytes)
+  gpu, why, aside = choose(s, node, name, memory)
+  if aside:
+    trainer = s.pools[aside[0]]
+    to, to_why, _ = choose(s, node, aside[0], trainer.memory, avoid=gpu)
+    body = {"pool": aside[0], "node": node, "gpus": [to], "memory": trainer.memory, "env": trainer.env, "for": name}
+    return {**body, "rule": "place.moved_aside", "gpu_rule": to_why}
   body = {"pool": name, "node": node, "gpus": [gpu], "memory": memory, "env": env}
-  return {**body, "rule": "place.least_loaded_node", "gpu_rule": gpu_rule}
+  return {**body, "rule": "place.least_loaded_node", "gpu_rule": why}
+
+
+def takes_turns(name: str, p: Pool) -> bool:
+  """Whether a pool may share a GPU it doesn't fit on. A trainer parks and resumes in about a second. A sampler wakes
+  its engine slowly, and an exclusive pool is alone by definition."""
+  return parse_pool(name)[0] == "trainer" and not p.exclusive
+
+
+def choose(s: State, node: str, name: str, memory: int, avoid: int = -1) -> tuple[int, str, list[str]]:
+  """The GPU on a node a pool goes to, why, and the trainers it moves out of the way. An exclusive pool is alone, and
+  others stay off its GPU. A pool takes an empty GPU, or one its memory budget fits on next to the pools there, and a
+  pool with a budget fills such a GPU before it takes an empty one. With neither, a pool that takes turns takes them
+  with the least busy trainers. One that doesn't takes those trainers' GPU, and they move to take turns elsewhere."""
+  gpus, gpu_bytes = s.nodes[node]
+  me = s.pools[name]
+  there = {g: [(q, p) for q, p in s.pools.items() if q != name and p.node == node and g in p.gpus] for g in range(gpus)}
+
+  def fits_on(g: int) -> bool:
+    others = [p for _, p in there[g]]
+    if not others:
+      return True
+    return (
+      not me.exclusive
+      and not any(p.exclusive for p in others)
+      and fit([p.memory for p in others] + [memory], gpu_bytes)
+    )
+
+  def trainers_only(g: int) -> bool:
+    return bool(there[g]) and all(takes_turns(q, p) for q, p in there[g])
+
+  options = [g for g in range(gpus) if g != avoid]
+  if fitting := [g for g in options if fits_on(g)]:
+    g = min(fitting, key=lambda g: (bool(there[g]) != bool(memory), g))
+    return g, "fits_next_to_others" if there[g] else "empty_gpu", []
+  busy = {g: sum(p.busy for _, p in there[g]) for g in options}
+  if takes_turns(name, me) or len(options) == 1:  # with one GPU there is nowhere to move to
+    g = min(options, key=lambda g: (not trainers_only(g), busy[g], g))
+    return g, "takes_turns", []
+  g = min(options, key=lambda g: (not trainers_only(g), len(there[g]), busy[g], g))  # as few moves as it can
+  return (g, "moves_trainers_aside", sorted(q for q, _ in there[g])) if trainers_only(g) else (g, "takes_turns", [])
 
 
 # ***** the loop *****
