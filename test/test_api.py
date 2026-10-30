@@ -343,7 +343,9 @@ class TestAPI(RedisTest):
     data = await self.scheduling_until(lambda d: d["state"]["pools"].get(pool, {}).get("node"))
     self.assertEqual(data["state"]["pools"][pool]["node"], "node-1")
     sampler = data["state"]["pools"][await self.pool(samp_id)]
-    self.assertEqual((sampler["role"], sampler["exclusive"], sampler["train_run"]), ("sampler", True, excl_id))
+    self.assertEqual(
+      sampler["kind"], {"role": "sampler", "base": "tiny", "lora": True, "exclusive": True, "train_run": excl_id}
+    )
     self.assertIn("node-1", data["nodes"])
 
     await self.post("delete_model", json={"model_id": run_id})
@@ -383,8 +385,7 @@ class TestAPI(RedisTest):
     await self.bus.heartbeat("n8", 8)
     await self.bus.emit("node_up", node="n8", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    data = await self.scheduling_until(lambda d: d["state"]["pools"].get(sampler, {}).get("node"))
-    self.assertEqual(data["state"]["pools"][sampler]["env"].get("TINYRL_WARM_SAMPLER"), "1")
+    await self.scheduling_until(lambda d: d["state"]["pools"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)
     await self.scheduling_until(lambda d: sampler not in d["state"]["pools"])
