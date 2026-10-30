@@ -25,13 +25,11 @@ python -m tinyrl.scheduler &                    # decides whose turn it is on ea
 python -m tinyrl.node_daemon                    # runs a trainer or sampler for each pool placed on it
 ```
 
-A **pool** is the set of runs one trainer serves. LoRA runs on the same base model share a pool, `lora:<base_model>:<n>`. A new run
-goes to the least loaded of its base's pools. Once all of them are busier than `TARGET_UTIL` (0.7), it opens another, up to one
-per GPU the node daemons report. A pool's load is how busy its trainer was over the last `UTIL_MS`, plus an estimate for each run
-placed on it since.
-
-A full fine-tune (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive LoRA (`"openrl.exclusive": "true"`) gets a pool
-of its own, named by its model id. Its trainer exits when the run is deleted.
+A **pool** is the set of runs one trainer or sampler process serves. The gateway records what a run needs, and the
+scheduler picks its pool: LoRA runs on the same base model share a trainer, sampling sessions on the same base model and
+kind share a sampler, and an exclusive run's sessions share a sampler of their own. A full fine-tune
+(`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive run (`"openrl.exclusive": "true"`) gets a pool of
+its own. Pool names encode nothing.
 
 Run one node daemon per GPU machine (`GPUS`, default 1) and one scheduler. The scheduler places each pool that has runs
 on the node daemon with the fewest pools per GPU, on GPUs it picks, and moves a dead node daemon's pools to live ones.
@@ -103,8 +101,8 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps checkpoints it downloaded), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`, `TARGET_UTIL`,
-`UTIL_MS`, `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`,
+`ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
 
 ## Telemetry
 
