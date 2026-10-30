@@ -1,7 +1,7 @@
-"""Sampling. A sampler serves a sampling pool the way a trainer serves a training pool: it holds the pool's lease, runs
-its commands in order, and takes turns on the GPU.
+"""Sampling. A sampler serves sampling sessions the way a trainer serves training runs: it holds its worker's lease,
+runs their commands in order, and takes turns on the GPU.
 
-It samples through an Engine, which knows nothing of Redis, pools or checkpoint URIs. ENGINE names the engine's class,
+It samples through an Engine, which knows nothing of Redis, workers or checkpoint URIs. ENGINE names the engine's class,
 vLLM (tinyrl/vllm.py) unless it's set.
 """
 
@@ -92,20 +92,20 @@ def encode(job: dict, out: Out) -> bytes:
 
 class Sampler:
   def __init__(
-    self, bus: Bus, pool: str, engine: type[Engine] | None = None, store: Store | None = None, worker: str = ""
+    self, bus: Bus, worker: str, engine: type[Engine] | None = None, store: Store | None = None, owner: str = ""
   ):
     module, name = ENGINE.split(":")
     self.bus = bus
-    self.pool = pool
+    self.worker = worker
     self.engine_type = engine or getattr(importlib.import_module(module), name)
     self.engine: Engine | None = None  # started by the first command, which says which base model
     self.store = store if store is not None else Store()
     self.lora = os.getenv("TINYRL_LORA", "1") != "0"
-    self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
+    self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.names: dict[tuple[str, str], str] = {}  # (uri, version) -> the engine's name for that checkpoint
     self.loading = asyncio.Lock()
     self.done = False
-    self.turn = GpuTurn(bus, pool, bool(GPU))
+    self.turn = GpuTurn(bus, worker, bool(GPU))
     self.loaded: str | None = None
 
   async def warm(self) -> None:
@@ -138,18 +138,18 @@ class Sampler:
       if self.engine:
         await self.engine.close()
       await self.turn.give_back()
-      await self.bus.release(self.pool, self.worker)
+      await self.bus.release(self.worker, self.owner)
 
   async def own(self) -> None:
-    while not await self.bus.own(self.pool, self.worker):
+    while not await self.bus.own(self.worker, self.owner):
       await asyncio.sleep(LEASE_MS / 4000)
 
   async def keep(self) -> None:
     while not self.done:
       await asyncio.sleep(LEASE_MS / 4000)
-      if not await self.bus.renew(self.pool, self.worker) and not await self.bus.own(self.pool, self.worker):
+      if not await self.bus.renew(self.worker, self.owner) and not await self.bus.own(self.worker, self.owner):
         self.done = (
-          True  # another sampler took the pool. An expired lease nobody took, as after a Redis restart, is taken again
+          True  # another sampler took the worker. A lease that expired untaken, as in a Redis restart, is taken again
         )
         return
 
@@ -162,14 +162,14 @@ class Sampler:
             self.engine = await self.engine_type.start(run["base"], self.lora)
 
   async def fail_stranded(self, min_idle_ms: int) -> None:
-    for cmd in await self.bus.reclaim(self.pool, self.worker, min_idle_ms):
-      await self.bus.finish(cmd, fail(RuntimeError("its sampler died, or lost the pool")), self.pool, self.worker)
+    for cmd in await self.bus.reclaim(self.worker, self.owner, min_idle_ms):
+      await self.bus.finish(cmd, fail(RuntimeError("its sampler died, or lost the worker")), self.worker, self.owner)
 
   async def step(self, count: int = 128, block_ms: int = 1000) -> int:
     if self.done:
       return 0
     take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
-    cmds = await self.bus.take(self.pool, self.worker, count, take_block)
+    cmds = await self.bus.take(self.worker, self.owner, count, take_block)
     if not cmds:
       await self.turn.went_idle()
       await self.yield_gpu()
@@ -180,7 +180,7 @@ class Sampler:
       first = await self.bus.first_reply(cmd)
       reply = first or await self.run(cmd.run, json.loads(cmd.body))
       ms = (time.time() - start) * 1000
-      if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
+      if not await self.bus.finish(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
         self.done = True
       return [cmd.op, ms]
 
@@ -193,7 +193,7 @@ class Sampler:
           boot = time.time() - batch_start
       if block_ms:
         await asyncio.sleep(0.02)
-        cmds += await self.bus.take(self.pool, self.worker, count, 0)
+        cmds += await self.bus.take(self.worker, self.owner, count, 0)
       if self.lora:
         batches = [cmds]
       else:

@@ -50,12 +50,12 @@ class TestAPI(RedisTest):
     return await self.http.post(f"/api/v1/{path}", **kwargs)
 
   async def drain(self, run_id: str):
-    """Let the trainer for the run's pool do all of the pool's queued work."""
-    pool = await self.pool(run_id)
-    if pool not in self.trainers:
-      self.trainers[pool] = Trainer(self.bus, pool, Model(tiny), store=self.store)
-      await self.own(self.trainers[pool])
-    while await self.trainers[pool].step(block_ms=10):
+    """Let the trainer for the run's worker do all of the worker's queued work."""
+    worker = await self.worker(run_id)
+    if worker not in self.trainers:
+      self.trainers[worker] = Trainer(self.bus, worker, Model(tiny), store=self.store)
+      await self.own(self.trainers[worker])
+    while await self.trainers[worker].step(block_ms=10):
       pass
 
   async def result(self, submitted: httpx.Response, **kwargs) -> httpx.Response:
@@ -92,9 +92,9 @@ class TestAPI(RedisTest):
     self.assertEqual((run["steps"], run["failed"], run["session"]), (8, 0, session_id))
     self.assertEqual((run["live"], run["queued"], run["in_flight"]), (True, 0, []))
     self.assertEqual(run["cmds"], 17)
-    metrics, pool = (await self.http.get("/metrics")).text, run["pool"]
-    self.assertIn(f'tinyrl_steps_total{{pool="{pool}",run="{run_id}"}} 8\n', metrics)
-    self.assertIn(f'tinyrl_busy_seconds_total{{pool="{pool}",run="{run_id}"}} {run["busy_ms"] / 1000}\n', metrics)
+    metrics, worker = (await self.http.get("/metrics")).text, run["worker"]
+    self.assertIn(f'tinyrl_steps_total{{worker="{worker}",run="{run_id}"}} 8\n', metrics)
+    self.assertIn(f'tinyrl_busy_seconds_total{{worker="{worker}",run="{run_id}"}} {run["busy_ms"] / 1000}\n', metrics)
 
     session = (await self.http.get(f"/api/v1/sessions/{session_id}")).json()
     self.assertEqual((session["runs"], session["live"]), ([run_id], True))
@@ -182,9 +182,9 @@ class TestAPI(RedisTest):
     full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
     exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})
 
-    pools = [(await self.bus.run(run_id))["pool"] for run_id in (shared, also_shared, full, exclusive)]
-    self.assertEqual(pools[0], pools[1])
-    self.assertEqual(len(set(pools)), 3)
+    workers = [(await self.bus.run(run_id))["worker"] for run_id in (shared, also_shared, full, exclusive)]
+    self.assertEqual(workers[0], workers[1])
+    self.assertEqual(len(set(workers)), 3)
     self.assertEqual((await self.bus.run(full))["rank"], 0)
     self.assertEqual((await self.post("get_info", json={"model_id": full})).json()["lora_rank"], 16)
 
@@ -194,7 +194,7 @@ class TestAPI(RedisTest):
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.run(full))["rank"], 0)
-    self.assertEqual(await self.bus.runs(await self.pool(full)), [full])
+    self.assertEqual(await self.bus.runs(await self.worker(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -227,15 +227,15 @@ class TestAPI(RedisTest):
 
   async def test_sampler_weights_preserve_base_model_dtype(self):
     async def drain_bf16(run_id: str):
-      pool = await self.pool(run_id)
-      if pool not in self.trainers:
+      worker = await self.worker(run_id)
+      if worker not in self.trainers:
 
         def bf16(name: str):
           return tiny(name).to(torch.bfloat16)
 
-        self.trainers[pool] = Trainer(self.bus, pool, Model(bf16), store=self.store)
-        await self.own(self.trainers[pool])
-      while await self.trainers[pool].step(block_ms=10):
+        self.trainers[worker] = Trainer(self.bus, worker, Model(bf16), store=self.store)
+        await self.own(self.trainers[worker])
+      while await self.trainers[worker].step(block_ms=10):
         pass
 
     with patch.object(self, "drain", drain_bf16):
@@ -339,10 +339,10 @@ class TestAPI(RedisTest):
     await self.bus.heartbeat("node-1", 8)
     await self.bus.emit("node_up", node="node-1", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    pool = await self.pool(run_id)
-    data = await self.scheduling_until(lambda d: d["state"]["pools"].get(pool, {}).get("node"))
-    self.assertEqual(data["state"]["pools"][pool]["node"], "node-1")
-    sampler = data["state"]["pools"][await self.pool(samp_id)]
+    worker = await self.worker(run_id)
+    data = await self.scheduling_until(lambda d: d["state"]["workers"].get(worker, {}).get("node"))
+    self.assertEqual(data["state"]["workers"][worker]["node"], "node-1")
+    sampler = data["state"]["workers"][await self.worker(samp_id)]
     self.assertEqual(
       sampler["kind"], {"role": "sampler", "base": "tiny", "lora": True, "exclusive": True, "train_run": excl_id}
     )
@@ -350,7 +350,7 @@ class TestAPI(RedisTest):
 
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
-    data = await self.scheduling_until(lambda d: pool not in d["state"]["pools"])
+    data = await self.scheduling_until(lambda d: worker not in d["state"]["workers"])
     self.assertNotIn(run_id, data["state"]["runs"])
 
   async def scheduling_until(self, done, tries: int = 100) -> dict:
@@ -380,15 +380,15 @@ class TestAPI(RedisTest):
     saved = await self.post("save_weights_for_sampler", json={"model_id": excl, "sampling_session_seq_id": 0})
     sid = (await self.result(saved)).json()["sampling_session_id"]
     self.assertEqual(await self.sampler_runs(), [sid])
-    sampler = await self.pool(sid)
+    sampler = await self.worker(sid)
 
     await self.bus.heartbeat("n8", 8)
     await self.bus.emit("node_up", node="n8", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    await self.scheduling_until(lambda d: d["state"]["pools"].get(sampler, {}).get("node"))
+    await self.scheduling_until(lambda d: d["state"]["workers"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)
-    await self.scheduling_until(lambda d: sampler not in d["state"]["pools"])
+    await self.scheduling_until(lambda d: sampler not in d["state"]["workers"])
 
 
 if __name__ == "__main__":

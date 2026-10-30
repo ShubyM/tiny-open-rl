@@ -429,7 +429,7 @@ class TestTrainer(RedisTest):
 
     self.assertEqual((await self.bus.run(run))["steps"], 1)
     self.assertIsNone(await self.bus.submit(run, Op.OPTIM_STEP, b"{}"))  # deleted
-    self.assertFalse(t.done)  # a LoRA trainer keeps serving its pool
+    self.assertFalse(t.done)  # a LoRA trainer keeps serving its worker
 
   async def test_a_new_trainer_fails_what_a_dead_one_left_in_flight(self):
     run = new_id()
@@ -437,7 +437,7 @@ class TestTrainer(RedisTest):
     [request_id] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}}))
     await self.bus.take("p", "dead", block_ms=10)  # taken, and never answered
 
-    t = Trainer(self.bus, "p", Model(tiny), worker="new")
+    t = Trainer(self.bus, "p", Model(tiny), owner="new")
     t.done = True  # so serve() stops right after reclaiming
     await t.serve()
 
@@ -460,8 +460,8 @@ class TestTrainer(RedisTest):
     store = Store(root=tempfile.mkdtemp())
     for rank, lora in ((4, LORA), (0, {})):
       ctrl, r1, r2 = new_id(), new_id(), new_id()
-      for r, pool in ((ctrl, f"ctrl-{rank}"), (r1, f"p1-{rank}"), (r2, f"p2-{rank}")):
-        await self.bus.create(Run(r, pool, "tiny", rank))
+      for r, worker in ((ctrl, f"ctrl-{rank}"), (r1, f"p1-{rank}"), (r2, f"p2-{rank}")):
+        await self.bus.create(Run(r, worker, "tiny", rank))
 
       tc = Trainer(self.bus, f"ctrl-{rank}", Model(tiny), store=store)
       t1 = Trainer(self.bus, f"p1-{rank}", Model(tiny), store=store)
@@ -508,7 +508,7 @@ class TestTrainer(RedisTest):
       ctrl, run = new_id(), new_id()
       await self.bus.create(Run(ctrl, f"ctrl-{rank}", "tiny", rank, lora=lora))
       await self.bus.create(Run(run, f"p-{rank}", "tiny", rank, lora=lora))
-      tc, first = (Trainer(self.bus, pool, Model(tiny), store=store) for pool in (f"ctrl-{rank}", f"p-{rank}"))
+      tc, first = (Trainer(self.bus, worker, Model(tiny), store=store) for worker in (f"ctrl-{rank}", f"p-{rank}"))
       serving = [asyncio.create_task(tc.serve()), asyncio.create_task(first.serve())]
 
       async def call(r: str, op: Op, body: dict | bytes):
@@ -546,9 +546,9 @@ class TestTrainer(RedisTest):
     await self.own(t)
     await self.bus.r.delete("tinyrl:owner:p")  # what a Redis restart longer than the lease does
     await asyncio.sleep(0.2)
-    self.assertEqual((await self.bus.owner("p"), t.done), (t.worker, False))
+    self.assertEqual((await self.bus.owner("p"), t.done), (t.owner, False))
 
-    t.model.params["r"] = {}  # but not once another trainer has served the pool and parked its run
+    t.model.params["r"] = {}  # but not once another trainer has served the worker and parked its run
     await self.bus.r.set("tinyrl:parked:r", "tinker://r/parked/1")
     await self.bus.r.delete("tinyrl:owner:p")
     await asyncio.sleep(0.2)
@@ -567,7 +567,7 @@ class TestTrainer(RedisTest):
       pass
     for task in self.renewal_tasks:  # it dies without saving
       task.cancel()
-    await self.bus.release("p", first.worker)
+    await self.bus.release("p", first.owner)
 
     second = Trainer(self.bus, "p", Model(tiny), store=store)
     await self.own(second)

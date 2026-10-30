@@ -1,6 +1,6 @@
 """Runs, sessions, commands and replies, all on Redis.
 
-Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The trainer for a pool reads its runs'
+Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The trainer for a worker reads its runs'
 streams through one consumer group, so Redis itself knows:
 
   what is queued       XINFO GROUPS, the group's lag
@@ -11,8 +11,8 @@ streams through one consumer group, so Redis itself knows:
 A reply is a stream with a single entry, tinyrl:f:<request_id>. XREAD from id 0 blocks until it is written and never
 consumes it, so a client can retry retrieve_future, or many clients can wait on one, and every one gets the same answer.
 
-A pool has one owner, the trainer holding its lease, tinyrl:owner:<pool>. Replies are written in a WATCH/MULTI/EXEC
-transaction on the lease key, so a trainer that lost its pool, say after a long pause, can't answer for it.
+A worker has one owner, the trainer holding its lease, tinyrl:owner:<worker>. Replies are written in a WATCH/MULTI/EXEC
+transaction on the lease key, so a trainer that lost its worker, say after a long pause, can't answer for it.
 """
 
 from __future__ import annotations
@@ -30,11 +30,11 @@ from redis.backoff import ExponentialBackoff
 
 from tinyrl.helpers import getenv
 
-GROUP = "trainer"  # the consumer group every pool's trainer reads through
+GROUP = "trainer"  # the consumer group every worker's trainer reads through
 LIVE_SECONDS = 120  # a session is live this long after its last heartbeat
 REPLY_TTL = getenv("REPLY_TTL", 3600)
 SESSION_TTL = getenv("SESSION_TTL", 7 * 24 * 3600)
-LEASE_MS = getenv("LEASE_MS", 10000)  # a trainer owns its pool this long after its last renewal
+LEASE_MS = getenv("LEASE_MS", 10000)  # a trainer owns its worker this long after its last renewal
 NODE_MS = 30000  # a node daemon is live this long after its last heartbeat
 
 
@@ -56,7 +56,7 @@ class Op(StrEnum):
 @dataclass(frozen=True)
 class Run:
   id: str
-  pool: str  # "" until the scheduler assigns one
+  worker: str  # "" until the scheduler assigns one
   base: str
   rank: int
   session: str = ""
@@ -95,7 +95,7 @@ def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
 def connect(url: str) -> redis.Redis:
   # a reply is waited for with a blocking read of up to 30s, and redis-py gives up on a read after 5s by default.
   # Retrying a dropped connection for about a minute rides out a Redis restart, which keeps its data in its AOF file.
-  # Each request the gateway waits on holds a connection for that read, and redis-py's pool stops at 100 by default
+  # Each request the gateway waits on holds a connection for that read, and redis-py's worker stops at 100 by default
   # ("Too many connections" at 400 concurrent samples): allow as many as Redis itself does (maxclients 10000)
   retry = Retry(ExponentialBackoff(cap=2.0, base=0.1), 30)
   return redis.from_url(url, socket_timeout=None, retry=retry, max_connections=10_000)
@@ -150,13 +150,13 @@ class Bus:
   # ***** runs *****
 
   async def create(self, run: Run) -> None:
-    # one transaction, so a run is in its pool exactly when its stream and consumer group exist
+    # one transaction, so a run is in its worker exactly when its stream and consumer group exist
     record = json.dumps({**asdict(run), "created": time.time()})
     p = self.r.pipeline(transaction=True)
     p.xgroup_create(key("q", run.id), GROUP, id="0", mkstream=True)
-    if run.pool:
-      p.sadd(key("pools"), run.pool)
-      p.sadd(key("pool", run.pool), run.id)
+    if run.worker:
+      p.sadd(key("workers"), run.worker)
+      p.sadd(key("worker", run.worker), run.id)
     p.hset(
       key("run", run.id), mapping={"record": record, "steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0}
     )
@@ -164,17 +164,17 @@ class Bus:
       p.sadd(key("sess", run.session, "runs"), run.id)
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
     body = {"run": run.id, "role": run.role, "base": run.base, "rank": run.rank, "exclusive": run.exclusive}
-    body |= {"train_run": run.train_run} | ({"pool": run.pool} if run.pool else {})
+    body |= {"train_run": run.train_run} | ({"worker": run.worker} if run.worker else {})
     p.xadd(key("events"), {"kind": "run_created", "body": json.dumps(body)})
     await p.execute()
 
-  async def assign(self, run: str, pool: str) -> None:
-    """The scheduler's assignment of a run to a pool, with its log entry, at once. Only the scheduler writes it."""
+  async def assign(self, run: str, worker: str) -> None:
+    """The scheduler's assignment of a run to a worker, with its log entry, at once. Only the scheduler writes it."""
     p = self.r.pipeline(transaction=True)
-    p.hset(key("run", run), "pool", pool)
-    p.sadd(key("pools"), pool)
-    p.sadd(key("pool", pool), run)
-    p.xadd(key("events"), {"kind": "assigned", "body": json.dumps({"run": run, "pool": pool})})
+    p.hset(key("run", run), "worker", worker)
+    p.sadd(key("workers"), worker)
+    p.sadd(key("worker", worker), run)
+    p.xadd(key("events"), {"kind": "assigned", "body": json.dumps({"run": run, "worker": worker})})
     await p.execute()
 
   async def run(self, run_id: str) -> dict | None:
@@ -183,40 +183,42 @@ class Bus:
       return None
 
     record = json.loads(fields.pop(b"record"))
-    if pool := fields.pop(b"pool", None):
-      record["pool"] = pool.decode()
+    if worker := fields.pop(b"worker", None):
+      record["worker"] = worker.decode()
     counters = {name.decode(): int(value) for name, value in fields.items()}  # steps, failed, cmds, busy_ms, wait_ms
     return {**record, **counters}
 
-  async def runs(self, pool: str) -> list[str]:
-    return [run_id.decode() for run_id in await self.r.smembers(key("pool", pool))]
+  async def runs(self, worker: str) -> list[str]:
+    return [run_id.decode() for run_id in await self.r.smembers(key("worker", worker))]
 
   async def join(self, run_id: str) -> int:
     return int(await self.r.incr(key("clients", run_id)))
 
-  async def pools(self) -> list[str]:
-    return sorted(pool.decode() for pool in await self.r.smembers(key("pools")))
+  async def workers(self) -> list[str]:
+    return sorted(worker.decode() for worker in await self.r.smembers(key("workers")))
 
   async def stats(self) -> dict[tuple[str, str], dict]:
-    """The counters of every run still in a pool, by (pool, run)."""
+    """The counters of every run still in a worker, by (worker, run)."""
     runs = [
-      (pool.decode(), run_id)
-      for pool in await self.r.smembers(key("pools"))
-      for run_id in await self.runs(pool.decode())
+      (worker.decode(), run_id)
+      for worker in await self.r.smembers(key("workers"))
+      for run_id in await self.runs(worker.decode())
     ]
     p = self.r.pipeline()
     for _, run_id in runs:
       p.hgetall(key("run", run_id))
-    counters = [{k.decode(): int(v) for k, v in f.items() if k not in (b"record", b"pool")} for f in await p.execute()]
+    counters = [
+      {k.decode(): int(v) for k, v in f.items() if k not in (b"record", b"worker")} for f in await p.execute()
+    ]
     return dict(zip(runs, counters))
 
-  async def drop(self, run_id: str, pool: str) -> None:
-    """Take a deleted run out of its pool and delete its stream, in one transaction."""
+  async def drop(self, run_id: str, worker: str) -> None:
+    """Take a deleted run out of its worker and delete its stream, in one transaction."""
     p = self.r.pipeline(transaction=True)
-    p.srem(key("pool", pool), run_id)
+    p.srem(key("worker", worker), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
     await p.execute()
-    await self.emit("run_deleted", run=run_id, pool=pool)
+    await self.emit("run_deleted", run=run_id, worker=worker)
 
   # ***** commands *****
 
@@ -231,16 +233,16 @@ class Bus:
       return None
     return f"{run_id}/{entry_id.decode()}"
 
-  async def take(self, pool: str, worker: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
-    """The next commands for a pool's trainer: up to `count` from each run that has work."""
-    runs = await self.runs(pool)
+  async def take(self, worker: str, owner: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
+    """The next commands for a worker's trainer: up to `count` from each run that has work."""
+    runs = await self.runs(worker)
     if not runs:
       await asyncio.sleep(block_ms / 1000)
       return []
 
     random.shuffle(runs)  # so no run always goes first
     streams = {key("q", run_id): ">" for run_id in runs}
-    got = await self.r.xreadgroup(GROUP, worker, streams, count=count, block=block_ms or None)
+    got = await self.r.xreadgroup(GROUP, owner, streams, count=count, block=block_ms or None)
 
     cmds = []
     for stream, entries in got:
@@ -249,10 +251,10 @@ class Bus:
     return cmds
 
   async def finish(
-    self, cmd: Cmd, reply: Reply, pool: str, worker: str, repeat: bool = False, started: float | None = None
+    self, cmd: Cmd, reply: Reply, worker: str, owner: str, repeat: bool = False, started: float | None = None
   ) -> bool:
-    """Write a command's reply, acknowledge the command, and count it, all at once, if `worker` still owns the pool.
-    Returns False, having written nothing, if it doesn't: another trainer took the pool over and fails the command.
+    """Write a command's reply, acknowledge the command, and count it, all at once, if `owner` still owns the worker.
+    Returns False, having written nothing, if it doesn't: another trainer took the worker over and fails the command.
     A command run at time.time() `started` also counts its wait since it was queued, and how long it ran."""
     counts = {}
     if not repeat:
@@ -268,12 +270,12 @@ class Bus:
           "busy_ms": int((time.time() - started) * 1000),
         }
 
-    k = key("owner", pool)
+    k = key("owner", worker)
     while True:
       try:
         async with self.r.pipeline(transaction=True) as p:
           await p.watch(k)
-          if await p.get(k) != worker.encode():
+          if await p.get(k) != owner.encode():
             await p.unwatch()
             return False
           p.multi()
@@ -303,55 +305,55 @@ class Bus:
     fields = got[0][1]
     return Reply(fields[b"ok"] == b"1", fields[b"content_type"].decode(), fields[b"body"])
 
-  async def reclaim(self, pool: str, worker: str, min_idle_ms: int = 0) -> list[Cmd]:
-    """Claim the pool's commands that have been in flight for at least min_idle_ms, on any trainer. Called by the pool's
-    owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the pool."""
+  async def reclaim(self, worker: str, owner: str, min_idle_ms: int = 0) -> list[Cmd]:
+    """Claim the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by its
+    owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the worker."""
     cmds = []
-    for run_id in await self.runs(pool):
+    for run_id in await self.runs(worker):
       stream = key("q", run_id)
-      _, entries, _ = await self.r.xautoclaim(stream, GROUP, worker, min_idle_time=min_idle_ms, count=10000)
+      _, entries, _ = await self.r.xautoclaim(stream, GROUP, owner, min_idle_time=min_idle_ms, count=10000)
       cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
     return cmds
 
   # ***** parked runs: the state a stopping trainer saved, for the next trainer to restore *****
 
-  async def park(self, run_id: str, uri: str | None, pool: str, worker: str) -> bool:
-    """Record where a run's state was saved, or clear it with None, if `worker` still owns the run's pool."""
-    k = key("owner", pool)
+  async def park(self, run_id: str, uri: str | None, worker: str, owner: str) -> bool:
+    """Record where a run's state was saved, or clear it with None, if `owner` still owns the run's worker."""
+    k = key("owner", worker)
     while True:
       try:
         async with self.r.pipeline(transaction=True) as p:
           await p.watch(k)
-          if await p.get(k) != worker.encode():
+          if await p.get(k) != owner.encode():
             await p.unwatch()
             return False
           p.multi()
           p.set(key("parked", run_id), uri) if uri else p.delete(key("parked", run_id))
           await p.execute()
           return True
-      except redis.WatchError:  # the lease was renewed, maybe by this worker
+      except redis.WatchError:  # the lease was renewed, maybe by this owner
         continue
 
   async def parked(self, run_id: str) -> str | None:
     uri = await self.r.get(key("parked", run_id))
     return uri.decode() if uri else None
 
-  # ***** pool leases *****
+  # ***** worker leases *****
 
-  async def own(self, pool: str, worker: str) -> bool:
-    """Take the pool's lease if no trainer holds it."""
-    return bool(await self.r.set(key("owner", pool), worker, nx=True, px=LEASE_MS))
+  async def own(self, worker: str, owner: str) -> bool:
+    """Take the worker's lease if no trainer holds it."""
+    return bool(await self.r.set(key("owner", worker), owner, nx=True, px=LEASE_MS))
 
-  async def renew(self, pool: str, worker: str) -> bool:
-    """Hold the pool's lease for another LEASE_MS. False if `worker` doesn't hold it anymore."""
-    return bool(await self.r.set(key("owner", pool), worker, ifeq=worker, px=LEASE_MS))
+  async def renew(self, worker: str, owner: str) -> bool:
+    """Hold the worker's lease for another LEASE_MS. False if `owner` doesn't hold it anymore."""
+    return bool(await self.r.set(key("owner", worker), owner, ifeq=owner, px=LEASE_MS))
 
-  async def release(self, pool: str, worker: str) -> None:
-    await self.r.delex(key("owner", pool), ifeq=worker)
+  async def release(self, worker: str, owner: str) -> None:
+    await self.r.delex(key("owner", worker), ifeq=owner)
 
-  async def owner(self, pool: str) -> str | None:
-    worker = await self.r.get(key("owner", pool))
-    return worker.decode() if worker else None
+  async def owner(self, worker: str) -> str | None:
+    owner = await self.r.get(key("owner", worker))
+    return owner.decode() if owner else None
 
   # ***** nodes *****
 

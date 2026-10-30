@@ -12,11 +12,11 @@ from tinyrl.trainer import Trainer
 
 class TestEvents(RedisTest):
   async def test_round_trip(self):
-    first = await self.bus.emit("started", pool="p", node="n", gpus=[0], memory=0)
-    second = await self.bus.emit("exited", pool="p")
+    first = await self.bus.emit("started", worker="p", node="n", gpus=[0], memory=0)
+    second = await self.bus.emit("exited", worker="p")
     events = await self.bus.events()
     self.assertEqual([(e.id, e.kind) for e in events], [(first, "started"), (second, "exited")])
-    self.assertEqual(events[0].body, {"pool": "p", "node": "n", "gpus": [0], "memory": 0})
+    self.assertEqual(events[0].body, {"worker": "p", "node": "n", "gpus": [0], "memory": 0})
     self.assertLessEqual(events[0].t, events[1].t)
     self.assertEqual([e.id for e in await self.bus.events(first)], [second])
 
@@ -26,7 +26,7 @@ class TestEvents(RedisTest):
       await self.bus.create(Run(run, "", "tiny", 4))
     await self.bus.create(Run("f", "", "tiny", 0))
     for _ in range(100):
-      runs = {r: (await self.bus.run(r))["pool"] for r in ("a", "b", "f")}
+      runs = {r: (await self.bus.run(r))["worker"] for r in ("a", "b", "f")}
       if all(runs.values()):
         break
       await asyncio.sleep(0.02)
@@ -41,7 +41,7 @@ class TestEvents(RedisTest):
     await self.bus.create(Run(run_id, "lora:tiny:1", "tiny", 4, exclusive=False))
 
     with patch("tinyrl.trainer.load", side_effect=tiny), patch("tinyrl.trainer.GPU", "0"):
-      trainer = Trainer(self.bus, "lora:tiny:1", worker="tw1")
+      trainer = Trainer(self.bus, "lora:tiny:1", owner="tw1")
       await self.own(trainer)
 
       await self.bus.submit(run_id, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": {}}).encode())
@@ -51,7 +51,7 @@ class TestEvents(RedisTest):
       await trainer.step()
 
     with patch("tinyrl.sampler.ENGINE", "test.helpers:FakeEngine"), patch("tinyrl.sampler.GPU", "1"):
-      sampler = Sampler(self.bus, "sampler:tiny", worker="sw1")
+      sampler = Sampler(self.bus, "sampler:tiny", owner="sw1")
       run_id2 = new_id()
       await self.bus.create(Run(run_id2, "sampler:tiny", "tiny", 0))
       req = {
@@ -71,8 +71,8 @@ class TestEvents(RedisTest):
 
     events = await self.bus.events()
     turns = ("wants_gpu", "granted", "batch_done", "idle")
-    for pool in ("lora:tiny:1", "sampler:tiny"):
-      self.assertEqual([e.kind for e in events if e.body.get("pool") == pool and e.kind in turns], list(turns))
+    for worker in ("lora:tiny:1", "sampler:tiny"):
+      self.assertEqual([e.kind for e in events if e.body.get("worker") == worker and e.kind in turns], list(turns))
     s = scheduler.State()
     for e in events:
       s = scheduler.fold(s, e)

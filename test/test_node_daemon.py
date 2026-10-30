@@ -19,33 +19,33 @@ class TestNodeDaemon(RedisTest):
   async def test_the_node_daemon_starts_a_trainer_for_a_pool_with_runs_and_again_when_it_dies(self):
     base = f"{tempfile.mkdtemp()}/tiny"
     tiny().save_pretrained(base)
-    pool, run = f"lora:{base}", new_id()
-    await self.bus.create(Run(run, pool, base, 4))
+    worker, run = f"lora:{base}", new_id()
+    await self.bus.create(Run(run, worker, base, 4))
     await self.bus.create(Run(new_id(), "empty", base, 4))
     await self.bus.drop((await self.bus.runs("empty"))[0], "empty")
 
     with patch.dict(os.environ, {"REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS)}):
       daemon = NodeDaemon(self.bus, gpus=2)
       await daemon.up()
-      scheduling = asyncio.create_task(scheduler.run(self.bus))  # it places the pool and grants GPU turns
+      scheduling = asyncio.create_task(scheduler.run(self.bus))  # it places the worker and grants GPU turns
       try:
         await self.until(lambda: daemon.trainers, daemon)
-        self.assertEqual(list(daemon.trainers), [pool])  # not the pool whose runs are all gone
+        self.assertEqual(list(daemon.trainers), [worker])  # not the worker whose runs are all gone
         request_id = await self.bus.submit(
           run, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
         )
         self.assertTrue((await self.bus.result(request_id, 60)).ok)
 
-        gpu, first = daemon.trainers[pool]
+        gpu, first = daemon.trainers[worker]
         await daemon.tick()
-        self.assertIs(daemon.trainers[pool][1], first)  # one trainer per pool
+        self.assertIs(daemon.trainers[worker][1], first)  # one trainer per worker
 
         first.kill()
         await asyncio.to_thread(first.wait)
-        while await self.bus.owner(pool):  # its lease runs out
+        while await self.bus.owner(worker):  # its lease runs out
           await asyncio.sleep(0.1)
         await daemon.tick()
-        self.assertIsNot(daemon.trainers[pool][1], first)
+        self.assertIsNot(daemon.trainers[worker][1], first)
         request_id = await self.bus.submit(
           run, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
         )
@@ -69,20 +69,20 @@ class TestNodeDaemon(RedisTest):
   @patch("tinyrl.bus.NODE_MS", 600)
   async def test_pools_spread_over_nodes_and_move_off_a_dead_one(self):
     for run in ("r1", "r2"):
-      await self.bus.create(Run(run, f"pool-{run}", "base", 4))
+      await self.bus.create(Run(run, f"worker-{run}", "base", 4))
     a, b = NodeDaemon(self.bus, gpus=1, node="a"), NodeDaemon(self.bus, gpus=1, node="b")
     await a.up()
     await b.up()
     scheduling = asyncio.create_task(scheduler.run(self.bus))
     try:
       with patch("subprocess.Popen", side_effect=lambda *_, **__: MagicMock(**{"poll.return_value": None})):
-        await self.until(lambda: len(a.trainers) == len(b.trainers) == 1, a, b)  # one pool on each node
+        await self.until(lambda: len(a.trainers) == len(b.trainers) == 1, a, b)  # one worker on each node
 
-        await self.until(lambda: sorted(b.trainers) == ["pool-r1", "pool-r2"], b)  # a stops ticking, so it dies
+        await self.until(lambda: sorted(b.trainers) == ["worker-r1", "worker-r2"], b)  # a stops ticking, so it dies
 
-        proc = b.trainers["pool-r1"][1]
-        await self.bus.drop("r1", "pool-r1")
-        await self.until(lambda: sorted(b.trainers) == ["pool-r2"], b)  # an empty pool's process is stopped
+        proc = b.trainers["worker-r1"][1]
+        await self.bus.drop("r1", "worker-r1")
+        await self.until(lambda: sorted(b.trainers) == ["worker-r2"], b)  # an empty worker's process is stopped
         proc.terminate.assert_called()
     finally:
       scheduling.cancel()
@@ -110,7 +110,7 @@ class TestNodeDaemon(RedisTest):
   def test_a_process_starts_on_its_placed_gpus_with_its_placed_settings(self, popen):
     daemon = NodeDaemon(None, gpus=8, node="n")
     daemon.gpu_mib = 81559
-    daemon.start("sampler:fft:a", scheduler.Pool(scheduler.Kind("sampler", lora=False), gpus=(6,)))
+    daemon.start("sampler:fft:a", scheduler.Worker(scheduler.Kind("sampler", lora=False), gpus=(6,)))
     env = popen.call_args[1]["env"]
     self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["GPU"]), ("6", f"{socket.gethostname()}:6"))
     self.assertEqual(env["TINYRL_GPU_MEM"], "0.42")
@@ -119,10 +119,10 @@ class TestNodeDaemon(RedisTest):
   @patch("tinyrl.node_daemon.subprocess.Popen")
   def test_start_sets_cuda_alloc_conf_on_trainer(self, popen):
     daemon = NodeDaemon(None, gpus=2, node="n")
-    daemon.start("lora:base:0", scheduler.Pool(gpus=(0,)))
+    daemon.start("lora:base:0", scheduler.Worker(gpus=(0,)))
     self.assertEqual(popen.call_args[1]["env"]["PYTORCH_CUDA_ALLOC_CONF"], "expandable_segments:True")
     with patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"}):
-      daemon.start("lora:base:1", scheduler.Pool(gpus=(0,)))
+      daemon.start("lora:base:1", scheduler.Worker(gpus=(0,)))
       self.assertEqual(popen.call_args[1]["env"]["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
 
 
