@@ -125,6 +125,24 @@ class TestNodeDaemon(RedisTest):
       daemon.start("lora:base:1", scheduler.Worker(gpus=(0,)))
       self.assertEqual(popen.call_args[1]["env"]["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
 
+  async def test_started_is_in_the_log_before_the_process_spawns(self):
+    await self.bus.create(Run("r1", "worker", "base", 4))
+    daemon = NodeDaemon(self.bus, gpus=1, node="n", gpu_mib=0)
+    await daemon.up()
+    await self.bus.emit("placed", worker="worker", node="n", gpus=[0], rule="test")
+    import redis
+
+    seen = []
+
+    def spawn(*_, **__):
+      with redis.Redis.from_url(self.url) as r:
+        seen.extend(f[b"kind"].decode() for _, entries in r.xread({"tinyrl:events": "0-0"}) for _, f in entries)
+      return MagicMock(**{"poll.return_value": None})
+
+    with patch("subprocess.Popen", side_effect=spawn):
+      await daemon.tick()
+    self.assertIn("started", seen)
+
 
 if __name__ == "__main__":
   unittest.main()
