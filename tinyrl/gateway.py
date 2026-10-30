@@ -32,6 +32,11 @@ class SessionRequest(BaseModel):
   session_id: str
 
 
+class CreateSessionRequest(BaseModel):
+  tags: list[str] = []  # TINKER_TAGS: open-rl clients ask for full fine-tuning with openrl.fine_tuning_type=full
+  user_metadata: dict[str, Any] | None = None
+
+
 class CreateModelRequest(BaseModel):
   base_model: str
   session_id: str = ""
@@ -151,9 +156,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     return {"supported_models": []}
 
   @api.post("/api/v1/create_session")
-  async def create_session():
+  async def create_session(req: CreateSessionRequest | None = None):
     session_id = f"sess-{uuid.uuid4().hex[:12]}"
-    await bus.session(session_id)
+    req = req or CreateSessionRequest()
+    await bus.session(session_id, dict(t.partition("=")[::2] for t in req.tags) | (req.user_metadata or {}))
     return {"type": "create_session", "session_id": session_id}
 
   @api.post("/api/v1/session_heartbeat")
@@ -163,7 +169,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/create_model")
   async def create_model(req: CreateModelRequest):
-    metadata, lora = req.user_metadata or {}, req.lora_config or {}
+    session = await bus.session_info(req.session_id) or {}
+    metadata, lora = session.get("metadata", {}) | (req.user_metadata or {}), req.lora_config or {}
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     run = str(uuid.uuid4())
     pool = await pool_for(bus, run, req.base_model, rank, metadata)
