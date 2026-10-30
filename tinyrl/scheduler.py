@@ -29,6 +29,7 @@ class Run:
   base: str = ""
   lora: bool = True
   exclusive: bool = False
+  train_run: str = ""  # the training run a sampling session samples
   worker: str = ""
 
 
@@ -38,6 +39,7 @@ class Worker:
   base: str = ""
   lora: bool = True
   exclusive: bool = False
+  train_run: str = ""
   node: str = ""
   gpus: tuple[int, ...] = ()
   mem: float = 1.0
@@ -83,14 +85,16 @@ def used(s: State, k: Key, holding: bool = False) -> float:
 # ***** policy *****
 
 
+def kind(x: Run | Worker) -> tuple:
+  return x.role, x.base, x.lora, x.exclusive and x.train_run
+
+
 def choose_worker(s: State, r: Run) -> str | None:
-  """The worker a new run joins: the one serving its kind of run, unless it must be alone."""
-  if r.exclusive or (r.role == "trainer" and not r.lora):
+  """The worker a new run joins: the one serving its kind of run. A full fine-tune or exclusive training run is
+  alone, and an exclusive run's sampling sessions share only with each other."""
+  if r.role == "trainer" and (r.exclusive or not r.lora):
     return None
-  same = (r.role, r.base, r.lora)
-  return next(
-    (name for name, w in s.workers.items() if live(s, w) and not w.exclusive and (w.role, w.base, w.lora) == same), None
-  )
+  return next((name for name, w in s.workers.items() if live(s, w) and kind(w) == kind(r)), None)
 
 
 def need(role: str) -> float:
@@ -135,6 +139,7 @@ def fold(state: State, e: Event) -> State:
         b.get("base", ""),
         b.get("rank", 1) > 0,
         b.get("exclusive", False),
+        b.get("train_run") or "",
         b.get("pool") or "",
       )
     case "run_deleted":
@@ -182,6 +187,7 @@ def next_decision(s: State, now: float) -> tuple[str, dict] | None:
     if at := place(s, mem):
       env = {"TINYRL_GPU_MEM": str(mem)} if r.role == "sampler" else {}
       body = dict(worker=f"w{s.n + 1}", run=run_id, role=r.role, base=r.base, lora=r.lora, exclusive=r.exclusive)
+      body["train_run"] = r.train_run
       return "worker_created", body | dict(node=at[0], gpus=[at[1]], mem=mem, env=env)
   for name, w in s.workers.items():
     if not w.stopping and not w.exited and not members(s, name):

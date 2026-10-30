@@ -88,6 +88,17 @@ class TestPolicy(unittest.TestCase):
     w = log.s.workers[worker["s1"]]
     self.assertEqual((w.role, w.mem, w.env["TINYRL_GPU_MEM"]), ("sampler", SAMPLER_MEM, str(SAMPLER_MEM)))
 
+  def test_an_exclusive_runs_sampling_sessions_share_one_worker_of_their_own(self):
+    log = Log()
+    log.node(2)
+    for name, train in (("x1", "X"), ("x2", "X"), ("y1", "Y")):
+      log.run(name, role="sampler", rank=0, exclusive=True, train_run=train)
+    log.run("shared", role="sampler", rank=0, train_run="Z")
+    log.tick()
+    worker = {r: x.worker for r, x in log.s.runs.items()}
+    self.assertEqual(worker["x1"], worker["x2"])
+    self.assertEqual(len({worker["x1"], worker["y1"], worker["shared"]}), 3)
+
   def test_new_workers_take_the_least_used_gpu_they_fit(self):
     log = Log()
     log.node(3)
