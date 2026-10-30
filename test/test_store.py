@@ -1,11 +1,14 @@
+import json
 import os
 import tempfile
+import threading
 import unittest
 import unittest.mock
 import uuid
 
 import torch
 
+import tinyrl.store
 from tinyrl.store import Store
 
 
@@ -90,8 +93,6 @@ class TestStore(unittest.TestCase):
     self.assertTrue(any("model-00001-of-" in f for f in sampler_files))
 
   def test_stage_below_and_above_max_pin_bytes(self):
-    import tinyrl.store
-
     old_max = tinyrl.store.MAX_PIN_BYTES
     tinyrl.store.MAX_PIN_BYTES = 64
     try:
@@ -119,6 +120,148 @@ class TestStore(unittest.TestCase):
         self.assertTrue(torch.equal(cpu[k], v))
     finally:
       tinyrl.store.MAX_PIN_BYTES = old_max
+
+  @unittest.mock.patch("tinyrl.store.SHARD_BYTES", 64)
+  def test_remote_sharded_upload_is_atomic_and_cleans_stale_shards(self):
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
+    uri = "tinker://run-1/sampler_weights/step-remote-atomic"
+    ones = torch.ones(8, dtype=torch.float32)
+    original_put_file = saver.fs.put_file
+
+    def on_first_upload(*args, **kwargs):
+      res = original_put_file(*args, **kwargs)
+      if args[0].endswith(".safetensors") and not getattr(on_first_upload, "called", False):
+        on_first_upload.called = True
+        with self.assertRaises(ValueError):
+          loader.local(uri)
+        with self.assertRaises(ValueError):
+          loader.get(uri)
+      return res
+
+    with unittest.mock.patch.object(saver.fs, "put_file", side_effect=on_first_upload):
+      saver.put(uri, {"a": ones, "b": ones * 2, "c": ones * 3}, {"lora": False, "config": {"v": 1}})
+
+    self.assertTrue(saver.fs.exists(f"{saver.path(uri)}/model-00001-of-00003.safetensors"))
+    got, meta = loader.get(uri)
+    self.assertEqual(meta["config"], {"v": 1})
+    self.assertTrue(torch.equal(got["a"], ones))
+    self.assertTrue(torch.equal(got["b"], ones * 2))
+    self.assertTrue(torch.equal(got["c"], ones * 3))
+
+    saver.put(uri, {"only": ones * 5}, {"lora": False, "config": {"v": 2}})
+    got2, meta2 = loader.get(uri)
+    self.assertEqual(meta2["config"], {"v": 2})
+    self.assertEqual(list(got2), ["only"])
+    self.assertTrue(torch.equal(got2["only"], ones * 5))
+    self.assertFalse(saver.fs.exists(f"{saver.path(uri)}/model-00001-of-00003.safetensors"))
+    self.assertTrue(saver.fs.exists(f"{saver.path(uri)}/model.safetensors"))
+
+  @unittest.mock.patch("tinyrl.store.SHARD_BYTES", 64)
+  def test_local_overwrite_is_atomic_and_keeps_prior_reader_files(self):
+    store = Store(tempfile.mkdtemp())
+    uri = "tinker://run-local/weights/atomic"
+    ones = torch.ones(8, dtype=torch.float32)
+
+    store.put(uri + ".bak", {"a": ones * 7, "b": ones * 7, "c": ones * 7})
+    store.put(uri, {"a": ones, "b": ones * 2, "c": ones * 3})
+    p1 = os.path.realpath(store.local(uri)[0])
+
+    errors = []
+    running = True
+
+    def reader():
+      while running:
+        try:
+          got, _ = store.get(uri)
+          val_a = got["a"][0].item()
+          self.assertTrue(torch.equal(got["a"], ones * val_a))
+          self.assertTrue(torch.equal(got["b"], ones * (val_a * 2 if val_a == 1 else val_a)))
+          self.assertTrue(torch.equal(got["c"], ones * (val_a * 3 if val_a == 1 else val_a)))
+        except Exception as e:
+          errors.append(e)
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    try:
+      for step in range(2, 7):
+        store.put(uri, {"a": ones * step, "b": ones * step, "c": ones * step})
+        if step == 2:
+          self.assertTrue(os.path.exists(p1), "p1 shard files stay intact for in-flight reader")
+        if step == 3:
+          self.assertFalse(os.path.exists(p1), "p1 is garbage-collected after two newer saves")
+          parent = os.path.dirname(store.path(uri))
+          atomic_entries = [
+            n
+            for n in os.listdir(parent)
+            if (n == "atomic" or n.startswith(".atomic.")) and not n.startswith(".atomic.bak.")
+          ]
+          self.assertLessEqual(len(atomic_entries), 4)
+    finally:
+      running = False
+      t.join()
+    self.assertEqual(errors, [])
+    self.assertTrue(
+      torch.equal(store.get(uri + ".bak")[0]["a"], ones * 7), "sibling checkpoint with prefix stays intact"
+    )
+
+  def test_failed_transfers_leave_no_temp_folders(self):
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    saver = Store(root, cache=tempfile.mkdtemp())
+    loader = Store(root, cache=tempfile.mkdtemp())
+    uri = "tinker://run/fail"
+
+    with unittest.mock.patch.object(saver.fs, "put_file", side_effect=RuntimeError("boom")):
+      with self.assertRaises(RuntimeError):
+        saver.put(uri, {"w": torch.ones(4)})
+    self.assertEqual(os.listdir(saver.cache), [])
+
+    saver.put(uri, {"w": torch.ones(4)})
+
+    with unittest.mock.patch.object(loader.fs, "get_file", side_effect=RuntimeError("boom")):
+      with self.assertRaises(RuntimeError):
+        loader.get(uri)
+    self.assertEqual(os.listdir(loader.cache), [])
+
+  def test_config_only_overwrite_and_empty_or_non_cpu_tensors(self):
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    loader = Store(root, cache=tempfile.mkdtemp())
+    uri = "tinker://run/config"
+    loader.put(uri, {"w": torch.ones(4)}, {"lora": True, "config": {"r": 4}})
+    _, v1 = loader.local(uri)
+    loader.put(uri, {"w": torch.ones(4)}, {"lora": True, "config": {"r": 8}})
+    f2, v2 = loader.local(uri)
+    self.assertNotEqual(v1, v2)
+    with open(f"{f2}/adapter_config.json") as f:
+      self.assertEqual(json.load(f)["r"], 8)
+
+    store = Store(tempfile.mkdtemp())
+    store.put(uri, {"w": torch.ones(4)}, {"lora": True, "config": {"r": 4}})
+    _, v1 = store.local(uri)
+    store.put(uri, {"w": torch.ones(4)}, {"lora": True, "config": {"r": 8}})
+    f2, v2 = store.local(uri)
+    self.assertNotEqual(v1, v2)
+    with open(f"{f2}/adapter_config.json") as f:
+      self.assertEqual(json.load(f)["r"], 8)
+
+    with unittest.mock.patch("tinyrl.store.SHARD_BYTES", 0):
+      store.put(uri, {})
+      got, _ = store.get(uri)
+      self.assertEqual(got, {})
+
+      tensors = {
+        "empty": torch.empty((0, 8), dtype=torch.bfloat16),
+        "scalar": torch.tensor(42.0),
+        "bool": torch.tensor([True, False]),
+        "sliced": torch.ones(4, 4)[::2, ::2],
+      }
+      store.put(uri, tensors)
+      got, _ = store.get(uri)
+      self.assertEqual(got["empty"].shape, (0, 8))
+      self.assertEqual(got["empty"].dtype, torch.bfloat16)
+      self.assertEqual(got["scalar"].item(), 42.0)
+      self.assertTrue(torch.equal(got["bool"], torch.tensor([True, False])))
+      self.assertTrue(torch.equal(got["sliced"], torch.ones(4, 4)[::2, ::2]))
 
 
 if __name__ == "__main__":
