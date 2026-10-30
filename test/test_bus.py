@@ -157,6 +157,36 @@ class TestBus(RedisTest):
     self.assertEqual(session["runs"], [run_id])
     self.assertIsNone(await self.bus.session_info("nope"))
 
+  async def test_stats_and_workers_cleanup(self):
+    run_unassigned = new_id()
+    await self.bus.create(Run(id=run_unassigned, worker="", base="base", rank=1))
+
+    run_assigned = new_id()
+    await self.bus.create(Run(id=run_assigned, worker="", base="base", rank=1))
+    await self.bus.assign(run_assigned, "w1")
+
+    run_preassigned = new_id()
+    await self.bus.create(Run(id=run_preassigned, worker="w2", base="base", rank=1))
+
+    stats = await self.bus.stats()
+    self.assertIn(("w1", run_assigned), stats)
+    self.assertIn(("w2", run_preassigned), stats)
+    self.assertEqual(len(stats), 2)
+    self.assertEqual(stats[("w1", run_assigned)], {"steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0})
+    self.assertEqual(stats[("w2", run_preassigned)], {"steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0})
+
+    await self.bus.drop(run_assigned, "w1")
+    stats_after = await self.bus.stats()
+    self.assertNotIn(("w1", run_assigned), stats_after)
+
+    self.assertFalse(await self.bus.r.exists(key("workers")))
+    runs_in_redis = {r.decode() for r in await self.bus.r.smembers(key("runs"))}
+    self.assertIn(run_preassigned, runs_in_redis)
+    self.assertIn(run_unassigned, runs_in_redis)
+    self.assertNotIn(run_assigned, runs_in_redis)
+
+    self.assertFalse(hasattr(self.bus, "workers"))
+
 
 class TestRedisRestart(unittest.IsolatedAsyncioTestCase):
   async def test_a_call_waits_out_a_redis_restart(self):
