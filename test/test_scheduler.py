@@ -27,14 +27,14 @@ def check(s: State) -> list[str]:
   for node, (gpus, gpu) in sorted(s.nodes.items()):
     for k in [(node, i) for i in range(gpus)]:
       held = holders(s, k)
-      memory = [s.pools[n].memory for n in held]
+      memory = [s.pools[n].uses for n in held]
       if len(held) > 1 and not (gpu and all(memory) and sum(memory) <= gpu):
         bad.append(f"{k} has holders that do not fit together")
   for name, p in sorted(s.pools.items()):
     if p.node is not None and p.node not in s.nodes:
       bad.append(f"{name} is placed on {p.node}, which is not up")
-    if p.running and p.node is None:
-      bad.append(f"{name} runs but is not placed")
+    if any(node not in s.nodes for node, _ in p.on):
+      bad.append(f"{name} runs on a node that is not up")
     if p.asked and p.since is not None:
       bad.append(f"{name} holds its GPUs and waits for them")
     if p.revoked and p.since is None:
@@ -117,7 +117,7 @@ class TestPlacement(unittest.TestCase):
     log("started", pool="r", node="a")
     log.node(1, node="b")
     self.assertEqual(log("node_lost", node="a"), [("placed", "r", PLACED)])
-    self.assertEqual((log.s.pools["r"].node, log.s.pools["r"].running), ("b", False))
+    self.assertEqual((log.s.pools["r"].node, log.s.pools["r"].on), ("b", ()))
 
   def test_each_trainer_gets_the_least_used_gpu(self):
     log = Log(self)
@@ -234,12 +234,31 @@ class TestTurns(unittest.TestCase):
     log.pool("a")
     self.assertEqual(log("wants_gpu", pool="a"), [])
 
+  def test_an_unplaced_pool_keeps_its_turn_until_its_process_exits(self):
+    log = self.one_gpu("a", "b")
+    log("wants_gpu", pool="a")
+    log("wants_gpu", pool="b")
+    self.assertEqual(log("run_deleted", run="a-run", pool="a"), [("unplaced", "a", EMPTIED)])
+    self.assertEqual(log("exited", pool="a"), [("granted", "b", GRANTED)])
+    self.assertNotIn("a", log.s.pools)
+
+  def test_a_moved_pool_keeps_its_old_gpus_until_its_process_exits(self):
+    log = Log(self)
+    log.node(2)
+    log.pool("a", gpus=(0,))
+    log.pool("b", gpus=(0,))
+    log("wants_gpu", pool="a")
+    log("wants_gpu", pool="b")
+    log.append("placed", {"pool": "a", "node": "n", "gpus": [1], "memory": 0, "env": {}, "rule": "test"})
+    self.assertEqual(log.tick(), [])  # a's process is still on GPU 0
+    self.assertEqual(log("exited", pool="a"), [("granted", "b", GRANTED)])
+
   def test_a_restarted_node_daemon_takes_its_processes_turns_with_it(self):
     log = self.one_gpu("a", "b")
     log("wants_gpu", pool="a")
     log("wants_gpu", pool="b")
     log.node(1)
-    self.assertEqual([(p.running, p.since, p.asked) for p in log.s.pools.values()], [(False, None, 0)] * 2)
+    self.assertEqual([(p.on, p.since, p.asked) for p in log.s.pools.values()], [((), None, 0)] * 2)
     self.assertEqual({p.node for p in log.s.pools.values()}, {"n"})  # still placed, so its node daemon restarts them
 
 

@@ -177,9 +177,10 @@ class Pool:
   exclusive: bool = False
   node: str | None = None  # None until it is placed
   gpus: tuple[int, ...] = ()
-  memory: int = 0  # bytes it uses on each of its GPUs while it holds them, 0 if unknown
+  memory: int = 0  # bytes a process placed now may use on each of its GPUs, 0 if unknown
   env: dict[str, str] = field(default_factory=dict)
-  running: bool = False
+  on: tuple[Key, ...] = ()  # the GPUs its process is on, until it exits, wherever the pool is placed now
+  uses: int = 0  # bytes that process may use on each of them
   asked: int = 0  # its place in line, the entry count when it asked. 0 while not waiting
   since: float | None = None  # when its turn started, pushed back by engine boot. None while it holds no GPU
   revoked: bool = False  # told to give its GPUs back
@@ -194,8 +195,8 @@ class State:
   pools: dict[str, Pool] = field(default_factory=dict)
 
 
-def keys(p: Pool) -> list[Key]:
-  return [(p.node, i) for i in p.gpus] if p.running else []
+def keys(p: Pool) -> tuple[Key, ...]:
+  return p.on
 
 
 def holders(s: State, k: Key) -> list[str]:
@@ -209,13 +210,13 @@ def first_in_line(s: State, k: Key) -> str | None:
 
 def fits(s: State, k: Key, name: str) -> bool:
   """A pool joins a GPU's holders if nobody holds it, or if its memory and every holder's are known and fit together."""
-  memory, gpu = [s.pools[n].memory for n in (*holders(s, k), name)], s.nodes[k[0]][1]
+  memory, gpu = [s.pools[n].uses for n in (*holders(s, k), name)], s.nodes[k[0]][1]
   return len(memory) == 1 or (gpu > 0 and all(memory) and sum(memory) <= gpu)
 
 
 def stop(p: Pool) -> None:
   """Its process is gone, and its turn with it."""
-  p.running, p.asked, p.since, p.revoked, p.idle = False, 0, None, False, False
+  p.on, p.uses, p.asked, p.since, p.revoked, p.idle = (), 0, 0, None, False, False
 
 
 # ***** fold *****
@@ -241,25 +242,25 @@ def fold(state: State, e: Event) -> State:
     case "node_up":  # a node daemon (re)started, and its processes died with the old one
       s.nodes[b["node"]] = (b["gpus"], b.get("memory", 0))
       for q in s.pools.values():
-        if q.node == b["node"]:
+        if any(node == b["node"] for node, _ in q.on):
           stop(q)
     case "node_lost":
       s.nodes.pop(b["node"], None)
       for q in s.pools.values():
-        if q.node == b["node"]:
+        if any(node == b["node"] for node, _ in q.on):
           stop(q)
+        if q.node == b["node"]:
           q.node, q.gpus = None, ()
-    case "placed" if p:  # a new place means a new process, so whatever ran before has lost its turn
-      stop(p)
+    case "placed" if p:  # a process still running elsewhere keeps its GPUs and its turn until it exits
       p.node, p.gpus, p.memory, p.env = b["node"], tuple(b["gpus"]), b["memory"], b["env"]
     case "unplaced" if p:
-      del s.pools[b["pool"]]
+      p.node, p.gpus = None, ()
     case "started" if p and p.node == b["node"]:
       stop(p)
-      p.running = True
+      p.on, p.uses = tuple((p.node, i) for i in p.gpus), p.memory
     case "exited" if p:
       stop(p)
-    case "wants_gpu" if p and p.running:
+    case "wants_gpu" if p and p.on:
       p.idle = False
       if p.since is None and not p.asked:
         p.asked = s.n
@@ -275,6 +276,7 @@ def fold(state: State, e: Event) -> State:
       p.asked, p.since = 0, e.t
     case "revoked" if p:
       p.revoked = True
+  s.pools = {name: q for name, q in s.pools.items() if q.runs or q.warm or q.node or q.on}
   return s
 
 
@@ -294,9 +296,9 @@ def decide(state: State, now: float) -> list[tuple[str, dict]]:
 
 def next_decision(s: State, now: float) -> tuple[str, dict] | None:
   for name, p in sorted(s.pools.items()):
-    if not (p.runs or p.warm):
+    if p.node and not (p.runs or p.warm):
       return "unplaced", {"pool": name, "rule": "place.emptied"}
-  unplaced = [name for name, p in s.pools.items() if p.node is None]
+  unplaced = [name for name, p in s.pools.items() if p.node is None and (p.runs or p.warm)]
   if unplaced and s.nodes:
     exclusive = {name for name, p in s.pools.items() if p.exclusive}
     return "placed", place(s, start_order(unplaced, exclusive)[0], exclusive)
