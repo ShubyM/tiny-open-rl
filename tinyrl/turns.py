@@ -1,4 +1,4 @@
-"""A worker's turn on its GPUs, when it shares them with other workers' workers.
+"""A worker's turn on its GPUs, when it shares them with other workers.
 
 The worker appends facts to tinyrl:events: wants_gpu, batch_done, idle, released. It reads the scheduler's decisions
 about its worker, granted and revoked, from the same log. See scheduler.py for the rules.
@@ -6,9 +6,7 @@ about its worker, granted and revoked, from the same log. See scheduler.py for t
 
 from __future__ import annotations
 
-import time
-
-from tinyrl.bus import LEASE_MS, Bus
+from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
 
 IDLE_MS = getenv(
@@ -27,14 +25,12 @@ class GpuTurn:
     """Wait for a grant. True if this call took the turn, so the worker brings its tensors back to the GPU."""
     if self.held:
       return False
-    while True:  # asking again every LEASE_MS / 4 covers an ask the scheduler could not place, like one before started
-      asked = await self.bus.emit("wants_gpu", worker=self.worker, queued=queued)
-      self.after = self.after or asked
-      deadline = time.monotonic() + LEASE_MS / 4000
-      while (left := deadline - time.monotonic()) > 0:
-        if await self.decision(max(1, int(left * 1000))) == "granted":
-          self.held = True
-          return True
+    asked = await self.bus.emit("wants_gpu", worker=self.worker, queued=queued)
+    self.after = self.after or asked
+    while await self.decision(5000) != "granted":
+      pass
+    self.held = True
+    return True
 
   async def revoked(self) -> bool:
     return self.held and self.shared and await self.decision(0) == "revoked"
