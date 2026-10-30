@@ -78,8 +78,8 @@ class NodeDaemon:
         del self.stopping[worker]
         await self.bus.emit("exited", worker=worker)
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
-      self.procs[worker] = self.start(worker, mine[worker])
       await self.bus.emit("started", worker=worker, node=self.id)
+      self.procs[worker] = self.start(worker, mine[worker])
 
   def start(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
     """Start a worker's process on its GPUs, with the settings for its kind. This node's environment wins."""

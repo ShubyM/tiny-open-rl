@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import patch
 
 from test.helpers import RedisTest
 from tinyrl import scheduler
@@ -63,5 +64,35 @@ class TestScheduler(RedisTest):
       self.assertEqual(
         await self.decisions(), [("granted", "a", "turn.granted"), ("revoked", "a", "turn.quantum_expired")]
       )
+    finally:
+      task.cancel()
+
+  @patch("tinyrl.turns.LEASE_MS", 200, create=True)
+  async def test_a_waiting_worker_emits_wants_gpu_once_and_can_take_a_second_turn(self):
+    task = await self.start("a", "b")
+    a = GpuTurn(self.bus, "a", shared=True)
+    b = GpuTurn(self.bus, "b", shared=True)
+    try:
+      self.assertTrue(await asyncio.wait_for(a.take(1), 5))
+      waiting = asyncio.create_task(b.take(1))
+      for _ in range(5):
+        await asyncio.sleep(0.05)
+        await self.bus.emit("random_event")
+      self.assertFalse(waiting.done())
+      wants = [e for e in await self.bus.events() if e.kind == "wants_gpu" and e.body.get("worker") == "b"]
+      self.assertEqual(len(wants), 1)
+
+      await a.went_idle()
+      while not await a.revoked():
+        await asyncio.sleep(0.02)
+      await a.give_back()
+      self.assertTrue(await asyncio.wait_for(waiting, 5))
+
+      second = asyncio.create_task(a.take(1))
+      await b.went_idle()
+      while not await b.revoked():
+        await asyncio.sleep(0.02)
+      await b.give_back()
+      self.assertTrue(await asyncio.wait_for(second, 5))
     finally:
       task.cancel()
