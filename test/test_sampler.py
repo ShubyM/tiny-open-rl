@@ -104,12 +104,12 @@ class TestSampler(RedisTest):
       return json.loads((await self.bus.result(request_id, 1)).body)["sampling_session_id"]
 
     run = (await call("create_model", {"base_model": base, "lora_config": {"rank": 4}}))["model_id"]
-    trainer = Trainer(self.bus, await self.pool(run), store=store)
+    trainer = Trainer(self.bus, await self.worker(run), store=store)
     await self.own(trainer)
     await trainer.step(block_ms=0)
 
     sid = await save_for_sampler(trainer, run)
-    sampler = Sampler(self.bus, await self.pool(sid), engine=FakeEngine, store=store)
+    sampler = Sampler(self.bus, await self.worker(sid), engine=FakeEngine, store=store)
     await self.own(sampler)
     self.assertTrue((await client.get(f"/api/v1/samplers/{sid}")).json()["model_path"].startswith("tinker://"))
     first = await call("join_sampling_session", {"sampling_session_id": sid})
@@ -126,7 +126,9 @@ class TestSampler(RedisTest):
     self.assertEqual(replies[0]["prompt_logprobs"], [None, -1.0, -1.0])
 
     request_id = (await call("asample", {"base_model": base, "prompt": tokens([1, 2])}))["request_id"]
-    self.assertEqual(await self.pool(request_id.split("/")[0]), sampler.pool)  # base sampling joins the same sampler
+    self.assertEqual(
+      await self.worker(request_id.split("/")[0]), sampler.worker
+    )  # base sampling joins the same sampler
     await sampler.step(block_ms=0)
     self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
     calls = sampler.engine.calls
@@ -140,13 +142,13 @@ class TestSampler(RedisTest):
     fft = (await call("create_model", {"base_model": base, "user_metadata": {"openrl.fine_tuning_type": "full"}}))[
       "model_id"
     ]
-    fft_trainer = Trainer(self.bus, await self.pool(fft), store=store)
+    fft_trainer = Trainer(self.bus, await self.worker(fft), store=store)
     await self.own(fft_trainer)
     await fft_trainer.step(block_ms=0)
     fft_sid = await save_for_sampler(fft_trainer, fft)
-    self.assertNotEqual(await self.pool(fft_sid), await self.pool(sid))
+    self.assertNotEqual(await self.worker(fft_sid), await self.worker(sid))
     with patch.dict(os.environ, {"TINYRL_LORA": "0"}):
-      fft_sampler = Sampler(self.bus, await self.pool(fft_sid), engine=FakeEngine, store=store)
+      fft_sampler = Sampler(self.bus, await self.worker(fft_sid), engine=FakeEngine, store=store)
     await self.own(fft_sampler)
     request_id = (await call("asample", {"sampling_session_id": fft_sid, "prompt": tokens([1, 2])}))["request_id"]
     await fft_sampler.step(block_ms=0)

@@ -1,9 +1,9 @@
 """Runs the trainers and samplers the scheduler placed on this node, on the GPUs it chose.
 
-python -m tinyrl.node_daemon replaces starting `python -m tinyrl.trainer <pool>` by hand. Every node daemon heartbeats
+python -m tinyrl.node_daemon replaces starting `python -m tinyrl.trainer <worker>` by hand. Every node daemon heartbeats
 into Redis and appends node_up when it starts. It folds tinyrl:events like the scheduler does, starts a process for each
-pool placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A
-pool's lease still decides who serves it.
+worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A
+worker's lease still decides who serves it.
 """
 
 from __future__ import annotations
@@ -22,7 +22,9 @@ from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
 
 GPUS = getenv("GPUS", 1)
-DRAIN_S = getenv("DRAIN_S", 20.0)  # how long a stopping node daemon waits for its trainers to save their runs
+DRAIN_S = getenv(
+  "DRAIN_S", 20.0
+)  # how long a stopping node daemon waits for its processes, so trainers save their runs
 TICK = getenv("TICK", 0.25)
 
 
@@ -48,7 +50,7 @@ class NodeDaemon:
   def __init__(self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None):
     self.bus = bus
     self.gpus = gpus
-    self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # pool -> (its GPUs, process)
+    self.procs: dict[str, tuple[list[int], subprocess.Popen]] = {}  # worker -> (its GPUs, its process)
     self.stopping: dict[str, subprocess.Popen] = {}  # told to stop, and maybe still on its GPUs
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
@@ -66,21 +68,21 @@ class NodeDaemon:
       for e in events:
         self.state = scheduler.fold(self.state, e)
       self.after = events[-1].id
-    mine = {n: p for n, p in self.state.pools.items() if p.node == self.id and scheduler.members(self.state, n)}
-    for pool, (gpus, proc) in list(self.trainers.items()):
-      if proc.poll() is not None or pool not in mine or list(mine[pool].gpus) != gpus:
+    mine = {n: p for n, p in self.state.workers.items() if p.node == self.id and scheduler.members(self.state, n)}
+    for worker, (gpus, proc) in list(self.procs.items()):
+      if proc.poll() is not None or worker not in mine or list(mine[worker].gpus) != gpus:
         proc.terminate()
-        self.stopping[pool] = self.trainers.pop(pool)[1]
-    for pool, proc in list(self.stopping.items()):
+        self.stopping[worker] = self.procs.pop(worker)[1]
+    for worker, proc in list(self.stopping.items()):
       if proc.poll() is not None:  # only now is the GPU free, so only now does its turn end
-        del self.stopping[pool]
-        await self.bus.emit("exited", pool=pool)
-    for pool in sorted(set(mine) - set(self.trainers) - set(self.stopping)):
-      self.trainers[pool] = self.start(pool, mine[pool])
-      await self.bus.emit("started", pool=pool, node=self.id)
+        del self.stopping[worker]
+        await self.bus.emit("exited", worker=worker)
+    for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
+      self.procs[worker] = self.start(worker, mine[worker])
+      await self.bus.emit("started", worker=worker, node=self.id)
 
-  def start(self, pool: str, p: scheduler.Pool) -> tuple[list[int], subprocess.Popen]:
-    """Start a pool's process on its GPUs, with the settings for its kind. This node's environment wins."""
+  def start(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
+    """Start a worker's process on its GPUs, with the settings for its kind. This node's environment wins."""
     gpus, k = list(p.gpus), p.kind
     env = {**scheduler.settings(k, self.gpus, self.gpu_mib * 2**20), **os.environ}
     env["CUDA_VISIBLE_DEVICES"], env["GPU"] = (
@@ -91,7 +93,7 @@ class NodeDaemon:
     mod = f"tinyrl.{k.role}"
     if mod == "tinyrl.trainer":
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
+    return gpus, subprocess.Popen([sys.executable, "-m", mod, worker], env=env)
 
   async def serve(self) -> None:
     await self.up()
@@ -100,14 +102,14 @@ class NodeDaemon:
         await self.tick()
         await asyncio.sleep(TICK)
     finally:
-      for _, proc in self.trainers.values():
+      for _, proc in self.procs.values():
         proc.terminate()  # a trainer saves its runs, then exits
       deadline = time.monotonic() + DRAIN_S
-      for _, proc in self.trainers.values():
+      for _, proc in self.procs.values():
         with contextlib.suppress(subprocess.TimeoutExpired):
           proc.wait(max(0.0, deadline - time.monotonic()))
 
 
 if __name__ == "__main__":
-  signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so serve's finally stops the trainers
+  signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so serve's finally stops its processes
   asyncio.run(NodeDaemon(Bus()).serve())

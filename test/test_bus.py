@@ -15,11 +15,11 @@ def ok(**body) -> Reply:
 class TestBus(RedisTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
-    await self.bus.own("p", "w0")  # only a pool's owner can answer for it
+    await self.bus.own("p", "w0")  # only a worker's owner can answer for it
 
-  async def new_run(self, pool: str = "p", session: str = "") -> str:
+  async def new_run(self, worker: str = "p", session: str = "") -> str:
     run_id = new_id()
-    await self.bus.create(Run(id=run_id, pool=pool, base="base", rank=8, session=session))
+    await self.bus.create(Run(id=run_id, worker=worker, base="base", rank=8, session=session))
     return run_id
 
   async def test_a_command_goes_through_the_stream_and_its_reply_comes_back(self):
@@ -35,7 +35,7 @@ class TestBus(RedisTest):
     self.assertEqual(await self.bus.take("p", "w0", block_ms=10), [])
 
     run = await self.bus.run(run_id)
-    self.assertEqual((run["pool"], run["base"], run["rank"], run["steps"]), ("p", "base", 8, 1))
+    self.assertEqual((run["worker"], run["base"], run["rank"], run["steps"]), ("p", "base", 8, 1))
 
   async def test_a_reply_wakes_every_waiter_and_reading_it_never_consumes_it(self):
     run_id = await self.new_run()
@@ -106,7 +106,7 @@ class TestBus(RedisTest):
     self.assertEqual({entry["trainer"] for entry in (await self.bus.queue(run_id))["in_flight"]}, {"new"})
     self.assertEqual(await self.bus.take("p", "new", block_ms=10), [])
 
-  async def test_every_run_in_a_pool_is_served_each_take(self):
+  async def test_every_run_in_a_worker_is_served_each_take(self):
     a, b, other = await self.new_run(), await self.new_run(), await self.new_run("other")
     for run_id in (a, a, a, b, other):
       await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
@@ -125,7 +125,7 @@ class TestBus(RedisTest):
     run = await self.bus.run(run_id)
     self.assertEqual((run["steps"], run["failed"]), (0, 1))
 
-  async def test_only_the_pools_owner_can_answer_for_it(self):
+  async def test_only_the_workers_owner_can_answer_for_it(self):
     run_id = await self.new_run()
     request_id = await self.bus.submit(run_id, Op.OPTIM_STEP, b"")
     [cmd] = await self.bus.take("p", "w0", block_ms=10)

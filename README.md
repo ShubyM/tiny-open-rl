@@ -22,18 +22,18 @@ pip install -e .
 redis-server &                                  # Redis 8.4 or newer
 python -m tinyrl.gateway &                      # the Tinker HTTP API, on :8000
 python -m tinyrl.scheduler &                    # decides whose turn it is on each shared GPU
-python -m tinyrl.node_daemon                    # runs a trainer or sampler for each pool placed on it
+python -m tinyrl.node_daemon                    # runs a trainer or sampler for each worker placed on it
 ```
 
-A **pool** is the set of runs one trainer or sampler process serves. The gateway records what a run needs, and the
-scheduler picks its pool: LoRA runs on the same base model share a trainer, sampling sessions on the same base model and
+A **worker** is one trainer or sampler process and the runs it serves. The gateway records what a run needs, and
+the scheduler picks its worker: LoRA runs on the same base model share a trainer, sampling sessions on the same base model and
 kind share a sampler, and an exclusive run's sessions share a sampler of their own. A full fine-tune
-(`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive run (`"openrl.exclusive": "true"`) gets a pool of
-its own. Pool names encode nothing.
+(`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive run (`"openrl.exclusive": "true"`) gets a worker of
+its own. Worker names encode nothing.
 
-Run one node daemon per GPU machine (`GPUS`, default 1) and one scheduler. The scheduler places each pool that has runs
-on the node daemon with the fewest pools per GPU, on GPUs it picks, and moves a dead node daemon's pools to live ones.
-Each node daemon runs `python -m tinyrl.trainer <pool>` or `python -m tinyrl.sampler <pool>` for the pools placed on it,
+Run one node daemon per GPU machine (`GPUS`, default 1) and one scheduler. The scheduler places each worker that has runs
+on the node daemon with the fewest workers per GPU, on GPUs it picks, and moves a dead node daemon's workers to live ones.
+Each node daemon runs `python -m tinyrl.trainer <worker>` or `python -m tinyrl.sampler <worker>` for the workers placed on it,
 and starts them again if they die. A sampler starts its engine on its first command.
 The engine is vLLM, `vllm serve` on a local port, unless `ENGINE` names another.
 
@@ -46,7 +46,7 @@ frees the GPU, and copies them back on its next turn.
 [k8s/](k8s) runs Redis with an append-only file, the gateway, the scheduler, and a node daemon on every node labeled `tinyrl-gpu=true`.
 Build the image from [Dockerfile](Dockerfile), point `CKPT` in [k8s/kustomization.yaml](k8s/kustomization.yaml) at a
 bucket the nodes' service account can write, and run `kubectl apply -k k8s/`. A drained node's trainers save their runs,
-and a dead node's pools move to live nodes. `python k8s/e2e.py` breaks a running cluster on purpose and checks it
+and a dead node's workers move to live nodes. `python k8s/e2e.py` breaks a running cluster on purpose and checks it
 survives.
 
 ## How it works
@@ -58,12 +58,12 @@ sdk --http--> gateway --XADD--> tinyrl:q:<run> --XREADGROUP--> trainer --XADD-->
 Every training call is a command on its run's Redis stream, and its reply is a stream with one entry, named by the request. That's the
 whole design. Redis does the bookkeeping that would otherwise take a database, a ledger and a heartbeat.
 
-* **The queue reads itself.** A pool's trainer reads its runs' streams through one consumer group so `XINFO GROUPS` says what's queued,
+* **The queue reads itself.** A worker's trainer reads its runs' streams through one consumer group so `XINFO GROUPS` says what's queued,
   and `XPENDING` says what's in flight, on which trainer, and for how long. `GET /api/v1/runs/<id>` just asks.
 * **A dead trainer fails fast.** The commands it took stay in the pending list. The next trainer to start claims them with `XAUTOCLAIM`
   and fails them, so no client waits on work that died with its process.
 * **A stopping trainer saves its runs.** On SIGTERM a trainer finishes its batch, saves every run's weights and AdamW state
-  to the store, and the pool's next trainer, on any node, restores them before running their next command.
+  to the store, and the worker's next trainer, on any node, restores them before running their next command.
 * **Retries are free.** `XREAD` from id `0` blocks until the reply is written and never consumes it, so
   `retrieve_future` can be retried, or waited on by many clients, and every one of them gets the same answer.
   A call the SDK retries with the same `seq_id` runs once, and every attempt gets the first attempt's answer.
@@ -79,7 +79,7 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
   [store.py](tinyrl/store.py) behind `put(uri)` and `get(uri)` as pure `safetensors` (no `torch.save` pickle), so any trainer can
   resume a run with its exact fp32 weights and AdamW state. `CKPT` can be a bucket (`gs://...`, with `pip install .[gcs]`), so
   every node sees every checkpoint.
-* **One owner per pool.** A trainer serves a pool only while it holds the pool's lease. A WATCH/MULTI/EXEC transaction on the lease key checks the lease before any reply lands.
+* **One owner per worker.** A trainer serves a worker only while it holds the worker's lease. A WATCH/MULTI/EXEC transaction on the lease key checks the lease before any reply lands.
 
 ## Reading the code
 
@@ -89,14 +89,14 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/sampler.py](tinyrl/sampler.py) | 164 | sampling pools, through an engine that knows nothing of Redis |
+| [tinyrl/sampler.py](tinyrl/sampler.py) | 164 | sampling workers, through an engine that knows nothing of Redis |
 | [tinyrl/vllm.py](tinyrl/vllm.py) | 102 | the vLLM engine: `vllm serve` over HTTP |
 | [tinyrl/trainer.py](tinyrl/trainer.py) | 429 | the losses, token budget batching, the model, and the trainer loop |
 | [tinyrl/bus.py](tinyrl/bus.py) | 291 | runs, sessions, commands and replies on Redis |
 | [tinyrl/gateway.py](tinyrl/gateway.py) | 270 | the Tinker HTTP API |
 | [tinyrl/wire.py](tinyrl/wire.py) | 155 | the Tinker protobuf, to numpy and back |
 | [tinyrl/store.py](tinyrl/store.py) | 70 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
-| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 69 | places pools on node daemons, and runs the ones placed on this one |
+| [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 69 | places workers on node daemons, and runs the ones placed on this one |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
@@ -109,17 +109,17 @@ GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS
 Every run's hash counts the commands it ran (`cmds`), the time they spent queued (`wait_ms`, from the stream entry id to the
 trainer starting it) and running (`busy_ms`), plus `steps` and `failed`. The trainer writes them in the same transaction as
 the reply. `GET /api/v1/runs/<run>` shows one run's counters, and `GET /metrics` shows every run's in Prometheus' text
-format, as `tinyrl_<counter>_total{pool, run}` in seconds. The numbers scheduling papers report are queries over those
+format, as `tinyrl_<counter>_total{worker, run}` in seconds. The numbers scheduling papers report are queries over those
 counters:
 
 | measure | PromQL |
 |---|---|
-| utilization of a pool's trainer | `sum by (pool) (rate(tinyrl_busy_seconds_total[5m]))` |
-| mean queueing delay per call | `sum by (pool) (rate(tinyrl_wait_seconds_total[5m])) / sum by (pool) (rate(tinyrl_cmds_total[5m]))` |
-| slowdown, (wait + run) / run | `1 + sum by (pool) (rate(tinyrl_wait_seconds_total[5m])) / sum by (pool) (rate(tinyrl_busy_seconds_total[5m]))` |
-| throughput, optimizer steps per second | `sum by (pool) (rate(tinyrl_steps_total[5m]))` |
+| utilization of a worker's trainer | `sum by (worker) (rate(tinyrl_busy_seconds_total[5m]))` |
+| mean queueing delay per call | `sum by (worker) (rate(tinyrl_wait_seconds_total[5m])) / sum by (worker) (rate(tinyrl_cmds_total[5m]))` |
+| slowdown, (wait + run) / run | `1 + sum by (worker) (rate(tinyrl_wait_seconds_total[5m])) / sum by (worker) (rate(tinyrl_busy_seconds_total[5m]))` |
+| throughput, optimizer steps per second | `sum by (worker) (rate(tinyrl_steps_total[5m]))` |
 | fairness, Jain's index of the GPU time active runs get (1 is equal shares) | `sum(rate(tinyrl_busy_seconds_total[5m]) > 0) ^ 2 / (count(rate(tinyrl_busy_seconds_total[5m]) > 0) * sum((rate(tinyrl_busy_seconds_total[5m]) > 0) ^ 2))` |
-| failure rate | `sum by (pool) (rate(tinyrl_failed_total[5m])) / sum by (pool) (rate(tinyrl_cmds_total[5m]))` |
+| failure rate | `sum by (worker) (rate(tinyrl_failed_total[5m])) / sum by (worker) (rate(tinyrl_cmds_total[5m]))` |
 
 A run's wait includes waiting on its own earlier calls, since a run's calls run in order.
 

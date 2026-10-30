@@ -1,6 +1,6 @@
-"""A trainer serves one pool: the LoRA adapters that share a base model, or a single full fine-tune.
+"""A trainer serves one worker: the LoRA adapters that share a base model, or a single full fine-tune.
 
-It takes commands from its pool's streams on the bus, runs each one on the model, and writes the reply back.
+It takes commands from its worker's streams on the bus, runs each one on the model, and writes the reply back.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward p
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
 CHUNK = getenv("CHUNK", 1024)  # positions per output head chunk when computing logprobs
 GRAD_CKPT = getenv("GRAD_CKPT", 1)  # gradient checkpointing
-STRANDED_MS = 5000  # a command in flight this long while its pool's owner has nothing in flight was stranded
+STRANDED_MS = 5000  # a command in flight this long while its worker's owner has nothing in flight was stranded
 GPU = getenv("GPU", "")  # the GPU this trainer takes turns on, set by the node daemon. Unset, it never takes turns
 
 # ***** losses *****
@@ -460,21 +460,21 @@ def enqueue_cmds(queue: collections.deque[Cmd], cmds: list[Cmd], lora: bool) -> 
 
 
 class Trainer:
-  def __init__(self, bus: Bus, pool: str, model: Model | None = None, worker: str = "", store: Store | None = None):
+  def __init__(self, bus: Bus, worker: str, model: Model | None = None, owner: str = "", store: Store | None = None):
     self.bus = bus
-    self.pool = pool
+    self.worker = worker
     self.model = model if model is not None else Model()
     self.store = store if store is not None else Store()
-    self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
+    self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.done = False
     self.draining = False
-    self.turn = GpuTurn(bus, pool, bool(GPU))
+    self.turn = GpuTurn(bus, worker, bool(GPU))
 
   async def serve(self) -> None:
     await self.own()
     renewing = asyncio.create_task(self.keep())
     try:
-      await self.fail_stranded(0)  # anything in flight now was taken by a trainer that died or lost the pool
+      await self.fail_stranded(0)  # anything in flight now was taken by a trainer that died or lost the worker
       while not self.done:
         await self.step()
         await self.fail_stranded(STRANDED_MS)
@@ -485,44 +485,44 @@ class Trainer:
       await self.leave()
 
   async def leave(self) -> None:
-    """Hand the GPU back with nothing of ours left on it, then the pool to its next trainer."""
+    """Hand the GPU back with nothing of ours left on it, then the worker to its next trainer."""
     if self.turn.held and self.turn.shared:
       await asyncio.to_thread(self.model.park)
     await self.turn.give_back()
-    await self.bus.release(self.pool, self.worker)
+    await self.bus.release(self.worker, self.owner)
 
   async def own(self) -> None:
-    """Wait until this trainer owns its pool. Only the owner's replies land, see Bus.finish."""
-    while not await self.bus.own(self.pool, self.worker):
+    """Wait until this trainer owns its worker. Only the owner's replies land, see Bus.finish."""
+    while not await self.bus.own(self.worker, self.owner):
       await asyncio.sleep(LEASE_MS / 4000)
 
   async def keep(self) -> None:
-    """Renew the pool's lease until another trainer has it."""
+    """Renew the worker's lease until another trainer has it."""
     while True:  # until serve() cancels it, so the lease holds while a stopping trainer saves its runs
       await asyncio.sleep(LEASE_MS / 4000)
-      if not await self.bus.renew(self.pool, self.worker) and not await self.reown():
+      if not await self.bus.renew(self.worker, self.owner) and not await self.reown():
         self.done = True
         return
 
   async def reown(self) -> bool:
-    """Take the pool's lease again if it ran out with nobody taking it, as it does while Redis restarts. Not if another
-    trainer has parked one of this trainer's runs since, which it only does after serving the pool."""
-    if not await self.bus.own(self.pool, self.worker):
+    """Take the worker's lease again if it ran out with nobody taking it, as it does while Redis restarts. Not if
+    another trainer has parked one of this trainer's runs since, which it only does after serving the worker."""
+    if not await self.bus.own(self.worker, self.owner):
       return False
     if any([await self.bus.parked(run) for run in self.model.params]):
-      await self.bus.release(self.pool, self.worker)
+      await self.bus.release(self.worker, self.owner)
       return False
     return True
 
   def stop(self) -> None:
-    """Finish the batch in hand, save every run for the pool's next trainer, and exit. SIGTERM calls it."""
+    """Finish the batch in hand, save every run for the worker's next trainer, and exit. SIGTERM calls it."""
     self.done = self.draining = True
 
   async def drain(self) -> None:
     for run in list(self.model.params):
       uri = f"tinker://{run}/parked/{time.time_ns()}"
       await asyncio.to_thread(self.store.put, uri, *self.model.state(run))
-      await self.bus.park(run, uri, self.pool, self.worker)
+      await self.bus.park(run, uri, self.worker, self.owner)
 
   async def recover(self, cmd: Cmd) -> None:
     """Bring back a run this trainer doesn't hold: from the state its last trainer saved when it stopped, or empty, for
@@ -536,7 +536,7 @@ class Trainer:
     if uri:
       tensors, meta = await asyncio.to_thread(self.store.get, uri)
       await asyncio.to_thread(self.model.restore, cmd.run, tensors, meta, True)
-      await self.bus.park(cmd.run, None, self.pool, self.worker)
+      await self.bus.park(cmd.run, None, self.worker, self.owner)
 
   async def answer(self, cmd: Cmd) -> Reply:
     try:
@@ -547,16 +547,16 @@ class Trainer:
     return await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
 
   async def fail_stranded(self, min_idle_ms: int) -> None:
-    for cmd in await self.bus.reclaim(self.pool, self.worker, min_idle_ms):
-      reply = fail(RuntimeError(f"its trainer died, or lost the pool, during {cmd.op}"))
-      await self.bus.finish(cmd, reply, self.pool, self.worker)
+    for cmd in await self.bus.reclaim(self.worker, self.owner, min_idle_ms):
+      reply = fail(RuntimeError(f"its trainer died, or lost the worker, during {cmd.op}"))
+      await self.bus.finish(cmd, reply, self.worker, self.owner)
 
   async def step(self, count: int = 16, block_ms: int = 1000) -> int:
-    """Take the next commands from the pool and run them. Returns how many there were."""
+    """Take the next commands from the worker and run them. Returns how many there were."""
     if self.done:
       return 0
     take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
-    cmds = await self.bus.take(self.pool, self.worker, count, take_block)
+    cmds = await self.bus.take(self.worker, self.owner, count, take_block)
     if not cmds:
       await self.turn.went_idle()
       await self.yield_gpu()
@@ -570,27 +570,27 @@ class Trainer:
       while queue:
         cmd = queue.popleft()
         start = time.time()
-        first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
+        first = await self.bus.first_reply(cmd)  # no lock needed, the worker's owner is the only writer of its seq keys
         reply = first or await self.answer(cmd)
         ms = (time.time() - start) * 1000
         ops.append([cmd.op, ms])
-        if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
-          self.done = True  # another trainer owns the pool now
+        if not await self.bus.finish(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
+          self.done = True  # another trainer owns the worker now
           break
 
         if cmd.op == Op.DELETE_MODEL and reply.ok:
-          await self.bus.drop(cmd.run, self.pool)
+          await self.bus.drop(cmd.run, self.worker)
           self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
 
         if DEBUG:
           error = "" if reply.ok else f"  {reply.body.decode()}"
-          print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
+          print(f"{self.worker} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
 
         processed += 1
         if self.model.lora and queue and (cmd.op == Op.OPTIM_STEP or queue[0].run != cmd.run):
           if cmd.op == Op.OPTIM_STEP:
             await asyncio.sleep(0.015)
-          more = await self.bus.take(self.pool, self.worker, count, 0)
+          more = await self.bus.take(self.worker, self.owner, count, 0)
           enqueue_cmds(queue, more, True)
       await self.turn.batch_done(queued=len(queue), seconds=time.time() - batch_start, ops=ops)
     return processed
@@ -648,8 +648,8 @@ class Trainer:
       return fail(e)
 
 
-async def main(pool: str) -> None:
-  trainer = Trainer(Bus(), pool)
+async def main(worker: str) -> None:
+  trainer = Trainer(Bus(), worker)
   asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, trainer.stop)
   await trainer.serve()
 

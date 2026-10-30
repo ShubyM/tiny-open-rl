@@ -6,13 +6,13 @@ from tinyrl.turns import GpuTurn
 
 
 class TestScheduler(RedisTest):
-  async def start(self, *pools: str, quantum: float = 30.0) -> asyncio.Task:
-    await self.running({pool: [0] for pool in pools})
+  async def start(self, *workers: str, quantum: float = 30.0) -> asyncio.Task:
+    await self.running({worker: [0] for worker in workers})
     return asyncio.create_task(scheduler.run(self.bus, quantum))
 
   async def decisions(self) -> list[tuple[str, str, str]]:
     return [
-      (e.kind, e.body["pool"], e.body["rule"]) for e in await self.bus.events() if e.kind in ("granted", "revoked")
+      (e.kind, e.body["worker"], e.body["rule"]) for e in await self.bus.events() if e.kind in ("granted", "revoked")
     ]
 
   async def test_a_worker_gets_its_turn_from_the_log_and_gives_it_back_when_revoked(self):
@@ -45,7 +45,7 @@ class TestScheduler(RedisTest):
     task = await self.start("a", "b")
     a = GpuTurn(self.bus, "a", shared=True)
     self.assertTrue(await asyncio.wait_for(a.take(1), 5))
-    await self.bus.emit("wants_gpu", pool="b", queued=1)
+    await self.bus.emit("wants_gpu", worker="b", queued=1)
     task.cancel()
     task = asyncio.create_task(scheduler.run(self.bus))
     await asyncio.sleep(0.5)
@@ -57,7 +57,7 @@ class TestScheduler(RedisTest):
     a = GpuTurn(self.bus, "a", shared=True)
     try:
       self.assertTrue(await asyncio.wait_for(a.take(1), 5))
-      await self.bus.emit("wants_gpu", pool="b", queued=1)
+      await self.bus.emit("wants_gpu", worker="b", queued=1)
       await asyncio.sleep(0.5)
       self.assertTrue(await a.revoked())
       self.assertEqual(

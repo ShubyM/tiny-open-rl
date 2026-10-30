@@ -16,13 +16,13 @@ LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
 class TestTakingTurns(RedisTest):
-  """Two trainers whose pools the node daemon put on one GPU: the scheduler decides whose turn it is."""
+  """Two trainers whose workers the node daemon put on one GPU: the scheduler decides whose turn it is."""
 
-  async def trainer(self, pool: str) -> tuple[Trainer, str]:
-    t = Trainer(self.bus, pool, Model(tiny), worker=pool)
+  async def trainer(self, worker: str) -> tuple[Trainer, str]:
+    t = Trainer(self.bus, worker, Model(tiny), owner=worker)
     await t.own()
     run = new_id()
-    await self.bus.create(Run(run, pool, "tiny", 4))
+    await self.bus.create(Run(run, worker, "tiny", 4))
     await self.submit(run, Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA})
     return t, run
 
@@ -34,7 +34,7 @@ class TestTakingTurns(RedisTest):
       await t.step(block_ms=10)
       if not t.turn.held:
         return
-    self.fail(f"{t.pool} kept its GPU")
+    self.fail(f"{t.worker} kept its GPU")
 
   async def test_an_idle_trainer_yields_its_gpu_to_one_that_waits(self):
     with patch.object(trainer, "GPU", "node-a:0"):
@@ -90,7 +90,7 @@ class TestTakingTurns(RedisTest):
   async def test_a_trainer_that_exits_gives_its_turn_to_the_next(self):
     with patch.object(trainer, "GPU", "node-a:0"):
       await self.run_scheduler({"a": [0], "b": [0]})
-      t = Trainer(self.bus, "a", Model(tiny), worker="a")
+      t = Trainer(self.bus, "a", Model(tiny), owner="a")
       run = new_id()
       await self.bus.create(Run(run, "a", "tiny", 0))
       await self.submit(run, Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}})
