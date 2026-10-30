@@ -22,7 +22,9 @@ from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
 
 GPUS = getenv("GPUS", 1)
-DRAIN_S = getenv("DRAIN_S", 20.0)  # how long a stopping node daemon waits for its trainers to save their runs
+DRAIN_S = getenv(
+  "DRAIN_S", 20.0
+)  # how long a stopping node daemon waits for its processes, so trainers save their runs
 TICK = getenv("TICK", 0.25)
 
 
@@ -48,7 +50,7 @@ class NodeDaemon:
   def __init__(self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None):
     self.bus = bus
     self.gpus = gpus
-    self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # worker -> (its GPUs, process)
+    self.procs: dict[str, tuple[list[int], subprocess.Popen]] = {}  # worker -> (its GPUs, its process)
     self.stopping: dict[str, subprocess.Popen] = {}  # told to stop, and maybe still on its GPUs
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
@@ -67,16 +69,16 @@ class NodeDaemon:
         self.state = scheduler.fold(self.state, e)
       self.after = events[-1].id
     mine = {n: p for n, p in self.state.workers.items() if p.node == self.id and scheduler.members(self.state, n)}
-    for worker, (gpus, proc) in list(self.trainers.items()):
+    for worker, (gpus, proc) in list(self.procs.items()):
       if proc.poll() is not None or worker not in mine or list(mine[worker].gpus) != gpus:
         proc.terminate()
-        self.stopping[worker] = self.trainers.pop(worker)[1]
+        self.stopping[worker] = self.procs.pop(worker)[1]
     for worker, proc in list(self.stopping.items()):
       if proc.poll() is not None:  # only now is the GPU free, so only now does its turn end
         del self.stopping[worker]
         await self.bus.emit("exited", worker=worker)
-    for worker in sorted(set(mine) - set(self.trainers) - set(self.stopping)):
-      self.trainers[worker] = self.start(worker, mine[worker])
+    for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
+      self.procs[worker] = self.start(worker, mine[worker])
       await self.bus.emit("started", worker=worker, node=self.id)
 
   def start(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
@@ -100,14 +102,14 @@ class NodeDaemon:
         await self.tick()
         await asyncio.sleep(TICK)
     finally:
-      for _, proc in self.trainers.values():
+      for _, proc in self.procs.values():
         proc.terminate()  # a trainer saves its runs, then exits
       deadline = time.monotonic() + DRAIN_S
-      for _, proc in self.trainers.values():
+      for _, proc in self.procs.values():
         with contextlib.suppress(subprocess.TimeoutExpired):
           proc.wait(max(0.0, deadline - time.monotonic()))
 
 
 if __name__ == "__main__":
-  signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so serve's finally stops the trainers
+  signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so serve's finally stops its processes
   asyncio.run(NodeDaemon(Bus()).serve())

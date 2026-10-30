@@ -26,7 +26,7 @@ class TestLease(RedisTest):
     request_id = await self.bus.submit(run, op, json.dumps(body).encode())
     return await self.bus.result(request_id, 60)
 
-  async def test_a_paused_trainer_cannot_answer_once_another_owns_its_pool(self):
+  async def test_a_paused_trainer_cannot_answer_once_another_owns_its_worker(self):
     base = f"{tempfile.mkdtemp()}/tiny"
     tiny().save_pretrained(base)
     worker, run = f"lora:{base}", new_id()

@@ -16,7 +16,7 @@ LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
 class TestNodeDaemon(RedisTest):
-  async def test_the_node_daemon_starts_a_trainer_for_a_pool_with_runs_and_again_when_it_dies(self):
+  async def test_the_node_daemon_starts_a_trainer_for_a_worker_with_runs_and_again_when_it_dies(self):
     base = f"{tempfile.mkdtemp()}/tiny"
     tiny().save_pretrained(base)
     worker, run = f"lora:{base}", new_id()
@@ -29,30 +29,30 @@ class TestNodeDaemon(RedisTest):
       await daemon.up()
       scheduling = asyncio.create_task(scheduler.run(self.bus))  # it places the worker and grants GPU turns
       try:
-        await self.until(lambda: daemon.trainers, daemon)
-        self.assertEqual(list(daemon.trainers), [worker])  # not the worker whose runs are all gone
+        await self.until(lambda: daemon.procs, daemon)
+        self.assertEqual(list(daemon.procs), [worker])  # not the worker whose runs are all gone
         request_id = await self.bus.submit(
           run, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
         )
         self.assertTrue((await self.bus.result(request_id, 60)).ok)
 
-        gpu, first = daemon.trainers[worker]
+        gpu, first = daemon.procs[worker]
         await daemon.tick()
-        self.assertIs(daemon.trainers[worker][1], first)  # one trainer per worker
+        self.assertIs(daemon.procs[worker][1], first)  # one trainer per worker
 
         first.kill()
         await asyncio.to_thread(first.wait)
         while await self.bus.owner(worker):  # its lease runs out
           await asyncio.sleep(0.1)
         await daemon.tick()
-        self.assertIsNot(daemon.trainers[worker][1], first)
+        self.assertIsNot(daemon.procs[worker][1], first)
         request_id = await self.bus.submit(
           run, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
         )
         self.assertTrue((await self.bus.result(request_id, 60)).ok)
       finally:
         scheduling.cancel()
-        for _, proc in daemon.trainers.values():
+        for _, proc in daemon.procs.values():
           proc.terminate()
           proc.wait()
 
@@ -67,7 +67,7 @@ class TestNodeDaemon(RedisTest):
     self.fail("never happened")
 
   @patch("tinyrl.bus.NODE_MS", 600)
-  async def test_pools_spread_over_nodes_and_move_off_a_dead_one(self):
+  async def test_workers_spread_over_nodes_and_move_off_a_dead_one(self):
     for run in ("r1", "r2"):
       await self.bus.create(Run(run, f"worker-{run}", "base", 4))
     a, b = NodeDaemon(self.bus, gpus=1, node="a"), NodeDaemon(self.bus, gpus=1, node="b")
@@ -76,13 +76,13 @@ class TestNodeDaemon(RedisTest):
     scheduling = asyncio.create_task(scheduler.run(self.bus))
     try:
       with patch("subprocess.Popen", side_effect=lambda *_, **__: MagicMock(**{"poll.return_value": None})):
-        await self.until(lambda: len(a.trainers) == len(b.trainers) == 1, a, b)  # one worker on each node
+        await self.until(lambda: len(a.procs) == len(b.procs) == 1, a, b)  # one worker on each node
 
-        await self.until(lambda: sorted(b.trainers) == ["worker-r1", "worker-r2"], b)  # a stops ticking, so it dies
+        await self.until(lambda: sorted(b.procs) == ["worker-r1", "worker-r2"], b)  # a stops ticking, so it dies
 
-        proc = b.trainers["worker-r1"][1]
+        proc = b.procs["worker-r1"][1]
         await self.bus.drop("r1", "worker-r1")
-        await self.until(lambda: sorted(b.trainers) == ["worker-r2"], b)  # an empty worker's process is stopped
+        await self.until(lambda: sorted(b.procs) == ["worker-r2"], b)  # an empty worker's process is stopped
         proc.terminate.assert_called()
     finally:
       scheduling.cancel()
@@ -94,7 +94,7 @@ class TestNodeDaemon(RedisTest):
     scheduling = asyncio.create_task(scheduler.run(self.bus))
     try:
       with patch("subprocess.Popen", return_value=proc):
-        await self.until(lambda: daemon.trainers, daemon)
+        await self.until(lambda: daemon.procs, daemon)
         await self.bus.drop("ra", "a")
         await self.until(lambda: proc.terminate.called, daemon)
         for _ in range(5):

@@ -177,7 +177,7 @@ class TestAPI(RedisTest):
       pending = await self.post("retrieve_future", json={"request_id": f"{run_id}/1-0"})
       self.assertEqual(pending.json()["type"], "try_again")
 
-  async def test_pools(self):
+  async def test_workers(self):
     shared, also_shared = await self.create_model(), await self.create_model()
     full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
     exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})

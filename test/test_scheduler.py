@@ -78,7 +78,7 @@ MIB = 2**20
 
 
 class TestPlacement(unittest.TestCase):
-  def test_a_pool_with_runs_is_placed_and_an_emptied_one_unplaced(self):
+  def test_a_worker_with_runs_is_placed_and_an_emptied_one_unplaced(self):
     log = Log(self)
     log.node(8)
     self.assertEqual(log("run_created", run="r1", worker="lora:a:0"), [("placed", "lora:a:0", PLACED)])
@@ -96,7 +96,7 @@ class TestPlacement(unittest.TestCase):
       log("run_deleted", run="r", worker="r"), [("unplaced", "r", EMPTIED), ("unplaced", "sampler:fft:r", EMPTIED)]
     )
 
-  def test_pools_go_to_the_node_with_the_fewest_pools_per_gpu(self):
+  def test_workers_go_to_the_node_with_the_fewest_workers_per_gpu(self):
     log = Log(self)
     log.node(1, node="a")
     log.node(2, node="b")
@@ -104,7 +104,7 @@ class TestPlacement(unittest.TestCase):
       log("run_created", run=run, worker=run)
     self.assertEqual([log.s.workers[run].node for run in ("r1", "r2", "r3")], ["a", "b", "b"])
 
-  def test_a_lost_node_s_pools_move_to_a_live_one(self):
+  def test_a_lost_node_s_workers_move_to_a_live_one(self):
     log = Log(self)
     log.node(1, node="a")
     log("run_created", run="r", worker="r")
@@ -113,7 +113,7 @@ class TestPlacement(unittest.TestCase):
     self.assertEqual(log("node_lost", node="a"), [("placed", "r", PLACED)])
     self.assertEqual((log.s.workers["r"].node, log.s.workers["r"].on), ("b", ()))
 
-  def test_each_pool_gets_an_empty_gpu_while_there_is_one(self):
+  def test_each_worker_gets_an_empty_gpu_while_there_is_one(self):
     log = Log(self)
     log.node(8)
     for name in ("lora:a:0", "lora:b:0", "lora:c:0"):
@@ -163,7 +163,7 @@ class TestTurns(unittest.TestCase):
       order += [worker for kind, worker, _ in log("released", worker=order[-1]) if kind == "granted"]
     self.assertEqual(order, ["a", "c", "b"])
 
-  def test_one_pass_never_grants_two_pools_that_do_not_fit(self):
+  def test_one_pass_never_grants_two_workers_that_do_not_fit(self):
     log = self.one_gpu("a", "b")
     log.append("wants_gpu", {"worker": "a"})
     log.append("wants_gpu", {"worker": "b"})
@@ -197,7 +197,7 @@ class TestTurns(unittest.TestCase):
     self.assertEqual(log.tick(at=64.9), [])
     self.assertEqual(log.tick(at=65), [("revoked", "a", QUANTUM)])
 
-  def test_pools_that_fit_together_hold_a_gpu_at_once_and_the_rest_take_turns(self):
+  def test_workers_that_fit_together_hold_a_gpu_at_once_and_the_rest_take_turns(self):
     log = Log(self)
     log.node(1, memory=80 * GIB)
     for name in ("sampler:fft:a", "sampler:fft:b", "t"):  # shared full fine-tune samplers each get 0.42 of a GPU
@@ -210,7 +210,7 @@ class TestTurns(unittest.TestCase):
     self.assertEqual(log("idle", at=7, worker="sampler:fft:b"), [("revoked", "sampler:fft:b", IDLE)])
     self.assertEqual(log("released", at=8, worker="sampler:fft:b"), [("granted", "t", GRANTED)])
 
-  def test_a_wide_pool_is_granted_only_with_every_gpu(self):
+  def test_a_wide_worker_is_granted_only_with_every_gpu(self):
     log = Log(self)
     log.node(2)
     log.worker("w", gpus=(0, 1))
@@ -228,7 +228,7 @@ class TestTurns(unittest.TestCase):
     log.worker("a")
     self.assertEqual(log("wants_gpu", worker="a"), [])
 
-  def test_an_unplaced_pool_keeps_its_turn_until_its_process_exits(self):
+  def test_an_unplaced_worker_keeps_its_turn_until_its_process_exits(self):
     log = self.one_gpu("a", "b")
     log("wants_gpu", worker="a")
     log("wants_gpu", worker="b")
@@ -236,7 +236,7 @@ class TestTurns(unittest.TestCase):
     self.assertEqual(log("exited", worker="a"), [("granted", "b", GRANTED)])
     self.assertNotIn("a", log.s.workers)
 
-  def test_a_moved_pool_keeps_its_old_gpus_until_its_process_exits(self):
+  def test_a_moved_worker_keeps_its_old_gpus_until_its_process_exits(self):
     log = Log(self)
     log.node(2)
     log.worker("a", gpus=(0,))
@@ -335,7 +335,7 @@ class TestLog(unittest.TestCase):
       self.assertLessEqual(granted[name] - asked[name], (place + 1) * 32.0, name)
 
 
-class TestPoolsAndGpus(unittest.TestCase):
+class TestWorkersAndGpus(unittest.TestCase):
   def test_a_trainer_takes_turns_with_the_least_busy_trainers(self):
     log = Log(self)
     log.node(2)
@@ -356,7 +356,7 @@ class TestPoolsAndGpus(unittest.TestCase):
     self.assertEqual(log.s.workers["light"].gpus, log.s.workers["busy"].gpus)
     self.assertNotEqual(log.s.workers["sampler:b"].gpus, log.s.workers["busy"].gpus)
 
-  def test_a_pool_with_a_memory_budget_fills_a_gpu_it_fits_on_before_an_empty_one(self):
+  def test_a_worker_with_a_memory_budget_fills_a_gpu_it_fits_on_before_an_empty_one(self):
     log = Log(self)
     log.node(2, memory=80 * GIB)
     log("run_created", run="t", worker="t")
@@ -366,7 +366,7 @@ class TestPoolsAndGpus(unittest.TestCase):
     log("sampler_warmed", worker="sampler:fft:b")
     self.assertEqual(log.s.workers["sampler:fft:b"].gpus, log.s.workers["sampler:fft:a"].gpus)
 
-  def test_no_pool_fits_next_to_an_exclusive_one_whatever_their_budgets(self):
+  def test_no_worker_fits_next_to_an_exclusive_one_whatever_their_budgets(self):
     log = Log(self)
     log.node(2, memory=80 * GIB)
     log.append("run_created", {"run": "x", "worker": "x", "exclusive": True})
@@ -392,7 +392,7 @@ class TestPoolsAndGpus(unittest.TestCase):
     log("sampler_warmed", worker="sampler:s")
     self.assertEqual((log.s.workers["sampler:s"].gpus, log.s.workers["lora:a"].gpus), ((1,), (0,)))
 
-  def test_an_exclusive_pool_gets_a_gpu_to_itself_and_others_stay_off_it(self):
+  def test_an_exclusive_worker_gets_a_gpu_to_itself_and_others_stay_off_it(self):
     log = Log(self)
     log.node(2)
     log("run_created", run="x", worker="x", exclusive=True)
@@ -432,7 +432,7 @@ class TestPoolsAndGpus(unittest.TestCase):
           self.assertIn(mine.body["gpu_rule"], ("empty_gpu", "fits_next_to_others"), name)
 
 
-def pools_after(*runs: dict) -> dict[str, str]:
+def workers_after(*runs: dict) -> dict[str, str]:
   """Each run's worker once the scheduler has decided, for runs created with these requirements."""
   s, n = State(), 0
   for r in runs:
@@ -444,8 +444,8 @@ def pools_after(*runs: dict) -> dict[str, str]:
 
 
 class TestChooseWorker(unittest.TestCase):
-  def test_lora_runs_of_one_base_share_a_pool_and_full_or_exclusive_runs_get_their_own(self):
-    worker = pools_after(
+  def test_lora_runs_of_one_base_share_a_worker_and_full_or_exclusive_runs_get_their_own(self):
+    worker = workers_after(
       {"run": "A"}, {"run": "B"}, {"run": "C", "base": "b"}, {"run": "F", "rank": 0}, {"run": "X", "exclusive": True}
     )
     self.assertEqual(worker["A"], worker["B"])
@@ -453,7 +453,7 @@ class TestChooseWorker(unittest.TestCase):
 
   def test_sampling_sessions_share_their_base_and_kinds_sampler(self):
     sampler = {"role": "sampler", "rank": 1}
-    worker = pools_after(
+    worker = workers_after(
       sampler | {"run": "s1", "train_run": "A"},
       sampler | {"run": "s2", "train_run": "B"},
       sampler | {"run": "f", "rank": 0, "train_run": "A"},

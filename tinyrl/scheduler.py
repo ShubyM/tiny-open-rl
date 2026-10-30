@@ -31,7 +31,7 @@ def choose_worker(s: State, run: Run) -> str | None:
   k = run.kind
   if k.role == "trainer" and (not k.lora or k.exclusive):
     return None
-  return next((name for name, p in s.workers.items() if p.kind == k), None)
+  return next((name for name, w in s.workers.items() if w.kind == k), None)
 
 
 def settings(k: Kind, gpus: int, gpu_bytes: int) -> dict[str, str]:
@@ -114,22 +114,22 @@ class State:
   runs: dict[str, Run] = field(default_factory=dict)
 
 
-def keys(p: Worker) -> tuple[Key, ...]:
-  return p.on
+def keys(w: Worker) -> tuple[Key, ...]:
+  return w.on
 
 
 def holders(s: State, k: Key) -> list[str]:
-  return sorted(name for name, p in s.workers.items() if p.since is not None and k in keys(p))
+  return sorted(name for name, w in s.workers.items() if w.since is not None and k in keys(w))
 
 
 def first_in_line(s: State, k: Key) -> str | None:
-  waiting = [(p.asked, name) for name, p in s.workers.items() if p.asked and k in keys(p)]
+  waiting = [(w.asked, name) for name, w in s.workers.items() if w.asked and k in keys(w)]
   return min(waiting)[1] if waiting else None
 
 
-def uses(s: State, p: Worker) -> int:
+def uses(s: State, w: Worker) -> int:
   """The budget of the process running now, from the node it runs on, which a moved worker's new node may not be."""
-  return budget(s, p.kind, p.on[0][0]) if p.on else 0
+  return budget(s, w.kind, w.on[0][0]) if w.on else 0
 
 
 def fits(s: State, k: Key, name: str) -> bool:
@@ -147,9 +147,9 @@ def members(s: State, worker: str) -> list[str]:
   return [r for r, x in s.runs.items() if x.worker == worker]
 
 
-def stop(p: Worker) -> None:
+def stop(w: Worker) -> None:
   """Its process is gone, and its turn with it."""
-  p.on, p.asked, p.since, p.revoked, p.idle = (), 0, None, False, False
+  w.on, w.asked, w.since, w.revoked, w.idle = (), 0, None, False, False
 
 
 # ***** fold *****
@@ -160,7 +160,7 @@ def fold(state: State, e: Event) -> State:
   s = copy.deepcopy(state)
   s.n += 1
   b = e.body
-  p = s.workers.get(b.get("worker", ""))
+  w = s.workers.get(b.get("worker", ""))
   match e.kind:
     case "run_created":
       exclusive = b.get("exclusive", False)
@@ -180,42 +180,42 @@ def fold(state: State, e: Event) -> State:
       s.runs = {r: x for r, x in s.runs.items() if r != b["run"] and x.kind.train_run != b["run"]}
     case "node_up":  # a node daemon (re)started, and its processes died with the old one
       s.nodes[b["node"]] = (b["gpus"], b.get("memory", 0))
-      for q in s.workers.values():
-        if any(node == b["node"] for node, _ in q.on):
-          stop(q)
+      for x in s.workers.values():
+        if any(node == b["node"] for node, _ in x.on):
+          stop(x)
     case "node_lost":
       s.nodes.pop(b["node"], None)
-      for q in s.workers.values():
-        if any(node == b["node"] for node, _ in q.on):
-          stop(q)
-        if q.node == b["node"]:
-          q.node, q.gpus = None, ()
-    case "placed" if p:  # a process still running elsewhere keeps its GPUs and its turn until it exits
-      p.node, p.gpus = b["node"], tuple(b["gpus"])
-    case "unplaced" if p:
-      p.node, p.gpus = None, ()
-    case "started" if p and p.node == b["node"]:
-      stop(p)
-      p.on = tuple((p.node, i) for i in p.gpus)
-    case "exited" if p:
-      stop(p)
-    case "wants_gpu" if p and p.on:
-      p.idle = False
-      if p.since is None and not p.asked:
-        p.asked = s.n
-    case "batch_done" if p:
-      p.idle, p.busy = False, p.busy + b.get("seconds", 0.0)
-      if p.since is not None:
-        p.since += b.get("boot", 0.0)
-    case "idle" if p:
-      p.idle = True
-    case "released" if p:
-      p.since, p.revoked = None, False
-    case "granted" if p:
-      p.asked, p.since = 0, e.t
-    case "revoked" if p:
-      p.revoked = True
-  s.workers = {name: q for name, q in s.workers.items() if q.node or q.on or members(s, name)}
+      for x in s.workers.values():
+        if any(node == b["node"] for node, _ in x.on):
+          stop(x)
+        if x.node == b["node"]:
+          x.node, x.gpus = None, ()
+    case "placed" if w:  # a process still running elsewhere keeps its GPUs and its turn until it exits
+      w.node, w.gpus = b["node"], tuple(b["gpus"])
+    case "unplaced" if w:
+      w.node, w.gpus = None, ()
+    case "started" if w and w.node == b["node"]:
+      stop(w)
+      w.on = tuple((w.node, i) for i in w.gpus)
+    case "exited" if w:
+      stop(w)
+    case "wants_gpu" if w and w.on:
+      w.idle = False
+      if w.since is None and not w.asked:
+        w.asked = s.n
+    case "batch_done" if w:
+      w.idle, w.busy = False, w.busy + b.get("seconds", 0.0)
+      if w.since is not None:
+        w.since += b.get("boot", 0.0)
+    case "idle" if w:
+      w.idle = True
+    case "released" if w:
+      w.since, w.revoked = None, False
+    case "granted" if w:
+      w.asked, w.since = 0, e.t
+    case "revoked" if w:
+      w.revoked = True
+  s.workers = {name: x for name, x in s.workers.items() if x.node or x.on or members(s, name)}
   return s
 
 
@@ -237,21 +237,21 @@ def next_decision(s: State, now: float) -> tuple[str, dict] | None:
   for run_id, r in sorted(s.runs.items()):
     if not r.worker:
       return "assigned", {"run": run_id, "worker": choose_worker(s, r) or f"w{s.n + 1}"}
-  for name, p in sorted(s.workers.items()):
-    if p.node and not members(s, name):
+  for name, w in sorted(s.workers.items()):
+    if w.node and not members(s, name):
       return "unplaced", {"worker": name, "rule": "place.emptied"}
-  unplaced = [name for name, p in s.workers.items() if p.node is None and members(s, name)]
+  unplaced = [name for name, w in s.workers.items() if w.node is None and members(s, name)]
   if unplaced and s.nodes:
     return "placed", place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
-  for _, name in sorted((p.asked, name) for name, p in s.workers.items() if p.asked):
+  for _, name in sorted((w.asked, name) for name, w in s.workers.items() if w.asked):
     if all(first_in_line(s, k) == name and fits(s, k, name) for k in keys(s.workers[name])):
       return "granted", {"worker": name, "rule": "turn.granted"}
-  for name, p in sorted(s.workers.items()):
-    if p.since is None or p.revoked or not any(first_in_line(s, k) for k in keys(p)):
+  for name, w in sorted(s.workers.items()):
+    if w.since is None or w.revoked or not any(first_in_line(s, k) for k in keys(w)):
       continue
-    if p.idle:
+    if w.idle:
       return "revoked", {"worker": name, "rule": "turn.idle_holder_yields"}
-    if now >= p.since + s.quantum:
+    if now >= w.since + s.quantum:
       return "revoked", {"worker": name, "rule": "turn.quantum_expired"}
   return None
 
@@ -259,7 +259,7 @@ def next_decision(s: State, now: float) -> tuple[str, dict] | None:
 def place(s: State, name: str) -> dict:
   """Where a worker goes: the node with the fewest workers per GPU, and the GPU choose picks there. When trainers have
   to move out of the way first, the decision is the move of one of them, and the worker goes once its GPU is clear."""
-  load = {n: sum(p.node == n for p in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items()}
+  load = {n: sum(w.node == n for w in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items()}
   node = min(sorted(load), key=load.get)
   gpu, why, aside = choose(s, node, name)
   if aside:
@@ -275,10 +275,10 @@ def place(s: State, name: str) -> dict:
   return {"worker": name, "node": node, "gpus": [gpu], "rule": "place.least_loaded_node", "gpu_rule": why}
 
 
-def takes_turns(p: Worker) -> bool:
+def takes_turns(w: Worker) -> bool:
   """Whether a worker may share a GPU it doesn't fit on. A trainer parks and resumes in about a second. A sampler wakes
   its engine slowly, and an exclusive worker is alone by definition."""
-  return p.kind.role == "trainer" and not p.kind.exclusive
+  return w.kind.role == "trainer" and not w.kind.exclusive
 
 
 def choose(s: State, node: str, name: str, avoid: int = -1) -> tuple[int, str, list[str]]:
@@ -289,34 +289,34 @@ def choose(s: State, node: str, name: str, avoid: int = -1) -> tuple[int, str, l
   gpus, gpu_bytes = s.nodes[node]
   me, memory = s.workers[name], budget(s, s.workers[name].kind, node)
   there = {
-    g: [(q, p) for q, p in s.workers.items() if q != name and p.node == node and g in p.gpus] for g in range(gpus)
+    g: [(n, w) for n, w in s.workers.items() if n != name and w.node == node and g in w.gpus] for g in range(gpus)
   }
 
   def fits_on(g: int) -> bool:
-    others = [p for _, p in there[g]]
+    others = [w for _, w in there[g]]
     if not others:
       return True
     return (
       not me.kind.exclusive
-      and not any(p.kind.exclusive for p in others)
-      and fit([budget(s, p.kind, node) for p in others] + [memory], gpu_bytes)
+      and not any(w.kind.exclusive for w in others)
+      and fit([budget(s, w.kind, node) for w in others] + [memory], gpu_bytes)
     )
 
   def trainers_only(g: int) -> bool:
-    return bool(there[g]) and all(takes_turns(p) for q, p in there[g])
+    return bool(there[g]) and all(takes_turns(w) for _, w in there[g])
 
   options = [g for g in range(gpus) if g != avoid]
   if fitting := [g for g in options if fits_on(g)]:
     g = min(fitting, key=lambda g: (bool(there[g]) != bool(memory), g))
     return g, "fits_next_to_others" if there[g] else "empty_gpu", []
-  busy = {g: sum(p.busy for _, p in there[g]) for g in options}
+  busy = {g: sum(w.busy for _, w in there[g]) for g in options}
   if takes_turns(me) or len(options) == 1:  # with one GPU there is nowhere to move to
     g = min(options, key=lambda g: (not trainers_only(g), busy[g], g))
     return g, "takes_turns", []
   # as few moves as it can, LoRA trainers first, since a full fine-tune saves its weights and AdamW state far slower
-  lora = {g: all(p.kind.lora for _, p in there[g]) for g in options}
+  lora = {g: all(w.kind.lora for _, w in there[g]) for g in options}
   g = min(options, key=lambda g: (not trainers_only(g), len(there[g]), not lora[g], busy[g], g))
-  return (g, "moves_trainers_aside", sorted(q for q, _ in there[g])) if trainers_only(g) else (g, "takes_turns", [])
+  return (g, "moves_trainers_aside", sorted(n for n, _ in there[g])) if trainers_only(g) else (g, "takes_turns", [])
 
 
 # ***** the loop *****

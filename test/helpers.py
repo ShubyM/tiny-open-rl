@@ -84,12 +84,12 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
   async def running(self, placed: dict[str, list[int]]) -> None:
     """Node n is up with these workers placed on these GPUs and their processes started, each kept by a held run."""
-    gpus = 1 + max(i for pool_gpus in placed.values() for i in pool_gpus)
+    gpus = 1 + max(i for worker_gpus in placed.values() for i in worker_gpus)
     await self.bus.heartbeat("n", gpus)
     await self.bus.emit("node_up", node="n", gpus=gpus, memory=0)
-    for worker, pool_gpus in placed.items():
+    for worker, worker_gpus in placed.items():
       await self.bus.emit("run_created", run=f"{worker}-held", worker=worker)
-      await self.bus.emit("placed", worker=worker, node="n", gpus=pool_gpus, rule="test")
+      await self.bus.emit("placed", worker=worker, node="n", gpus=worker_gpus, rule="test")
       await self.bus.emit("started", worker=worker, node="n")
 
   async def run_scheduler(self, placed: dict[str, list[int]], quantum: float = 30.0) -> None:
