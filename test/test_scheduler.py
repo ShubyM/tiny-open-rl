@@ -483,9 +483,9 @@ class TestPoolsAndGpus(unittest.TestCase):
           samplers = {gpu_of[p] for p in running if parse_pool(p)[0] == "sampler"}
           self.assertTrue(trainers.isdisjoint(samplers))
           for role in ("trainer", "sampler"):
-            z0, z1 = zone(role, gpus)
-            if z1 - z0 >= 3:
-              split = z0 + max(1, 2 * (z1 - z0) // 3)
+            home = zone(role, gpus)
+            if len(home) >= 3:
+              z0, split = home.start, home.start + max(1, 2 * len(home) // 3)
               shared = {p for p in running if parse_pool(p)[0] == role and parse_pool(p)[1]}
               timesliced = {p for p in running if parse_pool(p)[0] == role and not parse_pool(p)[1]}
               if len(shared) <= split - z0:

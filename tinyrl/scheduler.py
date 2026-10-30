@@ -85,11 +85,28 @@ def start_order(pools: Iterable[str], exclusive: set[str] = frozenset()) -> list
   )
 
 
-def zone(role: str, gpus: int) -> tuple[int, int]:
-  """The GPUs a role prefers on a node: trainers the lower half, samplers the upper half, both the one GPU of a 1-GPU
-  node."""
+def zone(role: str, gpus: int) -> range:
+  """The GPUs a role keeps to, since trainers and samplers are busy at once: trainers the lower half, samplers the upper
+  half, both the one GPU of a 1-GPU node."""
   half = gpus // 2
-  return (0, gpus) if half == 0 else (0, half) if role == "trainer" else (half, gpus)
+  return range(gpus) if half == 0 else range(half) if role == "trainer" else range(half, gpus)
+
+
+def lanes(zone: range, shared: bool, exclusive: bool, exclusives: int) -> tuple[range, range]:
+  """The GPUs a pool prefers within its role's zone, and the reserve at the top of the zone kept for exclusive pools.
+  Pools that serve many runs get the bottom, pools that serve one run the middle, exclusive pools the reserve. Zones of
+  two and three GPUs split by hand."""
+  lo, hi, n = zone.start, zone.stop, len(zone)
+  if n == 1:
+    return zone, range(hi, hi)
+  if n <= 3:
+    reserve = range(hi - 1, hi) if exclusives else range(hi, hi)
+    if n == 2:
+      return (range(lo, lo + 1) if shared and not exclusive else range(lo + 1, hi)), reserve
+    return (range(hi - 1, hi) if exclusive else range(lo, lo + 2) if shared else range(lo + 2, hi)), reserve
+  reserve = range(hi - min(n, max(1, exclusives)), hi)
+  split = lo + max(1, 2 * (n - 1) // 3)
+  return (reserve if exclusive else range(lo, split) if shared else range(split, hi - 1)), reserve
 
 
 def settings(pool: str, gpus: int, gpu_mib: int, exclusive: set[str] = frozenset()) -> dict[str, str]:
@@ -105,50 +122,34 @@ def settings(pool: str, gpus: int, gpu_mib: int, exclusive: set[str] = frozenset
   return env
 
 
-def choose_gpu(
-  pool: str, gpus: int, running: dict[str, tuple[int, ...]], exclusive: set[str] = frozenset()
-) -> tuple[int, str]:
-  """The GPU a pool runs on, given the pools already on the node, and the rule that chose it. Each GPU is ranked by a
-  tuple, most important first: sharing a GPU with this pool's own trainer or sampler, leaving its role's zone, sharing
-  with an exclusive pool, sitting in the exclusive reserve, leaving its subzone, sharing with the other role, sharing
-  with pools that serve many runs, and how many pools it already has."""
-  role, shared, target = parse_pool(pool)
+def choose_gpu(pool: str, gpus: int, running: dict[str, tuple[int, ...]], exclusive: set[str]) -> tuple[int, str]:
+  """The GPU a pool runs on, given the pools already on the node, and the rule that chose it. Each GPU is ranked by
+  what the pool would share it with, most important first."""
+  role, shared, model = parse_pool(pool)
   excl = pool in exclusive
-  z0, z1 = zone(role, gpus)
-  blocks = z1 - z0
-  excl_in_role = sum(1 for p in running if p in exclusive and parse_pool(p)[0] == role) + (excl and pool not in running)
-  if blocks <= 1:
-    reserve, subzone = (z1, z1), (z0, z1)
-  elif blocks <= 3:
-    reserve = (z1 - 1, z1) if excl_in_role else (z1, z1)
-    if blocks == 2:
-      subzone = (z0, z0 + 1) if shared and not excl else (z0 + 1, z1)
-    else:
-      subzone = (z1 - 1, z1) if excl else (z0, z0 + 2) if shared else (z0 + 2, z1)
-  else:
-    reserve = (z1 - min(blocks, max(1, excl_in_role)), z1)
-    shared_end = z0 + max(1, 2 * (z1 - 1 - z0) // 3)
-    subzone = reserve if excl else (z0, shared_end) if shared else (shared_end, z1 - 1)
+  home = zone(role, gpus)
+  exclusives = sum(p in exclusive and parse_pool(p)[0] == role for p in running) + (excl and pool not in running)
+  lane, reserve = lanes(home, shared, excl, exclusives)
 
   def rank(gpu: int) -> tuple:
-    on = [parse_pool(p) + (p,) for p, on_gpus in running.items() if gpu in on_gpus]
+    on = [(*parse_pool(p), p) for p, on_gpus in running.items() if gpu in on_gpus]
     return (
-      sum(r != role and s == shared and t == target for r, s, t, _ in on),
-      not z0 <= gpu < z1,
+      sum(r != role and s == shared and m == model for r, s, m, _ in on),  # its own trainer or sampler, busy with it
+      gpu not in home,
       sum(p in exclusive for *_, p in on),
-      not excl and reserve[0] <= gpu < reserve[1],
-      not subzone[0] <= gpu < subzone[1],
+      not excl and gpu in reserve,
+      gpu not in lane,
       sum(r != role for r, *_ in on),
-      sum(s for _, s, *_ in on),
+      sum(s for _, s, *_ in on),  # pools that serve many runs are always busy
       len(on),
-      -gpu if excl else gpu,
+      -gpu if excl else gpu,  # exclusive pools fill the zone from the top
     )
 
   gpu = min(range(gpus), key=rank)
-  _, out_of_zone, excl_overlap, in_reserve, out_of_subzone, _, _, load, _ = rank(gpu)
-  if excl and reserve[1] > reserve[0] and not out_of_subzone and not excl_overlap:
+  _, out_of_zone, excl_overlap, in_reserve, out_of_lane, _, _, load, _ = rank(gpu)
+  if excl and reserve and not out_of_lane and not excl_overlap:
     return gpu, "reserved_exclusive"
-  if not (in_reserve or out_of_zone or out_of_subzone):
+  if not (in_reserve or out_of_zone or out_of_lane):
     return gpu, "solo_in_zone" if load == 0 else "least_loaded_in_zone" if shared else "timesliced_in_subzone"
   return gpu, "overflow_least_penalty"
 
