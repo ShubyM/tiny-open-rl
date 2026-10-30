@@ -2,7 +2,7 @@ import random
 import unittest
 
 from tinyrl.bus import Event
-from tinyrl.scheduler import QUANTUM, RULES, Pool, State, decide, fold, holders, settings
+from tinyrl.scheduler import QUANTUM, RULES, Kind, State, budget, decide, fold, holders, settings, uses
 
 GIB = 1024**3
 
@@ -13,7 +13,7 @@ def check(s: State) -> list[str]:
   for node, (gpus, gpu) in sorted(s.nodes.items()):
     for k in [(node, i) for i in range(gpus)]:
       held = holders(s, k)
-      memory = [s.pools[n].uses for n in held]
+      memory = [uses(s, s.pools[n]) for n in held]
       if len(held) > 1 and not (gpu and all(memory) and sum(memory) <= gpu):
         bad.append(f"{k} has holders that do not fit together")
   for name, p in sorted(s.pools.items()):
@@ -65,10 +65,10 @@ class Log:
   def node(self, gpus: int, memory: int = 80 * GIB, node: str = "n") -> None:
     self("node_up", node=node, gpus=gpus, memory=memory)
 
-  def pool(self, name: str, gpus: tuple[int, ...] = (0,), memory: int = 0, node: str = "n") -> None:
+  def pool(self, name: str, gpus: tuple[int, ...] = (0,), node: str = "n") -> None:
     """A pool with a run, placed where the test says rather than where decide would, and its process started."""
     self.append("run_created", {"run": f"{name}-run", "pool": name})
-    self.append("placed", {"pool": name, "node": node, "gpus": list(gpus), "memory": memory, "env": {}, "rule": "test"})
+    self.append("placed", {"pool": name, "node": node, "gpus": list(gpus), "rule": "test"})
     self("started", pool=name, node=node)
 
 
@@ -90,7 +90,8 @@ class TestPlacement(unittest.TestCase):
     log = Log(self)
     log.node(8)
     log("run_created", run="r", pool="r")
-    self.assertEqual(log("sampler_warmed", pool="sampler:fft:r", train_run="r"), [("placed", "sampler:fft:r", PLACED)])
+    decided = log("sampler_warmed", pool="sampler:fft:r", train_run="r", exclusive=True)
+    self.assertEqual(decided, [("placed", "sampler:fft:r", PLACED)])
     self.assertEqual(
       log("run_deleted", run="r", pool="r"), [("unplaced", "r", EMPTIED), ("unplaced", "sampler:fft:r", EMPTIED)]
     )
@@ -126,21 +127,21 @@ class TestPlacement(unittest.TestCase):
     log("sampler_warmed", pool="sampler:fft:Gemma")
     log("sampler_warmed", pool="sampler:Qwen")
     log("sampler_warmed", pool="sampler:fft:Llama", exclusive=True)
-    budget = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}
+    shares = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}
     alone = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_KV_BYTES": str(24 * 1024**3)}
-    placed = {name: (p.gpus, p.env) for name, p in log.s.pools.items()}
+    placed = {name: (p.gpus, settings(p.kind, 8, 81559 * MIB)) for name, p in log.s.pools.items()}
     self.assertEqual(
       placed,
       {
-        "sampler:fft:Qwen": ((0,), budget),
-        "sampler:fft:Gemma": ((0,), budget),
+        "sampler:fft:Qwen": ((0,), shares),
+        "sampler:fft:Gemma": ((0,), shares),
         "sampler:Qwen": ((1,), alone),
         "sampler:fft:Llama": ((2,), alone),
       },
     )
-    self.assertEqual(log.s.pools["sampler:fft:Qwen"].memory, int(0.42 * 81559 * MIB))
-    self.assertEqual(settings(Pool("sampler", lora=False), 8, 23034), {"TINYRL_WARM_SAMPLER": "1"})
-    self.assertEqual(settings(Pool("sampler", lora=True), 1, 81559), {"TINYRL_KV_BYTES": str(24 * 1024**3)})
+    self.assertEqual(budget(log.s, log.s.pools["sampler:fft:Qwen"].kind, "n"), int(0.42 * 81559 * MIB))
+    self.assertEqual(settings(Kind("sampler", lora=False), 8, 23034 * MIB), {"TINYRL_WARM_SAMPLER": "1"})
+    self.assertEqual(settings(Kind("sampler", lora=True), 1, 81559 * MIB), {"TINYRL_KV_BYTES": str(24 * 1024**3)})
 
 
 class TestTurns(unittest.TestCase):
@@ -199,15 +200,15 @@ class TestTurns(unittest.TestCase):
   def test_pools_that_fit_together_hold_a_gpu_at_once_and_the_rest_take_turns(self):
     log = Log(self)
     log.node(1, memory=80 * GIB)
-    for name, memory in (("s1", 33 * GIB), ("s2", 33 * GIB), ("t", 50 * GIB)):
-      log.pool(name, memory=memory)
-    self.assertEqual(log("wants_gpu", pool="s1"), [("granted", "s1", GRANTED)])
-    self.assertEqual(log("wants_gpu", pool="s2"), [("granted", "s2", GRANTED)])
+    for name in ("sampler:fft:a", "sampler:fft:b", "t"):  # shared full fine-tune samplers each get 0.42 of a GPU
+      log.pool(name)
+    self.assertEqual(log("wants_gpu", pool="sampler:fft:a"), [("granted", "sampler:fft:a", GRANTED)])
+    self.assertEqual(log("wants_gpu", pool="sampler:fft:b"), [("granted", "sampler:fft:b", GRANTED)])
     self.assertEqual(log("wants_gpu", pool="t"), [])
-    self.assertEqual(log("idle", at=5, pool="s1"), [("revoked", "s1", IDLE)])
-    self.assertEqual(log("released", at=6, pool="s1"), [])  # t still doesn't fit next to s2
-    self.assertEqual(log("idle", at=7, pool="s2"), [("revoked", "s2", IDLE)])
-    self.assertEqual(log("released", at=8, pool="s2"), [("granted", "t", GRANTED)])
+    self.assertEqual(log("idle", at=5, pool="sampler:fft:a"), [("revoked", "sampler:fft:a", IDLE)])
+    self.assertEqual(log("released", at=6, pool="sampler:fft:a"), [])  # t still doesn't fit next to b
+    self.assertEqual(log("idle", at=7, pool="sampler:fft:b"), [("revoked", "sampler:fft:b", IDLE)])
+    self.assertEqual(log("released", at=8, pool="sampler:fft:b"), [("granted", "t", GRANTED)])
 
   def test_a_wide_pool_is_granted_only_with_every_gpu(self):
     log = Log(self)
@@ -242,7 +243,7 @@ class TestTurns(unittest.TestCase):
     log.pool("b", gpus=(0,))
     log("wants_gpu", pool="a")
     log("wants_gpu", pool="b")
-    log.append("placed", {"pool": "a", "node": "n", "gpus": [1], "memory": 0, "env": {}, "rule": "test"})
+    log.append("placed", {"pool": "a", "node": "n", "gpus": [1], "rule": "test"})
     self.assertEqual(log.tick(), [])  # a's process is still on GPU 0
     self.assertEqual(log("exited", pool="a"), [("granted", "b", GRANTED)])
 
@@ -263,14 +264,14 @@ class TestLog(unittest.TestCase):
     nodes = {f"n{i}": rng.choice([1, 2, 4, 8]) for i in range(rng.choice([1, 1, 2, 4]))}
     for node, gpus in nodes.items():
       log.node(gpus, node=node)
-    names = [f"p{i}" for i in range(rng.randint(1, 12))]
+    names = [rng.choice(("p", "sampler:fft:p")) + str(i) for i in range(rng.randint(1, 12))]  # those samplers share
     for _ in range(rng.randint(20, 200)):
       name, roll = rng.choice(names), rng.random()
       if roll < 0.15 and log.s.nodes:
         node = rng.choice(sorted(log.s.nodes))
         width = rng.choice([w for w in (1, 2, 4) if w <= nodes[node]])
         first = rng.randrange(0, nodes[node] - width + 1, width)
-        log.pool(name, range(first, first + width), rng.choice([0, 20, 40, 90]) * GIB, node)
+        log.pool(name, range(first, first + width), node)
       elif roll < 0.4:
         log("wants_gpu", pool=name)
       elif roll < 0.55:
@@ -369,7 +370,7 @@ class TestPoolsAndGpus(unittest.TestCase):
     log = Log(self)
     log.node(2, memory=80 * GIB)
     log.append("run_created", {"run": "x", "pool": "x", "exclusive": True})
-    log.append("placed", {"pool": "x", "node": "n", "gpus": [1], "memory": 30 * GIB, "env": {}, "rule": "test"})
+    log.append("placed", {"pool": "x", "node": "n", "gpus": [1], "rule": "test"})
     log("sampler_warmed", pool="sampler:fft:a")
     self.assertEqual(log.s.pools["sampler:fft:a"].gpus, (0,))
 

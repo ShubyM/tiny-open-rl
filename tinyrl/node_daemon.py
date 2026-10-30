@@ -66,7 +66,7 @@ class NodeDaemon:
       for e in events:
         self.state = scheduler.fold(self.state, e)
       self.after = events[-1].id
-    mine = {name: p for name, p in self.state.pools.items() if p.node == self.id and p.runs}
+    mine = {n: p for n, p in self.state.pools.items() if p.node == self.id and scheduler.members(self.state, n)}
     for pool, (gpus, proc) in list(self.trainers.items()):
       if proc.poll() is not None or pool not in mine or list(mine[pool].gpus) != gpus:
         proc.terminate()
@@ -80,12 +80,15 @@ class NodeDaemon:
       await self.bus.emit("started", pool=pool, node=self.id)
 
   def start(self, pool: str, p: scheduler.Pool) -> tuple[list[int], subprocess.Popen]:
-    """Start a pool's process on the GPUs and with the settings it was placed with. This node's environment wins."""
-    gpus = list(p.gpus)
-    env = {**p.env, **os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
-    env["GPU"] = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
-    env["TINYRL_LORA"], env["TINYRL_BASE"] = str(int(p.lora)), p.base
-    mod = f"tinyrl.{p.role}"
+    """Start a pool's process on its GPUs, with the settings for its kind. This node's environment wins."""
+    gpus, k = list(p.gpus), p.kind
+    env = {**scheduler.settings(k, self.gpus, self.gpu_mib * 2**20), **os.environ}
+    env["CUDA_VISIBLE_DEVICES"], env["GPU"] = (
+      ",".join(map(str, gpus)),
+      ",".join(f"{socket.gethostname()}:{g}" for g in gpus),
+    )
+    env["TINYRL_LORA"], env["TINYRL_BASE"] = str(int(k.lora)), k.base
+    mod = f"tinyrl.{k.role}"
     if mod == "tinyrl.trainer":
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
