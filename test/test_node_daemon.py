@@ -87,6 +87,25 @@ class TestNodeDaemon(RedisTest):
     finally:
       scheduling.cancel()
 
+  async def test_a_stopped_process_keeps_its_turn_until_it_exits(self):
+    await self.bus.create(Run("ra", "a", "base", 4))
+    daemon, proc = NodeDaemon(self.bus, gpus=1, node="n", gpu_mib=0), MagicMock(**{"poll.return_value": None})
+    await daemon.up()
+    scheduling = asyncio.create_task(scheduler.run(self.bus))
+    try:
+      with patch("subprocess.Popen", return_value=proc):
+        await self.until(lambda: daemon.trainers, daemon)
+        await self.bus.drop("ra", "a")
+        await self.until(lambda: proc.terminate.called, daemon)
+        for _ in range(5):
+          await daemon.tick()
+        self.assertNotIn("exited", [e.kind for e in await self.bus.events()])  # it may still be saving on its GPU
+        proc.poll.return_value = 0
+        await daemon.tick()
+        self.assertIn("exited", [e.kind for e in await self.bus.events()])
+    finally:
+      scheduling.cancel()
+
   @patch("tinyrl.node_daemon.subprocess.Popen")
   def test_a_process_starts_on_its_placed_gpus_with_its_placed_settings(self, popen):
     daemon = NodeDaemon(None, gpus=8, node="n")

@@ -49,6 +49,7 @@ class NodeDaemon:
     self.bus = bus
     self.gpus = gpus
     self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # pool -> (its GPUs, process)
+    self.stopping: dict[str, subprocess.Popen] = {}  # told to stop, and maybe still on its GPUs
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.state, self.after = scheduler.State(), "0-0"
@@ -69,9 +70,12 @@ class NodeDaemon:
     for pool, (gpus, proc) in list(self.trainers.items()):
       if proc.poll() is not None or pool not in mine or list(mine[pool].gpus) != gpus:
         proc.terminate()
-        del self.trainers[pool]
+        self.stopping[pool] = self.trainers.pop(pool)[1]
+    for pool, proc in list(self.stopping.items()):
+      if proc.poll() is not None:  # only now is the GPU free, so only now does its turn end
+        del self.stopping[pool]
         await self.bus.emit("exited", pool=pool)
-    for pool in sorted(set(mine) - set(self.trainers)):
+    for pool in sorted(set(mine) - set(self.trainers) - set(self.stopping)):
       self.trainers[pool] = self.start(pool, mine[pool])
       await self.bus.emit("started", pool=pool, node=self.id)
 

@@ -483,8 +483,14 @@ class Trainer:
         await self.drain()
     finally:
       renewing.cancel()
-      await self.turn.give_back()
-      await self.bus.release(self.pool, self.worker)
+      await self.leave()
+
+  async def leave(self) -> None:
+    """Hand the GPU back with nothing of ours left on it, then the pool to its next trainer."""
+    if self.turn.held and self.turn.shared:
+      await asyncio.to_thread(self.model.park)
+    await self.turn.give_back()
+    await self.bus.release(self.pool, self.worker)
 
   async def own(self) -> None:
     """Wait until this trainer owns its pool. Only the owner's replies land, see Bus.finish."""
