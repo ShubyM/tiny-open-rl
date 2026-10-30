@@ -382,6 +382,15 @@ class TestPoolsAndGpus(unittest.TestCase):
     log("sampler_warmed", pool="sampler:s")
     self.assertEqual((log.s.pools["sampler:s"].gpus, log.s.pools["c"].gpus), ((1,), (0,)))
 
+  def test_a_sampler_moves_a_lora_trainer_aside_before_a_full_fine_tune(self):
+    log = Log(self)
+    log.node(2)
+    for pool, gpu, busy in (("full", 0, 1.0), ("lora:a", 1, 9.0)):
+      log.pool(pool, gpus=(gpu,))
+      log("batch_done", pool=pool, seconds=busy)
+    log("sampler_warmed", pool="sampler:s")
+    self.assertEqual((log.s.pools["sampler:s"].gpus, log.s.pools["lora:a"].gpus), ((1,), (0,)))
+
   def test_an_exclusive_pool_gets_a_gpu_to_itself_and_others_stay_off_it(self):
     log = Log(self)
     log.node(2)
@@ -390,7 +399,7 @@ class TestPoolsAndGpus(unittest.TestCase):
     log("run_created", run="b", pool="b")
     self.assertEqual([log.s.pools[n].gpus for n in ("x", "a", "b")], [(0,), (1,), (1,)])
 
-  def test_the_benchmark_s_arrivals_end_with_light_trainers_together_and_samplers_alone(self):
+  def test_the_benchmark_s_arrivals_move_lora_trainers_and_leave_samplers_alone(self):
     log = Log(self)
     log.node(8, memory=81559 * MIB)
     trainers = {"x": 4.0, "lora:g:0": 7.0, "lora:q:0": 7.7, "q1": 1.7, "q2": 2.4, "g1": 4.8}
@@ -400,11 +409,10 @@ class TestPoolsAndGpus(unittest.TestCase):
     for pool in ("sampler:fft:q", "sampler:q", "sampler:fft:g", "sampler:fft:x", "sampler:g"):
       log("sampler_warmed", pool=pool, exclusive=pool == "sampler:fft:x")
     gpu = {name: p.gpus[0] for name, p in log.s.pools.items()}
-    self.assertEqual(gpu["q1"], gpu["q2"])
-    self.assertEqual(gpu["q1"], gpu["g1"])
+    self.assertEqual({gpu["lora:g:0"], gpu["lora:q:0"]}, {gpu["q1"], gpu["q2"]})
     self.assertEqual(gpu["sampler:fft:q"], gpu["sampler:fft:g"])
-    alone = [gpu[n] for n in ("x", "lora:g:0", "lora:q:0", "sampler:q", "sampler:fft:x", "sampler:g")]
-    self.assertEqual(sorted(alone + [gpu["q1"], gpu["sampler:fft:q"]]), list(range(8)))
+    alone = [gpu[n] for n in ("x", "g1", "sampler:q", "sampler:fft:x", "sampler:g")]
+    self.assertEqual(sorted(alone + [gpu["q1"], gpu["q2"], gpu["sampler:fft:q"]]), list(range(8)))
 
   def test_random_arrivals_never_make_a_sampler_take_turns_while_trainers_could_move(self):
     rnd = random.Random(42)
