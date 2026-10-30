@@ -25,9 +25,17 @@ from tinyrl import wire
 from tinyrl.bus import LEASE_MS, Bus, Reply
 from tinyrl.helpers import getenv
 from tinyrl.store import Store
-from tinyrl.trainer import GPU, HOLD_S, STRANDED_MS, fail
+from tinyrl.turns import IDLE_MS, GpuTurn
 
-GPUS = GPU.split(",") if GPU else []  # the leases of every GPU this sampler runs on, as tensor parallel ranks
+STRANDED_MS = 5000
+GPU = getenv("GPU", "")  # the GPUs this sampler takes turns on, set by the node daemon. Unset, it never takes turns
+
+
+def fail(error: Exception) -> Reply:
+  category = "user" if isinstance(error, (ValueError, KeyError)) else "server"
+  body = {"error": f"{type(error).__name__}: {error}", "category": category}
+  return Reply(False, wire.JSON, json.dumps(body).encode())
+
 
 ENGINE = getenv("ENGINE", "tinyrl.vllm:VLLM")
 MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
@@ -94,14 +102,38 @@ class Sampler:
     self.lora = not pool.startswith("sampler:fft:")
     self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.names: dict[tuple[str, str], str] = {}  # (uri, version) -> the engine's name for that checkpoint
+    self.loading = asyncio.Lock()
     self.done = False
-    self.seated = 0.0  # when this sampler took its GPU's lease, or 0 while it doesn't hold it
+    self.turn = GpuTurn(bus, pool, bool(GPU))
+    self.loaded: str | None = None
+
+  async def warm(self) -> None:
+    if self.engine is not None:
+      return
+    base = (await self.bus.warm_samplers()).get(self.pool)
+    if not base:
+      for run_id in await self.bus.runs(self.pool):
+        if (run := await self.bus.run(run_id)) and run.get("base"):
+          base = run["base"]
+          break
+    if not base:
+      return
+    async with self.acquire(0):
+      async with self.loading:
+        if self.engine is None:
+          with contextlib.suppress(Exception):
+            start = time.time()
+            self.engine = await self.engine_type.start(base, self.lora)
+            boot = time.time() - start
+            await self.turn.batch_done(queued=0, seconds=boot, boot=boot, ops=[])
 
   async def serve(self) -> None:
     await self.own()
     renewing = asyncio.create_task(self.keep())
     try:
       await self.fail_stranded(0)
+      if os.environ.get("TINYRL_WARM_SAMPLER") == "1":
+        await self.warm()
       while not self.done:
         await self.step()
         await self.fail_stranded(STRANDED_MS)
@@ -109,8 +141,7 @@ class Sampler:
       renewing.cancel()
       if self.engine:
         await self.engine.close()
-      await self.release_gpus(GPUS)
-      self.seated = 0.0
+      await self.turn.give_back()
       await self.bus.release(self.pool, self.worker)
 
   async def own(self) -> None:
@@ -125,28 +156,60 @@ class Sampler:
           True  # another sampler took the pool. An expired lease nobody took, as after a Redis restart, is taken again
         )
         return
-      if self.seated and not await self.renew_gpus(GPUS):
-        self.seated = 0.0
+
+  async def ensure_engine(self, session: str) -> None:
+    if self.engine is None:
+      run = await self.bus.run(session)
+      if run:
+        async with self.loading:
+          if self.engine is None:
+            self.engine = await self.engine_type.start(run["base"], self.lora)
 
   async def fail_stranded(self, min_idle_ms: int) -> None:
     for cmd in await self.bus.reclaim(self.pool, self.worker, min_idle_ms):
       await self.bus.finish(cmd, fail(RuntimeError("its sampler died, or lost the pool")), self.pool, self.worker)
 
-  async def step(self, count: int = 16, block_ms: int = 1000) -> int:
+  async def step(self, count: int = 128, block_ms: int = 1000) -> int:
     if self.done:
       return 0
-    cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
+    take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
+    cmds = await self.bus.take(self.pool, self.worker, count, take_block)
     if not cmds:
-      await self.yield_gpu(idle=True)
+      await self.turn.went_idle()
+      await self.yield_gpu()
       return 0
-    async with self.acquire():
-      for cmd in cmds:
-        start = time.time()
-        first = await self.bus.first_reply(cmd)
-        reply = first or await self.run(cmd.run, json.loads(cmd.body))
-        if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
-          self.done = True
-          break
+
+    async def one(cmd) -> list:
+      start = time.time()
+      first = await self.bus.first_reply(cmd)
+      reply = first or await self.run(cmd.run, json.loads(cmd.body))
+      ms = (time.time() - start) * 1000
+      if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
+        self.done = True
+      return [cmd.op, ms]
+
+    async with self.acquire(len(cmds)):
+      batch_start = time.time()
+      boot = 0.0
+      if self.engine is None:
+        with contextlib.suppress(Exception):
+          await self.ensure_engine(cmds[0].run)
+          boot = time.time() - batch_start
+      if block_ms:
+        await asyncio.sleep(0.02)
+        cmds += await self.bus.take(self.pool, self.worker, count, 0)
+      if self.lora:
+        batches = [cmds]
+      else:
+        by_run: dict[str, list] = {}
+        [by_run.setdefault(c.run, []).append(c) for c in cmds]
+        batches = list(by_run.values())
+      ops = []
+      for batch in batches:
+        if not self.done:
+          ops.extend(await asyncio.gather(*(one(c) for c in batch)))
+
+      await self.turn.batch_done(queued=len(cmds) - len(ops), seconds=time.time() - batch_start, boot=boot, ops=ops)
     return len(cmds)
 
   async def run(self, session: str, job: dict) -> Reply:
@@ -154,10 +217,11 @@ class Sampler:
       run = await self.bus.run(session)
       if run is None:
         raise ValueError(f"no sampling session {session}")
-      if self.engine is None:
-        self.engine = await self.engine_type.start(run["base"], self.lora)
-      out = await self.engine.sample(job, await self.load(run["model_path"]))
-      return Reply(True, wire.PROTO, encode(job, out))
+      async with self.loading:
+        if self.engine is None:
+          self.engine = await self.engine_type.start(run["base"], self.lora)
+        name = await self.load(run["model_path"])
+      return Reply(True, wire.PROTO, encode(job, await self.engine.sample(job, name)))
     except Exception as e:
       return fail(e)
 
@@ -166,49 +230,32 @@ class Sampler:
     if not uri:
       return None
     path, version = await asyncio.to_thread(self.store.local, uri)  # a checkpoint name can be saved again
-    name = self.names.setdefault((uri, version), f"c{len(self.names)}")
-    await self.engine.load(name, path)
-    return name
+    if (uri, version) not in self.names:
+      name = f"c{len(self.names)}"
+      await self.engine.load(name, path)
+      self.names[(uri, version)] = name
+      self.loaded = name
+    elif not self.lora and self.loaded != self.names[(uri, version)]:
+      await self.engine.load(self.names[(uri, version)], path)
+      self.loaded = self.names[(uri, version)]
+    return self.names[(uri, version)]
 
   @contextlib.asynccontextmanager
-  async def acquire(self):
-    if GPUS and not self.seated:
-      held: list[str] = []
-      try:  # take every GPU in index order, so two samplers that share GPUs never wait on each other
-        while len(held) < len(GPUS):
-          gpu = GPUS[len(held)]
-          if await self.bus.take_gpu(gpu, self.worker):
-            held.append(gpu)
-            continue
-          if not await self.renew_gpus(held):  # one expired while it waited for the next: start over
-            await self.release_gpus(held)
-            held = []
-          await asyncio.sleep(0.05)
-      finally:
-        for gpu in GPUS:
-          await self.bus.withdraw_request(gpu, self.worker)
-      if self.engine:
-        await self.engine.wake()
-      self.seated = time.time()
+  async def acquire(self, queued: int):
+    """Hold the GPU for a batch: wait for this sampler's turn and wake its engine, and after the batch give the turn
+    back if the scheduler revoked it."""
+    if await self.turn.take(queued) and self.engine:
+      await self.engine.wake()
     try:
       yield
     finally:
-      await self.yield_gpu(idle=False)
+      await self.yield_gpu()
 
-  async def yield_gpu(self, idle: bool) -> None:
-    held = self.seated and (idle or time.time() - self.seated >= HOLD_S)
-    if held and any([await self.bus.others_requested(gpu, self.worker) for gpu in GPUS]):
+  async def yield_gpu(self) -> None:
+    if await self.turn.revoked():
       if self.engine:
         await self.engine.sleep()
-      await self.release_gpus(GPUS)
-      self.seated = 0.0
-
-  async def renew_gpus(self, gpus: list[str]) -> bool:
-    return all([await self.bus.renew(f"gpu:{gpu}", self.worker) for gpu in gpus])
-
-  async def release_gpus(self, gpus: list[str]) -> None:
-    for gpu in gpus:
-      await self.bus.release(f"gpu:{gpu}", self.worker)
+      await self.turn.give_back()
 
 
 if __name__ == "__main__":

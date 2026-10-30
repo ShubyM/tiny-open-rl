@@ -5,6 +5,7 @@ resources:
 - namespace.yaml
 - redis.yaml
 - gateway.yaml
+- scheduler.yaml
 - node-daemon.yaml
 configMapGenerator:
 - name: tinyrl

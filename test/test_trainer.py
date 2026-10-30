@@ -1,7 +1,9 @@
 import asyncio
 import copy
 import json
+import os
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -66,9 +68,9 @@ class TestForwardPass(unittest.TestCase):
     gpu = SimpleNamespace(
       device=torch.device("cuda", 0), dtype=torch.bfloat16, config=LlamaConfig(num_hidden_layers=32, hidden_size=4096)
     )
-    bytes_per_token = 6 * 32 * 4096 * 2
 
-    def budget(free_gib: int) -> int:
+    def budget(free_gib: int, ckpt: bool = True) -> int:
+      gpu.is_gradient_checkpointing = ckpt
       with (
         patch.object(torch.cuda, "mem_get_info", return_value=(free_gib * 2**30, 0)),
         patch.object(torch.cuda, "memory_reserved", return_value=2**30),  # 1 GiB cached by torch but unused
@@ -76,11 +78,62 @@ class TestForwardPass(unittest.TestCase):
       ):
         return token_budget(gpu)
 
-    self.assertEqual(budget(7), 8 * 2**30 // 2 // bytes_per_token)
+    self.assertEqual(budget(7, True), 8 * 2**30 // 2 // (6 * 32 * 4096 * 2))
+    self.assertEqual(budget(7, False), 8 * 2**30 // 2 // (64 * 32 * 4096 * 2))
     self.assertEqual(budget(80), trainer.MAX_TOKEN_BUDGET)
     self.assertEqual(token_budget(tiny()), trainer.MAX_TOKEN_BUDGET)  # on the cpu
     with patch.object(trainer, "TOKEN_BUDGET", 512):
       self.assertEqual(token_budget(gpu), 512)
+
+  @patch("os.environ", {})
+  def test_should_checkpoint_layers(self):
+    from tinyrl.trainer import should_checkpoint_layers
+
+    class MockProps:
+      def __init__(self, mem):
+        self.total_memory = mem
+
+    def mock_get_device_properties(dev):
+      if str(dev) == "cuda:0":
+        return MockProps(80 * 1024**3)
+      return MockProps(40 * 1024**3)
+
+    gpu_80 = SimpleNamespace(device=torch.device("cuda", 0), config=SimpleNamespace())
+    gpu_40 = SimpleNamespace(device=torch.device("cuda", 1), config=SimpleNamespace())
+
+    with patch("torch.cuda.get_device_properties", mock_get_device_properties):
+      import tinyrl.trainer
+
+      old_grad = tinyrl.trainer.GRAD_CKPT
+      tinyrl.trainer.GRAD_CKPT = 1
+      self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
+      self.assertTrue(should_checkpoint_layers(gpu_80, lora=False))
+      self.assertTrue(should_checkpoint_layers(gpu_40, lora=True))
+
+      os.environ["GRAD_CKPT"] = "1"
+      self.assertTrue(should_checkpoint_layers(gpu_80, lora=True))
+
+      os.environ["GRAD_CKPT"] = "0"
+      self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
+      self.assertFalse(should_checkpoint_layers(gpu_80, lora=False))
+
+      del os.environ["GRAD_CKPT"]
+      tinyrl.trainer.GRAD_CKPT = 0
+      self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
+      tinyrl.trainer.GRAD_CKPT = old_grad
+
+  @patch("os.environ", {"GRAD_CKPT": "0"})
+  def test_cpu_lora_without_gradient_checkpointing(self):
+    model, runs = lora_runs(1)
+    run = runs[0]
+    weights_before = [p.clone() for p in model.lm.parameters()]
+    _, metrics = model.forward_backward(run, [counting(12)], "cross_entropy", {}, False)
+    step_metrics = model.optim_step(run, {"learning_rate": 1e-2})
+
+    self.assertGreater(step_metrics["grad_norm:mean"], 0)
+    weights_after = [p.clone() for p in model.lm.parameters()]
+    changed = any(not torch.equal(b, a) for b, a in zip(weights_before, weights_after))
+    self.assertTrue(changed)
 
   def test_chunked_logprobs_are_the_full_softmax(self):
     lm = tiny().eval()
@@ -111,7 +164,85 @@ class TestForwardPass(unittest.TestCase):
     torch.testing.assert_close(loss("ppo", kl_coeff=0.5) - loss("ppo"), 0.5 * kl * weights)
 
 
+class CudaMock(torch.Tensor):
+  @property
+  def is_cuda(self):
+    return getattr(self, "_is_cuda", False)
+
+  def is_pinned(self):
+    return getattr(self, "_is_pinned", False)
+
+  def to(self, *args, **kwargs):
+    device = args[0] if args else kwargs.get("device")
+    if device == "cuda":
+      ret = torch.Tensor.to(self, "cpu", **kwargs).as_subclass(CudaMock)
+      ret._is_cuda = True
+      ret._is_pinned = False
+      return ret
+    return super().to(*args, **kwargs)
+
+
 class TestModel(unittest.TestCase):
+  @patch("torch.cuda.is_available", return_value=True)
+  @patch("torch.cuda.synchronize")
+  @patch("torch.cuda.empty_cache")
+  @patch("torch.empty")
+  def test_move_buffer_reuse_and_cleanup(self, mock_empty, mock_empty_cache, mock_sync, mock_is_avail):
+    def fake_empty(*args, **kwargs):
+      kwargs.pop("pin_memory", None)
+      return torch.zeros(*args, **kwargs)
+
+    mock_empty.side_effect = fake_empty
+
+    model = Model(tiny)
+    model.create("run", "tiny", 4, LORA)
+
+    t = torch.randn(10, 10).as_subclass(CudaMock)
+    t._is_cuda = True
+    t._is_pinned = False
+
+    id_t = id(t)
+    original_tensors = model.tensors
+    model.tensors = lambda optim=True: iter([t])
+    model.move([t], "cpu")
+    self.assertIn(id_t, model.pinned)
+    buf_id = id(model.pinned[id_t])
+
+    t.data = t.data.as_subclass(CudaMock)
+    t._is_pinned = True
+    t.data._is_pinned = True
+    t.data._is_cuda = False
+    model.move([t], "cuda")
+
+    t.data = t.data.as_subclass(CudaMock)
+    t.data._is_cuda = True
+    t.data._is_pinned = False
+    t._is_cuda = True
+    model.move([t], "cpu")
+    self.assertEqual(id(model.pinned[id_t]), buf_id)
+
+    def fake_tensors(optim=True):
+      return iter([])
+
+    model.tensors = fake_tensors
+
+    model.move([], "cpu")
+    self.assertNotIn(id_t, model.pinned)
+    model.tensors = original_tensors
+    model.pinned["fake"] = torch.zeros(1)
+    t_opt = torch.randn(5, 5)
+    model.optimizers["run"] = torch.optim.Adam([torch.nn.Parameter(t_opt)])
+    model.optimizers["run"].state[model.optimizers["run"].param_groups[0]["params"][0]] = {"step": t_opt}
+
+    meta = {"optimizer": True}
+    state = model.state("run")[0]
+    model.restore("run", state, meta, True)
+    self.assertNotIn("fake", model.pinned)
+
+    model.pinned["fake"] = torch.zeros(1)
+    model.delete("run")
+    self.assertNotIn("fake", model.pinned)
+
   def test_lora_runs_share_a_frozen_base_and_train_apart(self):
     model, (a, b) = lora_runs(2)
     base = {name: p.detach().clone() for name, p in model.lm.named_parameters() if "lora" not in name}
@@ -452,6 +583,60 @@ class TestTrainer(RedisTest):
     self.assertEqual([reply.ok for reply in replies], [False, True, True])
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
 
+  async def test_sampler_save_is_processed_before_other_runs_finish(self):
+    store = Store(root=tempfile.mkdtemp())
+    t = Trainer(self.bus, "p", Model(tiny), store=store)
+    await self.own(t)
+
+    runs = [new_id() for _ in range(3)]
+    for r in runs:
+      await self.bus.create(Run(r, "p", "tiny", 4, lora=LORA))
+      await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    await t.step(count=16, block_ms=10)
+
+    opt_ids = {}
+    for r in runs:
+      ids = await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {}}))
+      opt_ids[r] = ids[-1]
+
+    done_at: dict[str, float] = {}
+
+    async def watch(name: str, req_id: str):
+      reply = await self.bus.result(req_id, 5)
+      done_at[name] = time.monotonic()
+      return reply
+
+    opt_tasks = {r: asyncio.create_task(watch(r, req_id)) for r, req_id in opt_ids.items()}
+
+    async def submit_first_save():
+      finished, _ = await asyncio.wait(opt_tasks.values(), return_when=asyncio.FIRST_COMPLETED)
+      first_run = next(r for r, task in opt_tasks.items() if task in finished)
+      [save_id] = await self.submit(first_run, (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": "tinker://r/sampler_weights/s0"}))
+      reply = await watch("save", save_id)
+      return first_run, reply
+
+    save_task = asyncio.create_task(submit_first_save())
+    n = await t.step(count=16, block_ms=10)
+    first_run, save_reply = await save_task
+    for task in opt_tasks.values():
+      await task
+
+    self.assertEqual(n, 7)
+    self.assertTrue(save_reply.ok)
+    other_times = [ts for name, ts in done_at.items() if name not in (first_run, "save")]
+    self.assertLess(done_at["save"], max(other_times))
+
+    causal = runs[0]
+    pipelined = await self.submit(
+      causal,
+      (Op.FORWARD_BACKWARD, proto_body(causal)),
+      (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.1}}),
+      (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{causal}/sampler_weights/s1"}),
+    )
+    self.assertEqual(await t.step(count=16, block_ms=10), 3)
+    self.assertTrue(all([(await self.bus.result(rid, 1)).ok for rid in pipelined]))
+    self.assertEqual((await self.bus.run(causal))["steps"], 2)
+
 
 class TestCheckpointNames(unittest.TestCase):
   def test_a_multimodal_checkpoint_trains_under_its_own_parameter_names(self):
@@ -488,6 +673,35 @@ class TestCheckpointNames(unittest.TestCase):
       module = key.removeprefix("base_model.model.").split(".lora_")[0]
       self.assertIn(f"{module}.weight", names)
     self.assertTrue(any(".language_model.layers." in key for key in tensors))
+
+  def test_gemma4_lora_skips_clippable_vision_and_audio_wrappers(self):
+    from transformers import Gemma4Config, Gemma4ForConditionalGeneration
+
+    cfg = Gemma4Config(
+      text_config={
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "vocab_size": 128,
+        "num_kv_shared_layers": 1,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "hidden_size_per_layer_input": 0,
+      },
+      vision_config={"hidden_size": 16, "intermediate_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2},
+      audio_config={"hidden_size": 16, "num_hidden_layers": 1, "num_attention_heads": 2, "conf_conv_kernel_size": 3},
+    )
+    path = tempfile.mkdtemp()
+    Gemma4ForConditionalGeneration(cfg).save_pretrained(path)
+
+    model, a, b = Model(trainer.load), new_id(), new_id()
+    model.create(a, path, 4, LORA)
+    model.create(b, path, 4, LORA)
+    tensors, _ = model.weights(b)
+    self.assertTrue(tensors)
+    self.assertTrue(all(".language_model." in k for k in tensors))
 
 
 if __name__ == "__main__":

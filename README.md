@@ -21,6 +21,7 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path  # a P
 pip install -e .
 redis-server &                                  # Redis 8.4 or newer
 python -m tinyrl.gateway &                      # the Tinker HTTP API, on :8000
+python -m tinyrl.scheduler &                    # decides whose turn it is on each shared GPU
 python -m tinyrl.node_daemon                    # runs a trainer or sampler for each pool placed on it
 ```
 
@@ -38,13 +39,13 @@ the node daemon with the fewest pools per GPU, and moves a dead node daemon's po
 fewest workers (`GPUS`, default 1), and starts them again if they die. A sampler starts its engine on its first command.
 The engine is vLLM, `vllm serve` on a local port, unless `ENGINE` names another.
 
-Trainers on one GPU take turns through a lease on it. Between batches, a trainer with nothing to do, or one that has had the GPU
-for `HOLD_S` (30 s), yields it to a trainer that waits: it copies its weights, gradients and AdamW state to pinned host memory,
+Trainers on one GPU take turns, granted by the scheduler. Between batches, a trainer with nothing to do, or
+one that has had the GPU for 30 s, yields it to a trainer that waits: it copies its weights, gradients and AdamW state to pinned host memory,
 frees the GPU, and copies them back on its next turn.
 
 ### On Kubernetes
 
-[k8s/](k8s) runs Redis with an append-only file, the gateway, and a node daemon on every node labeled `tinyrl-gpu=true`.
+[k8s/](k8s) runs Redis with an append-only file, the gateway, the scheduler, and a node daemon on every node labeled `tinyrl-gpu=true`.
 Build the image from [Dockerfile](Dockerfile), point `CKPT` in [k8s/kustomization.yaml](k8s/kustomization.yaml) at a
 bucket the nodes' service account can write, and run `kubectl apply -k k8s/`. A drained node's trainers save their runs,
 and a dead node's pools move to live nodes. `python k8s/e2e.py` breaks a running cluster on purpose and checks it
@@ -102,7 +103,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps checkpoints it downloaded), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `HOLD_S`, `TARGET_UTIL`,
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `TARGET_UTIL`,
 `UTIL_MS`, `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
 
 ## Telemetry

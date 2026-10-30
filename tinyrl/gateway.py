@@ -15,14 +15,14 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from tinyrl import wire
-from tinyrl.bus import Bus, Op, Run
+from tinyrl import schedule, wire
+from tinyrl.bus import Bus, Op, Run, key
 from tinyrl.helpers import getenv
 from tinyrl.store import Store
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
 TARGET_UTIL = getenv("TARGET_UTIL", 0.7)  # a LoRA shard busier than this gets no new runs while another can open
-NEW_RUN_UTIL = 0.1  # the load a new run adds before any shard on its base has reported
+NEW_RUN_UTIL = float(getenv("NEW_RUN_UTIL", 0.04))  # the load a new run adds before any shard on its base has reported
 
 
 # ***** requests *****
@@ -77,24 +77,16 @@ def checkpoint_uri(run: str, kind: str, name: str) -> str:
 
 
 async def pool_for(bus: Bus, run: str, base_model: str, rank: int, metadata: dict) -> str:
-  """A full fine-tune, or a LoRA run that asks for it, gets a pool of its own. Other LoRA runs on a base share one of
-  its shards, lora:<base>:<n>: the least loaded, or a new one once all are over TARGET_UTIL, up to one per live GPU.
-  A shard's load is its last reported busy fraction plus an estimate for each run placed on it since, so a burst of
-  new runs spreads out instead of all landing on the shard that looked idle."""
-  if rank == 0 or str(metadata.get("openrl.exclusive")).lower() == "true":
-    return run
+  exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
   shards = [p for p in await bus.pools() if p.startswith(f"lora:{base_model}:")]
-  shards.sort(key=lambda p: int(p.rsplit(":", 1)[1]))
   loads = await bus.loads(shards)
-  measured = [(u, runs - placed) for u, placed, runs in loads if u is not None and runs > placed]  # runs it measured
-  per_run = sum(u for u, _ in measured) / sum(runs for _, runs in measured) if measured else NEW_RUN_UTIL
-  scores = [(u or 0) + placed * per_run for u, placed, _ in loads]
-  if (scores and min(scores) < TARGET_UTIL) or len(shards) >= max(1, await bus.gpus()):
-    pool = shards[scores.index(min(scores))]
-  else:
-    pool = f"lora:{base_model}:{len(shards)}"
-  await bus.placed(pool)
-  return pool
+  shard_loads = [schedule.ShardLoad(p, u, placed, runs) for p, (u, placed, runs) in zip(shards, loads)]
+  gpus = await bus.gpus()
+  dec = schedule.choose_pool(run, base_model, rank, exclusive, shard_loads, gpus, TARGET_UTIL, NEW_RUN_UTIL)
+  await bus.decide("run", run, dec.as_dict())
+  if dec.choice != run:
+    await bus.placed(dec.choice)
+  return dec.choice
 
 
 def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
@@ -133,18 +125,36 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     else:
       if not base_model:
         raise ValueError("base_model required when model_path is None")
-      base, lora, uri = base_model, True, None
+      base, lora, uri, train_run = base_model, True, None, None
 
-    pool = f"sampler:{base}" if lora else f"sampler:fft:{train_run}"
+    exclusive = train_run in await bus.exclusive() if train_run else False
+    dec = schedule.choose_sampler_pool(base, lora, train_run, exclusive)
+    await bus.warm_sampler(dec.choice, base, exclusive=exclusive)
     sid = f"samp-{uuid.uuid4().hex[:12]}"
-    await bus.create(Run(sid, pool, base, int(lora), session_id, model_path=uri))
+    await bus.decide("run", sid, dec.as_dict())
+    await bus.create(Run(sid, dec.choice, base, int(lora), session_id, model_path=uri, exclusive=exclusive))
     return sid
 
   # ***** service *****
 
+  @api.get("/api/v1/scheduling")
+  async def scheduling():
+    return {
+      "nodes": await bus.nodes(),
+      "placements": await bus.placements(),
+      "exclusive": sorted(await bus.exclusive()),
+      "turns": json.loads(await bus.r.get(key("state")) or "{}"),
+      "decisions": await bus.decisions(),
+    }
+
   @api.get("/api/v1/healthz")
-  async def healthz():
+  @api.post("/api/v1/sessions/{session_id}/finish")
+  async def healthz(session_id: str = ""):
     return {"status": "ok"}
+
+  @api.post("/api/v1/telemetry")
+  async def telemetry():
+    return {"status": "accepted"}
 
   @api.post("/api/v1/client/config")
   @api.post("/api/v1/client/dynamic_config")
@@ -172,9 +182,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     session = await bus.session_info(req.session_id) or {}
     metadata, lora = session.get("metadata", {}) | (req.user_metadata or {}), req.lora_config or {}
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
+    exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
     run = str(uuid.uuid4())
     pool = await pool_for(bus, run, req.base_model, rank, metadata)
-    await bus.create(Run(run, pool, req.base_model, rank, req.session_id, lora=lora))
+    await bus.create(Run(run, pool, req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive))
     return await submit(run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora})
 
   @api.post("/api/v1/get_info")
@@ -226,18 +237,22 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveRequest):
+    train = await bus.run(req.model_id)
+    if not train:
+      raise HTTPException(404, f"no model {req.model_id}")
+    seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
+    name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
+    uri = checkpoint_uri(req.model_id, "sampler_weights", name)
     if req.path is None or req.sampling_session_seq_id is not None:
-      train = await bus.run(req.model_id)
-      if not train:
-        raise HTTPException(404, f"no model {req.model_id}")
-      seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
-      name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-      uri = checkpoint_uri(req.model_id, "sampler_weights", name)
       sid = await open_sampler(train["base"], uri, train.get("session", ""))
       return await submit(
         req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri, "sampling_session_id": sid}, req.seq_id
       )
-    return await save(req, Op.SAVE_WEIGHTS_FOR_SAMPLER, "sampler_weights")
+    if train["base"]:
+      excl = req.model_id in await bus.exclusive()
+      dec = schedule.choose_sampler_pool(train["base"], train["rank"] > 0, req.model_id, excl)
+      await bus.warm_sampler(dec.choice, train["base"], exclusive=excl)
+    return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri}, req.seq_id)
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):

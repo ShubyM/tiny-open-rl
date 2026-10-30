@@ -28,6 +28,7 @@ import redis.asyncio as redis
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialBackoff
 
+from tinyrl import control
 from tinyrl.helpers import getenv
 
 GROUP = "trainer"  # the consumer group every pool's trainer reads through
@@ -63,6 +64,7 @@ class Run:
   session: str = ""
   model_path: str | None = None
   lora: dict = field(default_factory=dict)  # the LoRA config it was created with, to create it again elsewhere
+  exclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,8 @@ class Bus:
     if run.session:
       p.sadd(key("sess", run.session, "runs"), run.id)
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
+    if run.exclusive:
+      p.sadd(key("excl"), run.id, run.pool)
     await p.execute()
 
   async def run(self, run_id: str) -> dict | None:
@@ -182,12 +186,40 @@ class Bus:
       p.hgetall(key("run", run_id))
     return {at: {k.decode(): int(v) for k, v in f.items() if k != b"record"} for at, f in zip(runs, await p.execute())}
 
+  async def warm_sampler(self, pool: str, base: str, exclusive: bool = False) -> None:
+    p = self.r.pipeline(transaction=True)
+    p.hset(key("warm"), pool, base)
+    if exclusive:
+      p.sadd(key("excl"), pool)
+    await p.execute()
+
+  async def warm_samplers(self) -> dict[str, str]:
+    return {k.decode(): v.decode() for k, v in (await self.r.hgetall(key("warm"))).items()}
+
   async def drop(self, run_id: str, pool: str) -> None:
     """Take a deleted run out of its pool and delete its stream, in one transaction."""
     p = self.r.pipeline(transaction=True)
     p.srem(key("pool", pool), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
+    p.hdel(key("decide", "run"), run_id)
+    p.hdel(key("warm"), f"sampler:fft:{run_id}", f"sampler:lora:{run_id}")
     await p.execute()
+
+  async def exclusive(self) -> set[str]:
+    return {v.decode() for v in await self.r.smembers(key("excl"))}
+
+  async def decide(self, kind: str, subject: str, decision: dict) -> None:
+    await self.r.hset(key("decide", kind), subject, json.dumps(decision))
+
+  async def forget_decision(self, kind: str, subject: str) -> None:
+    await self.r.hdel(key("decide", kind), subject)
+
+  async def decisions(self) -> dict[str, dict[str, dict]]:
+    out = {"run": {}, "node": {}, "gpu": {}}
+    for kind in out:
+      raw = await self.r.hgetall(key("decide", kind))
+      out[kind] = {k.decode(): json.loads(v) for k, v in raw.items()}
+    return out
 
   # ***** commands *****
 
@@ -211,7 +243,7 @@ class Bus:
 
     random.shuffle(runs)  # so no run always goes first
     streams = {key("q", run_id): ">" for run_id in runs}
-    got = await self.r.xreadgroup(GROUP, worker, streams, count=count, block=block_ms)
+    got = await self.r.xreadgroup(GROUP, worker, streams, count=count, block=block_ms or None)
 
     cmds = []
     for stream, entries in got:
@@ -324,7 +356,7 @@ class Bus:
     worker = await self.r.get(key("owner", pool))
     return worker.decode() if worker else None
 
-  # ***** taking turns on a GPU, whose lease is own("gpu:<node>:<i>") *****
+  # ***** GPU width *****
 
   async def width(self, pool: str) -> int:
     """How many GPUs the pool's process runs on, 1 unless set_width said otherwise."""
@@ -332,31 +364,6 @@ class Bus:
 
   async def set_width(self, pool: str, width: int) -> None:
     await self.r.set(key("width", pool), width)
-
-  async def take_gpu(self, gpu: str, worker: str) -> bool:
-    """Take the GPU's lease if it's free and `worker` has waited longest for it, so whoever polls fastest can't jump
-    the line. A wait counts from the first ask; a waiter that hasn't asked for LEASE_MS drops out of the line. Only
-    the lease's SET NX has to be atomic: the line just decides who may try it."""
-    now = time.time()
-    p = self.r.pipeline(transaction=False)
-    p.zadd(key("wait", gpu), {worker: now}, nx=True)  # in line since its first ask
-    p.zadd(key("alive", gpu), {worker: now + LEASE_MS / 1000})  # still asking until then
-    p.zrangebyscore(key("alive", gpu), "-inf", now)
-    if dead := (await p.execute())[-1]:
-      await self.r.zrem(key("wait", gpu), *dead)
-      await self.r.zrem(key("alive", gpu), *dead)
-    if await self.r.zrange(key("wait", gpu), 0, 0) != [worker.encode()] or not await self.own(f"gpu:{gpu}", worker):
-      return False
-    await self.withdraw_request(gpu, worker)
-    return True
-
-  async def withdraw_request(self, gpu: str, worker: str) -> None:
-    await self.r.zrem(key("wait", gpu), worker)
-    await self.r.zrem(key("alive", gpu), worker)
-
-  async def others_requested(self, gpu: str, worker: str) -> bool:
-    """Whether another trainer has asked for the GPU within the last LEASE_MS."""
-    return any(w.decode() != worker for w in await self.r.zrangebyscore(key("alive", gpu), time.time(), "+inf"))
 
   # ***** load *****
 
@@ -402,7 +409,14 @@ class Bus:
     return {k.decode(): v.decode() for k, v in (await self.r.hgetall(key("place"))).items()}
 
   async def place(self, pool: str, node: str | None) -> None:
-    await (self.r.hset(key("place"), pool, node) if node else self.r.hdel(key("place"), pool))
+    p = self.r.pipeline(transaction=True)
+    if node:
+      p.hset(key("place"), pool, node)
+    else:
+      p.hdel(key("place"), pool)
+      p.hdel(key("decide", "node"), pool)
+      p.hdel(key("decide", "gpu"), pool)
+    await p.execute()
 
   # ***** replies *****
 
@@ -436,3 +450,22 @@ class Bus:
       for entry in pending
     ]
     return {"live": True, "queued": groups[0]["lag"], "in_flight": in_flight}
+
+  # ***** events: the log GPU turns are decided from, see control.py *****
+
+  async def emit(self, _kind: str, **body) -> str:
+    """Append an entry to the log. Returns its stream id."""
+    entry_id = await self.r.xadd(
+      key("events"), {"kind": _kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
+    )
+    return entry_id.decode()
+
+  async def events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[control.Event]:
+    """The entries after stream id `after`, waiting up to block_ms for one, or not at all if it is 0."""
+    got = await self.r.xread({key("events"): after}, count=count, block=block_ms or None)
+    out = []
+    for entry_id, fields in got[0][1] if got else []:
+      entry_id = entry_id.decode()
+      t = int(entry_id.split("-")[0]) / 1000
+      out.append(control.Event(entry_id, t, fields[b"kind"].decode(), json.loads(fields[b"body"])))
+    return out

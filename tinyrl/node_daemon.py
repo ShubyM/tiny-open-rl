@@ -9,7 +9,6 @@ its least used GPU, and stops the ones placed elsewhere. A pool's lease still de
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextlib
 import os
 import signal
@@ -18,21 +17,43 @@ import subprocess
 import sys
 import time
 
+from tinyrl import schedule
 from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
 
 GPUS = getenv("GPUS", 1)
 DRAIN_S = getenv("DRAIN_S", 20.0)  # how long a stopping node daemon waits for its trainers to save their runs
-TICK = 1.0
+TICK = getenv("TICK", 0.25)
 SCHEDULER = "scheduler"  # the lease whose holder places pools
 
 
+def gpu_memory_mib() -> int:
+  if override := getenv("GPU_MEMORY_MIB", 0):
+    return int(override)
+  try:
+    res = subprocess.run(
+      ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits", "-i", "0"],
+      capture_output=True,
+      text=True,
+      timeout=2,
+      check=False,
+    )
+    if res.returncode == 0:
+      return int(res.stdout.strip())
+  except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+    pass
+  return 0
+
+
 class NodeDaemon:
-  def __init__(self, bus: Bus, gpus: int = GPUS, node: str = ""):
+  def __init__(self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None):
     self.bus = bus
     self.gpus = gpus
     self.trainers: dict[str, tuple[list[int], subprocess.Popen]] = {}  # pool -> (its GPUs, process)
+    self.memory: dict[str, int] = {}  # pool -> GPU bytes it may use while it holds its GPU, 0 if all of it
+    self.decisions = {}
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
+    self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
 
   async def tick(self) -> None:
     await self.bus.heartbeat(self.id, self.gpus)
@@ -45,34 +66,57 @@ class NodeDaemon:
       if proc.poll() is not None or placed.get(pool) != self.id:  # it exited, or its pool moved or emptied
         proc.terminate()
         del self.trainers[pool]
-    for pool, node in placed.items():
-      if node == self.id and pool not in self.trainers:
-        self.trainers[pool] = self.start(pool, await self.bus.width(pool))
+        self.memory.pop(pool, None)
+        if self.bus:
+          await self.bus.forget_decision("gpu", pool)
+          await self.bus.emit("exited", pool=pool)
+    excl = await self.bus.exclusive() if self.bus else set()
+    to_start = [p for p, n in placed.items() if n == self.id and p not in self.trainers]
+    for pool in schedule.start_order(to_start, excl):
+      width = await self.bus.width(pool) if self.bus else 1
+      self.trainers[pool] = self.start(pool, width, excl)
+      if self.bus:
+        await self.bus.decide("gpu", pool, self.decisions[pool].as_dict())
+        gpus, memory = self.trainers[pool][0], self.memory[pool]
+        await self.bus.emit("started", pool=pool, node=self.id, gpus=gpus, memory=memory)
 
   async def schedule(self) -> None:
     nodes, placed = await self.bus.nodes(), await self.bus.placements()
-    pools = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)}
+    pools = {pool for pool in await self.bus.pools() if await self.bus.runs(pool)} | set(await self.bus.warm_samplers())
     for pool in set(placed) - pools:
       await self.bus.place(pool, None)
-      del placed[pool]
-    for pool in sorted(pools):
-      if placed.get(pool) not in nodes and nodes:
-        load = collections.Counter(placed.values())
-        placed[pool] = min(nodes, key=lambda node: load[node] / nodes[node])
-        await self.bus.place(pool, placed[pool])
 
-  def start(self, pool: str, width: int = 1) -> tuple[list[int], subprocess.Popen]:
+    next_placed, decisions = schedule.place_pools(pools, nodes, placed)
+    for pool, dec in decisions.items():
+      await self.bus.place(pool, next_placed[pool])
+      await self.bus.decide("node", pool, dec.as_dict())
+
+  def start(self, pool: str, width: int = 1, exclusive: set[str] = frozenset()) -> tuple[list[int], subprocess.Popen]:
     """Start a pool's process on `width` GPUs: the least used block of them, aligned so blocks never straddle."""
-    on = [gpu for gpus, _ in self.trainers.values() for gpu in gpus]
-    first = min(range(0, self.gpus - width + 1, width), key=lambda i: sum(map(on.count, range(i, i + width))))
-    gpus = list(range(first, first + width))
-    # processes on one GPU take turns on it, named by host so processes a restarted node daemon left running count too
+    running = [schedule.RunningPool(p, gpus) for p, (gpus, _) in self.trainers.items()]
+    dec = schedule.choose_gpus(pool, width, self.gpus, running, exclusive)
+    self.decisions[pool] = dec
+    gpus = dec.choice
+    parsed = schedule.Pool.parse(pool)
     leases = ",".join(f"{socket.gethostname()}:{gpu}" for gpu in gpus)
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus)), "GPU": leases}
-    mod = "tinyrl.sampler" if pool.startswith("sampler:") else "tinyrl.trainer"
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
+    if parsed.role == "sampler" and schedule.gpu_zones(self.gpus, width).partitioned:
+      env.setdefault("TINYRL_WARM_SAMPLER", "1")
+    if self.gpu_mib >= 65536 and parsed.role == "sampler" and width == 1:
+      if pool.startswith("sampler:fft:") and pool not in exclusive:
+        env.setdefault("TINYRL_GPU_MEM", "0.42")
+        env.setdefault("TINYRL_KV_BYTES", str(16 * 1024**3))
+      else:
+        env.setdefault("TINYRL_KV_BYTES", str(24 * 1024**3))
+    env["GPU"] = leases
+    self.memory[pool] = int(float(env.get("TINYRL_GPU_MEM", 0)) * self.gpu_mib * 2**20)
+    mod = "tinyrl.sampler" if parsed.role == "sampler" else "tinyrl.trainer"
+    if mod == "tinyrl.trainer":
+      env["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return gpus, subprocess.Popen([sys.executable, "-m", mod, pool], env=env)
 
   async def serve(self) -> None:
+    await self.bus.emit("node_up", node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
     try:
       while True:
         await self.tick()

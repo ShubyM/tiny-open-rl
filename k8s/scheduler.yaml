@@ -1,0 +1,22 @@
+# Exactly one scheduler decides GPU turns for every node daemon. Recreate, so a rollout never runs two at once.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: scheduler}
+  template:
+    metadata:
+      labels: {app: scheduler}
+    spec:
+      containers:
+      - name: scheduler
+        image: tinyrl
+        command: ["python3", "-m", "tinyrl.scheduler"]
+        envFrom:
+        - configMapRef: {name: tinyrl}
+        resources:
+          requests: {cpu: "1", memory: 1Gi}

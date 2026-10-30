@@ -6,6 +6,7 @@ It takes commands from its pool's streams on the bus, runs each one on the model
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import math
@@ -27,16 +28,14 @@ from tinyrl import wire
 from tinyrl.bus import LEASE_MS, UTIL_MS, Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.store import Store
+from tinyrl.turns import IDLE_MS, GpuTurn
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
 CHUNK = getenv("CHUNK", 1024)  # positions per output head chunk when computing logprobs
 GRAD_CKPT = getenv("GRAD_CKPT", 1)  # gradient checkpointing
 STRANDED_MS = 5000  # a command in flight this long while its pool's owner has nothing in flight was stranded
-GPU = getenv(
-  "GPU", ""
-)  # the lease of the GPU this trainer takes turns on, set by the node daemon. Unset, it never yields
-HOLD_S = getenv("HOLD_S", 30.0)  # a busy trainer keeps its GPU this long before yielding to one that waits
+GPU = getenv("GPU", "")  # the GPU this trainer takes turns on, set by the node daemon. Unset, it never takes turns
 
 # ***** losses *****
 #
@@ -71,6 +70,16 @@ LOSSES = {"cross_entropy": cross_entropy, "importance_sampling": importance_samp
 # ***** forward pass *****
 
 
+def should_checkpoint_layers(lm: PreTrainedModel, lora: bool) -> bool:
+  if "GRAD_CKPT" in os.environ:
+    return bool(int(os.environ["GRAD_CKPT"]))
+  if not GRAD_CKPT:
+    return False
+  if lora and lm.device.type == "cuda" and torch.cuda.get_device_properties(lm.device).total_memory >= 64 * 1024**3:
+    return False
+  return True
+
+
 def token_budget(lm: PreTrainedModel) -> int:
   """How many padded tokens one forward/backward pass can hold: TOKEN_BUDGET if it's set, otherwise as many as fit in
   half of the free GPU memory. It's measured on every call, since memory use changes as runs come and go, and an
@@ -86,7 +95,12 @@ def token_budget(lm: PreTrainedModel) -> int:
   # with gradient checkpointing, a token keeps about one hidden vector per layer. 6x that covers the layer being
   # recomputed in the backward pass, and leaves a margin.
   config = lm.config.get_text_config()
-  bytes_per_token = 6 * config.num_hidden_layers * config.hidden_size * lm.dtype.itemsize
+  bytes_per_token = (
+    (6 if getattr(lm, "is_gradient_checkpointing", False) else 64)
+    * config.num_hidden_layers
+    * config.hidden_size
+    * lm.dtype.itemsize
+  )
   return min(MAX_TOKEN_BUDGET, int(free / 2 / bytes_per_token))
 
 
@@ -178,7 +192,11 @@ def lora_targets(lm: PreTrainedModel, config: dict) -> list[str]:
   tied = getattr(lm.config.get_text_config(), "tie_word_embeddings", False)
   if config.get("train_unembed", True) and not tied:
     targets.append("lm_head")
-  return targets
+  return [
+    n
+    for n, m in lm.named_modules()
+    if n.rsplit(".", 1)[-1] in targets and isinstance(getattr(m, "base_layer", m), torch.nn.Linear)
+  ]
 
 
 class Model:
@@ -192,15 +210,21 @@ class Model:
     self.dtype = torch.float32
     self.params: dict[str, dict[str, torch.nn.Parameter]] = {}  # canonical name -> trainable parameter
     self.optimizers: dict[str, torch.optim.AdamW] = {}
+    self.pinned: dict[int, torch.Tensor] = {}
     self.parked = False
+    self.dirty: set[str] = set()
 
   def create(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
       self.lm, self.base, self.lora = self.load(base), base, rank > 0
+      if hasattr(inner := getattr(self.lm, "model", None), "language_model"):
+        for child, _ in list(inner.named_children()):
+          if child != "language_model":
+            setattr(inner, child, None)
       self.dtype = self.lm.dtype
       if not self.lora:
         self.lm.float()  # a full fine-tune updates fp32 master weights. Its forward pass runs in bf16, under autocast
-      if GRAD_CKPT:
+      if should_checkpoint_layers(self.lm, self.lora):
         self.lm.gradient_checkpointing_enable()
         if self.lora:
           self.lm.enable_input_require_grads()  # with the embeddings frozen, checkpointed layers need a gradient path
@@ -210,6 +234,7 @@ class Model:
     if config.get("seed") is not None:
       torch.manual_seed(config["seed"])
 
+    self.dirty.discard(run)
     if not self.lora:
       if self.params:
         raise ValueError(f"a full fine-tune has its trainer to itself, and {next(iter(self.params))} is on this one")
@@ -266,7 +291,8 @@ class Model:
 
   def optimizer(self, run: str) -> torch.optim.AdamW:
     if run not in self.optimizers:
-      self.optimizers[run] = torch.optim.AdamW(self.params[run].values())
+      params = list(self.params[run].values())
+      self.optimizers[run] = torch.optim.AdamW(params, fused=bool(params and params[0].is_cuda))
     return self.optimizers[run]
 
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
@@ -282,8 +308,15 @@ class Model:
 
     max_norm = adam.get("grad_clip_norm") or math.inf  # 0 means don't clip
     grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run].values(), max_norm).item()
+    if not self.lora:
+      if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+      self.move(self.moments(), "cuda")
     optimizer.step()
     optimizer.zero_grad()
+    if not self.lora:
+      self.move(self.moments(), "cpu")
+    self.dirty.add(run)
     return {"grad_norm:mean": grad_norm}
 
   def state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
@@ -303,12 +336,18 @@ class Model:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
     lm = self.use(run)
     prefix = "base_model.model." if self.lora else ""
-    tensors = {f"{prefix}{name}": p.detach().cpu().to(self.dtype) for name, p in self.params[run].items()}
+    tensors = {f"{prefix}{name}": p.detach().to(self.dtype) for name, p in self.params[run].items()}
     if self.lora:
       cfg = {k: sorted(v) if isinstance(v, set) else v for k, v in lm.peft_config[run].to_dict().items()}
     else:
       cfg = lm.config.to_dict()
-    return tensors, {"base": self.base, "lora": self.lora, "optimizer": False, "config": cfg}
+    return tensors, {
+      "base": self.base,
+      "lora": self.lora,
+      "optimizer": False,
+      "untouched": not self.lora and run not in self.dirty,
+      "config": cfg,
+    }
 
   def restore(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
     self.use(run)
@@ -323,6 +362,7 @@ class Model:
     for name, p in self.params[run].items():
       p.data.copy_(weights[name])
 
+    self.pinned.clear()
     self.optimizers.pop(run, None)
     if optimizer and any(k.endswith(".step") for k in tensors):
       opt = self.optimizer(run)
@@ -330,44 +370,62 @@ class Model:
         opt.state[p] = {
           "exp_avg": tensors[f"{name}.exp_avg"].to(p.device, torch.float32),
           "exp_avg_sq": tensors[f"{name}.exp_avg_sq"].to(p.device, torch.float32),
-          "step": tensors[f"{name}.step"].cpu().float(),
+          "step": tensors[f"{name}.step"].to(p.device if opt.defaults.get("fused") else "cpu", torch.float32),
         }
+      if not self.lora:
+        self.move(self.moments(), "cpu")
+    self.dirty.add(run)
 
-  def tensors(self):
+  def moments(self):
+    return (v for opt in self.optimizers.values() for s in opt.state.values() for v in s.values() if torch.is_tensor(v))
+
+  def tensors(self, optim: bool = True):
     """Every tensor on the GPU: weights, buffers, gradients between forward_backward and optim_step, AdamW moments."""
     if self.lm is None:
       return
     yield from self.lm.parameters()
     yield from self.lm.buffers()
     yield from (p.grad for p in self.lm.parameters() if p.grad is not None)
-    yield from (
-      v for opt in self.optimizers.values() for s in opt.state.values() for v in s.values() if torch.is_tensor(v)
-    )
+    if optim:
+      yield from self.moments()
+
+  def move(self, tensors, device: str) -> None:
+    for t in tensors:
+      if device == "cpu" and t.is_cuda:
+        buf = self.pinned.get(id(t))
+        if buf is None or buf.shape != t.shape or buf.dtype != t.dtype:
+          buf = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+          self.pinned[id(t)] = buf
+        buf.copy_(t, non_blocking=True)
+        t.data = buf
+      elif device == "cuda" and (t.is_pinned() or id(t) in self.pinned):
+        t.data = t.data.to("cuda", non_blocking=True)
+
+    if torch.cuda.is_available():
+      torch.cuda.synchronize()
+      if device == "cpu":
+        torch.cuda.empty_cache()
+        active = {id(x) for x in self.tensors()}
+        for k in list(self.pinned.keys()):
+          if k not in active:
+            del self.pinned[k]
 
   def park(self) -> None:
     """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume() undoes it."""
-    for t in self.tensors():
-      if t.is_cuda:
-        host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-        t.data = host.copy_(t, non_blocking=True)
-    if torch.cuda.is_available():
-      torch.cuda.synchronize()
-      torch.cuda.empty_cache()
+    self.move(self.tensors(), "cpu")
     self.parked = True
 
   def resume(self) -> None:
-    for t in self.tensors():
-      if t.is_pinned():  # what park moved. AdamW's step counts live on the cpu anyway
-        t.data = t.data.to("cuda", non_blocking=True)
-    if torch.cuda.is_available():
-      torch.cuda.synchronize()
+    self.move(self.tensors(optim=self.lora), "cuda")
     self.parked = False
 
   def delete(self, run: str) -> None:
     lm = self.use(run)
+    self.dirty.discard(run)
     if self.lora:
       lm.delete_adapter(run)
     del self.params[run]
+    self.pinned.clear()
     self.optimizers.pop(run, None)
 
 
@@ -385,6 +443,22 @@ def fail(error: Exception) -> Reply:
   return Reply(False, wire.JSON, json.dumps(body).encode())
 
 
+def enqueue_cmds(queue: collections.deque[Cmd], cmds: list[Cmd], lora: bool) -> None:
+  if not lora:
+    queue.extend(cmds)
+    return
+  blocked = {x.run for x in queue}
+  front, back = [], []
+  for c in cmds:
+    if c.op == Op.SAVE_WEIGHTS_FOR_SAMPLER and c.run not in blocked:
+      front.append(c)
+    else:
+      blocked.add(c.run)
+      back.append(c)
+  queue.extendleft(reversed(front))
+  queue.extend(back)
+
+
 class Trainer:
   def __init__(self, bus: Bus, pool: str, model: Model | None = None, worker: str = "", store: Store | None = None):
     self.bus = bus
@@ -395,7 +469,7 @@ class Trainer:
     self.done = False
     self.draining = False
     self.busy = 0.0  # seconds spent running commands since the last load report
-    self.seated = 0.0  # when this trainer took its GPU's lease, or 0 while it doesn't hold it
+    self.turn = GpuTurn(bus, pool, bool(GPU))
 
   async def serve(self) -> None:
     await self.own()
@@ -409,9 +483,7 @@ class Trainer:
         await self.drain()
     finally:
       renewing.cancel()
-      if GPU:
-        await self.bus.release(f"gpu:{GPU}", self.worker)
-        self.seated = 0.0
+      await self.turn.give_back()
       await self.bus.release(self.pool, self.worker)
 
   async def own(self) -> None:
@@ -427,8 +499,6 @@ class Trainer:
       if not await self.bus.renew(self.pool, self.worker) and not await self.reown():
         self.done = True
         return
-      if self.seated and not await self.bus.renew(f"gpu:{GPU}", self.worker):
-        self.seated = 0.0  # paused past the GPU lease: take it again before the next batch
       if (now := time.time()) - reported >= UTIL_MS / 1000:
         await self.bus.report(self.pool, min(1.0, self.busy / (now - reported)))
         self.busy, reported = 0.0, now
@@ -484,15 +554,25 @@ class Trainer:
     """Take the next commands from the pool and run them. Returns how many there were."""
     if self.done:
       return 0
-    cmds = await self.bus.take(self.pool, self.worker, count, block_ms)
+    take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
+    cmds = await self.bus.take(self.pool, self.worker, count, take_block)
     if not cmds:
-      await self.yield_gpu(GPU, idle=True)  # nothing to run: hand the GPU over now if another trainer asked for it
+      await self.turn.went_idle()
+      await self.yield_gpu()
       return 0
-    async with self.acquire(GPU):
-      for cmd in cmds:
+    queue: collections.deque[Cmd] = collections.deque()
+    enqueue_cmds(queue, cmds, self.model.lora)
+    processed = 0
+    async with self.acquire(len(cmds)):
+      batch_start = time.time()
+      ops = []
+      while queue:
+        cmd = queue.popleft()
         start = time.time()
         first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
         reply = first or await self.answer(cmd)
+        ms = (time.time() - start) * 1000
+        ops.append([cmd.op, ms])
         self.busy += time.time() - start
         if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
           self.done = True  # another trainer owns the pool now
@@ -503,35 +583,33 @@ class Trainer:
           self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
 
         if DEBUG:
-          ms = (time.time() - start) * 1000
           error = "" if reply.ok else f"  {reply.body.decode()}"
           print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
-    return len(cmds)
+
+        processed += 1
+        if self.model.lora and queue and (cmd.op == Op.OPTIM_STEP or queue[0].run != cmd.run):
+          if cmd.op == Op.OPTIM_STEP:
+            await asyncio.sleep(0.015)
+          more = await self.bus.take(self.pool, self.worker, count, 0)
+          enqueue_cmds(queue, more, True)
+      await self.turn.batch_done(queued=len(queue), seconds=time.time() - batch_start, ops=ops)
+    return processed
 
   @contextlib.asynccontextmanager
-  async def acquire(self, gpu: str):
-    """Hold the GPU for a batch: wait for this trainer's turn and bring its tensors back. After the batch, yield it if
-    another trainer asked for it and this one has had it HOLD_S. With no GPU to share, it does nothing."""
-    if gpu and not self.seated:
-      try:
-        while not await self.bus.take_gpu(gpu, self.worker):
-          await asyncio.sleep(0.05)
-      finally:
-        await self.bus.withdraw_request(gpu, self.worker)
+  async def acquire(self, queued: int):
+    """Hold the GPU for a batch: wait for this trainer's turn and bring its tensors back, and after the batch give the
+    turn back if the scheduler revoked it."""
+    if await self.turn.take(queued):
       await asyncio.to_thread(self.model.resume)
-      self.seated = time.time()
     try:
       yield
     finally:
-      await self.yield_gpu(gpu, idle=False)
+      await self.yield_gpu()
 
-  async def yield_gpu(self, gpu: str, idle: bool) -> None:
-    """Park and release the GPU if another trainer asked for it, once this one is idle or has had it HOLD_S."""
-    held = self.seated and (idle or time.time() - self.seated >= HOLD_S)
-    if held and await self.bus.others_requested(gpu, self.worker):
+  async def yield_gpu(self) -> None:
+    if await self.turn.revoked():
       await asyncio.to_thread(self.model.park)
-      await self.bus.release(f"gpu:{gpu}", self.worker)
-      self.seated = 0.0
+      await self.turn.give_back()
 
   def run(self, cmd: Cmd) -> Reply:
     """Run one command on the model. A failure becomes the reply, never an exception."""

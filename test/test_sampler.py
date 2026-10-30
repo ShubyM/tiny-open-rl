@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import httpx
+import safetensors.torch
+import torch
 
 from test.helpers import FakeEngine, RedisTest, tiny
 from tinyrl import wire
@@ -140,8 +142,8 @@ class TestSampler(RedisTest):
     await self.own(fft_trainer)
     await fft_trainer.step(block_ms=0)
     fft_sid = await save_for_sampler(fft_trainer, fft)
-    self.assertEqual((await self.bus.run(fft_sid))["pool"], f"sampler:fft:{fft}")
-    fft_sampler = Sampler(self.bus, f"sampler:fft:{fft}", engine=FakeEngine, store=store)
+    self.assertEqual((await self.bus.run(fft_sid))["pool"], f"sampler:fft:{base}")
+    fft_sampler = Sampler(self.bus, f"sampler:fft:{base}", engine=FakeEngine, store=store)
     await self.own(fft_sampler)
     request_id = (await call("asample", {"sampling_session_id": fft_sid, "prompt": tokens([1, 2])}))["request_id"]
     await fft_sampler.step(block_ms=0)
@@ -150,20 +152,17 @@ class TestSampler(RedisTest):
     self.assertIn(("load", "c0", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.engine.calls)
     await client.aclose()
 
-  @patch("tinyrl.trainer.HOLD_S", 0.0)
-  @patch("tinyrl.sampler.HOLD_S", 0.0)
   @patch("tinyrl.trainer.GPU", "node-a:0")
-  @patch("tinyrl.sampler.GPUS", ["node-a:0"])
+  @patch("tinyrl.sampler.GPU", "node-a:0")
   async def test_a_trainer_and_a_sampler_take_turns_on_one_gpu(self):
+    await self.run_scheduler({"t1": [0], "sampler:base": [0]})
     await self.take_turns()
 
-  @patch("tinyrl.trainer.HOLD_S", 0.0)
-  @patch("tinyrl.sampler.HOLD_S", 0.0)
   @patch("tinyrl.trainer.GPU", "node-a:1")
-  @patch("tinyrl.sampler.GPUS", ["node-a:0", "node-a:1"])
+  @patch("tinyrl.sampler.GPU", "node-a:0,node-a:1")
   async def test_a_tensor_parallel_sampler_takes_turns_on_both_its_gpus(self):
+    await self.run_scheduler({"t1": [1], "sampler:base": [0, 1]})
     await self.take_turns()
-    self.assertIsNone(await self.bus.owner("gpu:node-a:1"))
 
   async def take_turns(self):
     await self.bus.create(Run("t1", "t1", "base", 0))
@@ -187,8 +186,280 @@ class TestSampler(RedisTest):
     finally:
       trainer.done = sampler.done = True
       await asyncio.gather(*tasks)
-    self.assertIsNone(await self.bus.owner("gpu:node-a:0"))
     self.assertEqual(sampler.engine.calls[-1], ("close",))
+
+  async def test_a_sampler_batches_queued_commands_concurrently_and_loads_once(self):
+    store = Store(tempfile.mkdtemp())
+    store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
+    await self.bus.create(Run("samp-1", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+    active = peak = starts = loads = 0
+
+    class BatchEngine(FakeEngine):
+      @classmethod
+      async def start(cls, base: str, lora: bool):
+        nonlocal starts
+        await asyncio.sleep(0.01)
+        starts += 1
+        return await super().start(base, lora)
+
+      async def load(self, name: str, path: str) -> None:
+        nonlocal loads
+        await asyncio.sleep(0.01)
+        if ("load", name, path) not in self.calls:
+          loads += 1
+        await super().load(name, path)
+
+      async def sample(self, job: dict, name: str | None) -> Out:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return await super().sample(job, name)
+
+    sampler = Sampler(self.bus, "sampler:base", engine=BatchEngine, store=store)
+    await self.own(sampler)
+    ids = [await self.bus.submit("samp-1", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(8)]
+    self.assertEqual(await sampler.step(block_ms=0), 8)
+    self.assertEqual((starts, loads, peak), (1, 1, 8))
+    self.assertTrue(all([(await self.bus.result(i, 1)).ok for i in ids]))
+
+  async def test_vllm_retries_a_dropped_keepalive_socket(self):
+    import httpx
+
+    from tinyrl.vllm import VLLM
+
+    calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+      nonlocal calls
+      calls += 1
+      if calls == 1:
+        raise httpx.ReadError("", request=req)
+      body = {
+        "choices": [
+          {
+            "index": 0,
+            "token_ids": [9],
+            "finish_reason": "stop",
+            "logprobs": {"token_logprobs": [-0.2], "top_logprobs": [{"token_id:9": -0.2}]},
+          }
+        ]
+      }
+      return httpx.Response(200, json=body)
+
+    engine = VLLM(
+      "http://vllm",
+      "base",
+      True,
+      client=httpx.AsyncClient(base_url="http://vllm", transport=httpx.MockTransport(handler)),
+    )
+    out = await engine.sample(JOB, "c0")
+    await engine.close()
+    self.assertEqual(calls, 2)
+    self.assertEqual(out.seqs[0].tokens, [9])
+
+  @patch("tinyrl.vllm.subprocess.Popen")
+  @patch("tinyrl.vllm.httpx.AsyncClient.get")
+  async def test_vllm_start_compilation_config(self, mock_get, mock_popen):
+    mock_popen.return_value.poll.return_value = None
+    mock_get.return_value.is_success = True
+
+    from tinyrl.vllm import CUDAGRAPH_CONFIG, VLLM
+
+    with patch("tinyrl.vllm.VLLM_ARGS", ""):
+      await (await VLLM.start("base", False)).http.aclose()
+      args = mock_popen.call_args[0][0]
+      self.assertIn("--compilation-config", args)
+      idx = args.index("--compilation-config")
+      self.assertEqual(args[idx + 1], CUDAGRAPH_CONFIG)
+
+    with patch("tinyrl.vllm.VLLM_ARGS", "--compilation-config '{}'"):
+      await (await VLLM.start("base", False)).http.aclose()
+      args = mock_popen.call_args[0][0]
+      self.assertIn("--compilation-config", args)
+      idx = args.index("--compilation-config")
+      self.assertEqual(args[idx + 1], "{}")
+      self.assertEqual(args.count("--compilation-config"), 1)
+      self.assertNotIn(CUDAGRAPH_CONFIG, args)
+
+  async def test_vllm_load_skips_untouched_fft_checkpoint(self):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+      calls.append(request.url.path)
+      return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://vllm")
+    full = VLLM("http://vllm", "base", lora=False, client=client)
+
+    dir1 = tempfile.mkdtemp()
+    safetensors.torch.save_file(
+      {"w": torch.ones(1)}, f"{dir1}/model.safetensors", metadata={"meta": json.dumps({"untouched": True})}
+    )
+
+    dir2 = tempfile.mkdtemp()
+    safetensors.torch.save_file(
+      {"w": torch.ones(1)}, f"{dir2}/model.safetensors", metadata={"meta": json.dumps({"untouched": True})}
+    )
+
+    dir3 = tempfile.mkdtemp()
+    safetensors.torch.save_file(
+      {"w": torch.ones(1)}, f"{dir3}/model.safetensors", metadata={"meta": json.dumps({"untouched": False})}
+    )
+
+    await full.load("c0", dir1)
+    self.assertEqual(calls, [])
+
+    await full.load("c1", dir2)
+    self.assertEqual(calls, [])
+
+    await full.load("c2", dir3)
+    self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache"])
+
+    await full.load("c0", dir1)
+    self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache", "/collective_rpc", "/reset_prefix_cache"])
+
+  async def test_a_sampler_takes_the_commands_that_arrive_while_its_engine_boots(self):
+    store = Store(tempfile.mkdtemp())
+    store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
+    await self.bus.create(Run("sess", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+
+    class SlowStartEngine(FakeEngine):
+      @classmethod
+      async def start(cls, base: str, lora: bool):
+        await asyncio.sleep(0.05)
+        return await super().start(base, lora)
+
+    sampler = Sampler(self.bus, "sampler:base", engine=SlowStartEngine, store=store)
+    await self.own(sampler)
+
+    await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+
+    async def push_more():
+      await asyncio.sleep(0.01)
+      await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+
+    asyncio.create_task(push_more())
+
+    handled = await sampler.step(block_ms=200)
+    self.assertEqual(handled, 3)
+
+  async def test_sampler_step_groups_non_exclusive_fft_interleaved(self):
+    store = Store(tempfile.mkdtemp())
+    store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": False, "config": {}})
+    store.put("tinker://r2/sampler_weights/s0", {}, {"base": "base", "lora": False, "config": {}})
+    await self.bus.create(Run("s1", "sampler:fft:base", "base", 0, model_path="tinker://r1/sampler_weights/s0"))
+    await self.bus.create(Run("s2", "sampler:fft:base", "base", 0, model_path="tinker://r2/sampler_weights/s0"))
+
+    loads = []
+
+    class RecordEngine(FakeEngine):
+      async def load(self, name: str, path: str) -> None:
+        loads.append((name, path))
+        await super().load(name, path)
+
+    sampler = Sampler(self.bus, "sampler:fft:base", engine=RecordEngine, store=store)
+    await self.own(sampler)
+
+    await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit("s2", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit("s2", Op.SAMPLE, json.dumps(JOB).encode())
+
+    handled = await sampler.step(block_ms=10)
+    self.assertEqual(handled, 4)
+
+    self.assertEqual([n for n, _ in loads], ["c0", "c1"])
+    first_sess = "s1" if "/r1/" in loads[0][1] else "s2"
+    loads.clear()
+
+    await self.bus.submit(first_sess, Op.SAMPLE, json.dumps(JOB).encode())
+    handled = await sampler.step(block_ms=10)
+    self.assertEqual(handled, 1)
+    self.assertEqual([n for n, _ in loads], ["c0"])
+
+  @patch("subprocess.Popen")
+  async def test_vllm_start_appends_memory_and_kv_args_from_environ(self, mock_popen):
+    mock_popen.return_value.poll.return_value = 0
+    import os
+
+    from tinyrl.vllm import VLLM
+
+    with patch.dict(os.environ, {"TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}):
+      with patch("tinyrl.vllm.VLLM_ARGS", "--gpu-memory-utilization 0.8"):
+        with self.assertRaises(RuntimeError):
+          await VLLM.start("base", False)
+        args = mock_popen.call_args[0][0]
+        child_env = mock_popen.call_args[1]["env"]
+        self.assertEqual(args[-4:], ["--gpu-memory-utilization", "0.42", "--kv-cache-memory-bytes", str(16 * 1024**3)])
+        self.assertNotIn("TINYRL_GPU_MEM", child_env)
+        self.assertNotIn("TINYRL_KV_BYTES", child_env)
+
+  async def test_warm_sampler_starts_engine_before_sample_and_strips_env_var(self):
+    import os
+
+    await self.bus.warm_sampler("sampler:base", "base")
+    sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine)
+    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1"}):
+      task = asyncio.create_task(sampler.serve())
+      try:
+        for _ in range(50):
+          if sampler.engine is not None:
+            break
+          await asyncio.sleep(0.02)
+        self.assertIsNotNone(sampler.engine)
+        self.assertEqual(sampler.engine.calls[0], ("start", "base", True))
+      finally:
+        sampler.done = True
+        await task
+
+      with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.poll.return_value = 0
+        with self.assertRaises(RuntimeError):
+          await VLLM.start("base", False)
+        self.assertNotIn("TINYRL_WARM_SAMPLER", mock_popen.call_args[1]["env"])
+
+  def test_sampler_imports_are_clean(self):
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+      [
+        sys.executable,
+        "-c",
+        "import sys, tinyrl.sampler, tinyrl.vllm; "
+        "assert not ({'torch', 'transformers', 'peft', 'safetensors'} & set(sys.modules))",
+      ],
+      capture_output=True,
+      text=True,
+    )
+    self.assertEqual(out.returncode, 0, out.stderr)
+
+  @patch("tinyrl.vllm.subprocess.Popen")
+  @patch("tinyrl.vllm.httpx.AsyncClient.get")
+  async def test_vllm_start_kernel_config(self, mock_get, mock_popen):
+    mock_popen.return_value.poll.return_value = None
+    mock_get.return_value.is_success = True
+
+    from tinyrl.vllm import KERNEL_CONFIG, VLLM
+
+    with patch("tinyrl.vllm.VLLM_ARGS", ""):
+      await (await VLLM.start("base", False)).http.aclose()
+      args = mock_popen.call_args[0][0]
+      self.assertIn("--kernel-config", args)
+      idx = args.index("--kernel-config")
+      self.assertEqual(args[idx + 1], KERNEL_CONFIG)
+
+    with patch("tinyrl.vllm.VLLM_ARGS", "--kernel-config '{\"enable_flashinfer_autotune\":true}'"):
+      await (await VLLM.start("base", False)).http.aclose()
+      args = mock_popen.call_args[0][0]
+      self.assertIn("--kernel-config", args)
+      idx = args.index("--kernel-config")
+      self.assertEqual(args[idx + 1], '{"enable_flashinfer_autotune":true}')
+      self.assertEqual(args.count("--kernel-config"), 1)
+      self.assertNotIn(KERNEL_CONFIG, args)
 
 
 if __name__ == "__main__":
