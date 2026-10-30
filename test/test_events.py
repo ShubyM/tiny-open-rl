@@ -11,11 +11,11 @@ from tinyrl.trainer import Trainer
 
 class TestEvents(RedisTest):
   async def test_round_trip(self):
-    first = await self.bus.emit("started", pool="p", node="n", gpus=[0], memory=0)
-    second = await self.bus.emit("exited", pool="p")
+    first = await self.bus.emit("started", worker="w", node="n", gpus=[0], memory=0)
+    second = await self.bus.emit("exited", worker="w")
     events = await self.bus.events()
     self.assertEqual([(e.id, e.kind) for e in events], [(first, "started"), (second, "exited")])
-    self.assertEqual(events[0].body, {"pool": "p", "node": "n", "gpus": [0], "memory": 0})
+    self.assertEqual(events[0].body, {"worker": "w", "node": "n", "gpus": [0], "memory": 0})
     self.assertLessEqual(events[0].t, events[1].t)
     self.assertEqual([e.id for e in await self.bus.events(first)], [second])
 
@@ -56,8 +56,8 @@ class TestEvents(RedisTest):
     events = await self.bus.events()
     turns = ("wants_gpu", "granted", "batch_done", "idle")
     for pool in ("lora:tiny:1", "sampler:tiny"):
-      self.assertEqual([e.kind for e in events if e.body.get("pool") == pool and e.kind in turns], list(turns))
+      self.assertEqual([e.kind for e in events if e.body.get("worker") == pool and e.kind in turns], list(turns))
     s = scheduler.State()
     for e in events:
       s = scheduler.fold(s, e)
-    self.assertEqual(check(s), [])
+    check(s)

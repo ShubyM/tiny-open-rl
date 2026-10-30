@@ -71,3 +71,91 @@ Both the browser and tests load the same engine; there is no generated bundle
 to rebuild. `vendor/d3.v7.9.0.min.js` is D3 7.9.0 from
 <https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js>; its license is in
 `vendor/LICENSE.d3`.
+
+## GPU-turn reference benchmark
+
+`scheduling.py` is a separate, small reference model for evaluating turn policies:
+
+```sh
+python3 -m simulator.scheduling
+python3 -m unittest test.test_fairness
+```
+
+With the project's Python dependencies installed, add `--actual` to compare the
+production scheduler with both references. `SchedulerPolicy` invokes the real
+`tinyrl.scheduler.fold` and `decide` functions; it does not copy their ranking logic.
+Each run gets one already-warm worker on the same GPU. Arrivals retain their
+timestamps, decisions occur at quantum boundaries, and release acknowledgements
+are immediate. Weighted attained-service accounting charges compute plus
+command-associated switching, matching the trainer's occupancy accounting;
+reported useful work excludes switching. New runnable runs join the current
+virtual-service cohort rather than competing against historical unspent capacity.
+Separate property tests cover delayed acknowledgements and
+shuffled facts from an old worker after replacement. A late-arrival regression
+checks that recurring switch costs do not accumulate unbounded unpaid debt for
+older jobs and prevent a new job from receiving service.
+
+It models one already-warm GPU, integer compute demand and arrivals, a fixed
+quantum, and a cost when changing workers. Compute is divisible at the observation
+horizon. It does not model kernels, memory placement, batching, worker startup,
+training convergence, or overlapping transfers. Its compute service is a resource
+metric, not a claim about model quality or training goodput.
+
+Every eligible job remains in the report, including jobs receiving zero service.
+Service is normalized against ideal weighted processor sharing with the same
+arrivals and finite demand, without switching cost. The report includes minimum
+normalized service, Jain's index, useful compute, switching and idle time,
+unfinished jobs, and the longest wait including unfinished waiting intervals.
+Jain alone is insufficient: serving 99 jobs while starving one can score 0.99,
+and equalizing tiny allocations can score 1 while most GPU time is wasted.
+
+The FIFO baseline requeues a worker after each turn, matching the former serial
+one-GPU turn policy; it does not reproduce the former placement zones. The exact
+oracle searches every legal turn choice and idle tick for at most four jobs and
+twelve time units. Its objective is lexicographic: maximize minimum normalized
+service, then total compute. It knows future arrivals and can wait longer than an
+online policy. It is an optimum only for this stated model and objective; it is
+neither a production policy nor a universal lower bound on latency.
+
+The committed [scheduling-results.json](scheduling-results.json) is the default `--actual` output.
+Six fixed workload seeds are evaluation cases, not an optimization dataset. The
+tests independently enumerate a tiny oracle case and check the homogeneous bound:
+with equal continuously runnable jobs, no switching cost, and complete rounds,
+round-robin gives each job the ideal equal share. Arrivals, weights, switching,
+placement, and delayed release require separate evidence; that bound says nothing
+about their global optimum.
+
+The default six cases give the following minimum normalized service. These cases
+were fixed before connecting the actual scheduler; they expose its remaining gaps.
+
+| Case | FIFO turns | Actual scheduler | Exact oracle |
+| --- | ---: | ---: | ---: |
+| 0 | 0.545 | 0.545 | 0.545 |
+| 1 | 0.500 | 0.500 | 0.500 |
+| 2 | 0.500 | 0.500 | 0.667 |
+| 3 | 0.577 | 0.577 | 0.577 |
+| 4 | 0.429 | 0.429 | 0.667 |
+| 5 | 0.364 | 0.545 | 0.727 |
+
+In cases 2, 4 and 5, the actual scheduler performs seven units of compute while the
+oracle performs eight. In case 5, the actual scheduler improves minimum useful
+service over FIFO, but increases the longest wait from six to eight units.
+This is a tradeoff, not evidence of a latency guarantee. The tests also keep the
+former placement regression separate: eight distinct shared LoRA workers on an
+eight-GPU node previously used only lanes 0 and 1; the actual scheduler uses all
+eight idle GPUs. A separate four-GPU/five-run scenario executes source-release,
+target-assignment and GPU-turn events to check that the extra run can relocate
+instead of remaining permanently limited to half a GPU. That lifecycle scenario
+uses instantaneous checkpoint, startup and release acknowledgements, and checks
+physical turn exclusion after every event. It is not a migration performance
+benchmark. None of these scenarios establishes cluster-wide optimality.
+
+This separation follows the evaluation distinction in
+[Gavel, sections 7.1 and 7.5](https://people.eecs.berkeley.edu/~matei/papers/2020/osdi_gavel.pdf):
+objective quality and realization of an ideal allocation are different questions.
+[Themis, sections 3.2 and 6](https://www.usenix.org/system/files/nsdi20-paper-mahajan.pdf)
+measures the distribution and worst finish-time fairness as well as GPU time for
+equal work. [Pollux, section 5.3.1](https://www.usenix.org/system/files/osdi21-qiao.pdf)
+also shows that pushing instantaneous equality harder can worsen eventual fairness
+through extra reallocations. The small oracle here establishes none of those
+papers' broader performance claims for this implementation.

@@ -13,7 +13,7 @@ import torch
 
 from test.helpers import RedisTest, tiny
 from test.test_wire import json_body
-from tinyrl import gateway, scheduler, wire
+from tinyrl import gateway, wire
 from tinyrl.proto import tinker_public_pb2 as pb
 from tinyrl.store import Store
 from tinyrl.trainer import Model, Trainer
@@ -51,12 +51,21 @@ class TestAPI(RedisTest):
 
   async def drain(self, run_id: str):
     """Let the trainer for the run's pool do all of the pool's queued work."""
-    pool = (await self.bus.run(run_id))["pool"]
+    pool = await self.assign_for_test(run_id)
     if pool not in self.trainers:
       self.trainers[pool] = Trainer(self.bus, pool, Model(tiny), store=self.store)
       await self.own(self.trainers[pool])
     while await self.trainers[pool].step(block_ms=10):
       pass
+
+  async def assign_for_test(self, run_id: str) -> str:
+    """The HTTP tests supply explicit workers; scheduler policy has its own integration tests."""
+    run = await self.bus.run(run_id)
+    if not run["pool"]:
+      pool = run_id if not run["rank"] or run["exclusive"] else "lora:tiny:0"
+      await self.bus.assign(run_id, pool, rule="test_worker")
+      return pool
+    return run["pool"]
 
   async def result(self, submitted: httpx.Response, **kwargs) -> httpx.Response:
     """Run a submitted call and retrieve its result."""
@@ -177,15 +186,42 @@ class TestAPI(RedisTest):
       pending = await self.post("retrieve_future", json={"request_id": f"{run_id}/1-0"})
       self.assertEqual(pending.json()["type"], "try_again")
 
-  async def test_pools(self):
-    shared, also_shared = await self.create_model(), await self.create_model()
-    full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
-    exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})
+  async def test_gateway_submits_requirements_and_leaves_placement_to_scheduler(self):
+    response = await self.post(
+      "create_model",
+      json={
+        "base_model": "tiny",
+        "lora_config": {"rank": 4},
+        "user_metadata": {"openrl.exclusive": "true", "openrl.weight": 2},
+      },
+    )
+    run_id = response.json()["model_id"]
+    run = await self.bus.run(run_id)
+    self.assertEqual(
+      (run["pool"], run["rank"], run["role"], run["weight"], run["exclusive"]), ("", 4, "trainer", 2, True)
+    )
+    self.assertEqual(await self.bus.pools(), [])
+    self.assertEqual((await self.bus.decisions())["run"], {})
+    self.assertEqual((await self.bus.queue(run_id))["queued"], 1)
 
-    pools = [(await self.bus.run(run_id))["pool"] for run_id in (shared, also_shared, full, exclusive)]
-    self.assertEqual(pools, ["lora:tiny:0", "lora:tiny:0", full, exclusive])
-    self.assertEqual((await self.bus.run(full))["rank"], 0)
-    self.assertEqual((await self.post("get_info", json={"model_id": full})).json()["lora_rank"], 16)
+  async def test_fairness_metrics_include_eligible_runs_with_no_service_and_no_worker(self):
+    await self.bus.r.set(
+      "tinyrl:state",
+      json.dumps(
+        {
+          "runs": {
+            "waiting": {"worker": "", "served": 0, "entitled": 12, "owed": 12, "pending": 1},
+            "served": {"worker": "w1", "served": 10, "entitled": 12, "owed": 2, "pending": 0},
+          }
+        }
+      ),
+    )
+    metrics = (await self.http.get("/metrics")).text
+    self.assertIn('tinyrl_service_seconds_total{run="waiting"} 0\n', metrics)
+    self.assertIn('tinyrl_entitled_seconds_total{run="waiting"} 12\n', metrics)
+    self.assertIn('tinyrl_pending{run="waiting"} 1\n', metrics)
+    self.assertIn('tinyrl_pending{run="served"} 0\n', metrics)
+    self.assertIn('tinyrl_owed_seconds{run="waiting"} 12\n', metrics)
 
   async def test_session_tags_apply_to_its_models(self):
     """TINKER_TAGS reach the server on create_session, which is how open-rl clients ask for a full fine-tune."""
@@ -225,7 +261,7 @@ class TestAPI(RedisTest):
 
   async def test_sampler_weights_preserve_base_model_dtype(self):
     async def drain_bf16(run_id: str):
-      pool = (await self.bus.run(run_id))["pool"]
+      pool = await self.assign_for_test(run_id)
       if pool not in self.trainers:
 
         def bf16(name: str):
@@ -326,7 +362,7 @@ class TestAPI(RedisTest):
     )
     self.assertEqual((await self.post("telemetry", json={"events": []})).json(), {"status": "accepted"})
 
-  async def test_end_to_end_scheduling_inspection_and_cleanup(self):
+  async def test_assignment_inspection_and_cleanup(self):
     run_id = await self.create_model()
     excl_id = await self.create_model(user_metadata={"openrl.exclusive": "true"})
     saved = await self.result(
@@ -334,20 +370,16 @@ class TestAPI(RedisTest):
     )
     samp_id = saved.json()["sampling_session_id"]
 
-    await self.bus.heartbeat("node-1", 8)
-    await self.bus.emit("node_up", node="node-1", gpus=8, memory=0)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    data = await self.scheduling_until(lambda d: "lora:tiny:0" in d["state"]["pools"])
+    data = (await self.http.get("/api/v1/scheduling")).json()
     self.assertIn(run_id, data["decisions"]["run"])
     self.assertIn(excl_id, data["exclusive"])
-    self.assertIn(f"sampler:lora:{excl_id}", data["exclusive"])
-    self.assertEqual(data["decisions"]["run"][samp_id]["rule"], "dedicated_exclusive_sampler")
-    self.assertEqual(data["state"]["pools"]["lora:tiny:0"]["node"], "node-1")
-    self.assertIn("node-1", data["nodes"])
+    self.assertIn(samp_id, data["exclusive"])
+    self.assertEqual((await self.bus.run(samp_id))["pool"], "")
+    self.assertEqual((await self.bus.run(samp_id))["train_run"], excl_id)
 
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
-    data = await self.scheduling_until(lambda d: "lora:tiny:0" not in d["state"]["pools"])
+    data = (await self.http.get("/api/v1/scheduling")).json()
     self.assertNotIn(run_id, data["decisions"]["run"])
 
   async def scheduling_until(self, done, tries: int = 100) -> dict:
@@ -359,7 +391,7 @@ class TestAPI(RedisTest):
       await asyncio.sleep(0.05)
     self.fail(f"never: {data}")
 
-  async def test_sft_never_warms_samplers_while_save_weights_for_sampler_does(self):
+  async def test_only_actual_sampling_sessions_request_sampler_workers(self):
     sft = await self.create_model()
     await self.result(await self.post("forward_backward", content=proto_body(sft), headers=PROTO))
     await self.result(await self.post("optim_step", json={"model_id": sft, "adam_params": {}}))
@@ -372,21 +404,16 @@ class TestAPI(RedisTest):
     self.assertEqual(await self.bus.warm_samplers(), {})
 
     await self.post("save_weights_for_sampler", json={"model_id": sft, "path": "000000"})
-    self.assertEqual(await self.bus.warm_samplers(), {"sampler:tiny": "tiny"})
-
-    await self.bus.heartbeat("n8", 8)
-    await self.bus.emit("node_up", node="n8", gpus=8, memory=0)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    data = await self.scheduling_until(lambda d: "sampler:tiny" in d["state"]["pools"])
-    self.assertEqual(data["state"]["pools"]["sampler:tiny"]["node"], "n8")
-    self.assertEqual(data["state"]["pools"]["sampler:tiny"]["env"].get("TINYRL_WARM_SAMPLER"), "1")
+    self.assertEqual(await self.bus.warm_samplers(), {})
 
     excl = await self.create_model(user_metadata={"openrl.exclusive": "true"})
-    await self.post("save_weights_for_sampler", json={"model_id": excl, "sampling_session_seq_id": 0})
-    self.assertIn(f"sampler:lora:{excl}", await self.bus.warm_samplers())
-    await self.post("delete_model", json={"model_id": excl})
-    await self.drain(excl)
-    self.assertNotIn(f"sampler:lora:{excl}", await self.bus.warm_samplers())
+    response = await self.result(
+      await self.post("save_weights_for_sampler", json={"model_id": excl, "sampling_session_seq_id": 0})
+    )
+    sampler = await self.bus.run(response.json()["sampling_session_id"])
+    self.assertEqual(
+      (sampler["role"], sampler["base"], sampler["pool"], sampler["exclusive"]), ("sampler", "tiny", "", True)
+    )
 
 
 if __name__ == "__main__":

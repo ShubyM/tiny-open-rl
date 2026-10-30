@@ -15,14 +15,12 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from tinyrl import scheduler, wire
+from tinyrl import wire
 from tinyrl.bus import Bus, Op, Run, key
 from tinyrl.helpers import getenv
 from tinyrl.store import Store
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
-TARGET_UTIL = getenv("TARGET_UTIL", 0.7)  # a LoRA shard busier than this gets no new runs while another can open
-NEW_RUN_UTIL = float(getenv("NEW_RUN_UTIL", 0.04))  # the load a new run adds before any shard on its base has reported
 
 
 # ***** requests *****
@@ -76,19 +74,6 @@ def checkpoint_uri(run: str, kind: str, name: str) -> str:
   return f"tinker://{run}/{kind}/{name}"
 
 
-async def pool_for(bus: Bus, run: str, base_model: str, rank: int, metadata: dict) -> str:
-  exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
-  shards = [p for p in await bus.pools() if p.startswith(f"lora:{base_model}:")]
-  loads = await bus.loads(shards)
-  shard_loads = [(pool, *load) for pool, load in zip(shards, loads)]
-  gpus = await bus.gpus()
-  dec = scheduler.choose_pool(run, base_model, rank, exclusive, shard_loads, gpus, TARGET_UTIL, NEW_RUN_UTIL)
-  await bus.decide("run", run, dec)
-  if dec["choice"] != run:
-    await bus.placed(dec["choice"])
-  return dec["choice"]
-
-
 def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   bus = bus if bus is not None else Bus()
   store = store if store is not None else Store()
@@ -128,11 +113,12 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       base, lora, uri, train_run = base_model, True, None, None
 
     exclusive = train_run in await bus.exclusive() if train_run else False
-    dec = scheduler.choose_sampler_pool(base, lora, train_run, exclusive)
-    await bus.warm_sampler(dec["choice"], base, exclusive=exclusive)
     sid = f"samp-{uuid.uuid4().hex[:12]}"
-    await bus.decide("run", sid, dec)
-    await bus.create(Run(sid, dec["choice"], base, int(lora), session_id, model_path=uri, exclusive=exclusive))
+    await bus.create(
+      Run(
+        sid, "", base, int(lora), session_id, model_path=uri, exclusive=exclusive, role="sampler", train_run=train_run
+      )
+    )
     return sid
 
   # ***** service *****
@@ -183,8 +169,13 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
     run = str(uuid.uuid4())
-    pool = await pool_for(bus, run, req.base_model, rank, metadata)
-    await bus.create(Run(run, pool, req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive))
+    try:
+      weight = float(metadata.get("openrl.weight", 1.0))
+    except (TypeError, ValueError) as error:
+      raise ValueError("openrl.weight must be positive and finite") from error
+    if not 0 < weight < float("inf"):
+      raise ValueError("openrl.weight must be positive and finite")
+    await bus.create(Run(run, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive, weight=weight))
     return await submit(run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora})
 
   @api.post("/api/v1/get_info")
@@ -247,10 +238,6 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       return await submit(
         req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri, "sampling_session_id": sid}, req.seq_id
       )
-    if train["base"]:
-      excl = req.model_id in await bus.exclusive()
-      dec = scheduler.choose_sampler_pool(train["base"], train["rank"] > 0, req.model_id, excl)
-      await bus.warm_sampler(dec["choice"], train["base"], exclusive=excl)
     return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri}, req.seq_id)
 
   @api.post("/api/v1/load_weights")
@@ -367,6 +354,16 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       for name, n in counters.items():
         name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
         lines.append(f'tinyrl_{name}_total{{pool="{pool}",run="{run}"}} {n}')
+    state = json.loads(await bus.r.get(key("state")) or "{}")
+    for run, record in state.get("runs", {}).items():
+      labels = f"run={json.dumps(run)}"
+      for metric, field in (
+        ("service_seconds_total", "served"),
+        ("entitled_seconds_total", "entitled"),
+        ("pending", "pending"),
+        ("owed_seconds", "owed"),
+      ):
+        lines.append(f"tinyrl_{metric}{{{labels}}} {record.get(field, 0)}")
     return PlainTextResponse("\n".join(lines) + "\n")
 
   return api

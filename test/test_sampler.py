@@ -93,7 +93,16 @@ class TestSampler(RedisTest):
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app(self.bus, store)), base_url="http://test")
 
     async def call(path: str, body: dict) -> dict:
-      return (await client.post(f"/api/v1/{path}", json=body)).json()
+      result = (await client.post(f"/api/v1/{path}", json=body)).json()
+      # Supply explicit workers in this API test; production placement is covered separately.
+      for e in await self.bus.events():
+        if e.kind == "run_created" and not (record := await self.bus.run(e.body["run"]))["pool"]:
+          if record["role"] == "sampler":
+            pool = f"sampler:{'' if record['rank'] else 'fft:'}{base}"
+          else:
+            pool = f"lora:{base}:0" if record["rank"] else e.body["run"]
+          await self.bus.assign(e.body["run"], pool)
+      return result
 
     async def save_for_sampler(trainer: Trainer, run: str) -> str:
       request_id = (await call("save_weights_for_sampler", {"model_id": run, "sampling_session_seq_id": 0}))[

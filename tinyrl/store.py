@@ -171,6 +171,18 @@ class Store:
       shutil.rmtree(old)
     else:
       os.rename(folder, dest)
+    if not self.remote or self.fs.protocol == "file" or "file" in self.fs.protocol:
+      # A handoff publishes its pointer only after put returns. Persist files and directory entries first.
+      for name in names:
+        with open(f"{dest}/{name}", "rb") as f:
+          os.fsync(f.fileno())
+      folder_path = pathlib.Path(dest).resolve()
+      for directory in (folder_path, *folder_path.parents):
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+          os.fsync(fd)
+        finally:
+          os.close(fd)
     return dest
 
   def local(self, uri: str) -> tuple[str, str]:

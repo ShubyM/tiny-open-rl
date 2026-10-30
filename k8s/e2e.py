@@ -5,10 +5,10 @@ gateway, trains two LoRA runs through the SDK, then injects one failure at a tim
 
   trainer_killed   a trainer process dies: the node daemon starts another, calls fail cleanly, load_state recovers
   gateway_deleted  every gateway pod is deleted: the SDK's retries land and no call runs twice
-  redis_restarted  Redis is down past the pool lease: runs survive on its append-only file and training goes on
+  redis_restarted  Redis is down past the worker lease: runs survive on its append-only file and training goes on
   node_drained     a node is drained, as on a Spot notice: its trainer saves the run, which goes on on another node
-  node_died        a node is reset with no notice: its pools move, calls fail cleanly, load_state recovers
-  no_leaks         afterwards, one trainer process per placed pool and no lease without a pool
+  node_died        a node is reset with no notice: its runs move, calls fail cleanly, load_state recovers
+  no_leaks         afterwards, one trainer process per placed worker and no lease without a pool
 
 python k8s/e2e.py prints one line per check and writes the report to e2e.json.
 """
@@ -60,13 +60,17 @@ def daemons() -> dict[str, str]:
 
 
 def placements() -> dict[str, str]:
-  """Pool -> the node daemon pod the scheduler placed it on. A node daemon's id is its pod name and pid."""
-  pools = json.loads(redis("GET", "tinyrl:state") or "{}").get("pools", {})
-  return {pool: p["node"].rsplit("-", 1)[0] for pool, p in pools.items() if p["node"]}
+  """Worker ID -> node daemon pod. IDs end in a fresh daemon-incarnation UUID."""
+  workers = json.loads(redis("GET", "tinyrl:state") or "{}").get("workers", {})
+  return {worker: w["node"].rsplit("-", 1)[0] for worker, w in workers.items() if not w["exited"]}
 
 
-def serving(pool: str) -> str | None:
-  return placements().get(pool)
+def worker_for(run: str) -> str:
+  return json.loads(redis("HGET", f"tinyrl:run:{run}", "record") or "{}").get("pool", "")
+
+
+def serving(run: str) -> str | None:
+  return placements().get(worker_for(run))
 
 
 def trainers(pod: str) -> list[str]:
@@ -90,7 +94,7 @@ class Run:
   def __init__(self, client: tinker.ServiceClient, tok, name: str):
     self.name = name
     self.tc = client.create_lora_training_client(MODEL, rank=8, seed=0, user_metadata={"openrl.exclusive": "true"})
-    self.pool = self.tc.model_id  # an exclusive run has a pool of its own, named by its id
+    self.id = self.tc.model_id  # the run stays stable when its worker changes
     ids = tok.encode("tinyrl keeps training when its pods, nodes and Redis go away.", add_special_tokens=False)
     self.datum = types.Datum(
       model_input=types.ModelInput.from_ints(ids[:-1]),
@@ -105,7 +109,7 @@ class Run:
     return fb.result().metrics["loss:sum"]
 
   def server_steps(self) -> int:
-    return int(redis("HGET", f"tinyrl:run:{self.pool}", "steps"))
+    return int(redis("HGET", f"tinyrl:run:{self.id}", "steps"))
 
   def fails_cleanly(self) -> str:
     try:
@@ -150,9 +154,10 @@ def main() -> None:
   checkpoint = run.tc.save_state("e2e").result().path
 
   def trainer_killed():
-    pod = serving(run.pool)
-    kubectl("exec", pod, "--", "pkill", "-9", "-f", f"tinyrl.trainer {run.pool}")
-    restart = wait("a new trainer", lambda: any(run.pool in t for t in trainers(pod)), 15)
+    pod = serving(run.id)
+    previous = worker_for(run.id)
+    kubectl("exec", pod, "--", "pkill", "-9", "-f", f"tinyrl.trainer {previous}")
+    restart = wait("a new trainer", lambda: worker_for(run.id) not in ("", previous) and serving(run.id), 30)
     error = run.fails_cleanly()
     assert "lost its unsaved steps" in error, error
     run.tc.load_state_with_optimizer(checkpoint).result()
@@ -168,19 +173,19 @@ def main() -> None:
   def redis_restarted():
     kubectl("scale", "statefulset/redis", "--replicas=0")
     kubectl("wait", "--for=delete", "pod/redis-0", "--timeout=120s", check=False)
-    time.sleep(15)  # down longer than the 10 s pool lease, so every lease runs out
+    time.sleep(15)  # down longer than the 10 s worker lease, so every lease runs out
     kubectl("scale", "statefulset/redis", "--replicas=1")
     c, r = both_step()
-    assert redis("EXISTS", f"tinyrl:run:{run.pool}") == "1"
+    assert redis("EXISTS", f"tinyrl:run:{run.id}") == "1"
     return f"runs survived, and both stepped after the restart (losses {c:.3f}, {r:.3f})"
 
   def node_drained():
-    pod = serving(run.pool)
+    pod = serving(run.id)
     node = daemons()[pod]
     kubectl("taint", "node", node, "tinyrl-e2e-drain=true:NoExecute")  # evicts the node daemon, as a Spot notice does
     try:
-      wait("the run parked", lambda: redis("EXISTS", f"tinyrl:parked:{run.pool}") == "1", 40)
-      moved = wait("the pool moved", lambda: serving(run.pool) not in (None, pod), 90)
+      wait("the run parked", lambda: redis("EXISTS", f"tinyrl:parked:{run.id}") == "1", 40)
+      moved = wait("the pool moved", lambda: serving(run.id) not in (None, pod), 90)
       c, r = both_step()
       gap = abs(r - c) / c
       assert gap < 0.05, f"after the move the run's loss {r:.4f} is {gap:.1%} off the control's {c:.4f}"
@@ -189,7 +194,7 @@ def main() -> None:
       kubectl("taint", "node", node, "tinyrl-e2e-drain-", check=False)
 
   def node_died():
-    pod = serving(run.pool)
+    pod = serving(run.id)
     node = daemons()[pod]
     token = subprocess.run(
       ["gcloud", "auth", "application-default", "print-access-token"], capture_output=True, text=True
@@ -200,7 +205,7 @@ def main() -> None:
       check=True,
       capture_output=True,
     )
-    moved = wait("the pool moved off the dead node", lambda: serving(run.pool) not in (None, pod), 120)
+    moved = wait("the pool moved off the dead node", lambda: serving(run.id) not in (None, pod), 120)
     error = run.fails_cleanly()
     assert "lost its unsaved steps" in error, error
     run.tc.load_state_with_optimizer(checkpoint).result()
@@ -219,7 +224,7 @@ def main() -> None:
     owners = [k.removeprefix("tinyrl:owner:") for k in redis("KEYS", "tinyrl:owner:*").split()]
     leaked = [o for o in owners if o not in placed and o != "scheduler" and not o.startswith("gpu:")]
     assert not any(extra.values()) and not missing and not leaked, (extra, missing, leaked)
-    return f"{len(placed)} pools, each with one process, and no stray processes or leases"
+    return f"{len(placed)} workers, each with one process, and no stray processes or leases"
 
   for name, fn in [
     ("trainer_killed", trainer_killed),

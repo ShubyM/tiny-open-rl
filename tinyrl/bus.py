@@ -1,7 +1,7 @@
 """Runs, sessions, commands and replies, all on Redis.
 
-Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The trainer for a pool reads its runs'
-streams through one consumer group, so Redis itself knows:
+Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The scheduler assigns runs to workers;
+the legacy `pool` field holds that dispatch identity. Workers read assigned streams through one consumer group:
 
   what is queued       XINFO GROUPS, the group's lag
   what is in flight    XPENDING: which trainer took each command, and how long ago
@@ -11,15 +11,15 @@ streams through one consumer group, so Redis itself knows:
 A reply is a stream with a single entry, tinyrl:f:<request_id>. XREAD from id 0 blocks until it is written and never
 consumes it, so a client can retry retrieve_future, or many clients can wait on one, and every one gets the same answer.
 
-A pool has one owner, the trainer holding its lease, tinyrl:owner:<pool>. Replies are written in a WATCH/MULTI/EXEC
-transaction on the lease key, so a trainer that lost its pool, say after a long pause, can't answer for it.
+A dispatch identity has one owner, holding tinyrl:owner:<pool>. Claims and replies check both ownership and assignment.
+Moves stop new source claims, then commit a durable release before the target can read the stable run stream.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import random
+import math
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -64,6 +64,10 @@ class Run:
   model_path: str | None = None
   lora: dict = field(default_factory=dict)  # the LoRA config it was created with, to create it again elsewhere
   exclusive: bool = False
+  role: str = "trainer"
+  weight: float = 1.0
+  memory: int = 0
+  train_run: str | None = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +118,31 @@ class Bus:
   def __init__(self, r: redis.Redis | None = None):
     self.r = r if r is not None else connect(getenv("REDIS_URL", "redis://localhost:6379"))
 
+  @staticmethod
+  def event(p, kind: str, **body) -> None:
+    # Never trim a replay log without a checkpoint and its corresponding cursor.
+    p.xadd(key("events"), {"kind": kind, "body": json.dumps(body)})
+
+  async def at_tail(self, p, after: str | None) -> bool:
+    if after is None:
+      return True
+    await p.watch(key("events"))
+    tail = await p.xrevrange(key("events"), count=1)
+    return (tail[0][0].decode() if tail else "0-0") == after
+
+  async def emit_decision(self, kind: str, after: str, **body) -> bool:
+    """A decision applies only to the exact log prefix from which it was computed."""
+    try:
+      async with self.r.pipeline() as p:
+        if not await self.at_tail(p, after):
+          return False
+        p.multi()
+        self.event(p, kind, **body)
+        await p.execute()
+        return True
+    except redis.WatchError:
+      return False
+
   # ***** sessions *****
 
   async def session(self, session_id: str, metadata: dict | None = None) -> None:
@@ -149,12 +178,19 @@ class Bus:
   # ***** runs *****
 
   async def create(self, run: Run) -> None:
+    if run.role not in ("trainer", "sampler"):
+      raise ValueError("run role must be trainer or sampler")
+    if not isinstance(run.weight, (int, float)) or not math.isfinite(run.weight) or run.weight <= 0:
+      raise ValueError("run weight must be positive and finite")
+    if not isinstance(run.memory, int) or run.memory < 0:
+      raise ValueError("run memory must be a nonnegative byte count")
     # one transaction, so a run is in its pool exactly when its stream and consumer group exist
     record = json.dumps({**asdict(run), "created": time.time()})
     p = self.r.pipeline(transaction=True)
     p.xgroup_create(key("q", run.id), GROUP, id="0", mkstream=True)
-    p.sadd(key("pools"), run.pool)
-    p.sadd(key("pool", run.pool), run.id)
+    if run.pool:
+      p.sadd(key("pools"), run.pool)
+      p.sadd(key("pool", run.pool), run.id)
     p.hset(
       key("run", run.id), mapping={"record": record, "steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0}
     )
@@ -162,9 +198,11 @@ class Bus:
       p.sadd(key("sess", run.session, "runs"), run.id)
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
     if run.exclusive:
-      p.sadd(key("excl"), run.id, run.pool)
+      p.sadd(key("excl"), run.id)
+    requirements = asdict(run)
+    requirements.pop("id")
+    self.event(p, "run_created", run=run.id, **requirements)
     await p.execute()
-    await self.emit("run_created", run=run.id, pool=run.pool, exclusive=run.exclusive)
 
   async def run(self, run_id: str) -> dict | None:
     fields = await self.r.hgetall(key("run", run_id))
@@ -177,6 +215,126 @@ class Bus:
 
   async def runs(self, pool: str) -> list[str]:
     return [run_id.decode() for run_id in await self.r.smembers(key("pool", pool))]
+
+  async def assign(self, run_id: str, pool: str, after: str | None = None, **decision) -> bool:
+    """Project the scheduler's assignment and its fact together. A live source must release first."""
+    record_key, stream, moves = key("run", run_id), key("q", run_id), key("moves")
+    while True:
+      try:
+        async with self.r.pipeline() as p:
+          if not await self.at_tail(p, after):
+            return False
+          await p.watch(record_key, stream, moves)
+          raw = await p.hget(record_key, "record")
+          if not raw or not await p.exists(stream):
+            return False
+          record = json.loads(raw)
+          if record["pool"]:
+            return record["pool"] == pool
+          # Release is the safety boundary. Its suggested target may have died;
+          # the scheduler can choose a replacement from the current log prefix.
+          record["pool"] = pool
+          p.multi()
+          p.hset(record_key, "record", json.dumps(record))
+          p.sadd(key("pools"), pool)
+          p.sadd(key("pool", pool), run_id)
+          p.hdel(moves, run_id)
+          p.hset(key("decide", "run"), run_id, json.dumps({"choice": pool, **decision}))
+          self.event(p, "run_assigned", run=run_id, worker=pool, **decision)
+          await p.execute()
+          return True
+      except redis.WatchError:
+        continue
+
+  async def request_move(self, run_id: str, target: str, token: str, after: str | None = None) -> bool:
+    """Stop new source claims. The target receives nothing until release_run commits."""
+    record_key, moves = key("run", run_id), key("moves")
+    while True:
+      try:
+        async with self.r.pipeline() as p:
+          if not await self.at_tail(p, after):
+            return False
+          await p.watch(record_key, moves, key("q", run_id))
+          raw = await p.hget(record_key, "record")
+          if not raw or not await p.exists(key("q", run_id)):
+            return False
+          source = json.loads(raw)["pool"]
+          if not source or source == target or not token:
+            return False
+          move = {"source": source, "target": target, "token": token}
+          previous = await p.hget(moves, run_id)
+          if previous:
+            return json.loads(previous) == move
+          p.multi()
+          p.hset(moves, run_id, json.dumps(move))
+          self.event(p, "run_move_requested", run=run_id, **move)
+          await p.execute()
+          return True
+      except redis.WatchError:
+        continue
+
+  async def moves(self, pool: str, worker: str) -> dict[str, dict]:
+    if await self.owner(pool) != worker:
+      return {}
+    return {
+      run.decode(): move
+      for run, raw in (await self.r.hgetall(key("moves"))).items()
+      if (move := json.loads(raw))["source"] == pool
+    }
+
+  async def release_run(self, run_id: str, pool: str, worker: str, token: str, uri: str | None = None) -> bool:
+    """Commit a completed source drain. The caller saved state and must stop using this run after success."""
+    owner, record_key, stream, moves = key("owner", pool), key("run", run_id), key("q", run_id), key("moves")
+    receipt_key = key("released", run_id, token)
+    receipt = json.dumps({"source": pool, "worker": worker, "uri": uri}, sort_keys=True)
+    while True:
+      try:
+        async with self.r.pipeline() as p:
+          await p.watch(owner, record_key, stream, moves, receipt_key)
+          if previous := await p.get(receipt_key):
+            return previous.decode() == receipt
+          raw, moving = await p.hget(record_key, "record"), await p.hget(moves, run_id)
+          if not raw or not moving or await p.get(owner) != worker.encode() or not await p.exists(stream):
+            return False
+          record, move = json.loads(raw), json.loads(moving)
+          if record["pool"] != pool or move["source"] != pool or move["token"] != token:
+            return False
+          if (await p.xpending(stream, GROUP))["pending"]:
+            return False
+          record["pool"] = ""
+          p.multi()
+          if uri:
+            p.set(key("parked", run_id), uri)
+          p.srem(key("pool", pool), run_id)
+          p.hset(record_key, "record", json.dumps(record))
+          p.set(receipt_key, receipt, ex=SESSION_TTL)
+          self.event(p, "run_released", run=run_id, source=pool, token=token, uri=uri)
+          await p.execute()
+          return True
+      except redis.WatchError:
+        continue
+
+  async def unassign_worker(self, pool: str) -> None:
+    """Scheduler only, after confirmed process exit. Unfinished commands stay pending and are failed, never replayed."""
+    for run_id in await self.runs(pool):
+      record_key = key("run", run_id)
+      while True:
+        try:
+          async with self.r.pipeline() as p:
+            await p.watch(record_key)
+            raw = await p.hget(record_key, "record")
+            if not raw or (record := json.loads(raw))["pool"] != pool:
+              break
+            record["pool"] = ""
+            p.multi()
+            p.hset(record_key, "record", json.dumps(record))
+            p.srem(key("pool", pool), run_id)
+            p.hdel(key("moves"), run_id)
+            self.event(p, "run_released", run=run_id, source=pool, token="", uri=None, reason="exited")
+            await p.execute()
+            break
+        except redis.WatchError:
+          continue
 
   async def join(self, run_id: str) -> int:
     return int(await self.r.incr(key("clients", run_id)))
@@ -201,8 +359,8 @@ class Bus:
     p.hset(key("warm"), pool, base)
     if exclusive:
       p.sadd(key("excl"), pool)
+    self.event(p, "sampler_warmed", pool=pool, base=base, exclusive=exclusive)
     await p.execute()
-    await self.emit("sampler_warmed", pool=pool, exclusive=exclusive)
 
   async def warm_samplers(self) -> dict[str, str]:
     return {k.decode(): v.decode() for k, v in (await self.r.hgetall(key("warm"))).items()}
@@ -214,8 +372,9 @@ class Bus:
     p.delete(key("q", run_id), key("parked", run_id))
     p.hdel(key("decide", "run"), run_id)
     p.hdel(key("warm"), f"sampler:fft:{run_id}", f"sampler:lora:{run_id}")
+    p.hdel(key("moves"), run_id)
+    self.event(p, "run_deleted", run=run_id, pool=pool)
     await p.execute()
-    await self.emit("run_deleted", run=run_id, pool=pool)
 
   async def exclusive(self) -> set[str]:
     return {v.decode() for v in await self.r.smembers(key("excl"))}
@@ -224,7 +383,7 @@ class Bus:
     await self.r.hset(key("decide", kind), subject, json.dumps(decision))
 
   async def decisions(self) -> dict[str, dict[str, dict]]:
-    """The gateway's pool choice for each run. Placement and turns are decided in the log, see scheduler.py."""
+    """The scheduler's current worker assignment for each run."""
     raw = await self.r.hgetall(key("decide", "run"))
     return {"run": {k.decode(): json.loads(v) for k, v in raw.items()}}
 
@@ -236,30 +395,71 @@ class Bus:
     fields = {"op": op, "body": body}
     if seq_id is not None:
       fields["seq"] = str(seq_id)
-    entry_id = await self.r.xadd(key("q", run_id), fields, nomkstream=True)
-    if entry_id is None:
-      return None
-    return f"{run_id}/{entry_id.decode()}"
+    stream = key("q", run_id)
+    while True:
+      try:
+        async with self.r.pipeline() as p:
+          await p.watch(stream)
+          if not await p.exists(stream):
+            return None
+          pending = await p.xlen(stream)
+          p.multi()
+          p.xadd(stream, fields, nomkstream=True)
+          self.event(p, "run_queued", run=run_id, count=pending + 1)
+          entry_id, _ = await p.execute()
+          return f"{run_id}/{entry_id.decode()}"
+      except redis.WatchError:
+        continue
 
   async def take(self, pool: str, worker: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
-    """The next commands for a pool's trainer: up to `count` from each run that has work."""
-    runs = await self.runs(pool)
-    if not runs:
-      await asyncio.sleep(block_ms / 1000)
-      return []
-
-    random.shuffle(runs)  # so no run always goes first
-    streams = {key("q", run_id): ">" for run_id in runs}
-    got = await self.r.xreadgroup(GROUP, worker, streams, count=count, block=block_ms or None)
-
-    cmds = []
-    for stream, entries in got:
-      run_id = stream.decode().removeprefix(key("q", ""))
-      cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
-    return cmds
+    """One run per finite batch, chosen by weighted virtual service. Claims are fenced against changes and moves."""
+    deadline = time.monotonic() + block_ms / 1000
+    while True:
+      try:
+        async with self.r.pipeline() as p:
+          await p.watch(key("owner", pool), key("pool", pool), key("moves"))
+          if await p.get(key("owner", pool)) != worker.encode():
+            return []
+          moving = await p.hgetall(key("moves"))
+          runs = [r.decode() for r in await p.smembers(key("pool", pool)) if r not in moving]
+          state = json.loads(await p.get(key("state")) or "{}").get("runs", {})
+          candidates = []
+          for run_id in runs:
+            stream = key("q", run_id)
+            try:
+              groups = await p.xinfo_groups(stream)
+            except redis.ResponseError:  # deletion changed membership; the WATCH also rejects a racing claim
+              continue
+            if not groups or not groups[0].get("lag"):
+              continue
+            head = await p.xrange(stream, count=1)
+            if head:
+              entry = tuple(int(n) for n in head[0][0].decode().split("-"))
+              candidates.append((state.get(run_id, {}).get("vruntime", 0), entry, run_id))
+          if candidates:
+            run_id = min(candidates)[2]
+            stream = key("q", run_id)
+            await p.watch(stream)
+            p.multi()
+            p.xreadgroup(GROUP, worker, {stream: ">"}, count=max(1, min(count, 128)))
+            [got] = await p.execute()
+            if got:
+              return [parse_cmd(run_id, entry_id, fields) for _, entries in got for entry_id, fields in entries]
+      except redis.WatchError:
+        continue
+      if (left := deadline - time.monotonic()) <= 0:
+        return []
+      await asyncio.sleep(min(left, 0.05))
 
   async def finish(
-    self, cmd: Cmd, reply: Reply, pool: str, worker: str, repeat: bool = False, started: float | None = None
+    self,
+    cmd: Cmd,
+    reply: Reply,
+    pool: str,
+    worker: str,
+    repeat: bool = False,
+    started: float | None = None,
+    service_seconds: float | None = None,
   ) -> bool:
     """Write a command's reply, acknowledge the command, and count it, all at once, if `worker` still owns the pool.
     Returns False, having written nothing, if it doesn't: another trainer took the pool over and fails the command.
@@ -282,10 +482,17 @@ class Bus:
     while True:
       try:
         async with self.r.pipeline(transaction=True) as p:
-          await p.watch(k)
+          stream, record_key = key("q", cmd.run), key("run", cmd.run)
+          await p.watch(k, stream, record_key)
           if await p.get(k) != worker.encode():
             await p.unwatch()
             return False
+          record = await p.hget(record_key, "record")
+          if not record or json.loads(record)["pool"] != pool:
+            return False
+          if not await p.xrange(stream, cmd.entry_id, cmd.entry_id):
+            return bool(await p.exists(key("f", cmd.request_id)))
+          pending = await p.xlen(stream)
           p.multi()
           fields = {"ok": int(reply.ok), "content_type": reply.content_type, "body": reply.body}
           p.xadd(key("f", cmd.request_id), fields, maxlen=1, approximate=False)
@@ -296,6 +503,9 @@ class Bus:
             p.hincrby(key("run", cmd.run), name, n)
           if not repeat and cmd.seq is not None:
             p.set(key("seq", cmd.run, str(cmd.seq)), cmd.request_id, ex=REPLY_TTL)
+          self.event(p, "run_queued", run=cmd.run, count=pending - 1)
+          if service_seconds is not None:
+            self.event(p, "service", worker=pool, run=cmd.run, seconds=max(0.0, service_seconds))
           await p.execute()
           return True
       except redis.WatchError:
@@ -316,12 +526,26 @@ class Bus:
   async def reclaim(self, pool: str, worker: str, min_idle_ms: int = 0) -> list[Cmd]:
     """Claim the pool's commands that have been in flight for at least min_idle_ms, on any trainer. Called by the pool's
     owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the pool."""
-    cmds = []
-    for run_id in await self.runs(pool):
-      stream = key("q", run_id)
-      _, entries, _ = await self.r.xautoclaim(stream, GROUP, worker, min_idle_time=min_idle_ms, count=10000)
-      cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
-    return cmds
+    while True:
+      try:
+        async with self.r.pipeline() as p:
+          await p.watch(key("owner", pool), key("pool", pool))
+          if await p.get(key("owner", pool)) != worker.encode():
+            return []
+          runs = [r.decode() for r in await p.smembers(key("pool", pool))]
+          if not runs:
+            return []
+          p.multi()
+          for run_id in runs:
+            p.xautoclaim(key("q", run_id), GROUP, worker, min_idle_time=min_idle_ms, count=10000)
+          got = await p.execute()
+          return [
+            parse_cmd(run_id, entry_id, fields)
+            for run_id, (_, entries, _) in zip(runs, got)
+            for entry_id, fields in entries
+          ]
+      except redis.WatchError:
+        continue
 
   # ***** parked runs: the state a stopping trainer saved, for the next trainer to restore *****
 
@@ -331,8 +555,10 @@ class Bus:
     while True:
       try:
         async with self.r.pipeline(transaction=True) as p:
-          await p.watch(k)
-          if await p.get(k) != worker.encode():
+          record_key = key("run", run_id)
+          await p.watch(k, record_key)
+          record = await p.hget(record_key, "record")
+          if await p.get(k) != worker.encode() or not record or json.loads(record)["pool"] != pool:
             await p.unwatch()
             return False
           p.multi()
@@ -350,7 +576,38 @@ class Bus:
 
   async def own(self, pool: str, worker: str) -> bool:
     """Take the pool's lease if no trainer holds it."""
-    return bool(await self.r.set(key("owner", pool), worker, nx=True, px=LEASE_MS))
+    owner, retired = key("owner", pool), key("retired", pool)
+    while True:
+      try:
+        async with self.r.pipeline() as p:
+          await p.watch(owner, retired)
+          if await p.exists(retired) or await p.exists(owner):
+            return False
+          p.multi()
+          p.set(owner, worker, nx=True, px=LEASE_MS)
+          return bool((await p.execute())[0])
+      except redis.WatchError:
+        continue
+
+  async def fence_worker(self, worker: str, after: str) -> bool:
+    """Retire a lost node's process identity after its lease expires; this does not assert physical exit."""
+    owner, retired = key("owner", worker), key("retired", worker)
+    try:
+      async with self.r.pipeline() as p:
+        if not await self.at_tail(p, after):
+          return False
+        await p.watch(owner, retired)
+        if await p.exists(owner):
+          return False
+        if await p.exists(retired):
+          return True
+        p.multi()
+        p.set(retired, 1)
+        self.event(p, "worker_fenced", worker=worker)
+        await p.execute()
+        return True
+    except redis.WatchError:
+      return False
 
   async def renew(self, pool: str, worker: str) -> bool:
     """Hold the pool's lease for another LEASE_MS. False if `worker` doesn't hold it anymore."""
@@ -389,14 +646,14 @@ class Bus:
     return [(None if u is None else float(u), int(n or 0), runs) for u, n, runs in zip(got[::3], got[1::3], got[2::3])]
 
   async def heartbeat(self, node: str, gpus: int) -> None:
-    await self.r.hset(key("nodes"), node, json.dumps({"gpus": gpus, "until": time.time() + NODE_MS / 1000}))
+    p = self.r.pipeline()
+    p.hset(key("nodes"), node, gpus)
+    p.hpexpire(key("nodes"), NODE_MS, node)
+    await p.execute()
 
   async def nodes(self) -> dict[str, int]:
     """The GPU count of every live node daemon, by id."""
-    nodes = {k.decode(): json.loads(v) for k, v in (await self.r.hgetall(key("nodes"))).items()}
-    if dead := [k for k, v in nodes.items() if v["until"] < time.time()]:
-      await self.r.hdel(key("nodes"), *dead)
-    return {k: v["gpus"] for k, v in nodes.items() if k not in dead}
+    return {k.decode(): int(v) for k, v in (await self.r.hgetall(key("nodes"))).items()}
 
   async def gpus(self) -> int:
     return sum((await self.nodes()).values())
@@ -437,9 +694,7 @@ class Bus:
   # ***** events *****
 
   async def emit(self, _kind: str, **body) -> str:
-    entry_id = await self.r.xadd(
-      key("events"), {"kind": _kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
-    )
+    entry_id = await self.r.xadd(key("events"), {"kind": _kind, "body": json.dumps(body)})
     return entry_id.decode()
 
   async def log_size(self) -> int:

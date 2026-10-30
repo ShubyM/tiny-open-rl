@@ -59,6 +59,8 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   def tearDownClass(cls):
     if cls.proc:
       cls.proc.terminate()
+      cls.proc.wait(timeout=5)
+      cls.proc.wait(timeout=5)
 
   async def asyncSetUp(self):
     self.renewal_tasks = []
@@ -71,26 +73,47 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     self.renewal_tasks.append(asyncio.create_task(trainer.keep()))
 
   async def running(self, placed: dict[str, list[int]]) -> None:
-    """Node n is up with these pools placed on these GPUs and their processes started, each kept by a held run."""
+    """Explicit worker processes and runnable work for GPU-turn integration tests."""
     gpus = 1 + max(i for pool_gpus in placed.values() for i in pool_gpus)
     await self.bus.heartbeat("n", gpus)
     await self.bus.emit("node_up", node="n", gpus=gpus, memory=0)
     for pool, pool_gpus in placed.items():
+      await self.bus.emit("worker_created", worker=pool, node="n", gpus=pool_gpus, memory=0, env={})
       await self.bus.emit("run_created", run=f"{pool}-held", pool=pool)
-      await self.bus.emit("placed", pool=pool, node="n", gpus=pool_gpus, memory=0, env={}, rule="test")
-      await self.bus.emit("started", pool=pool, node="n")
+      await self.bus.emit("run_queued", run=f"{pool}-held", count=1)
+      await self.bus.emit("started", worker=pool, node="n")
 
   async def run_scheduler(self, placed: dict[str, list[int]], quantum: float = 30.0) -> None:
     """Run the scheduler over these running pools, so workers that share a GPU get turns."""
     from tinyrl import scheduler
 
     await self.running(placed)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus, quantum)))
+
+    async def turns():
+      state, after = scheduler.State(quantum=quantum), "0-0"
+      while True:
+        events = await self.bus.events(after, block_ms=20)
+        for event in events:
+          state = scheduler.fold(state, event)
+        if events:
+          after = events[-1].id
+        # Fixed-placement fixtures exercise the real turn policy; placement/migration has separate tests.
+        for kind, body in scheduler.decide(state, time.time()):
+          if kind in ("granted", "revoked"):
+            await self.bus.emit_decision(kind, after, **body)
+            break
+
+    self.renewal_tasks.append(asyncio.create_task(turns()))
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
       task.cancel()
+    await asyncio.gather(*self.renewal_tasks, return_exceptions=True)
+    results = await asyncio.gather(*self.renewal_tasks, return_exceptions=True)
     await self.bus.r.aclose()
+    for result in results:
+      if isinstance(result, Exception):
+        raise result
 
 
 class FakeEngine:

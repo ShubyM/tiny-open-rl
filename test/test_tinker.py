@@ -63,12 +63,14 @@ class TestTinkerSDK(unittest.TestCase):
       model_id = out.stdout.split("model ")[1].split()[0]
       self.assertTrue(os.path.exists(f"{tmp}/ckpt/{model_id}/sampler_weights/final/adapter_model.safetensors"))
     finally:
-      for proc in procs:
+      # Workers drain while Redis is still available; stop the backend last.
+      for proc in reversed(procs):
         proc.terminate()
         try:
-          proc.wait(timeout=5)
+          proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
           proc.kill()
+          proc.wait(timeout=5)
 
 
 if __name__ == "__main__":

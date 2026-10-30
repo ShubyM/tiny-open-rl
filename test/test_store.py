@@ -25,6 +25,13 @@ class TestStore(unittest.TestCase):
     self.assertEqual(meta, {"optimizer": True})
     self.assertTrue(all(torch.equal(got[k], want[k]) for k in want))
 
+  def test_put_does_not_report_success_when_local_durability_fails(self):
+    for prefix in ("", "file://"):
+      store = Store(root=prefix + tempfile.mkdtemp())
+      with unittest.mock.patch("tinyrl.store.os.fsync", side_effect=OSError("disk failure")):
+        with self.assertRaisesRegex(OSError, "disk failure"):
+          store.put("tinker://run/handoff/token", {"w": torch.ones(4)})
+
   def test_missing_checkpoints_fail_cleanly(self):
     store = Store(root=tempfile.mkdtemp())
     with self.assertRaises(ValueError):

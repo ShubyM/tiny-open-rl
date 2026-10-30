@@ -6,7 +6,6 @@ It takes commands from its pool's streams on the bus, runs each one on the model
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextlib
 import json
 import math
@@ -320,12 +319,14 @@ class Model:
     return {"grad_norm:mean": grad_norm}
 
   def state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
-    """A run's portable training checkpoint: fp32 master weights and named AdamW state, with no pickle."""
+    """Weights, pending gradients, and Adam state at a completed command boundary."""
     self.use(run)
     tensors = {name: p.detach() for name, p in self.params[run].items()}
     optim = self.optimizers.get(run)
     for name, p in self.params[run].items():
-      if optim and p in optim.state:
+      if p.grad is not None:
+        tensors[f"__grad.{name}"] = p.grad.detach()
+      if optim and optim.state.get(p):
         s = optim.state[p]
         tensors[f"{name}.exp_avg"] = s["exp_avg"].detach()
         tensors[f"{name}.exp_avg_sq"] = s["exp_avg_sq"].detach()
@@ -354,24 +355,43 @@ class Model:
     if optimizer and not meta.get("optimizer"):
       raise ValueError("checkpoint has no optimizer state")
     suffixes = (".exp_avg", ".exp_avg_sq", ".step")
-    weights = {k.removeprefix("base_model.model."): v for k, v in tensors.items() if not k.endswith(suffixes)}
+    weights = {
+      k.removeprefix("base_model.model."): v
+      for k, v in tensors.items()
+      if not k.endswith(suffixes) and not k.startswith("__grad.")
+    }
     if not self.lora and "lm_head.weight" not in self.params[run]:
       weights.pop("lm_head.weight", None)  # tied to embed_tokens
     if weights.keys() != self.params[run].keys():
       raise ValueError("checkpoint does not fit this model")
-    for name, p in self.params[run].items():
-      p.data.copy_(weights[name])
 
+    def stage(value, parameter):
+      if value.shape != parameter.shape or not value.is_floating_point():
+        raise ValueError("checkpoint tensor shape or dtype does not fit this model")
+      return value.to(parameter.device, parameter.dtype, copy=True)
+
+    params = self.params[run]
+    staged = {name: stage(weights[name], p) for name, p in params.items()}
+    grads = {k.removeprefix("__grad."): v for k, v in tensors.items() if k.startswith("__grad.")}
+    if not grads.keys() <= params.keys():
+      raise ValueError("checkpoint gradients do not fit this model")
+    grads = {name: stage(value, params[name]) for name, value in grads.items()} if optimizer else {}
+    moments = {}
+    for name, p in params.items():
+      if optimizer and f"{name}.step" in tensors:
+        step = tensors[f"{name}.step"]
+        if step.ndim != 0 or not step.is_floating_point():
+          raise ValueError("checkpoint Adam step must be a scalar")
+        moments[p] = {field: stage(tensors[f"{name}.{field}"], p) for field in ("exp_avg", "exp_avg_sq")}
+        moments[p]["step"] = step.to(p.device if p.is_cuda else "cpu", torch.float32, copy=True)
+    # Everything that can fail validation has been staged before touching live state.
+    for name, p in params.items():
+      p.data.copy_(staged[name])
+      p.grad = grads.get(name)
     self.pinned.clear()
     self.optimizers.pop(run, None)
-    if optimizer and any(k.endswith(".step") for k in tensors):
-      opt = self.optimizer(run)
-      for name, p in self.params[run].items():
-        opt.state[p] = {
-          "exp_avg": tensors[f"{name}.exp_avg"].to(p.device, torch.float32),
-          "exp_avg_sq": tensors[f"{name}.exp_avg_sq"].to(p.device, torch.float32),
-          "step": tensors[f"{name}.step"].to(p.device if opt.defaults.get("fused") else "cpu", torch.float32),
-        }
+    if moments:
+      self.optimizer(run).state.update(moments)
       if not self.lora:
         self.move(self.moments(), "cpu")
     self.dirty.add(run)
@@ -427,6 +447,8 @@ class Model:
     del self.params[run]
     self.pinned.clear()
     self.optimizers.pop(run, None)
+    if not self.lora:
+      self.lm, self.base, self.lora, self.parked = None, "", True, False
 
 
 # ***** trainer *****
@@ -443,29 +465,15 @@ def fail(error: Exception) -> Reply:
   return Reply(False, wire.JSON, json.dumps(body).encode())
 
 
-def enqueue_cmds(queue: collections.deque[Cmd], cmds: list[Cmd], lora: bool) -> None:
-  if not lora:
-    queue.extend(cmds)
-    return
-  blocked = {x.run for x in queue}
-  front, back = [], []
-  for c in cmds:
-    if c.op == Op.SAVE_WEIGHTS_FOR_SAMPLER and c.run not in blocked:
-      front.append(c)
-    else:
-      blocked.add(c.run)
-      back.append(c)
-  queue.extendleft(reversed(front))
-  queue.extend(back)
-
-
 class Trainer:
   def __init__(self, bus: Bus, pool: str, model: Model | None = None, worker: str = "", store: Store | None = None):
     self.bus = bus
     self.pool = pool
     self.model = model if model is not None else Model()
     self.store = store if store is not None else Store()
-    self.worker = worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
+    self.worker = (
+      os.getenv("TINYRL_WORKER_ID") or worker or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
+    )
     self.done = False
     self.draining = False
     self.busy = 0.0  # seconds spent running commands since the last load report
@@ -538,10 +546,15 @@ class Trainer:
         f"model {cmd.run} lost its unsaved steps when its trainer stopped. load_state to go on from a checkpoint"
       )
     await asyncio.to_thread(self.model.create, cmd.run, run["base"], run["rank"], run.get("lora", {}))
-    if uri:
-      tensors, meta = await asyncio.to_thread(self.store.get, uri)
-      await asyncio.to_thread(self.model.restore, cmd.run, tensors, meta, True)
-      await self.bus.park(cmd.run, None, self.pool, self.worker)
+    try:
+      if uri:
+        tensors, meta = await asyncio.to_thread(self.store.get, uri)
+        await asyncio.to_thread(self.model.restore, cmd.run, tensors, meta, True)
+        await self.bus.park(cmd.run, None, self.pool, self.worker)
+    except Exception:
+      self.model.delete(cmd.run)
+      raise
+    await self.report_memory()
 
   async def answer(self, cmd: Cmd) -> Reply:
     try:
@@ -556,61 +569,83 @@ class Trainer:
       reply = fail(RuntimeError(f"its trainer died, or lost the pool, during {cmd.op}"))
       await self.bus.finish(cmd, reply, self.pool, self.worker)
 
-  async def step(self, count: int = 16, block_ms: int = 1000) -> int:
-    """Take the next commands from the pool and run them. Returns how many there were."""
+  async def report_memory(self) -> None:
+    if not self.turn.shared:
+      return
+    if self.model.lm is None:
+      await self.bus.emit("worker_memory", worker=self.pool, memory=0, run_memory={})
+      return
+    run_memory = {r: max(1, 24 * sum(p.numel() for p in ps.values())) for r, ps in self.model.params.items()}
+    weights = sum(t.numel() * t.element_size() for t in (*self.model.lm.parameters(), *self.model.lm.buffers()))
+    trainable = sum(p.numel() * p.element_size() for ps in self.model.params.values() for p in ps.values())
+    reserve = weights - trainable + sum(run_memory.values())
+    allocated = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+    await self.bus.emit(
+      "worker_memory", worker=self.pool, memory=int(max(reserve, allocated) * 1.1), run_memory=run_memory
+    )
+
+  async def handoff(self) -> None:
+    for run, move in (await self.bus.moves(self.pool, self.worker)).items():
+      uri = None
+      if run in self.model.params:
+        uri = f"tinker://{run}/handoff/{move['token']}"
+        await asyncio.to_thread(self.store.put, uri, *self.model.state(run))
+      if await self.bus.release_run(run, self.pool, self.worker, move["token"], uri):
+        if run in self.model.params:
+          self.model.delete(run)
+        await self.report_memory()
+
+  async def step(self, count: int = 1, block_ms: int = 1000) -> int:
+    """A finite batch from one run; every command is a GPU yielding boundary."""
     if self.done:
       return 0
+    await self.handoff()
     take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
     cmds = await self.bus.take(self.pool, self.worker, count, take_block)
     if not cmds:
       await self.turn.went_idle()
       await self.yield_gpu()
       return 0
-    queue: collections.deque[Cmd] = collections.deque()
-    enqueue_cmds(queue, cmds, self.model.lora)
     processed = 0
-    async with self.acquire(len(cmds)):
-      batch_start = time.time()
-      ops = []
-      while queue:
-        cmd = queue.popleft()
+    for cmd in cmds:
+      async with self.acquire(len(cmds) - processed) as occupied:
         start = time.time()
-        first = await self.bus.first_reply(cmd)  # no lock needed, the pool's owner is the only writer of its seq keys
+        was_full, cold = not self.model.lora, self.model.lm is None
+        first = await self.bus.first_reply(cmd)
         reply = first or await self.answer(cmd)
-        ms = (time.time() - start) * 1000
-        ops.append([cmd.op, ms])
-        self.busy += time.time() - start
-        if not await self.bus.finish(cmd, reply, self.pool, self.worker, repeat=first is not None, started=start):
-          self.done = True  # another trainer owns the pool now
-          break
-
-        if cmd.op == Op.DELETE_MODEL and reply.ok:
-          await self.bus.drop(cmd.run, self.pool)
-          self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
-
-        if DEBUG:
-          error = "" if reply.ok else f"  {reply.body.decode()}"
-          print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
-
-        processed += 1
-        if self.model.lora and queue and (cmd.op == Op.OPTIM_STEP or queue[0].run != cmd.run):
-          if cmd.op == Op.OPTIM_STEP:
-            await asyncio.sleep(0.015)
-          more = await self.bus.take(self.pool, self.worker, count, 0)
-          enqueue_cmds(queue, more, True)
-      await self.turn.batch_done(queued=len(queue), seconds=time.time() - batch_start, ops=ops)
+        elapsed = time.time() - start
+        self.busy += elapsed
+        if cmd.op in (Op.CREATE_MODEL, Op.LOAD_WEIGHTS, Op.DELETE_MODEL):
+          await self.report_memory()
+        await self.turn.batch_done(
+          queued=len(cmds) - processed - 1, seconds=elapsed, boot=elapsed if cold else 0, ops=[[cmd.op, elapsed * 1000]]
+        )
+      if not await self.bus.finish(
+        cmd, reply, self.pool, self.worker, repeat=first is not None, started=start, service_seconds=occupied[0]
+      ):
+        self.done = True
+        break
+      processed += 1
+      if cmd.op == Op.DELETE_MODEL and reply.ok:
+        await self.bus.drop(cmd.run, self.pool)
+        self.done = was_full and not os.getenv("TINYRL_WORKER_ID")
+      if DEBUG:
+        print(f"{self.pool} {cmd.request_id} {cmd.op:24s} {elapsed * 1000:9.2f} ms")
+    if not self.done:
+      await self.handoff()
     return processed
 
   @contextlib.asynccontextmanager
   async def acquire(self, queued: int):
-    """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back
-    after the batch if the scheduler revoked it."""
-    if await self.turn.take(queued):
+    taken = await self.turn.take(queued)
+    start, occupied = time.monotonic(), []
+    if taken:
       await asyncio.to_thread(self.model.resume)
     try:
-      yield
+      yield occupied
     finally:
       await self.yield_gpu()
+      occupied.append(time.monotonic() - start)  # include resume and park, exclude waiting for the grant
 
   async def yield_gpu(self) -> None:
     if await self.turn.revoked():
