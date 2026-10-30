@@ -95,7 +95,7 @@ def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
 def connect(url: str) -> redis.Redis:
   # a reply is waited for with a blocking read of up to 30s, and redis-py gives up on a read after 5s by default.
   # Retrying a dropped connection for about a minute rides out a Redis restart, which keeps its data in its AOF file.
-  # Each request the gateway waits on holds a connection for that read, and redis-py's worker stops at 100 by default
+  # Each request the gateway waits on holds a connection for that read, and redis-py's connection pool stops at 100
   # ("Too many connections" at 400 concurrent samples): allow as many as Redis itself does (maxclients 10000)
   retry = Retry(ExponentialBackoff(cap=2.0, base=0.1), 30)
   return redis.from_url(url, socket_timeout=None, retry=retry, max_connections=10_000)
@@ -154,12 +154,12 @@ class Bus:
     record = json.dumps({**asdict(run), "created": time.time()})
     p = self.r.pipeline(transaction=True)
     p.xgroup_create(key("q", run.id), GROUP, id="0", mkstream=True)
+    p.sadd(key("runs"), run.id)
+    mapping = {"record": record, "steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0}
     if run.worker:
-      p.sadd(key("workers"), run.worker)
       p.sadd(key("worker", run.worker), run.id)
-    p.hset(
-      key("run", run.id), mapping={"record": record, "steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0}
-    )
+      mapping["worker"] = run.worker
+    p.hset(key("run", run.id), mapping=mapping)
     if run.session:
       p.sadd(key("sess", run.session, "runs"), run.id)
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
@@ -172,7 +172,6 @@ class Bus:
     """The scheduler's assignment of a run to a worker, with its log entry, at once. Only the scheduler writes it."""
     p = self.r.pipeline(transaction=True)
     p.hset(key("run", run), "worker", worker)
-    p.sadd(key("workers"), worker)
     p.sadd(key("worker", worker), run)
     p.xadd(key("events"), {"kind": "assigned", "body": json.dumps({"run": run, "worker": worker})})
     await p.execute()
@@ -194,28 +193,23 @@ class Bus:
   async def join(self, run_id: str) -> int:
     return int(await self.r.incr(key("clients", run_id)))
 
-  async def workers(self) -> list[str]:
-    return sorted(worker.decode() for worker in await self.r.smembers(key("workers")))
-
   async def stats(self) -> dict[tuple[str, str], dict]:
     """The counters of every run still in a worker, by (worker, run)."""
-    runs = [
-      (worker.decode(), run_id)
-      for worker in await self.r.smembers(key("workers"))
-      for run_id in await self.runs(worker.decode())
-    ]
+    runs = sorted(r.decode() for r in await self.r.smembers(key("runs")))
     p = self.r.pipeline()
-    for _, run_id in runs:
+    for run_id in runs:
       p.hgetall(key("run", run_id))
-    counters = [
-      {k.decode(): int(v) for k, v in f.items() if k not in (b"record", b"worker")} for f in await p.execute()
-    ]
-    return dict(zip(runs, counters))
+    return {
+      (f[b"worker"].decode(), run_id): {k.decode(): int(v) for k, v in f.items() if k not in (b"record", b"worker")}
+      for run_id, f in zip(runs, await p.execute())
+      if b"worker" in f
+    }
 
   async def drop(self, run_id: str, worker: str) -> None:
     """Take a deleted run out of its worker and delete its stream, in one transaction."""
     p = self.r.pipeline(transaction=True)
     p.srem(key("worker", worker), run_id)
+    p.srem(key("runs"), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
     await p.execute()
     await self.emit("run_deleted", run=run_id, worker=worker)
