@@ -299,7 +299,9 @@ def choose(s: State, node: str, name: str, memory: int, avoid: int = -1) -> tupl
   if takes_turns(me) or len(options) == 1:  # with one GPU there is nowhere to move to
     g = min(options, key=lambda g: (not trainers_only(g), busy[g], g))
     return g, "takes_turns", []
-  g = min(options, key=lambda g: (not trainers_only(g), len(there[g]), busy[g], g))  # as few moves as it can
+  # as few moves as it can, LoRA trainers first, since a full fine-tune saves its weights and AdamW state far slower
+  lora = {g: all(p.lora for _, p in there[g]) for g in options}
+  g = min(options, key=lambda g: (not trainers_only(g), len(there[g]), not lora[g], busy[g], g))
   return (g, "moves_trainers_aside", sorted(q for q, _ in there[g])) if trainers_only(g) else (g, "takes_turns", [])
 
 
