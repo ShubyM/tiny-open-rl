@@ -32,6 +32,7 @@ from tinyrl.helpers import getenv
 
 GROUP = "trainer"  # the consumer group every worker's trainer reads through
 LIVE_SECONDS = 120  # a session is live this long after its last heartbeat
+SESSION_GRACE = getenv("SESSION_GRACE", 180)  # and its runs are deleted this long after it
 REPLY_TTL = getenv("REPLY_TTL", 3600)
 SESSION_TTL = getenv("SESSION_TTL", 7 * 24 * 3600)
 LEASE_MS = getenv("LEASE_MS", 10000)  # a trainer owns its worker this long after its last renewal
@@ -125,6 +126,7 @@ class Bus:
     if metadata:
       p.hset(k, "metadata", json.dumps(metadata))
     p.hset(k, "seen", now)
+    p.zadd(key("seen"), {session_id: now})
     p.expire(k, SESSION_TTL)
     p.expire(f"{k}:runs", SESSION_TTL)
     await p.execute()
@@ -146,6 +148,20 @@ class Bus:
       "runs": sorted(r.decode() for r in runs),
       "metadata": json.loads(record.get(b"metadata") or "{}"),
     }
+
+  async def expired(self) -> list[str]:
+    """The sessions whose client stopped heartbeating SESSION_GRACE seconds ago."""
+    return [s.decode() for s in await self.r.zrangebyscore(key("seen"), 0, time.time() - SESSION_GRACE)]
+
+  async def end(self, session_id: str) -> None:
+    """Delete an expired session's runs: a training run once its queued work is done, a sampling session now."""
+    for run_id in (await self.session_info(session_id) or {}).get("runs", []):
+      run = await self.run(run_id) or {}
+      if run.get("role") == "sampler" and await self.r.sismember(key("runs"), run_id):
+        await self.drop(run_id, run.get("worker", ""))
+      elif run.get("role") == "trainer":
+        await self.submit(run_id, Op.DELETE_MODEL, b"{}")
+    await self.r.zrem(key("seen"), session_id)
 
   # ***** runs *****
 
