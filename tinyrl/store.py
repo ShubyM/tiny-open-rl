@@ -246,3 +246,37 @@ class Store:
 
   def meta(self, uri: str) -> dict:
     return header(self.weights(uri)[0])
+
+  # ***** delete *****
+
+  def delete(self, uri: str) -> None:
+    """Delete a checkpoint and every version of it this store kept."""
+    dest = self.path(uri)
+    if self.remote:
+      with contextlib.suppress(FileNotFoundError):
+        self.fs.rm(dest, recursive=True)
+      return
+    parent, base = os.path.split(dest)
+    # the random suffix of a version folder has no dot, so step-1 never takes step-1.5's
+    tail = len(parent) + len(base) + 3
+    versions = [p for p in glob.glob(f"{glob.escape(parent)}/.{glob.escape(base)}.*") if "." not in p[tail:]]
+    for p in [dest, *versions]:  # the link to the live version, the .prev link, and the folders they name
+      if os.path.islink(p):
+        os.unlink(p)
+      else:
+        shutil.rmtree(p, ignore_errors=True)
+
+  def stored(self) -> list[str]:
+    """Every checkpoint in the store."""
+    if self.remote:
+      return [
+        f"tinker://{p[len(self.base) + 1 : -len('/_latest')]}" for p in self.fs.glob(f"{self.base}/*/*/*/_latest")
+      ]
+    found = glob.glob(f"{glob.escape(self.base)}/*/*/*")  # glob skips the dot folders a save writes into
+    return [f"tinker://{os.path.relpath(p, self.base)}" for p in found]
+
+  def saved_at(self, uri: str) -> float:
+    """When a checkpoint was last saved."""
+    if self.remote:
+      return self.fs.modified(f"{self.path(uri)}/_latest").timestamp()
+    return os.lstat(self.path(uri)).st_mtime
