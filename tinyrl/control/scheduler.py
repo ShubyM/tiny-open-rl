@@ -65,7 +65,7 @@ RULES = {
   "place.near_its_trainer": "a full fine-tune's sampler goes to its trainer's node, where its weights are saved",
   "place.moved_aside": "a trainer moves to take turns with other trainers, so a sampler or exclusive worker gets a GPU",
   "place.emptied": "a worker with no runs is unplaced, which stops its process",
-  "place.spread": "a trainer taking turns moves to a GPU that emptied on its node, so trainers share only while no GPU is free",
+  "place.spread": "a trainer that takes turns moves to an empty GPU on its node, so trainers share a GPU only when none is free",
   "turn.granted": "a worker that asked gets its GPUs once it is first in line on each and fits next to their holders",
   "turn.idle_holder_yields": "a holder that found no commands gives its GPUs back as soon as someone waits for one",
   "turn.quantum_expired": "a busy holder gives its GPUs back QUANTUM seconds into its turn if someone waits for one",
@@ -277,7 +277,7 @@ def place(s: State, name: str) -> dict:
 
 
 def spread(s: State) -> dict | None:
-  """A trainer taking turns moves to a GPU that emptied on its node: nothing is placed on it and no process still runs there. Workers that share a GPU because their budgets fit stay. A LoRA trainer moves before a full fine-tune, which saves its weights and AdamW state far slower, and one waiting for its turn before the one holding it."""
+  """Move one trainer off a shared GPU onto an empty one on the same node. Empty means no worker is placed on it and no old process still runs on it. Only trainers that take turns move: workers that share because their memory fits stay put. LoRA trainers move first, since a full fine-tune is slow to save and restore. Then a trainer waiting for its turn moves before the one using the GPU."""
   for node, (gpus, gpu_bytes) in sorted(s.nodes.items()):
     there = {g: [n for n, w in s.workers.items() if w.node == node and g in w.gpus] for g in range(gpus)}
     running = {g for w in s.workers.values() for n, g in w.on if n == node}
