@@ -21,39 +21,39 @@ class GpuTurn:
     self.idle = False
     self.after: str | None = None  # the last log entry read. None until its first ask, so it never reads older ones
 
-  async def take(self, queued: int) -> bool:
+  async def wait_for_turn(self, queued: int) -> bool:
     """Wait for a grant. True if this call took the turn, so the worker brings its tensors back to the GPU."""
     if self.held:
       return False
-    asked = await self.bus.emit("wants_gpu", worker=self.worker, queued=queued)
+    asked = await self.bus.append_event("wants_gpu", worker=self.worker, queued=queued)
     self.after = self.after or asked
-    while await self.decision(5000) != "granted":
+    while await self.next_decision(5000) != "granted":
       pass
     self.held = True
     return True
 
-  async def revoked(self) -> bool:
-    return self.held and self.shared and await self.decision(0) == "revoked"
+  async def was_revoked(self) -> bool:
+    return self.held and self.shared and await self.next_decision(0) == "revoked"
 
-  async def batch_done(self, **report) -> None:
+  async def report_batch_done(self, **report) -> None:
     self.idle = False
     if self.shared:
-      await self.bus.emit("batch_done", worker=self.worker, **report)
+      await self.bus.append_event("batch_done", worker=self.worker, **report)
 
-  async def went_idle(self) -> None:
+  async def report_idle(self) -> None:
     if self.held and self.shared and not self.idle:
       self.idle = True
-      await self.bus.emit("idle", worker=self.worker)
+      await self.bus.append_event("idle", worker=self.worker)
 
-  async def give_back(self) -> None:
+  async def give_turn_back(self) -> None:
     if self.held and self.shared:
       self.held = False
-      await self.bus.emit("released", worker=self.worker)
+      await self.bus.append_event("released", worker=self.worker)
 
-  async def decision(self, block_ms: int) -> str | None:
+  async def next_decision(self, block_ms: int) -> str | None:
     """The next decision about this worker in the log, reading past everything else. None once it has read it all, after
     waiting up to block_ms for a new entry."""
-    while events := await self.bus.events(self.after, count=100, block_ms=block_ms):
+    while events := await self.bus.read_events(self.after, count=100, block_ms=block_ms):
       block_ms = 0
       for e in events:
         self.after = e.id

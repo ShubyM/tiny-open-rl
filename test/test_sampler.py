@@ -69,11 +69,11 @@ class TestSampler(RedisTest):
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://vllm")
     full = VLLM("http://vllm", "base", lora=False, client=client)
-    await full.load("c0", "/ckpt/w")
-    await full.load("c0", "/ckpt/w")  # already in place
+    await full.load_checkpoint("c0", "/ckpt/w")
+    await full.load_checkpoint("c0", "/ckpt/w")  # already in place
     engine = VLLM("http://vllm", "base", lora=True, client=client)
-    await engine.load("c0", "/ckpt/a")
-    await engine.load("c0", "/ckpt/a")
+    await engine.load_checkpoint("c0", "/ckpt/a")
+    await engine.load_checkpoint("c0", "/ckpt/a")
     await engine.sleep()
     await engine.wake()
     paths = [path for path, _ in calls]
@@ -101,7 +101,7 @@ class TestSampler(RedisTest):
         "request_id"
       ]
       await trainer.step(block_ms=0)
-      return json.loads((await self.bus.result(request_id, 1)).body)["sampling_session_id"]
+      return json.loads((await self.bus.wait_for_reply(request_id, 1)).body)["sampling_session_id"]
 
     run = (await call("create_model", {"base_model": base, "lora_config": {"rank": 4}}))["model_id"]
     trainer = Trainer(self.bus, await self.worker(run), store=store)
@@ -170,8 +170,8 @@ class TestSampler(RedisTest):
     await self.take_turns()
 
   async def take_turns(self):
-    await self.bus.create(Run("t1", "t1", "base", 0))
-    await self.bus.create(Run("samp-1", "sampler:base", "base", 1))
+    await self.bus.create_run(Run("t1", "t1", "base", 0))
+    await self.bus.create_run(Run("samp-1", "sampler:base", "base", 1))
     model = MagicMock()
     model.optim_step.return_value = {"grad_norm:mean": 0.5}
     model.params = {"t1": {}}  # the trainer holds run t1
@@ -185,7 +185,7 @@ class TestSampler(RedisTest):
         ("samp-1", Op.SAMPLE, JOB),
         ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
       ]:
-        reply = await self.bus.result(await self.bus.submit(run, op, json.dumps(body).encode()), 5)
+        reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, json.dumps(body).encode()), 5)
         self.assertTrue(reply.ok, reply.body)
       self.assertIn(("sleep",), sampler.engine.calls)
     finally:
@@ -196,7 +196,7 @@ class TestSampler(RedisTest):
   async def test_a_sampler_batches_queued_commands_concurrently_and_loads_once(self):
     store = Store(tempfile.mkdtemp())
     store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
-    await self.bus.create(Run("samp-1", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+    await self.bus.create_run(Run("samp-1", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
     active = peak = starts = loads = 0
 
     class BatchEngine(FakeEngine):
@@ -207,12 +207,12 @@ class TestSampler(RedisTest):
         starts += 1
         return await super().start(base, lora)
 
-      async def load(self, name: str, path: str) -> None:
+      async def load_checkpoint(self, name: str, path: str) -> None:
         nonlocal loads
         await asyncio.sleep(0.01)
         if ("load", name, path) not in self.calls:
           loads += 1
-        await super().load(name, path)
+        await super().load_checkpoint(name, path)
 
       async def sample(self, job: dict, name: str | None) -> Out:
         nonlocal active, peak
@@ -224,10 +224,10 @@ class TestSampler(RedisTest):
 
     sampler = Sampler(self.bus, "sampler:base", engine=BatchEngine, store=store)
     await self.own(sampler)
-    ids = [await self.bus.submit("samp-1", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(8)]
+    ids = [await self.bus.submit_command("samp-1", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(8)]
     self.assertEqual(await sampler.step(block_ms=0), 8)
     self.assertEqual((starts, loads, peak), (1, 1, 8))
-    self.assertTrue(all([(await self.bus.result(i, 1)).ok for i in ids]))
+    self.assertTrue(all([(await self.bus.wait_for_reply(i, 1)).ok for i in ids]))
 
   async def test_vllm_retries_a_dropped_keepalive_socket(self):
     import httpx
@@ -313,22 +313,22 @@ class TestSampler(RedisTest):
       {"w": torch.ones(1)}, f"{dir3}/model.safetensors", metadata={"meta": json.dumps({"untouched": False})}
     )
 
-    await full.load("c0", dir1)
+    await full.load_checkpoint("c0", dir1)
     self.assertEqual(calls, [])
 
-    await full.load("c1", dir2)
+    await full.load_checkpoint("c1", dir2)
     self.assertEqual(calls, [])
 
-    await full.load("c2", dir3)
+    await full.load_checkpoint("c2", dir3)
     self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache"])
 
-    await full.load("c0", dir1)
+    await full.load_checkpoint("c0", dir1)
     self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache", "/collective_rpc", "/reset_prefix_cache"])
 
   async def test_a_sampler_takes_the_commands_that_arrive_while_its_engine_boots(self):
     store = Store(tempfile.mkdtemp())
     store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
-    await self.bus.create(Run("sess", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+    await self.bus.create_run(Run("sess", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
 
     class SlowStartEngine(FakeEngine):
       @classmethod
@@ -339,12 +339,12 @@ class TestSampler(RedisTest):
     sampler = Sampler(self.bus, "sampler:base", engine=SlowStartEngine, store=store)
     await self.own(sampler)
 
-    await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())
 
     async def push_more():
       await asyncio.sleep(0.01)
-      await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
-      await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())
 
     asyncio.create_task(push_more())
 
@@ -355,24 +355,24 @@ class TestSampler(RedisTest):
     store = Store(tempfile.mkdtemp())
     store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": False, "config": {}})
     store.put("tinker://r2/sampler_weights/s0", {}, {"base": "base", "lora": False, "config": {}})
-    await self.bus.create(Run("s1", "sampler:fft:base", "base", 0, model_path="tinker://r1/sampler_weights/s0"))
-    await self.bus.create(Run("s2", "sampler:fft:base", "base", 0, model_path="tinker://r2/sampler_weights/s0"))
+    await self.bus.create_run(Run("s1", "sampler:fft:base", "base", 0, model_path="tinker://r1/sampler_weights/s0"))
+    await self.bus.create_run(Run("s2", "sampler:fft:base", "base", 0, model_path="tinker://r2/sampler_weights/s0"))
 
     loads = []
 
     class RecordEngine(FakeEngine):
-      async def load(self, name: str, path: str) -> None:
+      async def load_checkpoint(self, name: str, path: str) -> None:
         loads.append((name, path))
-        await super().load(name, path)
+        await super().load_checkpoint(name, path)
 
     with patch.dict(os.environ, {"TINYRL_LORA": "0"}):
       sampler = Sampler(self.bus, "sampler:fft:base", engine=RecordEngine, store=store)
     await self.own(sampler)
 
-    await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
-    await self.bus.submit("s2", Op.SAMPLE, json.dumps(JOB).encode())
-    await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
-    await self.bus.submit("s2", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("s2", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("s2", Op.SAMPLE, json.dumps(JOB).encode())
 
     handled = await sampler.step(block_ms=10)
     self.assertEqual(handled, 4)
@@ -381,7 +381,7 @@ class TestSampler(RedisTest):
     first_sess = "s1" if "/r1/" in loads[0][1] else "s2"
     loads.clear()
 
-    await self.bus.submit(first_sess, Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command(first_sess, Op.SAMPLE, json.dumps(JOB).encode())
     handled = await sampler.step(block_ms=10)
     self.assertEqual(handled, 1)
     self.assertEqual([n for n, _ in loads], ["c0"])

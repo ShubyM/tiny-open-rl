@@ -113,7 +113,7 @@ class VLLM:
           raise
     raise AssertionError
 
-  async def load(self, name: str, path: str) -> None:
+  async def load_checkpoint(self, name: str, path: str) -> None:
     if name in self.loaded:
       return
     if not self.lora and self.clean and os.path.isdir(path):

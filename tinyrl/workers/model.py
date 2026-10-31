@@ -161,7 +161,7 @@ def load(name: str) -> PreTrainedModel:
   name = models.local(name)
   arch = (AutoConfig.from_pretrained(name).architectures or [""])[0]
   cls = getattr(transformers, arch, AutoModelForCausalLM)
-  # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create
+  # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create_run
   if torch.cuda.is_available():
     return cls.from_pretrained(name, dtype=torch.bfloat16, device_map="auto")
   return cls.from_pretrained(name, dtype=torch.float32)
@@ -200,7 +200,7 @@ class Model:
     self.parked = False
     self.dirty: set[str] = set()
 
-  def create(self, run: str, base: str, rank: int, config: dict) -> None:
+  def create_run(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
       self.lm, self.base, self.lora = self.load(base), base, rank > 0
       if hasattr(inner := getattr(self.lm, "model", None), "language_model"):
@@ -239,7 +239,7 @@ class Model:
     for p in self.params[run].values():
       p.data = p.data.float()  # PEFT gives an adapter its base model's dtype, but master weights are fp32
 
-  def use(self, run: str) -> PreTrainedModel:
+  def activate_run(self, run: str) -> PreTrainedModel:
     """The model, with the run's adapter active."""
     if self.lm is None or run not in self.params:
       raise KeyError(f"model {run} is not on this trainer, it was deleted or its trainer restarted")
@@ -253,7 +253,7 @@ class Model:
     if loss_fn not in LOSSES:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
-    lm = self.use(run).train(not forward_only)
+    lm = self.activate_run(run).train(not forward_only)
     lengths = [min(len(d.tokens), len(d.inputs["target_tokens"])) for d in data]
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total = 0.0
@@ -275,15 +275,15 @@ class Model:
 
     return logprobs, {"loss:sum": total, "loss:mean": total / max(1, len(data))}
 
-  def optimizer(self, run: str) -> torch.optim.AdamW:
+  def adam_for_run(self, run: str) -> torch.optim.AdamW:
     if run not in self.optimizers:
       params = list(self.params[run].values())
       self.optimizers[run] = torch.optim.AdamW(params, fused=bool(params and params[0].is_cuda))
     return self.optimizers[run]
 
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
-    self.use(run)
-    optimizer = self.optimizer(run)
+    self.activate_run(run)
+    optimizer = self.adam_for_run(run)
 
     # every step brings its own hyperparameters, so a learning rate schedule just works
     for group in optimizer.param_groups:
@@ -297,17 +297,17 @@ class Model:
     if not self.lora:
       if torch.cuda.is_available():
         torch.cuda.empty_cache()
-      self.move(self.moments(), "cuda")
+      self.move_tensors(self.adam_moments(), "cuda")
     optimizer.step()
     optimizer.zero_grad()
     if not self.lora:
-      self.move(self.moments(), "cpu")
+      self.move_tensors(self.adam_moments(), "cpu")
     self.dirty.add(run)
     return {"grad_norm:mean": grad_norm}
 
-  def state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
+  def training_state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """A run's portable training checkpoint: fp32 master weights and named AdamW state, with no pickle."""
-    self.use(run)
+    self.activate_run(run)
     tensors = {name: p.detach() for name, p in self.params[run].items()}
     optim = self.optimizers.get(run)
     for name, p in self.params[run].items():
@@ -318,9 +318,9 @@ class Model:
         tensors[f"{name}.step"] = s["step"].detach()
     return tensors, {"optimizer": True}
 
-  def weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
+  def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
-    lm = self.use(run)
+    lm = self.activate_run(run)
     prefix = "base_model.model." if self.lora else ""
     tensors = {f"{prefix}{name}": p.detach().to(self.dtype) for name, p in self.params[run].items()}
     if self.lora:
@@ -335,8 +335,8 @@ class Model:
       "config": cfg,
     }
 
-  def restore(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
-    self.use(run)
+  def restore_run(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
+    self.activate_run(run)
     if optimizer and not meta.get("optimizer"):
       raise ValueError("checkpoint has no optimizer state")
     suffixes = (".exp_avg", ".exp_avg_sq", ".step")
@@ -351,7 +351,7 @@ class Model:
     self.pinned.clear()
     self.optimizers.pop(run, None)
     if optimizer and any(k.endswith(".step") for k in tensors):
-      opt = self.optimizer(run)
+      opt = self.adam_for_run(run)
       for name, p in self.params[run].items():
         opt.state[p] = {
           "exp_avg": tensors[f"{name}.exp_avg"].to(p.device, torch.float32),
@@ -359,13 +359,13 @@ class Model:
           "step": tensors[f"{name}.step"].to(p.device if opt.defaults.get("fused") else "cpu", torch.float32),
         }
       if not self.lora:
-        self.move(self.moments(), "cpu")
+        self.move_tensors(self.adam_moments(), "cpu")
     self.dirty.add(run)
 
-  def moments(self):
+  def adam_moments(self):
     return (v for opt in self.optimizers.values() for s in opt.state.values() for v in s.values() if torch.is_tensor(v))
 
-  def tensors(self, optim: bool = True):
+  def gpu_tensors(self, optim: bool = True):
     """Every tensor on the GPU: weights, buffers, gradients between forward_backward and optim_step, AdamW moments."""
     if self.lm is None:
       return
@@ -373,9 +373,9 @@ class Model:
     yield from self.lm.buffers()
     yield from (p.grad for p in self.lm.parameters() if p.grad is not None)
     if optim:
-      yield from self.moments()
+      yield from self.adam_moments()
 
-  def move(self, tensors, device: str) -> None:
+  def move_tensors(self, tensors, device: str) -> None:
     for t in tensors:
       if device == "cpu" and t.is_cuda:
         buf = self.pinned.get(id(t))
@@ -391,22 +391,22 @@ class Model:
       torch.cuda.synchronize()
       if device == "cpu":
         torch.cuda.empty_cache()
-        active = {id(x) for x in self.tensors()}
+        active = {id(x) for x in self.gpu_tensors()}
         for k in list(self.pinned.keys()):
           if k not in active:
             del self.pinned[k]
 
-  def park(self) -> None:
-    """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume() undoes it."""
-    self.move(self.tensors(), "cpu")
+  def park_on_host(self) -> None:
+    """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume_on_gpu() undoes it."""
+    self.move_tensors(self.gpu_tensors(), "cpu")
     self.parked = True
 
-  def resume(self) -> None:
-    self.move(self.tensors(optim=self.lora), "cuda")
+  def resume_on_gpu(self) -> None:
+    self.move_tensors(self.gpu_tensors(optim=self.lora), "cuda")
     self.parked = False
 
-  def delete(self, run: str) -> None:
-    lm = self.use(run)
+  def delete_run(self, run: str) -> None:
+    lm = self.activate_run(run)
     self.dirty.discard(run)
     if self.lora:
       lm.delete_adapter(run)

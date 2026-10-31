@@ -90,13 +90,13 @@ change without touching scheduling. What's new, and who writes it:
 | `worker` in `tinyrl:run:<run>`, and `tinyrl:worker:<worker>` | the run's worker, and each worker's runs | **whoever holds the run**: the scheduler while the run is in no worker, its worker's trainer while it's in one | trainers, scheduler |
 | `release_to` in `tinyrl:run:<run>` | a request: move the run to this worker, or to `""` (none) | scheduler (or node daemon on Spot drain); the trainer clears it when done | the run's trainer |
 | `parked` in `tinyrl:run:<run>` | immutable `ref` of the run's state in the store while between workers | the trainer that releases it, and the one that restores and drops it | trainers |
-| `tinyrl:ckpt:<run>` | hash `{<kind>/<name>: ref}` mapping `tinker://` URIs to immutable `ref`s | `Bus.finish`, under the worker's lease | trainers, samplers |
+| `tinyrl:ckpt:<run>` | hash `{<kind>/<name>: ref}` mapping `tinker://` URIs to immutable `ref`s | `Bus.write_reply`, under the worker's lease | trainers, samplers |
 | `tinyrl:loc:<ref>` | string with TTL: peer address of a node daemon holding `<ref>` in `/dev/shm` | the node daemon that staged `<ref>` | any trainer or sampler calling `store.get` |
 | `tinyrl:owner:<worker>` | string with a 10 s TTL: the lease | the trainer that holds it | trainers, scheduler, gateway |
 | `tinyrl:node:<id>` | hash `{gpus, gpu_bytes, host_bytes, gpu_model, tier, addr, draining}` with a 30 s TTL; `tier` is `reserved` or `burst`, from a node label | that node daemon | scheduler, store |
 | `tinyrl:events` | stream: the log placement and GPU turns are decided from. Facts like `run_created`, `node_up` and `wants_gpu`, and the scheduler's decisions, `placed`, `unplaced`, `granted` and `revoked` | the gateway, node daemons, trainers and samplers append facts; the scheduler appends decisions | the scheduler, node daemons, trainers, samplers |
 | `tinyrl:state` | JSON: the scheduler's current state, placements and turns | the scheduler | gateway |
-| `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | counters (built): calls run, time queued, time running | `Bus.finish`, under the worker's lease | scheduler, `GET /metrics` |
+| `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | counters (built): calls run, time queued, time running | `Bus.write_reply`, under the worker's lease | scheduler, `GET /metrics` |
 | `gpu_bytes`, `host_bytes` in `tinyrl:run:<run>` | measured state size, so a move's cost is known | the run's trainer | scheduler |
 
 A run's membership has one writer at a time, and the writer changes hands with the run. The scheduler can only put a run
@@ -135,7 +135,7 @@ sequenceDiagram
 
 ## The store: a trainer can resume anywhere
 
-Today [`Store`](../tinyrl/storage/store.py) writes named `safetensors` bundles (`Model.state` and `Model.weights`) to a local
+Today [`Store`](../tinyrl/storage/store.py) writes named `safetensors` bundles (`Model.training_state` and `Model.sampler_weights`) to a local
 `CKPT` directory. Mounting `CKPT` on shared NFS does not scale across nodes. In open-rl's two-job 8B full fine-tune
 benchmark (`docs/fft/fft.md` §9), writing sampler weights (`save_pretrained` + `torch.save`) to shared NFS took **74 to 88
 seconds of every 130-second RL step**, leaving GPUs idle for three fifths of the job.
@@ -177,7 +177,7 @@ class Store:
 ```
 
 Because `ref` is write-once, readers never see torn or overwritten files, and a paused trainer whose lease expired can call
-`put` without harming anything—its `Bus.finish` transaction rejects publishing `ref` to `tinyrl:ckpt:<run>`. Every `put` and
+`put` without harming anything—its `Bus.write_reply` transaction rejects publishing `ref` to `tinyrl:ckpt:<run>`. Every `put` and
 `get` moves through up to three tiers behind that interface:
 
 1. **Tier 1 — GPU ↔ `/dev/shm` on the node daemon (26.6 GB/s pinned D2H, 25 GB/s H2D, measured per GPU on `a3-highgpu-1g`).**
@@ -422,7 +422,7 @@ and `trainer.py` plus immutable `Store` `ref`s enforce that:
 1. **The lease.** A trainer serves a worker only after `SET tinyrl:owner:<worker> <worker> NX PX 10000` succeeds. It renews
    every 2.5 s with `SET ... IFEQ <worker>` from the event loop while commands run in a thread. If a renewal fails, the
    trainer stops before reading or running another command.
-2. **The fenced finish and handoff.** `Bus.finish` writes the reply, acknowledges the command, updates counters, and (for
+2. **The fenced finish and handoff.** `Bus.write_reply` writes the reply, acknowledges the command, updates counters, and (for
    `save_weights*`) publishes `ref` into `tinyrl:ckpt:<run>` in one WATCH/MULTI/EXEC transaction on the lease key.
    Releasing a run (`parked = ref`) goes through the same lease check.
 
@@ -451,7 +451,7 @@ over subsequent steps.
 | source node daemon dies while a peer pulls `<ref>` from `/dev/shm` | `store.get` catches the connection error and falls back to durable storage (`CKPT` / GCS) | nothing once flushed; if the source node died before a background flush completed, same as sudden node death |
 | a Spot VM gets a 30 s preemption notice | node daemon marks `draining=1`; trainers dump active runs (`durable=True`) after their current batch and release them | nothing when current batch + flush completes within 30 s |
 | a node dies suddenly | node daemon heartbeat expires in 30 s; scheduler places its workers elsewhere | same as a trainer dying |
-| a paused trainer writes `save_weights` | `store.put` writes an unreferenced immutable `ref`, then `Bus.finish` fails the lease check; `tinyrl:ckpt:<run>` is untouched | one failed command; existing checkpoints are never overwritten |
+| a paused trainer writes `save_weights` | `store.put` writes an unreferenced immutable `ref`, then `Bus.write_reply` fails the lease check; `tinyrl:ckpt:<run>` is untouched | one failed command; existing checkpoints are never overwritten |
 | the scheduler dies | trainers and samplers keep serving; Deployment restarts it from Redis state | nothing |
 | Redis restarts (AOF, every-second fsync) or fails over | up to 1 s of writes may be lost, triggering early lease takeover; replies and `ref` pointers remain fenced | at most in-flight commands during the window, failed cleanly, never answered twice |
 
@@ -494,7 +494,7 @@ class Engine(Protocol):
 
 | File | Lines | Change |
 |---|---:|---|
-| [trainer.py](../tinyrl/workers/trainer.py) | 382 → ~410 | parking, releasing and restoring runs through `Store` (lease loop, sweep, `Model.weights`/`state`, load reporting, and pinned-memory parking are built) |
+| [trainer.py](../tinyrl/workers/trainer.py) | 382 → ~410 | parking, releasing and restoring runs through `Store` (lease loop, sweep, `Model.sampler_weights`/`state`, load reporting, and pinned-memory parking are built) |
 | [bus.py](../tinyrl/bus.py) | 260 → ~295 | fenced `ckpt` `ref` publish and `release_run`; placement and `loc` helpers (leases, fenced `finish`, `reclaim`, node heartbeats, utilization, and GPU wait set are built) |
 | [gateway.py](../tinyrl/api/gateway.py) | 175 → ~150 | `pool_for` and `CKPT` paths go away; records LoRA config; passes `tinker://` URIs; `paused_capacity` |
 | [node_daemon.py](../tinyrl/control/node_daemon.py) | 41 → ~90 | per-node placements, Spot preemption watch, `/dev/shm` peer server (process supervisor, heartbeat, and GPU lease assignment are built) |

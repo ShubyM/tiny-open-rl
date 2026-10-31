@@ -73,15 +73,15 @@ class NodeDaemon:
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.state, self.after = scheduler.State(), "0-0"
 
-  async def up(self) -> None:
-    await self.bus.heartbeat(self.id, self.gpus)  # first, so the scheduler never finds it up without a heartbeat
-    await self.bus.emit("node_up", node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
+  async def announce_node(self) -> None:
+    await self.bus.node_heartbeat(self.id, self.gpus)  # first, so the scheduler never finds it up without a heartbeat
+    await self.bus.append_event("node_up", node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
 
   async def tick(self) -> None:
-    await self.bus.heartbeat(self.id, self.gpus)
-    if await self.bus.log_size() < self.state.n:  # the log shrank, so Redis was flushed
+    await self.bus.node_heartbeat(self.id, self.gpus)
+    if await self.bus.event_log_size() < self.state.n:  # the log shrank, so Redis was flushed
       self.state, self.after = scheduler.State(), "0-0"
-    while events := await self.bus.events(self.after):
+    while events := await self.bus.read_events(self.after):
       for e in events:
         self.state = scheduler.fold(self.state, e)
       self.after = events[-1].id
@@ -94,31 +94,36 @@ class NodeDaemon:
       if proc.poll() is not None:  # only now is the GPU free, so only now does its turn end
         reap(proc)
         del self.stopping[worker]
-        await self.bus.emit("exited", worker=worker)
+        await self.bus.append_event("exited", worker=worker)
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
-      await self.bus.emit("started", worker=worker, node=self.id)
-      self.procs[worker] = self.start(worker, mine[worker])
+      await self.bus.append_event("started", worker=worker, node=self.id)
+      self.procs[worker] = self.start_worker_process(worker, mine[worker])
     if time.time() - self.swept > SWEEP_S:
       self.swept = time.time()
-      await self.sweep()
+      await self.sweep_checkpoints()
     if self.uploading is None or self.uploading.done():  # this node's saves go up to a bucket CKPT behind, in order
       if self.uploading and self.uploading.exception():
         print(f"upload failed, trying again: {self.uploading.exception()!r}", file=sys.stderr, flush=True)
-      self.uploading = asyncio.create_task(asyncio.to_thread(self.store.flush))
+      self.uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
 
-  async def sweep(self) -> None:
+  async def sweep_checkpoints(self) -> None:
     """Delete the checkpoints in this node's store that the registry doesn't have: deleted, expired, or their run's. Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before. Then the links of full sampler weight chains no registered checkpoint is built from. It also keeps the node's cache of a bucket store under CKPT_CACHE_BYTES."""
-    await asyncio.to_thread(self.store.trim)
-    if (since := await self.registry.registry_since()) is None:
+    await asyncio.to_thread(self.store.trim_cache)
+    if (since := await self.registry.first_registered_at()) is None:
       return
-    for uri in await asyncio.to_thread(self.store.stored):
-      if await self.registry.checkpoint(uri) is None:
+    for uri in await asyncio.to_thread(self.store.list_checkpoints):
+      if await self.registry.get_checkpoint(uri) is None:
         saved = await asyncio.to_thread(self.store.saved_at, uri)
         if since < saved < time.time() - SWEEP_GRACE_S:
           await asyncio.to_thread(self.store.delete, uri)
-    await asyncio.to_thread(self.store.collect, await self.registry.versions(), since, time.time() - SWEEP_GRACE_S)
+    await asyncio.to_thread(
+      self.store.delete_unused_chain_links,
+      await self.registry.registered_versions(),
+      since,
+      time.time() - SWEEP_GRACE_S,
+    )
 
-  def start(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
+  def start_worker_process(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
     """Start a worker's process on its GPUs, with the settings for its kind. This node's environment wins."""
     gpus, k = list(p.gpus), p.kind
     env = {**scheduler.settings(k, self.gpus, self.gpu_mib * 2**20), **os.environ}
@@ -133,7 +138,7 @@ class NodeDaemon:
     return gpus, subprocess.Popen([sys.executable, "-m", mod, worker], env=env, start_new_session=True)
 
   async def serve(self) -> None:
-    await self.up()
+    await self.announce_node()
     try:
       while True:
         await self.tick()
@@ -146,7 +151,7 @@ class NodeDaemon:
         with contextlib.suppress(subprocess.TimeoutExpired):
           proc.wait(max(0.0, deadline - time.monotonic()))
         reap(proc)
-      self.store.flush()  # what they saved last
+      self.store.upload_pending_saves()  # what they saved last
 
 
 if __name__ == "__main__":

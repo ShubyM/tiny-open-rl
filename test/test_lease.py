@@ -23,14 +23,14 @@ class TestLease(RedisTest):
     return subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", worker], env=env)
 
   async def call(self, run: str, op: Op, body: dict) -> Reply:
-    request_id = await self.bus.submit(run, op, json.dumps(body).encode())
-    return await self.bus.result(request_id, 60)
+    request_id = await self.bus.submit_command(run, op, json.dumps(body).encode())
+    return await self.bus.wait_for_reply(request_id, 60)
 
   async def test_a_paused_trainer_cannot_answer_once_another_owns_its_worker(self):
     base = f"{tempfile.mkdtemp()}/tiny"
     tiny().save_pretrained(base)
     worker, run = f"lora:{base}", new_id()
-    await self.bus.create(Run(run, worker, base, 4))
+    await self.bus.create_run(Run(run, worker, base, 4))
 
     first = self.trainer(worker)
     second = None
@@ -47,22 +47,22 @@ class TestLease(RedisTest):
       while not any(c["cmd"] == "xreadgroup" and "b" in c["flags"] for c in await self.bus.r.client_list()):
         await asyncio.sleep(0.01)
       first.send_signal(signal.SIGSTOP)
-      request_id = await self.bus.submit(run, Op.OPTIM_STEP, b'{"adam_params": {}}')
+      request_id = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params": {}}')
       await asyncio.sleep(0.2)
-      [stranded] = (await self.bus.queue(run))["in_flight"]
+      [stranded] = (await self.bus.queued_and_in_flight(run))["in_flight"]
       self.assertEqual(stranded["request_id"], request_id)
 
-      reply = await self.bus.result(request_id, 30)  # the second takes the worker over and fails the command
+      reply = await self.bus.wait_for_reply(request_id, 30)  # the second takes the worker over and fails the command
       self.assertFalse(reply.ok)
       self.assertIn("lost the worker", json.loads(reply.body)["error"])
 
       first.send_signal(signal.SIGCONT)
       await asyncio.to_thread(first.wait, 30)  # it finds its lease gone, and exits
-      self.assertEqual(await self.bus.result(request_id, 0), reply)  # and nothing it did reached the client
-      self.assertEqual((await self.bus.queue(run))["in_flight"], [])
+      self.assertEqual(await self.bus.wait_for_reply(request_id, 0), reply)  # and nothing it did reached the client
+      self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
 
       other = new_id()
-      await self.bus.create(Run(other, worker, base, 4))
+      await self.bus.create_run(Run(other, worker, base, 4))
       self.assertTrue((await self.call(other, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
       self.assertIsNone(second.poll())  # the second serves the worker from now on
     finally:
@@ -76,16 +76,16 @@ class TestLease(RedisTest):
     base, ckpt = f"{tempfile.mkdtemp()}/tiny", tempfile.mkdtemp()
     tiny().save_pretrained(base)
     worker, run = f"lora:{base}", new_id()
-    await self.bus.create(Run(run, worker, base, 4, lora=LORA))
+    await self.bus.create_run(Run(run, worker, base, 4, lora=LORA))
     env = {**os.environ, "REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS), "CKPT": ckpt}
     proc = subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", worker], env=env)
     try:
       self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
       proc.terminate()
       self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
-      uri = await self.bus.parked(run)
+      uri = await self.bus.parked_checkpoint(run)
       self.assertTrue(os.path.exists(f"{ckpt}/{uri.removeprefix('tinker://')}/state.safetensors"))
-      self.assertIsNone(await self.bus.owner(worker))  # released, so the next trainer starts at once
+      self.assertIsNone(await self.bus.lease_owner(worker))  # released, so the next trainer starts at once
     finally:
       if proc.poll() is None:
         proc.kill()
