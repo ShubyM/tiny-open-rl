@@ -10,6 +10,11 @@ flush() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri
 daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node waits for the
 version it wants to land, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node
 lost before its uploads finish loses those versions.
+
+A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named
+<keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0, and every link whose parent
+didn't upload, goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC
+per chunk, and a node rebuilds a link from the newest one it has. collect() deletes the links nothing is built from.
 """
 
 from __future__ import annotations
@@ -25,9 +30,11 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 from typing import TYPE_CHECKING
 
 import fsspec
+import numpy as np
 
 if TYPE_CHECKING:
   import torch
@@ -41,6 +48,8 @@ MAX_SHARDS = 16
 MAX_PIN_BYTES = getenv("MAX_PIN_BYTES", 10 * 1024 * 1024 * 1024)  # the most pinned host memory a save holds
 UPLOAD_WAIT_S = getenv("UPLOAD_WAIT_S", 900.0)  # how long a node waits for a version another node is uploading
 CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)  # trim() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
+KEYFRAME_EVERY = getenv("KEYFRAME_EVERY", 8)  # the most links in a chain of full sampler weights
+XOR_CHUNK = 16 * 1024 * 1024
 
 
 def nbytes(t: torch.Tensor) -> int:
@@ -71,6 +80,43 @@ def parallel(fn, *xs):
     return list(pool.map(fn, *xs))
 
 
+def raw(path: str) -> tuple[bytes, np.ndarray]:
+  """A safetensors file's header, and the bytes after it, mapped rather than read."""
+  with open(path, "rb") as f:
+    head = f.read(int.from_bytes(f.read(8), "little"))
+  empty = os.path.getsize(path) == 8 + len(head)
+  return head, np.zeros(0, np.uint8) if empty else np.memmap(path, np.uint8, "r", offset=8 + len(head))
+
+
+def layout(head: bytes) -> dict:
+  return {k: v for k, v in json.loads(head).items() if k != "__metadata__"}
+
+
+def chunks(n: int, size: int) -> list[slice]:
+  return [slice(i, min(i + size, n)) for i in range(0, n, size)]
+
+
+def threads(fn, *xs) -> list:
+  with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as pool:
+    return list(pool.map(fn, *xs))  # zlib and numpy let go of the GIL
+
+
+def sparse(old: np.ndarray, new: np.ndarray) -> tuple[bytes, int]:
+  """The bytes of new that differ from old, as the gaps between them then their XOR with old, zlib compressed, and
+  new's CRC. Few bytes differ, so this is small, and quicker to compress than the whole XOR."""
+  x = np.bitwise_xor(old, new)
+  at = np.flatnonzero(x)
+  return zlib.compress(np.diff(at, prepend=-1).astype(np.uint32).tobytes() + x[at].tobytes(), 1), zlib.crc32(new)
+
+
+def unsparse(data: np.ndarray, z: np.ndarray) -> int:
+  """Apply sparse()'s bytes to data in place, and return its CRC."""
+  raw = zlib.decompress(z)
+  at = np.cumsum(np.frombuffer(raw, np.uint32, len(raw) // 5), dtype=np.int64) - 1
+  data[at] ^= np.frombuffer(raw, np.uint8, offset=len(raw) // 5 * 4)
+  return zlib.crc32(data)
+
+
 class Store:
   def __init__(self, root: str | None = None, cache: str | None = None):
     self.root = (CKPT if root is None else root).rstrip("/")
@@ -82,6 +128,7 @@ class Store:
     self.pinned: torch.Tensor | None = None  # reused by every save, since pinning host memory is slow
     self.lock = threading.RLock()  # a save's tensors can be views of self.pinned until it is written
     self.versions: dict[str, str] = {}  # uri -> the version this process last saved
+    self.chains: dict[str, str] = {}  # run -> the last link of its chain this process saved
 
   def path(self, uri: str) -> str:
     return f"{self.base}/{uri.removeprefix('tinker://')}"
@@ -149,6 +196,10 @@ class Store:
     if self.remote:
       os.makedirs(self.cache, exist_ok=True)
       folder, version = tempfile.mkdtemp(dir=self.cache), uuid.uuid4().hex[:16]
+      if (meta or {}).get("config") and not (meta or {}).get("lora"):  # a full fine-tune's sampler weights
+        run = uri.removeprefix("tinker://").split("/")[0]
+        k, _, n = self.chains.get(run, "").rpartition(".")
+        version = self.chains[run] = f"{k}.{int(n) + 1}" if k and int(n) + 1 < KEYFRAME_EVERY else f"{version}.0"
       try:
         with self.lock:
           names = self.write(folder, self.stage(tensors), dict(meta or {}))
@@ -207,17 +258,58 @@ class Store:
     return None
 
   def upload(self, dest: str, version: str, names: list[str]) -> None:
-    folder = f"{self.cache}/{version}"
-    parallel(lambda n: self.fs.put_file(f"{folder}/{n}", f"{dest}/{version}/{n}"), names)
+    folder, rel = f"{self.cache}/{version}", dest[len(self.base) + 1 :]
+    info, files = {"version": version, "dir": f"{rel}/{version}", "files": names}, [f"{folder}/{n}" for n in names]
+    k, _, n = version.rpartition(".")
+    if k:  # a link of the run's chain
+      info["dir"], parent = f"{rel.split('/')[0]}/_versions/{version}", f"{self.cache}/{k}.{int(n) - 1}"
+      first = ""  # the newest link before it that went up whole, if the one before it went up
+      with contextlib.suppress(FileNotFoundError), open(f"{parent}.uploaded") as f:
+        first = f.read()
+      xor = int(n) and first and self.diff(parent, folder, names, f"{folder}.xor")
+      if xor:
+        files = [f"{folder}.xor/{x}" for x in xor] + [f for f in files if not f.endswith(".safetensors")]
+      info["from"] = first if xor else version
+    try:
+      parallel(lambda f: self.fs.put_file(f, f"{self.base}/{info['dir']}/{os.path.basename(f)}"), files)
+    finally:
+      shutil.rmtree(f"{folder}.xor", ignore_errors=True)
     old = {}
     with contextlib.suppress(FileNotFoundError):
       old = json.loads(self.fs.cat_file(f"{dest}/_latest"))
-    self.fs.pipe_file(f"{dest}/_latest", json.dumps({"version": version, "dir": version, "files": names}).encode())
-    stale = [f"{dest}/{old['dir']}"] if old.get("dir") else [f"{dest}/{n}" for n in old.get("files", [])]
-    for path in stale:  # the version before, which readers that started on it may still be downloading
-      with contextlib.suppress(FileNotFoundError):
-        self.fs.rm(path, recursive=True)
-    open(f"{folder}.uploaded", "w").close()  # beside the folder, so engines that list it never see it
+    self.fs.pipe_file(f"{dest}/_latest", json.dumps(info).encode())
+    if "." not in old.get("version", "."):  # a link stays until collect(), since other checkpoints may build on it
+      stale = [f"{self.base}/{old['dir']}"] if old.get("dir") else [f"{dest}/{n}" for n in old.get("files", [])]
+      for path in stale:  # the version before, which readers that started on it may still be downloading
+        with contextlib.suppress(FileNotFoundError):
+          self.fs.rm(path, recursive=True)
+    with open(f"{folder}.uploaded", "w") as f:  # beside the folder, so engines that list it never see it
+      f.write(info.get("from", ""))
+
+  def diff(self, parent: str, folder: str, names: list[str], out: str) -> list[str] | None:
+    """Write each weights file in folder as the bytes that differ from parent's, by chunk, with the file's header and a
+    CRC per chunk. None if the files don't line up."""
+    import safetensors.numpy
+
+    shards = [n for n in names if n.endswith(".safetensors")]
+    try:
+      files = [(raw(f"{parent}/{n}"), raw(f"{folder}/{n}")) for n in shards]
+    except FileNotFoundError:
+      return None
+    if any(layout(was) != layout(head) or len(old) != len(new) for (was, old), (head, new) in files):
+      return None
+    jobs = [(i, s) for i, (_, (_, new)) in enumerate(files) for s in chunks(len(new), XOR_CHUNK)]
+    done = threads(
+      lambda i, s: sparse(files[i][0][1][s], files[i][1][1][s]), [i for i, _ in jobs], [s for _, s in jobs]
+    )
+    os.makedirs(out, exist_ok=True)
+    for i, (name, (_, (head, _))) in enumerate(zip(shards, files)):
+      mine = [d for (j, _), d in zip(jobs, done) if j == i]
+      meta = {"head": head.decode(), "chunk": str(XOR_CHUNK), "crc": json.dumps([c for _, c in mine])}
+      safetensors.numpy.save_file(
+        {str(k): np.frombuffer(z, np.uint8) for k, (z, _) in enumerate(mine)}, f"{out}/{name}.xor", metadata=meta
+      )
+    return [f"{n}.xor" for n in shards]
 
   def flush(self) -> None:
     """Upload this node's saves in the order they were made. The first that fails stops the rest, so a checkpoint's
@@ -272,22 +364,67 @@ class Store:
     version, names = info["version"], info["files"]
     if not any(n.endswith(".safetensors") for n in names):
       raise ValueError(f"no checkpoint at {uri}")
-    src = f"{dest}/{info['dir']}" if info.get("dir") else dest
+    src = f"{self.base}/{info['dir']}" if info.get("dir") else dest
+    if info.get("from", version) == version:
+      return self.fetch(version, lambda tmp: self.download(src, names, tmp)), version
+    return self.fetch(
+      version, lambda tmp: self.rebuild(os.path.dirname(src), version, info["from"], names, tmp)
+    ), version
+
+  def fetch(self, version: str, fill) -> str:
+    """This node's folder for a version, which fill(folder) makes the first time."""
     folder = f"{self.cache}/{version}"
     if not os.path.isdir(folder):
       os.makedirs(self.cache, exist_ok=True)
-      download = tempfile.mkdtemp(dir=self.cache)
+      tmp = tempfile.mkdtemp(dir=self.cache)
       try:
-        parallel(lambda n: self.fs.get_file(f"{src}/{n}", f"{download}/{n}"), names)
+        fill(tmp)
         try:
-          os.rename(download, folder)
+          os.rename(tmp, folder)
         except OSError:
           if not os.path.isdir(folder):
             raise
         open(f"{folder}.uploaded", "w").close()  # the bucket has it, so trim() may drop it here
       finally:
-        shutil.rmtree(download, ignore_errors=True)
-    return folder, version
+        shutil.rmtree(tmp, ignore_errors=True)
+    return folder
+
+  def download(self, src: str, names: list[str], folder: str) -> None:
+    parallel(lambda n: self.fs.get_file(f"{src}/{n}", f"{folder}/{n}"), names)
+
+  def rebuild(self, links: str, version: str, whole: str, names: list[str], folder: str) -> None:
+    """Make a link of a chain in folder, from the newest link before it this node has, or else the newest one uploaded
+    whole, by XORing in each link after that. The CRCs check the result is the exact bytes saved."""
+    import safetensors
+
+    k, _, n = version.rpartition(".")
+    chain = [f"{k}.{i}" for i in range(int(whole.rpartition(".")[2]), int(n) + 1)]
+    have = next(i for i in reversed(range(len(chain) - 1)) if i == 0 or os.path.isdir(f"{self.cache}/{chain[i]}"))
+    start = self.fetch(chain[have], lambda tmp: self.download(f"{links}/{chain[have]}", names, tmp))
+    shards, after = [n for n in names if n.endswith(".safetensors")], chain[have + 1 :]
+    self.download(f"{links}/{version}", [n for n in names if n not in shards], folder)
+    pairs = [(f"{link}/{name}.xor", f"{folder}/{link}.{name}.xor") for link in after for name in shards]
+    parallel(lambda a, b: self.fs.get_file(f"{links}/{a}", b), *zip(*pairs))
+    data = {name: np.array(raw(f"{start}/{name}")[1]) for name in shards}
+    for link in after:
+      metas, jobs = {}, []
+      for name in shards:
+        with safetensors.safe_open(f"{folder}/{link}.{name}.xor", framework="np") as f:
+          metas[name] = f.metadata()
+          size = int(metas[name]["chunk"])
+          jobs += [(name, s, f.get_tensor(str(k))) for k, s in enumerate(chunks(len(data[name]), size))]
+        os.unlink(f"{folder}/{link}.{name}.xor")
+      crcs = threads(lambda name, s, z: (name, unsparse(data[name][s], z)), *zip(*jobs)) if jobs else []
+      if any([c for n, c in crcs if n == name] != json.loads(metas[name]["crc"]) for name in shards):
+        raise ValueError(f"{link} rebuilt wrong")
+
+    def write(name: str) -> None:
+      head = metas[name]["head"].encode()
+      with open(f"{folder}/{name}", "wb") as f:
+        f.write(len(head).to_bytes(8, "little") + head)
+        f.write(data[name])
+
+    parallel(write, shards)
 
   def weights(self, uri: str, version: str | None = None) -> list[str]:
     folder = self.local(uri, version)[0]
@@ -342,6 +479,14 @@ class Store:
     if self.remote:
       return self.fs.modified(f"{self.path(uri)}/_latest").timestamp()
     return os.lstat(self.path(uri)).st_mtime
+
+  def collect(self, live: set[str], since: float, before: float) -> None:
+    """Delete the links of chains that none of the live versions is built from, uploaded between since and before."""
+    keep = {f"{k}.{i}" for v in live if "." in v for k, _, n in [v.rpartition(".")] for i in range(int(n) + 1)}
+    for links in self.fs.glob(f"{self.base}/*/_versions/*") if self.remote else []:
+      if links.rsplit("/", 1)[1] not in keep and (files := self.fs.ls(links, detail=False)):
+        if since < self.fs.modified(files[0]).timestamp() < before:
+          self.fs.rm(links, recursive=True)
 
   def trim(self) -> None:
     """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the
