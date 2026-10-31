@@ -69,7 +69,7 @@ class TestTinkerSDK(unittest.TestCase):
           break
         time.sleep(0.1)
       with open(f"{final}/_latest") as f:
-        version = json.load(f)["dir"]
+        version = json.load(f)["version"]
       self.assertTrue(os.path.exists(f"{final}/{version}/adapter_model.safetensors"))
     finally:
       for proc in procs:
