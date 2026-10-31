@@ -191,6 +191,20 @@ class TestNodeDaemon(RedisTest):
     await daemon.uploading
     self.assertEqual(store.stored(), ["tinker://r/weights/w"])
 
+  async def test_a_sweep_keeps_the_chain_links_a_registered_checkpoint_builds_on(self):
+    store, v = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp()), []
+    for step in range(3):
+      store.put(
+        f"tinker://r/sampler_weights/{step}", {"w": torch.full((64,), float(step))}, {"config": {"model_type": "x"}}
+      )
+      v.append(store.versions[f"tinker://r/sampler_weights/{step}"])
+    store.flush()
+    await self.bus.saved("tinker://r/sampler_weights/1", 128, version=v[1])
+    await self.bus.r.set("tinyrl:ckpt_since", 0)
+    with patch("tinyrl.node_daemon.SWEEP_GRACE_S", -60):
+      await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep()
+    self.assertEqual(sorted(p.rsplit("/", 1)[1] for p in store.fs.glob(f"{store.base}/r/_versions/*")), v[:2])
+
 
 if __name__ == "__main__":
   unittest.main()

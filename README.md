@@ -48,6 +48,10 @@ machine. Set it to a bucket (`gs://...`, `s3://...`) to keep checkpoints past a 
 machines. A save still lands in the node's `CKPT_CACHE` first and replies, and the node daemon uploads it behind, so a
 bucket never holds up a step. A sampler on the node reads the cached copy; one on another node waits for the upload.
 
+A full fine-tune's sampler weights change in few bytes a step, so they upload as the bytes that changed since the save
+before, in chains of at most `KEYFRAME_EVERY` (8) saves that start with a whole one. Another node rebuilds a save from
+the newest one it has and checks each chunk against the CRC the saving node took. The node daemons delete the links no registered checkpoint needs.
+
 ### On Kubernetes
 
 [k8s/](k8s) runs Redis with an append-only file, the gateway, the scheduler, and a node daemon on every node labeled `tinyrl-gpu=true`.
@@ -107,7 +111,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
-checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
+checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `KEYFRAME_EVERY`, `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`,
 `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
 
