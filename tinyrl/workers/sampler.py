@@ -16,6 +16,7 @@ import signal
 import socket
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -121,11 +122,14 @@ class Sampler:
     async with self.hold_gpu_for_batch(0):
       async with self.loading:
         if self.engine is None:
-          with contextlib.suppress(Exception):
+          try:
             start = time.time()
             self.engine = await self.engine_type.start(base, self.lora)
             boot = time.time() - start
             await self.turn.report_batch_done(queued=0, seconds=boot, boot=boot, ops=[])
+          except Exception:  # its first command starts it again and replies with the error
+            print(f"{self.worker}: the engine failed to start ahead of its commands", file=sys.stderr, flush=True)
+            traceback.print_exc()
 
   async def serve(self) -> None:
     await self.wait_for_lease()
@@ -196,9 +200,12 @@ class Sampler:
       batch_start = time.time()
       boot = 0.0
       if self.engine is None:
-        with contextlib.suppress(Exception):
+        try:
           await self.start_engine_for_session(cmds[0].run)
           boot = time.time() - batch_start
+        except Exception:  # each command starts it again and replies with the error
+          print(f"{self.worker}: the engine failed to start for a batch", file=sys.stderr, flush=True)
+          traceback.print_exc()
       if block_ms:
         await asyncio.sleep(0.02)
         cmds += await self.bus.take_commands(self.worker, self.owner, count, 0)

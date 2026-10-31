@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -431,6 +432,18 @@ class TestSampler(RedisTest):
         with self.assertRaises(RuntimeError):
           await VLLM.start("base", False)
         self.assertNotIn("TINYRL_WARM_SAMPLER", mock_popen.call_args[1]["env"])
+
+  async def test_an_engine_that_fails_to_start_early_is_logged_and_the_sampler_keeps_going(self):
+    class Broken(FakeEngine):
+      @classmethod
+      async def start(cls, base: str, lora: bool):
+        raise RuntimeError("no GPU memory")
+
+    sampler = Sampler(self.bus, "sampler:base", engine=Broken)
+    with patch.dict(os.environ, {"TINYRL_BASE": "base"}), patch("sys.stderr", new_callable=io.StringIO) as err:
+      await sampler.warm_engine()
+    self.assertIsNone(sampler.engine)
+    self.assertIn("RuntimeError: no GPU memory", err.getvalue())
 
   def test_sampler_imports_are_clean(self):
     import subprocess

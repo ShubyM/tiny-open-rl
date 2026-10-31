@@ -258,7 +258,12 @@ class Bus:
 
     random.shuffle(runs)  # so no run always goes first
     streams = {key("q", run_id): ">" for run_id in runs}
-    got = await self.r.xreadgroup(GROUP, owner, streams, count=count, block=block_ms or None)
+    try:
+      got = await self.r.xreadgroup(GROUP, owner, streams, count=count, block=block_ms or None)
+    except redis.ResponseError as e:
+      if "NOGROUP" not in str(e):
+        raise
+      return []  # a run was deleted after it was listed, and the next take lists the worker again
 
     cmds = []
     for stream, entries in got:

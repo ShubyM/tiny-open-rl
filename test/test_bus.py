@@ -3,6 +3,7 @@ import json
 import tempfile
 import time
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from test.helpers import RedisTest, new_id, start_redis
 from tinyrl.bus import Bus, Cmd, Op, Reply, Run, connect, key
@@ -171,6 +172,14 @@ class TestBus(RedisTest):
     await self.bus.delete_run(run_id, "p")
     await self.bus.end_session("s")
     self.assertIsNone(await self.bus.r.zscore(key("seen"), "s"))
+
+  async def test_a_run_deleted_after_its_worker_was_listed_takes_nothing_until_the_next_take(self):
+    run_id, gone = await self.new_run(), await self.new_run()
+    await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
+    await self.bus.delete_run(gone, "p")
+    with patch.object(self.bus, "runs_in_worker", AsyncMock(return_value=[run_id, gone])):  # listed before it went
+      self.assertEqual(await self.bus.take_commands("p", "o", block_ms=10), [])
+    self.assertEqual([c.run for c in await self.bus.take_commands("p", "o", block_ms=10)], [run_id])
 
   async def test_stats_and_workers_cleanup(self):
     run_unassigned = new_id()
