@@ -1,8 +1,6 @@
 """Checkpoint storage behind put(uri) and get(uri).
 
-Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write
-the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors +
-config.json, sharded with a model.safetensors.index.json when large).
+Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors + config.json, sharded with a model.safetensors.index.json when large).
 
 CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache
 in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once.
@@ -312,8 +310,7 @@ class Store:
     return [f"{n}.xor" for n in shards]
 
   def flush(self) -> None:
-    """Upload this node's saves in the order they were made. The first that fails stops the rest, so a checkpoint's
-    _latest never goes back to an older version, and the next flush tries it again."""
+    """Upload this node's saves in the order they were made. The first that fails stops the rest, so a checkpoint's _latest never goes back to an older version, and the next flush tries it again."""
     found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
     for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
       version = e.name.removesuffix(".upload")
@@ -330,8 +327,7 @@ class Store:
   # ***** get *****
 
   def local(self, uri: str, version: str | None = None) -> tuple[str, str]:
-    """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again.
-    With a version, from a store on another node, it waits for that version to land."""
+    """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again. With a version, from a store on another node, it waits for that version to land."""
     dest = self.path(uri)
     if not self.remote:
       real = dest
@@ -455,9 +451,8 @@ class Store:
         self.fs.rm(dest, recursive=True)
       return
     parent, base = os.path.split(dest)
-    tail = (
-      len(parent) + len(base) + 3
-    )  # the random suffix of a version folder has no dot, so step-1 never takes step-1.5's
+    # the random suffix of a version folder has no dot, so step-1 never takes step-1.5's
+    tail = len(parent) + len(base) + 3
     versions = [p for p in glob.glob(f"{glob.escape(parent)}/.{glob.escape(base)}.*") if "." not in p[tail:]]
     for p in [dest, *versions]:  # the link to the live version, the .prev link, and the folders they name
       if os.path.islink(p):
@@ -489,8 +484,7 @@ class Store:
           self.fs.rm(links, recursive=True)
 
   def trim(self) -> None:
-    """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the
-    bucket has: a version still uploading stays."""
+    """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the bucket has: a version still uploading stays."""
     if not os.path.isdir(self.cache):
       return
     limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2
