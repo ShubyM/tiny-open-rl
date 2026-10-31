@@ -2,17 +2,9 @@
 
 Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors + config.json, sharded with a model.safetensors.index.json when large).
 
-CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache
-in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once.
-flush() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node
-daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node waits for the
-version it wants to land, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node
-lost before its uploads finish loses those versions.
+CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. flush() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node waits for the version it wants to land, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
 
-A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named
-<keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0, and every link whose parent
-didn't upload, goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC
-per chunk, and a node rebuilds a link from the newest one it has. collect() deletes the links nothing is built from.
+A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named <keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0, and every link whose parent didn't upload, goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC per chunk, and a node rebuilds a link from the newest one it has. collect() deletes the links nothing is built from.
 """
 
 from __future__ import annotations
@@ -100,8 +92,7 @@ def threads(fn, *xs) -> list:
 
 
 def sparse(old: np.ndarray, new: np.ndarray) -> tuple[bytes, int]:
-  """The bytes of new that differ from old, as the gaps between them then their XOR with old, zlib compressed, and
-  new's CRC. Few bytes differ, so this is small, and quicker to compress than the whole XOR."""
+  """The bytes of new that differ from old, as the gaps between them then their XOR with old, zlib compressed, and new's CRC. Few bytes differ, so this is small, and quicker to compress than the whole XOR."""
   x = np.bitwise_xor(old, new)
   at = np.flatnonzero(x)
   return zlib.compress(np.diff(at, prepend=-1).astype(np.uint32).tobytes() + x[at].tobytes(), 1), zlib.crc32(new)
@@ -285,8 +276,7 @@ class Store:
       f.write(info.get("from", ""))
 
   def diff(self, parent: str, folder: str, names: list[str], out: str) -> list[str] | None:
-    """Write each weights file in folder as the bytes that differ from parent's, by chunk, with the file's header and a
-    CRC per chunk. None if the files don't line up."""
+    """Write each weights file in folder as the bytes that differ from parent's, by chunk, with the file's header and a CRC per chunk. None if the files don't line up."""
     import safetensors.numpy
 
     shards = [n for n in names if n.endswith(".safetensors")]
@@ -389,8 +379,7 @@ class Store:
     parallel(lambda n: self.fs.get_file(f"{src}/{n}", f"{folder}/{n}"), names)
 
   def rebuild(self, links: str, version: str, whole: str, names: list[str], folder: str) -> None:
-    """Make a link of a chain in folder, from the newest link before it this node has, or else the newest one uploaded
-    whole, by XORing in each link after that. The CRCs check the result is the exact bytes saved."""
+    """Make a link of a chain in folder, from the newest link before it this node has, or else the newest one uploaded whole, by XORing in each link after that. The CRCs check the result is the exact bytes saved."""
     import safetensors
 
     k, _, n = version.rpartition(".")
