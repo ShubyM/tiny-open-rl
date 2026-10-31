@@ -11,7 +11,8 @@ from tinyrl.api import wire
 from tinyrl.bus import Op, Run
 from tinyrl.control.turns import GpuTurn
 from tinyrl.workers import trainer
-from tinyrl.workers.trainer import Model, Trainer
+from tinyrl.workers.model import Model
+from tinyrl.workers.trainer import Trainer
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 

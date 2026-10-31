@@ -19,7 +19,8 @@ from tinyrl.api import gateway, wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
-from tinyrl.workers.trainer import Model, Trainer
+from tinyrl.workers.model import Model
+from tinyrl.workers.trainer import Trainer
 
 PROTO = {"content-type": wire.PROTO}
 

@@ -13,13 +13,14 @@ import torch
 from peft import PeftModel
 from transformers import LlamaConfig, LlamaForCausalLM
 
+import tinyrl.workers.model
 from test.helpers import RedisTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl.api import wire
 from tinyrl.bus import Op, Run
 from tinyrl.storage.store import Store
-from tinyrl.workers import trainer
-from tinyrl.workers.trainer import LOSSES, Model, Trainer, batches, target_logprobs, token_budget
+from tinyrl.workers.model import LOSSES, Model, batches, target_logprobs, token_budget
+from tinyrl.workers.trainer import Trainer
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -81,14 +82,14 @@ class TestForwardPass(unittest.TestCase):
 
     self.assertEqual(budget(7, True), 8 * 2**30 // 2 // (6 * 32 * 4096 * 2))
     self.assertEqual(budget(7, False), 8 * 2**30 // 2 // (64 * 32 * 4096 * 2))
-    self.assertEqual(budget(80), trainer.MAX_TOKEN_BUDGET)
-    self.assertEqual(token_budget(tiny()), trainer.MAX_TOKEN_BUDGET)  # on the cpu
-    with patch.object(trainer, "TOKEN_BUDGET", 512):
+    self.assertEqual(budget(80), tinyrl.workers.model.MAX_TOKEN_BUDGET)
+    self.assertEqual(token_budget(tiny()), tinyrl.workers.model.MAX_TOKEN_BUDGET)  # on the cpu
+    with patch.object(tinyrl.workers.model, "TOKEN_BUDGET", 512):
       self.assertEqual(token_budget(gpu), 512)
 
   @patch("os.environ", {})
   def test_should_checkpoint_layers(self):
-    from tinyrl.workers.trainer import should_checkpoint_layers
+    from tinyrl.workers.model import should_checkpoint_layers
 
     class MockProps:
       def __init__(self, mem):
@@ -103,10 +104,10 @@ class TestForwardPass(unittest.TestCase):
     gpu_40 = SimpleNamespace(device=torch.device("cuda", 1), config=SimpleNamespace())
 
     with patch("torch.cuda.get_device_properties", mock_get_device_properties):
-      import tinyrl.workers.trainer
+      import tinyrl.workers.model
 
-      old_grad = tinyrl.workers.trainer.GRAD_CKPT
-      tinyrl.workers.trainer.GRAD_CKPT = 1
+      old_grad = tinyrl.workers.model.GRAD_CKPT
+      tinyrl.workers.model.GRAD_CKPT = 1
       self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
       self.assertTrue(should_checkpoint_layers(gpu_80, lora=False))
       self.assertTrue(should_checkpoint_layers(gpu_40, lora=True))
@@ -119,9 +120,9 @@ class TestForwardPass(unittest.TestCase):
       self.assertFalse(should_checkpoint_layers(gpu_80, lora=False))
 
       del os.environ["GRAD_CKPT"]
-      tinyrl.workers.trainer.GRAD_CKPT = 0
+      tinyrl.workers.model.GRAD_CKPT = 0
       self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
-      tinyrl.workers.trainer.GRAD_CKPT = old_grad
+      tinyrl.workers.model.GRAD_CKPT = old_grad
 
   @patch("os.environ", {"GRAD_CKPT": "0"})
   def test_cpu_lora_without_gradient_checkpointing(self):
@@ -142,7 +143,7 @@ class TestForwardPass(unittest.TestCase):
     mask = torch.ones_like(ids)
     mask[2, 7:] = 0
 
-    with patch.object(trainer, "CHUNK", 4), torch.no_grad():
+    with patch.object(tinyrl.workers.model, "CHUNK", 4), torch.no_grad():
       got = target_logprobs(lm, ids, mask, targets)
     with torch.no_grad():
       want = lm(ids, attention_mask=mask).logits.log_softmax(-1).gather(-1, targets[..., None])[..., 0]
@@ -678,7 +679,7 @@ class TestCheckpointNames(unittest.TestCase):
     with safe_open(f"{path}/model.safetensors", "pt") as f:
       names = set(f.keys())
 
-    model, run = Model(trainer.load), new_id()
+    model, run = Model(tinyrl.workers.model.load), new_id()
     model.create(run, path, 4, LORA)
     train(model, run, steps=1)
     tensors, meta = model.weights(run)
@@ -709,7 +710,7 @@ class TestCheckpointNames(unittest.TestCase):
     path = tempfile.mkdtemp()
     Gemma4ForConditionalGeneration(cfg).save_pretrained(path)
 
-    model, a, b = Model(trainer.load), new_id(), new_id()
+    model, a, b = Model(tinyrl.workers.model.load), new_id(), new_id()
     model.create(a, path, 4, LORA)
     model.create(b, path, 4, LORA)
     tensors, _ = model.weights(b)

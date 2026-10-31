@@ -40,7 +40,7 @@ class TestEvents(RedisTest):
     await self.run_scheduler({"lora:tiny:1": [0], "sampler:tiny": [1]})
     await self.bus.create(Run(run_id, "lora:tiny:1", "tiny", 4, exclusive=False))
 
-    with patch("tinyrl.workers.trainer.load", side_effect=tiny), patch("tinyrl.workers.trainer.GPU", "0"):
+    with patch("tinyrl.workers.model.load", side_effect=tiny), patch("tinyrl.workers.trainer.GPU", "0"):
       trainer = Trainer(self.bus, "lora:tiny:1", owner="tw1")
       await self.own(trainer)
 
