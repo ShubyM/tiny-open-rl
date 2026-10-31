@@ -1,15 +1,8 @@
 """Checkpoint storage behind put(uri) and get(uri).
 
-Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write
-the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors +
-config.json, sharded with a model.safetensors.index.json when large).
+Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors + config.json, sharded with a model.safetensors.index.json when large).
 
-CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache
-in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once.
-flush() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node
-daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node waits for the
-version it wants to land, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node
-lost before its uploads finish loses those versions.
+CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. flush() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node waits for the version it wants to land, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
 """
 
 from __future__ import annotations
@@ -220,8 +213,7 @@ class Store:
     open(f"{folder}.uploaded", "w").close()  # beside the folder, so engines that list it never see it
 
   def flush(self) -> None:
-    """Upload this node's saves in the order they were made. The first that fails stops the rest, so a checkpoint's
-    _latest never goes back to an older version, and the next flush tries it again."""
+    """Upload this node's saves in the order they were made. The first that fails stops the rest, so a checkpoint's _latest never goes back to an older version, and the next flush tries it again."""
     found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
     for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
       version = e.name.removesuffix(".upload")
@@ -238,8 +230,7 @@ class Store:
   # ***** get *****
 
   def local(self, uri: str, version: str | None = None) -> tuple[str, str]:
-    """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again.
-    With a version, from a store on another node, it waits for that version to land."""
+    """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again. With a version, from a store on another node, it waits for that version to land."""
     dest = self.path(uri)
     if not self.remote:
       real = dest
@@ -343,8 +334,7 @@ class Store:
     return os.lstat(self.path(uri)).st_mtime
 
   def trim(self) -> None:
-    """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the
-    bucket has: a version still uploading stays."""
+    """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the bucket has: a version still uploading stays."""
     if not os.path.isdir(self.cache):
       return
     limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2
