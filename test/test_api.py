@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -13,7 +14,7 @@ import torch
 
 from test.helpers import RedisTest, tiny
 from test.test_wire import json_body
-from tinyrl import gateway, scheduler, wire
+from tinyrl import bus, gateway, scheduler, wire
 from tinyrl.proto import tinker_public_pb2 as pb
 from tinyrl.store import Store
 from tinyrl.trainer import Model, Trainer
@@ -204,6 +205,28 @@ class TestAPI(RedisTest):
     await self.drain(run_id)
     self.assertEqual((await self.post("optim_step", json={"model_id": run_id})).status_code, 404)
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
+
+  async def test_a_session_whose_client_stops_heartbeating_loses_its_runs(self):
+    session = await self.post("create_session", json={"tags": [], "user_metadata": None, "sdk_version": "0.29.0"})
+    session_id = session.json()["session_id"]
+    run_id = await self.create_model(session_id=session_id)
+    sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
+    samp_id = sampling.json()["sampling_session_id"]
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    await self.scheduling_until(lambda d: samp_id in d["state"]["runs"])
+
+    stale = {session_id: time.time() - bus.SESSION_GRACE - 1}
+    await self.bus.r.zadd(bus.key("seen"), stale)
+    await self.post("session_heartbeat", json={"session_id": session_id})  # a heartbeat in time keeps it
+    await asyncio.sleep(0.3)
+    self.assertTrue((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
+
+    await self.bus.r.zadd(bus.key("seen"), stale)  # its last heartbeat, longer ago than the grace
+    await self.scheduling_until(lambda d: samp_id not in d["state"]["runs"])
+    await self.drain(run_id)  # its training run goes once its queued work is done
+    self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
+    self.assertFalse((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
+    self.assertEqual(await self.bus.expired(), [])
 
   async def test_training_checkpoints_are_safetensors_with_adam_moments(self):
     run_id = await self.create_model()
