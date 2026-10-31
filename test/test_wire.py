@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from tinyrl import wire
-from tinyrl.proto import tinker_public_pb2 as pb
+from tinyrl.api import wire
+from tinyrl.api.proto import tinker_public_pb2 as pb
 
 
 def json_body(n: int = 3, loss_fn: str = "cross_entropy", **config) -> dict:

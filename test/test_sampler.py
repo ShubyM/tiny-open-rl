@@ -10,13 +10,13 @@ import safetensors.torch
 import torch
 
 from test.helpers import FakeEngine, RedisTest, tiny
-from tinyrl import wire
+from tinyrl.api import wire
+from tinyrl.api.gateway import app
 from tinyrl.bus import Op, Run
-from tinyrl.gateway import app
-from tinyrl.sampler import Out, Sampler, Seq, encode
-from tinyrl.store import Store
-from tinyrl.trainer import Trainer
-from tinyrl.vllm import VLLM
+from tinyrl.storage.store import Store
+from tinyrl.workers.sampler import Out, Sampler, Seq, encode
+from tinyrl.workers.trainer import Trainer
+from tinyrl.workers.vllm import VLLM
 
 JOB = {
   "prompt": [1, 2, 3],
@@ -157,14 +157,14 @@ class TestSampler(RedisTest):
     self.assertIn(("load", "c0", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.engine.calls)
     await client.aclose()
 
-  @patch("tinyrl.trainer.GPU", "node-a:0")
-  @patch("tinyrl.sampler.GPU", "node-a:0")
+  @patch("tinyrl.workers.trainer.GPU", "node-a:0")
+  @patch("tinyrl.workers.sampler.GPU", "node-a:0")
   async def test_a_trainer_and_a_sampler_take_turns_on_one_gpu(self):
     await self.run_scheduler({"t1": [0], "sampler:base": [0]})
     await self.take_turns()
 
-  @patch("tinyrl.trainer.GPU", "node-a:1")
-  @patch("tinyrl.sampler.GPU", "node-a:0,node-a:1")
+  @patch("tinyrl.workers.trainer.GPU", "node-a:1")
+  @patch("tinyrl.workers.sampler.GPU", "node-a:0,node-a:1")
   async def test_a_tensor_parallel_sampler_takes_turns_on_both_its_gpus(self):
     await self.run_scheduler({"t1": [1], "sampler:base": [0, 1]})
     await self.take_turns()
@@ -232,7 +232,7 @@ class TestSampler(RedisTest):
   async def test_vllm_retries_a_dropped_keepalive_socket(self):
     import httpx
 
-    from tinyrl.vllm import VLLM
+    from tinyrl.workers.vllm import VLLM
 
     calls = 0
 
@@ -264,22 +264,22 @@ class TestSampler(RedisTest):
     self.assertEqual(calls, 2)
     self.assertEqual(out.seqs[0].tokens, [9])
 
-  @patch("tinyrl.vllm.subprocess.Popen")
-  @patch("tinyrl.vllm.httpx.AsyncClient.get")
+  @patch("tinyrl.workers.vllm.subprocess.Popen")
+  @patch("tinyrl.workers.vllm.httpx.AsyncClient.get")
   async def test_vllm_start_compilation_config(self, mock_get, mock_popen):
     mock_popen.return_value.poll.return_value = None
     mock_get.return_value.is_success = True
 
-    from tinyrl.vllm import CUDAGRAPH_CONFIG, VLLM
+    from tinyrl.workers.vllm import CUDAGRAPH_CONFIG, VLLM
 
-    with patch("tinyrl.vllm.VLLM_ARGS", ""):
+    with patch("tinyrl.workers.vllm.VLLM_ARGS", ""):
       await (await VLLM.start("base", False)).http.aclose()
       args = mock_popen.call_args[0][0]
       self.assertIn("--compilation-config", args)
       idx = args.index("--compilation-config")
       self.assertEqual(args[idx + 1], CUDAGRAPH_CONFIG)
 
-    with patch("tinyrl.vllm.VLLM_ARGS", "--compilation-config '{}'"):
+    with patch("tinyrl.workers.vllm.VLLM_ARGS", "--compilation-config '{}'"):
       await (await VLLM.start("base", False)).http.aclose()
       args = mock_popen.call_args[0][0]
       self.assertIn("--compilation-config", args)
@@ -391,13 +391,13 @@ class TestSampler(RedisTest):
     mock_popen.return_value.poll.return_value = 0
     import os
 
-    from tinyrl.vllm import VLLM
+    from tinyrl.workers.vllm import VLLM
 
     with patch.dict(os.environ, {"TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}):
       with (
-        patch("tinyrl.vllm.VLLM_ARGS", "--gpu-memory-utilization 0.8"),
-        patch("tinyrl.vllm.GPU_MEM", "0.42"),
-        patch("tinyrl.vllm.KV_BYTES", str(16 * 1024**3)),
+        patch("tinyrl.workers.vllm.VLLM_ARGS", "--gpu-memory-utilization 0.8"),
+        patch("tinyrl.workers.vllm.GPU_MEM", "0.42"),
+        patch("tinyrl.workers.vllm.KV_BYTES", str(16 * 1024**3)),
       ):
         with self.assertRaises(RuntimeError):
           await VLLM.start("base", False)
@@ -411,7 +411,10 @@ class TestSampler(RedisTest):
     import os
 
     sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine)
-    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1", "TINYRL_BASE": "base"}), patch("tinyrl.sampler.WARM", 1):
+    with (
+      patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1", "TINYRL_BASE": "base"}),
+      patch("tinyrl.workers.sampler.WARM", 1),
+    ):
       task = asyncio.create_task(sampler.serve())
       try:
         for _ in range(50):
@@ -438,7 +441,7 @@ class TestSampler(RedisTest):
       [
         sys.executable,
         "-c",
-        "import sys, tinyrl.sampler, tinyrl.vllm; "
+        "import sys, tinyrl.workers.sampler, tinyrl.workers.vllm; "
         "assert not ({'torch', 'transformers', 'peft', 'safetensors'} & set(sys.modules))",
       ],
       capture_output=True,
@@ -446,22 +449,22 @@ class TestSampler(RedisTest):
     )
     self.assertEqual(out.returncode, 0, out.stderr)
 
-  @patch("tinyrl.vllm.subprocess.Popen")
-  @patch("tinyrl.vllm.httpx.AsyncClient.get")
+  @patch("tinyrl.workers.vllm.subprocess.Popen")
+  @patch("tinyrl.workers.vllm.httpx.AsyncClient.get")
   async def test_vllm_start_kernel_config(self, mock_get, mock_popen):
     mock_popen.return_value.poll.return_value = None
     mock_get.return_value.is_success = True
 
-    from tinyrl.vllm import KERNEL_CONFIG, VLLM
+    from tinyrl.workers.vllm import KERNEL_CONFIG, VLLM
 
-    with patch("tinyrl.vllm.VLLM_ARGS", ""):
+    with patch("tinyrl.workers.vllm.VLLM_ARGS", ""):
       await (await VLLM.start("base", False)).http.aclose()
       args = mock_popen.call_args[0][0]
       self.assertIn("--kernel-config", args)
       idx = args.index("--kernel-config")
       self.assertEqual(args[idx + 1], KERNEL_CONFIG)
 
-    with patch("tinyrl.vllm.VLLM_ARGS", "--kernel-config '{\"enable_flashinfer_autotune\":true}'"):
+    with patch("tinyrl.workers.vllm.VLLM_ARGS", "--kernel-config '{\"enable_flashinfer_autotune\":true}'"):
       await (await VLLM.start("base", False)).http.aclose()
       args = mock_popen.call_args[0][0]
       self.assertIn("--kernel-config", args)

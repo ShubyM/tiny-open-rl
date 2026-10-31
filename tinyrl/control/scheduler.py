@@ -1,6 +1,6 @@
 """The scheduler: which worker a run joins, where each worker runs, and whose turn it is on each GPU.
 
-The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.scheduler
+The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.control.scheduler
 folds every entry into a State and appends what decide says back to the same log: placed and unplaced, granted and
 revoked. A decision changes the state only once it is folded from the log, so the state is always fold(log), and
 replaying the log rebuilds every state the scheduler saw. Each decision names the rule in RULES that made it. Run

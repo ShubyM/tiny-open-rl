@@ -27,7 +27,7 @@ def count(path: str) -> tuple[int, int]:
 def stats(base: str = ".") -> list[list]:
   table = []
   for directory, _, files in os.walk(os.path.join(base, "tinyrl")):
-    if "tinyrl/proto" in directory.replace("\\", "/"):  # generated
+    if "tinyrl/api/proto" in directory.replace("\\", "/"):  # generated
       continue
     for name in files:
       if name.endswith(".py"):

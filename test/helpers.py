@@ -72,7 +72,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
   async def worker(self, run: str) -> str:
     """The run's worker, once every new run is assigned the way the scheduler assigns it."""
-    from tinyrl import scheduler
+    from tinyrl.control import scheduler
 
     s = scheduler.State()
     for e in await self.bus.events():
@@ -94,7 +94,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
   async def run_scheduler(self, placed: dict[str, list[int]], quantum: float = 30.0) -> None:
     """Run the scheduler over these running workers, so workers that share a GPU get turns."""
-    from tinyrl import scheduler
+    from tinyrl.control import scheduler
 
     await self.running(placed)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus, quantum)))
@@ -131,7 +131,7 @@ class FakeEngine:
     self.calls.append(("close",))
 
   async def sample(self, job: dict, name: str | None):
-    from tinyrl.sampler import Out, Seq
+    from tinyrl.workers.sampler import Out, Seq
 
     self.calls.append(("sample", name))
     tokens = [(job["prompt"][-1] + 1 + i) % 32 for i in range(job["max_tokens"])]

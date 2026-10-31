@@ -20,7 +20,7 @@ class TestLease(RedisTest):
 
   def trainer(self, worker: str) -> subprocess.Popen:
     env = {**os.environ, "REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS)}
-    return subprocess.Popen([sys.executable, "-m", "tinyrl.trainer", worker], env=env)
+    return subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", worker], env=env)
 
   async def call(self, run: str, op: Op, body: dict) -> Reply:
     request_id = await self.bus.submit(run, op, json.dumps(body).encode())
@@ -78,7 +78,7 @@ class TestLease(RedisTest):
     worker, run = f"lora:{base}", new_id()
     await self.bus.create(Run(run, worker, base, 4, lora=LORA))
     env = {**os.environ, "REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS), "CKPT": ckpt}
-    proc = subprocess.Popen([sys.executable, "-m", "tinyrl.trainer", worker], env=env)
+    proc = subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", worker], env=env)
     try:
       self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
       proc.terminate()

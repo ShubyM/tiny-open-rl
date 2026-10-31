@@ -7,10 +7,11 @@ import torch
 
 from test.helpers import RedisTest, new_id, tiny
 from test.test_api import proto_body
-from tinyrl import trainer, wire
+from tinyrl.api import wire
 from tinyrl.bus import Op, Run
-from tinyrl.trainer import Model, Trainer
-from tinyrl.turns import GpuTurn
+from tinyrl.control.turns import GpuTurn
+from tinyrl.workers import trainer
+from tinyrl.workers.trainer import Model, Trainer
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 

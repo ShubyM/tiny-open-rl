@@ -1,6 +1,6 @@
 """Runs the trainers and samplers the scheduler placed on this node, on the GPUs it chose.
 
-python -m tinyrl.node_daemon replaces starting `python -m tinyrl.trainer <worker>` by hand. Every node daemon heartbeats
+python -m tinyrl.control.node_daemon replaces starting `python -m tinyrl.workers.trainer <worker>` by hand. Every node daemon heartbeats
 into Redis and appends node_up when it starts. It folds tinyrl:events like the scheduler does, starts a process for each
 worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A
 worker's lease still decides who serves it.
@@ -17,10 +17,10 @@ import subprocess
 import sys
 import time
 
-from tinyrl import scheduler
 from tinyrl.bus import Bus
+from tinyrl.control import scheduler
 from tinyrl.helpers import getenv
-from tinyrl.store import Store
+from tinyrl.storage.store import Store
 
 GPUS = getenv("GPUS", 1)
 DRAIN_S = getenv(
@@ -125,8 +125,8 @@ class NodeDaemon:
       ",".join(f"{socket.gethostname()}:{g}" for g in gpus),
     )
     env["TINYRL_LORA"], env["TINYRL_BASE"] = str(int(k.lora)), k.base
-    mod = f"tinyrl.{k.role}"
-    if mod == "tinyrl.trainer":
+    mod = f"tinyrl.workers.{k.role}"
+    if mod == "tinyrl.workers.trainer":
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return gpus, subprocess.Popen([sys.executable, "-m", mod, worker], env=env, start_new_session=True)
 

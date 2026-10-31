@@ -15,10 +15,11 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from test.helpers import RedisTest, new_id, tiny
 from test.test_api import proto_body
-from tinyrl import trainer, wire
+from tinyrl.api import wire
 from tinyrl.bus import Op, Run
-from tinyrl.store import Store
-from tinyrl.trainer import LOSSES, Model, Trainer, batches, target_logprobs, token_budget
+from tinyrl.storage.store import Store
+from tinyrl.workers import trainer
+from tinyrl.workers.trainer import LOSSES, Model, Trainer, batches, target_logprobs, token_budget
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -87,7 +88,7 @@ class TestForwardPass(unittest.TestCase):
 
   @patch("os.environ", {})
   def test_should_checkpoint_layers(self):
-    from tinyrl.trainer import should_checkpoint_layers
+    from tinyrl.workers.trainer import should_checkpoint_layers
 
     class MockProps:
       def __init__(self, mem):
@@ -102,10 +103,10 @@ class TestForwardPass(unittest.TestCase):
     gpu_40 = SimpleNamespace(device=torch.device("cuda", 1), config=SimpleNamespace())
 
     with patch("torch.cuda.get_device_properties", mock_get_device_properties):
-      import tinyrl.trainer
+      import tinyrl.workers.trainer
 
-      old_grad = tinyrl.trainer.GRAD_CKPT
-      tinyrl.trainer.GRAD_CKPT = 1
+      old_grad = tinyrl.workers.trainer.GRAD_CKPT
+      tinyrl.workers.trainer.GRAD_CKPT = 1
       self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
       self.assertTrue(should_checkpoint_layers(gpu_80, lora=False))
       self.assertTrue(should_checkpoint_layers(gpu_40, lora=True))
@@ -118,9 +119,9 @@ class TestForwardPass(unittest.TestCase):
       self.assertFalse(should_checkpoint_layers(gpu_80, lora=False))
 
       del os.environ["GRAD_CKPT"]
-      tinyrl.trainer.GRAD_CKPT = 0
+      tinyrl.workers.trainer.GRAD_CKPT = 0
       self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
-      tinyrl.trainer.GRAD_CKPT = old_grad
+      tinyrl.workers.trainer.GRAD_CKPT = old_grad
 
   @patch("os.environ", {"GRAD_CKPT": "0"})
   def test_cpu_lora_without_gradient_checkpointing(self):
@@ -540,7 +541,7 @@ class TestTrainer(RedisTest):
       tc.done = second.done = True
       await asyncio.gather(*serving)
 
-  @patch("tinyrl.trainer.LEASE_MS", 200)
+  @patch("tinyrl.workers.trainer.LEASE_MS", 200)
   async def test_a_trainer_takes_its_lease_again_when_redis_loses_it(self):
     t = Trainer(self.bus, "p", Model(tiny))
     await self.own(t)

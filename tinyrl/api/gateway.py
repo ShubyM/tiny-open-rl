@@ -16,10 +16,10 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from tinyrl import wire
+from tinyrl.api import wire
 from tinyrl.bus import Bus, Op, Run, key
 from tinyrl.helpers import getenv
-from tinyrl.store import Store
+from tinyrl.storage.store import Store
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
 

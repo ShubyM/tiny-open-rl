@@ -2,8 +2,8 @@ import asyncio
 from unittest.mock import patch
 
 from test.helpers import RedisTest
-from tinyrl import scheduler
-from tinyrl.turns import GpuTurn
+from tinyrl.control import scheduler
+from tinyrl.control.turns import GpuTurn
 
 
 class TestScheduler(RedisTest):
@@ -67,7 +67,7 @@ class TestScheduler(RedisTest):
     finally:
       task.cancel()
 
-  @patch("tinyrl.turns.LEASE_MS", 200, create=True)
+  @patch("tinyrl.control.turns.LEASE_MS", 200, create=True)
   async def test_a_waiting_worker_emits_wants_gpu_once_and_can_take_a_second_turn(self):
     task = await self.start("a", "b")
     a = GpuTurn(self.bus, "a", shared=True)

@@ -14,10 +14,12 @@ import torch
 
 from test.helpers import RedisTest, tiny
 from test.test_wire import json_body
-from tinyrl import bus, gateway, scheduler, wire
-from tinyrl.proto import tinker_public_pb2 as pb
-from tinyrl.store import Store
-from tinyrl.trainer import Model, Trainer
+from tinyrl import bus
+from tinyrl.api import gateway, wire
+from tinyrl.api.proto import tinker_public_pb2 as pb
+from tinyrl.control import scheduler
+from tinyrl.storage.store import Store
+from tinyrl.workers.trainer import Model, Trainer
 
 PROTO = {"content-type": wire.PROTO}
 

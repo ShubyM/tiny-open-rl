@@ -15,7 +15,7 @@ spec:
       containers:
       - name: scheduler
         image: tinyrl
-        command: ["python3", "-m", "tinyrl.scheduler"]
+        command: ["python3", "-m", "tinyrl.control.scheduler"]
         envFrom:
         - configMapRef: {name: tinyrl}
         resources:

@@ -24,11 +24,12 @@ from peft import LoraConfig
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
-from tinyrl import models, wire
+from tinyrl.api import wire
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
+from tinyrl.control.turns import IDLE_MS, GpuTurn
 from tinyrl.helpers import DEBUG, getenv
-from tinyrl.store import Store, nbytes
-from tinyrl.turns import IDLE_MS, GpuTurn
+from tinyrl.storage import models
+from tinyrl.storage.store import Store, nbytes
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory

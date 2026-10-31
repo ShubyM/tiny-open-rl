@@ -14,10 +14,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from test.helpers import RedisTest, new_id, tiny
-from tinyrl import scheduler
 from tinyrl.bus import Op, Run
-from tinyrl.node_daemon import SWEEP_GRACE_S, NodeDaemon, reap
-from tinyrl.store import Store
+from tinyrl.control import scheduler
+from tinyrl.control.node_daemon import SWEEP_GRACE_S, NodeDaemon, reap
+from tinyrl.storage.store import Store
 
 LEASE_MS = 2000
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
@@ -130,7 +130,7 @@ class TestNodeDaemon(RedisTest):
     else:
       self.fail("the process a worker started outlived it")
 
-  @patch("tinyrl.node_daemon.subprocess.Popen")
+  @patch("tinyrl.control.node_daemon.subprocess.Popen")
   def test_a_process_starts_on_its_placed_gpus_with_its_placed_settings(self, popen):
     daemon = NodeDaemon(None, gpus=8, node="n")
     daemon.gpu_mib = 81559
@@ -140,7 +140,7 @@ class TestNodeDaemon(RedisTest):
     self.assertEqual(env["TINYRL_GPU_MEM"], "0.42")
     self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", env)
 
-  @patch("tinyrl.node_daemon.subprocess.Popen")
+  @patch("tinyrl.control.node_daemon.subprocess.Popen")
   def test_start_sets_cuda_alloc_conf_on_trainer(self, popen):
     daemon = NodeDaemon(None, gpus=2, node="n")
     daemon.start("lora:base:0", scheduler.Worker(gpus=(0,)))
@@ -201,7 +201,7 @@ class TestNodeDaemon(RedisTest):
     store.flush()
     await self.bus.saved("tinker://r/sampler_weights/1", 128, version=v[1])
     await self.bus.r.set("tinyrl:ckpt_since", 0)
-    with patch("tinyrl.node_daemon.SWEEP_GRACE_S", -60):
+    with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
       await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep()
     self.assertEqual(sorted(p.rsplit("/", 1)[1] for p in store.fs.glob(f"{store.base}/r/_versions/*")), v[:2])
 

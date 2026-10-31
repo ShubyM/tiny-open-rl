@@ -2,7 +2,7 @@ import random
 import unittest
 
 from tinyrl.bus import Event
-from tinyrl.scheduler import QUANTUM, RULES, Kind, State, budget, decide, fold, holders, settings, uses
+from tinyrl.control.scheduler import QUANTUM, RULES, Kind, State, budget, decide, fold, holders, settings, uses
 
 GIB = 1024**3
 

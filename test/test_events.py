@@ -4,10 +4,10 @@ from unittest.mock import patch
 
 from test.helpers import RedisTest, new_id, tiny
 from test.test_scheduler import check
-from tinyrl import scheduler
 from tinyrl.bus import Op, Run
-from tinyrl.sampler import Sampler
-from tinyrl.trainer import Trainer
+from tinyrl.control import scheduler
+from tinyrl.workers.sampler import Sampler
+from tinyrl.workers.trainer import Trainer
 
 
 class TestEvents(RedisTest):
@@ -40,7 +40,7 @@ class TestEvents(RedisTest):
     await self.run_scheduler({"lora:tiny:1": [0], "sampler:tiny": [1]})
     await self.bus.create(Run(run_id, "lora:tiny:1", "tiny", 4, exclusive=False))
 
-    with patch("tinyrl.trainer.load", side_effect=tiny), patch("tinyrl.trainer.GPU", "0"):
+    with patch("tinyrl.workers.trainer.load", side_effect=tiny), patch("tinyrl.workers.trainer.GPU", "0"):
       trainer = Trainer(self.bus, "lora:tiny:1", owner="tw1")
       await self.own(trainer)
 
@@ -50,7 +50,7 @@ class TestEvents(RedisTest):
 
       await trainer.step()
 
-    with patch("tinyrl.sampler.ENGINE", "test.helpers:FakeEngine"), patch("tinyrl.sampler.GPU", "1"):
+    with patch("tinyrl.workers.sampler.ENGINE", "test.helpers:FakeEngine"), patch("tinyrl.workers.sampler.GPU", "1"):
       sampler = Sampler(self.bus, "sampler:tiny", owner="sw1")
       run_id2 = new_id()
       await self.bus.create(Run(run_id2, "sampler:tiny", "tiny", 0))

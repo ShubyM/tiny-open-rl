@@ -2,7 +2,7 @@
 runs their commands in order, and takes turns on the GPU.
 
 It samples through an Engine, which knows nothing of Redis, workers or checkpoint URIs. ENGINE names the engine's class,
-vLLM (tinyrl/vllm.py) unless it's set.
+vLLM (tinyrl/workers/vllm.py) unless it's set.
 """
 
 from __future__ import annotations
@@ -21,11 +21,11 @@ from typing import Protocol
 
 import numpy as np
 
-from tinyrl import wire
+from tinyrl.api import wire
 from tinyrl.bus import LEASE_MS, Bus, Reply
+from tinyrl.control.turns import IDLE_MS, GpuTurn
 from tinyrl.helpers import getenv
-from tinyrl.store import Store
-from tinyrl.turns import IDLE_MS, GpuTurn
+from tinyrl.storage.store import Store
 
 STRANDED_MS = 5000
 GPU = getenv("GPU", "")  # the GPUs this sampler takes turns on, set by the node daemon. Unset, it never takes turns
@@ -37,7 +37,7 @@ def fail(error: Exception) -> Reply:
   return Reply(False, wire.JSON, json.dumps(body).encode())
 
 
-ENGINE = getenv("ENGINE", "tinyrl.vllm:VLLM")
+ENGINE = getenv("ENGINE", "tinyrl.workers.vllm:VLLM")
 WARM = getenv("TINYRL_WARM_SAMPLER", 0)  # start the engine before the first command, from the scheduler's placement
 MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
 

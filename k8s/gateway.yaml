@@ -13,7 +13,7 @@ spec:
       containers:
       - name: gateway
         image: tinyrl
-        command: ["python3", "-m", "tinyrl.gateway"]
+        command: ["python3", "-m", "tinyrl.api.gateway"]
         envFrom:
         - configMapRef: {name: tinyrl}
         ports:

@@ -10,8 +10,8 @@ from unittest.mock import patch
 
 import torch
 
-import tinyrl.store
-from tinyrl.store import Store
+import tinyrl.storage.store
+from tinyrl.storage.store import Store
 
 
 class TestStore(unittest.TestCase):
@@ -67,7 +67,7 @@ class TestStore(unittest.TestCase):
     self.assertTrue(torch.equal(got["contiguous"], want["contiguous"]), "roundtrips contiguous tensor")
     self.assertTrue(torch.equal(got["transposed"], want["transposed"]), "roundtrips non-contiguous tensor")
 
-  @unittest.mock.patch("tinyrl.store.SHARD_BYTES", 64)
+  @unittest.mock.patch("tinyrl.storage.store.SHARD_BYTES", 64)
   def test_shards_large_tensors(self):
     store = Store(root=tempfile.mkdtemp())
     uri = "tinker://run-1/weights/step-3"
@@ -97,8 +97,8 @@ class TestStore(unittest.TestCase):
     self.assertTrue(any("model-00001-of-" in f for f in sampler_files))
 
   def test_stage_below_and_above_max_pin_bytes(self):
-    old_max = tinyrl.store.MAX_PIN_BYTES
-    tinyrl.store.MAX_PIN_BYTES = 64
+    old_max = tinyrl.storage.store.MAX_PIN_BYTES
+    tinyrl.storage.store.MAX_PIN_BYTES = 64
     try:
       store = Store(root=tempfile.mkdtemp())
       tensors = {
@@ -117,15 +117,15 @@ class TestStore(unittest.TestCase):
         self.assertEqual(got[k].shape, v.shape)
         self.assertTrue(torch.equal(got[k], v))
 
-      tinyrl.store.MAX_PIN_BYTES = 1000000
+      tinyrl.storage.store.MAX_PIN_BYTES = 1000000
       cpu = store.stage(tensors, is_cuda=lambda _: True)
       for k, v in tensors.items():
         self.assertEqual(cpu[k].shape, v.shape)
         self.assertTrue(torch.equal(cpu[k], v))
     finally:
-      tinyrl.store.MAX_PIN_BYTES = old_max
+      tinyrl.storage.store.MAX_PIN_BYTES = old_max
 
-  @unittest.mock.patch("tinyrl.store.SHARD_BYTES", 64)
+  @unittest.mock.patch("tinyrl.storage.store.SHARD_BYTES", 64)
   def test_remote_sharded_upload_is_atomic_and_cleans_stale_shards(self):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
@@ -164,7 +164,7 @@ class TestStore(unittest.TestCase):
     self.assertFalse(saver.fs.exists(f"{saver.path(uri)}/{v1}"))  # the version before is gone from the bucket
     self.assertTrue(saver.fs.exists(f"{saver.path(uri)}/{saver.versions[uri]}/state.safetensors"))
 
-  @unittest.mock.patch("tinyrl.store.SHARD_BYTES", 64)
+  @unittest.mock.patch("tinyrl.storage.store.SHARD_BYTES", 64)
   def test_local_overwrite_is_atomic_and_keeps_prior_reader_files(self):
     store = Store(tempfile.mkdtemp())
     uri = "tinker://run-local/weights/atomic"
@@ -255,7 +255,7 @@ class TestStore(unittest.TestCase):
     with open(f"{f2}/adapter_config.json") as f:
       self.assertEqual(json.load(f)["r"], 8)
 
-    with unittest.mock.patch("tinyrl.store.SHARD_BYTES", 0):
+    with unittest.mock.patch("tinyrl.storage.store.SHARD_BYTES", 0):
       store.put(uri, {})
       got, _ = store.get(uri)
       self.assertEqual(got, {})
@@ -320,7 +320,7 @@ class TestStore(unittest.TestCase):
       store.flush()
       time.sleep(0.01)
     store.put("tinker://r/weights/uploading", {"w": torch.ones(1024)})
-    with unittest.mock.patch("tinyrl.store.CACHE_BYTES", 1):
+    with unittest.mock.patch("tinyrl.storage.store.CACHE_BYTES", 1):
       store.trim()
     v = store.versions["tinker://r/weights/uploading"]
     self.assertEqual(sorted(n for n in os.listdir(store.cache) if n != "latest"), [v, f"{v}.upload"])
@@ -330,7 +330,10 @@ class TestStore(unittest.TestCase):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     w, meta, uris = torch.randn(128, 128).to(torch.bfloat16), {"lora": False, "config": {"model_type": "x"}}, []
-    with patch("tinyrl.store.SHARD_BYTES", 1024), patch("tinyrl.store.XOR_CHUNK", 4096):  # two files, many chunks
+    with (
+      patch("tinyrl.storage.store.SHARD_BYTES", 1024),
+      patch("tinyrl.storage.store.XOR_CHUNK", 4096),
+    ):  # two files, many chunks
       for step in range(3):
         w.view(-1)[step::101] *= 2  # a step changes a few values
         uris.append(f"tinker://r/sampler_weights/{step}")
@@ -356,7 +359,7 @@ class TestStore(unittest.TestCase):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     meta, v = {"config": {"model_type": "x"}}, []
-    with patch("tinyrl.store.KEYFRAME_EVERY", 2):
+    with patch("tinyrl.storage.store.KEYFRAME_EVERY", 2):
       for step in range(4):
         saver.put(f"tinker://r/sampler_weights/{step}", {"w": torch.full((64,), float(step))}, meta)
         v.append(saver.versions[f"tinker://r/sampler_weights/{step}"])

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import fsspec
 
-from tinyrl import models
+from tinyrl.storage import models
 
 
 def publish(url: str, files: dict[str, bytes]) -> None:
