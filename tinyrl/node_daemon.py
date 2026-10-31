@@ -100,8 +100,7 @@ class NodeDaemon:
       await self.sweep()
 
   async def sweep(self) -> None:
-    """Delete the checkpoints in this node's store that the registry doesn't have: deleted, expired, or their run's.
-    Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before."""
+    """Delete the checkpoints in this node's store that the registry doesn't have: deleted, expired, or their run's. Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before."""
     if (since := await self.bus.registry_since()) is None:
       return
     for uri in await asyncio.to_thread(self.store.stored):

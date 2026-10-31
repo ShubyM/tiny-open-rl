@@ -351,8 +351,7 @@ class Bus:
   # ***** checkpoints: the registry the store is kept by *****
 
   async def saved(self, uri: str, size: int, ttl: int | None = None, owned: bool = False) -> None:
-    """Record a checkpoint the store now holds. One the run owns, like a sampling session's weights or the state a
-    stopping trainer parked, goes when the run is deleted. The rest stay until deleted, or their TTL runs out."""
+    """Record a checkpoint the store now holds. One the run owns, like a sampling session's weights or the state a stopping trainer parked, goes when the run is deleted. The rest stay until deleted, or their TTL runs out."""
     run, cid = uri.removeprefix("tinker://").split("/", 1)
     now, kind = time.time(), cid.split("/", 1)[0]
     info = {

@@ -257,9 +257,8 @@ class Store:
         self.fs.rm(dest, recursive=True)
       return
     parent, base = os.path.split(dest)
-    tail = (
-      len(parent) + len(base) + 3
-    )  # the random suffix of a version folder has no dot, so step-1 never takes step-1.5's
+    # the random suffix of a version folder has no dot, so step-1 never takes step-1.5's
+    tail = len(parent) + len(base) + 3
     versions = [p for p in glob.glob(f"{glob.escape(parent)}/.{glob.escape(base)}.*") if "." not in p[tail:]]
     for p in [dest, *versions]:  # the link to the live version, the .prev link, and the folders they name
       if os.path.islink(p):
