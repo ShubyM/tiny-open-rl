@@ -405,7 +405,7 @@ class Store:
     self.download(f"{links}/{version}", [n for n in names if n not in shards], folder)
     pairs = [(f"{link}/{name}.xor", f"{folder}/{link}.{name}.xor") for link in after for name in shards]
     parallel(lambda a, b: self.fs.get_file(f"{links}/{a}", b), *zip(*pairs))
-    data = {name: np.array(raw(f"{start}/{name}")[1]) for name in shards}
+    data = dict(zip(shards, parallel(lambda name: np.array(raw(f"{start}/{name}")[1]), shards)))
     for link in after:
       metas, jobs = {}, []
       for name in shards:
