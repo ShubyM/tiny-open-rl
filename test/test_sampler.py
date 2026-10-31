@@ -126,9 +126,8 @@ class TestSampler(RedisTest):
     self.assertEqual(replies[0]["prompt_logprobs"], [None, -1.0, -1.0])
 
     request_id = (await call("asample", {"base_model": base, "prompt": tokens([1, 2])}))["request_id"]
-    self.assertEqual(
-      await self.worker(request_id.split("/")[0]), sampler.worker
-    )  # base sampling joins the same sampler
+    # base sampling joins the same sampler
+    self.assertEqual(await self.worker(request_id.split("/")[0]), sampler.worker)
     await sampler.step(block_ms=0)
     self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
     calls = sampler.engine.calls

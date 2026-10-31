@@ -9,9 +9,8 @@ from __future__ import annotations
 from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
 
-IDLE_MS = getenv(
-  "IDLE_MS", 150
-)  # how long a worker holding its GPU waits for commands before it reports idle, so waiters don't wait
+# how long a worker holding its GPU waits for commands before it reports idle, so waiters don't wait
+IDLE_MS = getenv("IDLE_MS", 150)
 
 
 class GpuTurn:

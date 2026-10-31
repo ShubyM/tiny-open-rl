@@ -539,9 +539,8 @@ class TestTrainer(RedisTest):
         losses_ctrl.append(await step(ctrl))
         losses.append(await step(run))
       self.assertEqual(losses, losses_ctrl, f"rank {rank}")
-      self.assertIsNone(
-        await self.bus.parked_checkpoint(run)
-      )  # restored once, so a later crash can't bring back old state
+      # restored once, so a later crash can't bring back old state
+      self.assertIsNone(await self.bus.parked_checkpoint(run))
 
       tc.done = second.done = True
       await asyncio.gather(*serving)

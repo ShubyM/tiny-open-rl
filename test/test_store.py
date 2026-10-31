@@ -332,10 +332,8 @@ class TestStore(unittest.TestCase):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     w, meta, uris = torch.randn(128, 128).to(torch.bfloat16), {"lora": False, "config": {"model_type": "x"}}, []
-    with (
-      patch("tinyrl.storage.store.SHARD_BYTES", 1024),
-      patch("tinyrl.storage.store.XOR_CHUNK", 4096),
-    ):  # two files, many chunks
+    # two files, many chunks
+    with patch("tinyrl.storage.store.SHARD_BYTES", 1024), patch("tinyrl.storage.store.XOR_CHUNK", 4096):
       for step in range(3):
         w.view(-1)[step::101] *= 2  # a step changes a few values
         uris.append(f"tinker://r/sampler_weights/{step}")

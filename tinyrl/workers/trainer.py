@@ -189,9 +189,8 @@ class Trainer:
       while queue:
         cmd = queue.popleft()
         start = time.time()
-        first = await self.bus.reply_to_repeated_command(
-          cmd
-        )  # no lock needed, the worker's owner is the only writer of its seq keys
+        # no lock needed, the worker's owner is the only writer of its seq keys
+        first = await self.bus.reply_to_repeated_command(cmd)
         reply = first or await self.answer_command(cmd)
         ms = (time.time() - start) * 1000
         ops.append([cmd.op, ms])

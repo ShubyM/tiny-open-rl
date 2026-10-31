@@ -349,9 +349,8 @@ async def run(bus: Bus, quantum: float = QUANTUM) -> None:
       continue  # decide once they are folded, so nothing is placed on them
     for session in await bus.expired_sessions():  # their clients stopped heartbeating
       await bus.end_session(session)
-    await registry.unregister_checkpoints(
-      *await registry.expired_checkpoints()
-    )  # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
+    # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
+    await registry.unregister_checkpoints(*await registry.expired_checkpoints())
     for decision, body in decide(state, time.time()):  # folded when it is read back on the next pass
       if decision == "assigned":
         await bus.assign_run_to_worker(body["run"], body["worker"])

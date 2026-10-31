@@ -37,9 +37,8 @@ SHARD_BYTES = getenv("SHARD_BYTES", 256 * 1024 * 1024)  # a full checkpoint this
 MAX_SHARDS = 16
 MAX_PIN_BYTES = getenv("MAX_PIN_BYTES", 10 * 1024 * 1024 * 1024)  # the most pinned host memory a save holds
 UPLOAD_WAIT_S = getenv("UPLOAD_WAIT_S", 900.0)  # how long a node waits for a version another node is uploading
-CACHE_BYTES = getenv(
-  "CKPT_CACHE_BYTES", 0
-)  # trim_cache() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
+# trim_cache() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
+CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)
 KEYFRAME_EVERY = getenv("KEYFRAME_EVERY", 8)  # the most links in a chain of full sampler weights
 XOR_CHUNK = 16 * 1024 * 1024
 
@@ -201,9 +200,8 @@ class Store:
       self.versions[uri] = version
       with open(f"{self.cache}/{version}.upload.tmp", "w") as f:
         json.dump({"uri": uri, "names": names}, f)
-      os.replace(
-        f"{self.cache}/{version}.upload.tmp", f"{self.cache}/{version}.upload"
-      )  # upload_pending_saves() takes it from here
+      # upload_pending_saves() takes it from here
+      os.replace(f"{self.cache}/{version}.upload.tmp", f"{self.cache}/{version}.upload")
       return dest
     parent, base = os.path.dirname(dest), os.path.basename(dest)
     os.makedirs(parent, exist_ok=True)
@@ -271,9 +269,8 @@ class Store:
     with contextlib.suppress(FileNotFoundError):
       old = json.loads(self.fs.cat_file(f"{dest}/_latest"))
     self.fs.pipe_file(f"{dest}/_latest", json.dumps(info).encode())
-    if "." not in old.get(
-      "version", "."
-    ):  # a link stays until delete_unused_chain_links(), since other checkpoints may build on it
+    # a link stays until delete_unused_chain_links(), since other checkpoints may build on it
+    if "." not in old.get("version", "."):
       stale = [f"{self.base}/{old['dir']}"] if old.get("dir") else [f"{dest}/{n}" for n in old.get("files", [])]
       for path in stale:  # the version before, which readers that started on it may still be downloading
         with contextlib.suppress(FileNotFoundError):
@@ -336,9 +333,8 @@ class Store:
       if not any(n.endswith(".safetensors") for n, _, _ in stats):
         raise ValueError(f"no checkpoint at {uri}")
       return dest, hashlib.blake2b(repr((real, stats)).encode(), digest_size=8).hexdigest()
-    want = version or self.latest_version_here(
-      uri
-    )  # without a version: the one this node saved last, else the bucket's
+    # without a version: the one this node saved last, else the bucket's
+    want = version or self.latest_version_here(uri)
     if want and os.path.isdir(f"{self.cache}/{want}"):
       os.utime(f"{self.cache}/{want}")  # so trim_cache() takes the ones nobody read for longest
       return f"{self.cache}/{want}", want

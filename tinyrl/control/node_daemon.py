@@ -24,9 +24,8 @@ from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 
 GPUS = getenv("GPUS", 1)
-DRAIN_S = getenv(
-  "DRAIN_S", 20.0
-)  # how long a stopping node daemon waits for its processes, so trainers save their runs
+# how long a stopping node daemon waits for its processes, so trainers save their runs
+DRAIN_S = getenv("DRAIN_S", 20.0)
 TICK = getenv("TICK", 0.25)
 SWEEP_S = getenv("SWEEP_S", 60.0)  # how often it deletes the checkpoints nobody registered, or nobody wants any more
 SWEEP_GRACE_S = 600  # a checkpoint younger than this is left alone, since a save registers it only once it's written

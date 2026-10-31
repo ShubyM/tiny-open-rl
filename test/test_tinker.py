@@ -50,9 +50,8 @@ class TestTinkerSDK(unittest.TestCase):
     try:
       procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.api.gateway"], env=env))
       procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.control.scheduler"], env=env))
-      procs.append(
-        subprocess.Popen([sys.executable, "-m", "tinyrl.control.node_daemon"], env=env)
-      )  # starts the trainer
+      # starts the trainer
+      procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.control.node_daemon"], env=env))
       wait_until_up(f"http://127.0.0.1:{port}/api/v1/healthz")
 
       sdk_env = {**env, "BASE_URL": f"http://127.0.0.1:{port}", "BASE_MODEL": base}
