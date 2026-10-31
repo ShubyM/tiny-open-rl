@@ -1,18 +1,15 @@
 """Runs, sessions, commands and replies, all on Redis.
 
-Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The trainer for a worker reads its runs'
-streams through one consumer group, so Redis itself knows:
+Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The trainer for a worker reads its runs' streams through one consumer group, so Redis itself knows:
 
   what is queued       XINFO GROUPS, the group's lag
   what is in flight    XPENDING: which trainer took each command, and how long ago
   what a dead trainer  XAUTOCLAIM, so the next trainer can fail it instead of leaving a client waiting
   left unfinished
 
-A reply is a stream with a single entry, tinyrl:f:<request_id>. XREAD from id 0 blocks until it is written and never
-consumes it, so a client can retry retrieve_future, or many clients can wait on one, and every one gets the same answer.
+A reply is a stream with a single entry, tinyrl:f:<request_id>. XREAD from id 0 blocks until it is written and never consumes it, so a client can retry retrieve_future, or many clients can wait on one, and every one gets the same answer.
 
-A worker has one owner, the trainer holding its lease, tinyrl:owner:<worker>. Replies are written in a WATCH/MULTI/EXEC
-transaction on the lease key, so a trainer that lost its worker, say after a long pause, can't answer for it.
+A worker has one owner, the trainer holding its lease, tinyrl:owner:<worker>. Replies are written in a WATCH/MULTI/EXEC transaction on the lease key, so a trainer that lost its worker, say after a long pause, can't answer for it.
 """
 
 from __future__ import annotations
@@ -119,10 +116,7 @@ def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
 
 
 def connect(url: str) -> redis.Redis:
-  # a reply is waited for with a blocking read of up to 30s, and redis-py gives up on a read after 5s by default.
-  # Retrying a dropped connection for about a minute rides out a Redis restart, which keeps its data in its AOF file.
-  # Each request the gateway waits on holds a connection for that read, and redis-py's connection pool stops at 100
-  # ("Too many connections" at 400 concurrent samples): allow as many as Redis itself does (maxclients 10000)
+  # a reply is waited for with a blocking read of up to 30s, and redis-py gives up on a read after 5s by default. Retrying a dropped connection for about a minute rides out a Redis restart, which keeps its data in its AOF file. Each request the gateway waits on holds a connection for that read, and redis-py's connection pool stops at 100 ("Too many connections" at 400 concurrent samples): allow as many as Redis itself does (maxclients 10000)
   retry = Retry(ExponentialBackoff(cap=2.0, base=0.1), 30)
   return redis.from_url(url, socket_timeout=None, retry=retry, max_connections=10_000)
 
@@ -299,9 +293,7 @@ class Bus:
   async def write_reply(
     self, cmd: Cmd, reply: Reply, worker: str, owner: str, repeat: bool = False, started: float | None = None
   ) -> bool:
-    """Write a command's reply, acknowledge the command, and count it, all at once, if `owner` still owns the worker.
-    Returns False, having written nothing, if it doesn't: another trainer took the worker over and fails the command.
-    A command run at time.time() `started` also counts its wait since it was queued, and how long it ran."""
+    """Write a command's reply, acknowledge the command, and count it, all at once, if `owner` still owns the worker. Returns False, having written nothing, if it doesn't: another trainer took the worker over and fails the command. A command run at time.time() `started` also counts its wait since it was queued, and how long it ran."""
     counts = {}
     if not repeat:
       if not reply.ok:
@@ -352,8 +344,7 @@ class Bus:
     return Reply(fields[b"ok"] == b"1", fields[b"content_type"].decode(), fields[b"body"])
 
   async def reclaim_stranded_commands(self, worker: str, owner: str, min_idle_ms: int = 0) -> list[Cmd]:
-    """Claim the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by its
-    owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the worker."""
+    """Claim the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by its owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the worker."""
     cmds = []
     for run_id in await self.runs_in_worker(worker):
       stream = key("q", run_id)

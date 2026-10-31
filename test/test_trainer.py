@@ -673,8 +673,7 @@ class TestTrainer(RedisTest):
 
 class TestCheckpointNames(unittest.TestCase):
   def test_a_multimodal_checkpoint_trains_under_its_own_parameter_names(self):
-    """Qwen3.5's checkpoint and vLLM name its layers model.language_model.*, its causal LM class model.layers.*. The
-    trainer loads the class the checkpoint names, so a saved adapter's weights carry names vLLM maps."""
+    """Qwen3.5's checkpoint and vLLM name its layers model.language_model.*, its causal LM class model.layers.*. The trainer loads the class the checkpoint names, so a saved adapter's weights carry names vLLM maps."""
     from safetensors import safe_open
     from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
 

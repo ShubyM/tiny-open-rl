@@ -1,7 +1,6 @@
 """A worker's turn on its GPUs, when it shares them with other workers.
 
-The worker appends facts to tinyrl:events: wants_gpu, batch_done, idle, released. It reads the scheduler's decisions
-about its worker, granted and revoked, from the same log. See scheduler.py for the rules.
+The worker appends facts to tinyrl:events: wants_gpu, batch_done, idle, released. It reads the scheduler's decisions about its worker, granted and revoked, from the same log. See scheduler.py for the rules.
 """
 
 from __future__ import annotations
@@ -50,8 +49,7 @@ class GpuTurn:
       await self.bus.append_event(Ev.RELEASED, worker=self.worker)
 
   async def next_decision(self, block_ms: int) -> str | None:
-    """The next decision about this worker in the log, reading past everything else. None once it has read it all, after
-    waiting up to block_ms for a new entry."""
+    """The next decision about this worker in the log, reading past everything else. None once it has read it all, after waiting up to block_ms for a new entry."""
     while events := await self.bus.read_events(self.after, count=100, block_ms=block_ms):
       block_ms = 0
       for e in events:

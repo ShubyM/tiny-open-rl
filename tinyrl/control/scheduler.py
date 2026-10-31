@@ -1,13 +1,8 @@
 """The scheduler: which worker a run joins, where each worker runs, and whose turn it is on each GPU.
 
-The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.control.scheduler
-folds every entry into a State and appends what decide says back to the same log: placed and unplaced, granted and
-revoked. A decision changes the state only once it is folded from the log, so the state is always fold(log), and
-replaying the log rebuilds every state the scheduler saw. Each decision names the rule in RULES that made it. Run
-exactly one. A restarted scheduler folds the whole log again and carries on, since its earlier decisions are in it.
+The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.control.scheduler folds every entry into a State and appends what decide says back to the same log: placed and unplaced, granted and revoked. A decision changes the state only once it is folded from the log, so the state is always fold(log), and replaying the log rebuilds every state the scheduler saw. Each decision names the rule in RULES that made it. Run exactly one. A restarted scheduler folds the whole log again and carries on, since its earlier decisions are in it.
 
-Everything here but run is a pure function. The gateway records what a run needs, choose_worker picks its worker, and
-node daemons fold the log to learn what to run.
+Everything here but run is a pure function. The gateway records what a run needs, choose_worker picks its worker, and node daemons fold the log to learn what to run.
 """
 
 from __future__ import annotations
@@ -27,8 +22,7 @@ from tinyrl.storage.registry import Registry
 
 
 def choose_worker(s: State, run: Run) -> str | None:
-  """The worker a new run joins: the one serving its kind of run. A full fine-tune or exclusive training run is alone,
-  and an exclusive run's sampling sessions share only with each other."""
+  """The worker a new run joins: the one serving its kind of run. A full fine-tune or exclusive training run is alone, and an exclusive run's sampling sessions share only with each other."""
   k = run.kind
   if k.role == Role.TRAINER and (not k.lora or k.exclusive):
     return None
@@ -226,9 +220,7 @@ def fold(state: State, e: Event) -> State:
 
 
 def decide(state: State, now: float) -> list[tuple[Ev, dict]]:
-  """The decisions to append now, in order. Each is folded into a copy before the next is chosen, so one call never
-  grants two workers that don't fit together, or places two workers blind to each other. Once they are folded from the
-  log, deciding again returns none."""
+  """The decisions to append now, in order. Each is folded into a copy before the next is chosen, so one call never grants two workers that don't fit together, or places two workers blind to each other. Once they are folded from the log, deciding again returns none."""
   s, out = state, []
   while d := next_decision(s, now):
     s = fold(s, Event("", now, *d))
@@ -260,8 +252,7 @@ def next_decision(s: State, now: float) -> tuple[Ev, dict] | None:
 
 
 def place(s: State, name: str) -> dict:
-  """Where a worker goes: the node with the fewest workers per GPU, and the GPU choose picks there. When trainers have
-  to move out of the way first, the decision is the move of one of them, and the worker goes once its GPU is clear."""
+  """Where a worker goes: the node with the fewest workers per GPU, and the GPU choose picks there. When trainers have to move out of the way first, the decision is the move of one of them, and the worker goes once its GPU is clear."""
   load = {n: sum(w.node == n for w in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items()}
   me, trainers = s.workers[name], [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
@@ -283,16 +274,12 @@ def place(s: State, name: str) -> dict:
 
 
 def takes_turns(w: Worker) -> bool:
-  """Whether a worker may share a GPU it doesn't fit on. A trainer parks and resumes in about a second. A sampler wakes
-  its engine slowly, and an exclusive worker is alone by definition."""
+  """Whether a worker may share a GPU it doesn't fit on. A trainer parks and resumes in about a second. A sampler wakes its engine slowly, and an exclusive worker is alone by definition."""
   return w.kind.role == Role.TRAINER and not w.kind.exclusive
 
 
 def choose(s: State, node: str, name: str, avoid: int = -1) -> tuple[int, str, list[str]]:
-  """The GPU on a node a worker goes to, why, and the trainers it moves out of the way. An exclusive worker is alone,
-  and others stay off its GPU. A worker takes an empty GPU, or one its memory budget fits on next to the workers there,
-  and a worker with a budget fills such a GPU before it takes an empty one. With neither, a worker that takes turns
-  takes them with the least busy trainers. One that doesn't takes those trainers' GPU, and they move elsewhere."""
+  """The GPU on a node a worker goes to, why, and the trainers it moves out of the way. An exclusive worker is alone, and others stay off its GPU. A worker takes an empty GPU, or one its memory budget fits on next to the workers there, and a worker with a budget fills such a GPU before it takes an empty one. With neither, a worker that takes turns takes them with the least busy trainers. One that doesn't takes those trainers' GPU, and they move elsewhere."""
   gpus, gpu_bytes = s.nodes[node]
   me, memory = s.workers[name], budget(s, s.workers[name].kind, node)
   there = {

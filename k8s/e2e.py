@@ -1,7 +1,6 @@
 """Break tinyrl on GKE on purpose and check it survives. Rerun after any change to know it still does.
 
-Needs kubectl pointed at a cluster running k8s/ on at least two GPU nodes, and the tinker SDK. It port-forwards the
-gateway, trains two LoRA runs through the SDK, then injects one failure at a time and checks what the user sees:
+Needs kubectl pointed at a cluster running k8s/ on at least two GPU nodes, and the tinker SDK. It port-forwards the gateway, trains two LoRA runs through the SDK, then injects one failure at a time and checks what the user sees:
 
   trainer_killed   a trainer process dies: the node daemon starts another, calls fail cleanly, load_state recovers
   gateway_deleted  every gateway pod is deleted: the SDK's retries land and no call runs twice

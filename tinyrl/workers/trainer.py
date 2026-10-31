@@ -109,8 +109,7 @@ class Trainer:
         return
 
   async def retake_lost_lease(self) -> bool:
-    """Take the worker's lease again if it ran out with nobody taking it, as it does while Redis restarts. Not if
-    another trainer has parked one of this trainer's runs since, which it only does after serving the worker."""
+    """Take the worker's lease again if it ran out with nobody taking it, as it does while Redis restarts. Not if another trainer has parked one of this trainer's runs since, which it only does after serving the worker."""
     if not await self.bus.take_lease(self.worker, self.owner):
       return False
     if any([await self.bus.parked_checkpoint(run) for run in self.model.params]):
@@ -132,8 +131,7 @@ class Trainer:
       await self.bus.set_parked_checkpoint(run, uri, self.worker, self.owner)
 
   async def restore_missing_run(self, cmd: Cmd) -> None:
-    """Bring back a run this trainer doesn't hold: from the state its last trainer saved when it stopped, or empty, for
-    load_weights to fill. A run whose trainer died without saving it can't go on from where it was."""
+    """Bring back a run this trainer doesn't hold: from the state its last trainer saved when it stopped, or empty, for load_weights to fill. A run whose trainer died without saving it can't go on from where it was."""
     run, uri = await self.bus.get_run(cmd.run), await self.bus.parked_checkpoint(cmd.run)
     if not uri and cmd.op not in (Op.LOAD_WEIGHTS, Op.DELETE_MODEL):
       raise KeyError(
@@ -222,8 +220,7 @@ class Trainer:
 
   @contextlib.asynccontextmanager
   async def hold_gpu_for_batch(self, queued: int):
-    """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back
-    after the batch if the scheduler revoked it."""
+    """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back after the batch if the scheduler revoked it."""
     if await self.turn.wait_for_turn(queued):
       await asyncio.to_thread(self.model.resume_on_gpu)
     try:

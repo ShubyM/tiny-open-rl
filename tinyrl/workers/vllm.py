@@ -1,6 +1,4 @@
-"""vLLM as a sampling engine: `vllm serve` on a local port, driven through its OpenAI completions API and its dev-mode
-endpoints for adapters, weight reloads and sleep. Any server with the same endpoints can stand in.
-"""
+"""vLLM as a sampling engine: `vllm serve` on a local port, driven through its OpenAI completions API and its dev-mode endpoints for adapters, weight reloads and sleep. Any server with the same endpoints can stand in."""
 
 from __future__ import annotations
 

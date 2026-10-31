@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Count the lines of code in each tinyrl file, the way tinygrad counts them: lines with a token on them, not counting
-blank lines, comments or docstrings. MAX_LINE_COUNT=n fails if the total is over n."""
+"""Count the lines of code in each tinyrl file, the way tinygrad counts them: lines with a token on them, not counting blank lines, comments or docstrings. MAX_LINE_COUNT=n fails if the total is over n."""
 
 import os
 import sys

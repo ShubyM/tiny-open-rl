@@ -1,8 +1,6 @@
-"""Sampling. A sampler serves sampling sessions the way a trainer serves training runs: it holds its worker's lease,
-runs their commands in order, and takes turns on the GPU.
+"""Sampling. A sampler serves sampling sessions the way a trainer serves training runs: it holds its worker's lease, runs their commands in order, and takes turns on the GPU.
 
-It samples through an Engine, which knows nothing of Redis, workers or checkpoint URIs. ENGINE names the engine's class,
-vLLM (tinyrl/workers/vllm.py) unless it's set.
+It samples through an Engine, which knows nothing of Redis, workers or checkpoint URIs. ENGINE names the engine's class, vLLM (tinyrl/workers/vllm.py) unless it's set.
 """
 
 from __future__ import annotations
@@ -74,9 +72,8 @@ class Running:
   """A started engine and the checkpoints it loaded, which go with it."""
 
   engine: Engine
-  names: dict[tuple[str, str], str] = field(
-    default_factory=dict
-  )  # (uri, version) -> the engine's name for that checkpoint
+  # (uri, version) -> the engine's name for that checkpoint
+  names: dict[tuple[str, str], str] = field(default_factory=dict)
   loaded: str | None = None  # the checkpoint loaded last: a full fine-tune's, whose weights are in place
 
 
@@ -263,8 +260,7 @@ class Sampler:
 
   @contextlib.asynccontextmanager
   async def hold_gpu_for_batch(self, queued: int):
-    """Hold the GPU for one batch. Waits for this sampler's turn and wakes its engine, then gives the turn back after
-    the batch if the scheduler revoked it."""
+    """Hold the GPU for one batch. Waits for this sampler's turn and wakes its engine, then gives the turn back after the batch if the scheduler revoked it."""
     if await self.turn.wait_for_turn(queued) and self.running:
       await self.running.engine.wake()
     try:

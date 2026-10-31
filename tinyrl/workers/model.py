@@ -66,9 +66,7 @@ def should_checkpoint_layers(lm: PreTrainedModel, lora: bool) -> bool:
 
 
 def token_budget(lm: PreTrainedModel) -> int:
-  """How many padded tokens one forward/backward pass can hold: TOKEN_BUDGET if it's set, otherwise as many as fit in
-  half of the free GPU memory. It's measured on every call, since memory use changes as runs come and go, and an
-  optimizer allocates its state on its first step."""
+  """How many padded tokens one forward/backward pass can hold: TOKEN_BUDGET if it's set, otherwise as many as fit in half of the free GPU memory. It's measured on every call, since memory use changes as runs come and go, and an optimizer allocates its state on its first step."""
   if TOKEN_BUDGET:
     return TOKEN_BUDGET
   if lm.device.type != "cuda":
@@ -77,8 +75,7 @@ def token_budget(lm: PreTrainedModel) -> int:
   free, _ = torch.cuda.mem_get_info(lm.device)
   free += torch.cuda.memory_reserved(lm.device) - torch.cuda.memory_allocated(lm.device)  # cached by torch, but unused
 
-  # with gradient checkpointing, a token keeps about one hidden vector per layer. 6x that covers the layer being
-  # recomputed in the backward pass, and leaves a margin.
+  # with gradient checkpointing, a token keeps about one hidden vector per layer. 6x that covers the layer being recomputed in the backward pass, and leaves a margin.
   config = lm.config.get_text_config()
   bytes_per_token = (
     (6 if getattr(lm, "is_gradient_checkpointing", False) else 64)
@@ -90,8 +87,7 @@ def token_budget(lm: PreTrainedModel) -> int:
 
 
 def batches(lengths: list[int], budget: int) -> list[list[int]]:
-  """Group sequences into passes, shortest first so a pass pads little. A sequence starts a new pass if joining the
-  current one would go over the token budget, or make the pass more than 25% padding."""
+  """Group sequences into passes, shortest first so a pass pads little. A sequence starts a new pass if joining the current one would go over the token budget, or make the pass more than 25% padding."""
   passes: list[list[int]] = []
   for i in sorted(range(len(lengths)), key=lambda i: lengths[i]):
     if passes:
@@ -132,8 +128,7 @@ def batch_tensors(data: list[wire.Datum], lengths: list[int], device: torch.devi
 def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
   """The logprob of each target token.
 
-  The model returns its hidden states instead of logits. The output head and the logsumexp then run CHUNK positions at a
-  time under checkpointing, so the [tokens, vocab] logits never exist all at once."""
+  The model returns its hidden states instead of logits. The output head and the logsumexp then run CHUNK positions at a time under checkpointing, so the [tokens, vocab] logits never exist all at once."""
   out = lm(ids, attention_mask=mask, use_cache=False, logits_to_keep=1, output_hidden_states=True)
   hidden = out.hidden_states[-1].flatten(0, 1)
   head = lm.get_output_embeddings()
@@ -154,10 +149,7 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
 
 
 def load(name: str) -> PreTrainedModel:
-  """The class the checkpoint names in its config, which is the one vLLM serves, so the weights and adapters a
-  trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal
-  checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and
-  vLLM drops an adapter whose names it can't map, without an error."""
+  """The class the checkpoint names in its config, which is the one vLLM serves, so the weights and adapters a trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and vLLM drops an adapter whose names it can't map, without an error."""
   name = models.local(name)
   arch = (AutoConfig.from_pretrained(name).architectures or [""])[0]
   cls = getattr(transformers, arch, AutoModelForCausalLM)
@@ -248,8 +240,7 @@ class Model:
     return self.lm
 
   def forward_backward(self, run: str, data: list[wire.Datum], loss_fn: str, config: dict, forward_only: bool):
-    """Run the loss over every datum, accumulating gradients unless forward_only. Returns each datum's target
-    logprobs, and the loss metrics."""
+    """Run the loss over every datum, accumulating gradients unless forward_only. Returns each datum's target logprobs, and the loss metrics."""
     if loss_fn not in LOSSES:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
