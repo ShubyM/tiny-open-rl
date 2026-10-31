@@ -422,6 +422,13 @@ class Bus:
     """The checkpoints whose TTL has run out."""
     return [u.decode() for u in await self.r.zrangebyscore(key("expiry"), 0, time.time())]
 
+  async def versions(self) -> set[str]:
+    """The version of every checkpoint in the registry, parked ones too."""
+    found = set()
+    async for k in self.r.scan_iter(match=key("ckpt", "*")):
+      found |= {json.loads(v).get("version") for v in await self.r.hvals(k)}
+    return found - {None}
+
   async def registry_since(self) -> float | None:
     """When the first checkpoint was registered. A sweep leaves files older than that alone."""
     since = await self.r.get(key("ckpt_since"))
