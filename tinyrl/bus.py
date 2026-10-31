@@ -118,7 +118,7 @@ class Bus:
 
   # ***** sessions *****
 
-  async def session(self, session_id: str, metadata: dict | None = None) -> None:
+  async def heartbeat_session(self, session_id: str, metadata: dict | None = None) -> None:
     """Open a session, or record a heartbeat on one. `metadata` applies to every model the session creates."""
     k, now = key("sess", session_id), time.time()
     p = self.r.pipeline()
@@ -131,7 +131,7 @@ class Bus:
     p.expire(f"{k}:runs", SESSION_TTL)
     await p.execute()
 
-  async def session_info(self, session_id: str) -> dict | None:
+  async def get_session(self, session_id: str) -> dict | None:
     p = self.r.pipeline()
     p.hgetall(key("sess", session_id))
     p.smembers(key("sess", session_id, "runs"))
@@ -149,21 +149,21 @@ class Bus:
       "metadata": json.loads(record.get(b"metadata") or "{}"),
     }
 
-  async def expired(self) -> list[str]:
+  async def expired_sessions(self) -> list[str]:
     """The sessions whose client stopped heartbeating SESSION_GRACE seconds ago."""
     return [s.decode() for s in await self.r.zrangebyscore(key("seen"), 0, time.time() - SESSION_GRACE)]
 
-  async def end(self, session_id: str) -> None:
+  async def end_session(self, session_id: str) -> None:
     """Delete an expired session's runs: a training run once its queued work is done, a sampling session now. A session with a training run left is ended again SESSION_GRACE later, since the next trainer fails a delete one died holding."""
     left = False
-    for run_id in (await self.session_info(session_id) or {}).get("runs", []):
-      run = await self.run(run_id) or {}
+    for run_id in (await self.get_session(session_id) or {}).get("runs", []):
+      run = await self.get_run(run_id) or {}
       if not await self.r.sismember(key("runs"), run_id):
         continue
       if run.get("role") == "sampler":
-        await self.drop(run_id, run.get("worker", ""))
+        await self.delete_run(run_id, run.get("worker", ""))
       elif run.get("role") == "trainer":
-        left = bool(await self.submit(run_id, Op.DELETE_MODEL, b"{}")) or left
+        left = bool(await self.submit_command(run_id, Op.DELETE_MODEL, b"{}")) or left
     if left:
       await self.r.zadd(key("seen"), {session_id: time.time()})
     else:
@@ -171,7 +171,7 @@ class Bus:
 
   # ***** runs *****
 
-  async def create(self, run: Run) -> None:
+  async def create_run(self, run: Run) -> None:
     # one transaction, so a run is in its worker exactly when its stream and consumer group exist
     record = json.dumps({**asdict(run), "created": time.time()})
     p = self.r.pipeline(transaction=True)
@@ -190,7 +190,7 @@ class Bus:
     p.xadd(key("events"), {"kind": "run_created", "body": json.dumps(body)})
     await p.execute()
 
-  async def assign(self, run: str, worker: str) -> None:
+  async def assign_run_to_worker(self, run: str, worker: str) -> None:
     """The scheduler's assignment of a run to a worker, with its log entry, at once. Only the scheduler writes it."""
     p = self.r.pipeline(transaction=True)
     p.hset(key("run", run), "worker", worker)
@@ -198,7 +198,7 @@ class Bus:
     p.xadd(key("events"), {"kind": "assigned", "body": json.dumps({"run": run, "worker": worker})})
     await p.execute()
 
-  async def run(self, run_id: str) -> dict | None:
+  async def get_run(self, run_id: str) -> dict | None:
     fields = await self.r.hgetall(key("run", run_id))
     if not fields:
       return None
@@ -209,13 +209,13 @@ class Bus:
     counters = {name.decode(): int(value) for name, value in fields.items()}  # steps, failed, cmds, busy_ms, wait_ms
     return {**record, **counters}
 
-  async def runs(self, worker: str) -> list[str]:
+  async def runs_in_worker(self, worker: str) -> list[str]:
     return [run_id.decode() for run_id in await self.r.smembers(key("worker", worker))]
 
-  async def join(self, run_id: str) -> int:
+  async def join_sampling_session(self, run_id: str) -> int:
     return int(await self.r.incr(key("clients", run_id)))
 
-  async def stats(self) -> dict[tuple[str, str], dict]:
+  async def run_counters(self) -> dict[tuple[str, str], dict]:
     """The counters of every run still in a worker, by (worker, run)."""
     runs = sorted(r.decode() for r in await self.r.smembers(key("runs")))
     p = self.r.pipeline()
@@ -227,18 +227,18 @@ class Bus:
       if b"worker" in f
     }
 
-  async def drop(self, run_id: str, worker: str) -> None:
+  async def delete_run(self, run_id: str, worker: str) -> None:
     """Take a deleted run out of its worker and delete its stream, in one transaction."""
     p = self.r.pipeline(transaction=True)
     p.srem(key("worker", worker), run_id)
     p.srem(key("runs"), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
     await p.execute()
-    await self.emit("run_deleted", run=run_id, worker=worker)
+    await self.append_event("run_deleted", run=run_id, worker=worker)
 
   # ***** commands *****
 
-  async def submit(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
+  async def submit_command(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
     """Queue a command on a run's stream. Returns its request id, or None if there is no such run."""
     # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
     fields = {"op": op, "body": body}
@@ -249,16 +249,21 @@ class Bus:
       return None
     return f"{run_id}/{entry_id.decode()}"
 
-  async def take(self, worker: str, owner: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
+  async def take_commands(self, worker: str, owner: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
     """The next commands for a worker's trainer: up to `count` from each run that has work."""
-    runs = await self.runs(worker)
+    runs = await self.runs_in_worker(worker)
     if not runs:
       await asyncio.sleep(block_ms / 1000)
       return []
 
     random.shuffle(runs)  # so no run always goes first
     streams = {key("q", run_id): ">" for run_id in runs}
-    got = await self.r.xreadgroup(GROUP, owner, streams, count=count, block=block_ms or None)
+    try:
+      got = await self.r.xreadgroup(GROUP, owner, streams, count=count, block=block_ms or None)
+    except redis.ResponseError as e:
+      if "NOGROUP" not in str(e):
+        raise
+      return []  # a run was deleted after it was listed, and the next take lists the worker again
 
     cmds = []
     for stream, entries in got:
@@ -266,7 +271,7 @@ class Bus:
       cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
     return cmds
 
-  async def finish(
+  async def write_reply(
     self, cmd: Cmd, reply: Reply, worker: str, owner: str, repeat: bool = False, started: float | None = None
   ) -> bool:
     """Write a command's reply, acknowledge the command, and count it, all at once, if `owner` still owns the worker.
@@ -309,7 +314,7 @@ class Bus:
       except redis.WatchError:
         continue
 
-  async def first_reply(self, cmd: Cmd) -> Reply | None:
+  async def reply_to_repeated_command(self, cmd: Cmd) -> Reply | None:
     if cmd.seq is None:
       return None
     request_id = await self.r.get(key("seq", cmd.run, str(cmd.seq)))
@@ -321,11 +326,11 @@ class Bus:
     fields = got[0][1]
     return Reply(fields[b"ok"] == b"1", fields[b"content_type"].decode(), fields[b"body"])
 
-  async def reclaim(self, worker: str, owner: str, min_idle_ms: int = 0) -> list[Cmd]:
+  async def reclaim_stranded_commands(self, worker: str, owner: str, min_idle_ms: int = 0) -> list[Cmd]:
     """Claim the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by its
     owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the worker."""
     cmds = []
-    for run_id in await self.runs(worker):
+    for run_id in await self.runs_in_worker(worker):
       stream = key("q", run_id)
       _, entries, _ = await self.r.xautoclaim(stream, GROUP, owner, min_idle_time=min_idle_ms, count=10000)
       cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
@@ -333,7 +338,7 @@ class Bus:
 
   # ***** parked runs: the state a stopping trainer saved, for the next trainer to restore *****
 
-  async def park(self, run_id: str, uri: str | None, worker: str, owner: str) -> bool:
+  async def set_parked_checkpoint(self, run_id: str, uri: str | None, worker: str, owner: str) -> bool:
     """Record where a run's state was saved, or clear it with None, if `owner` still owns the run's worker."""
     k = key("owner", worker)
     while True:
@@ -350,113 +355,33 @@ class Bus:
       except redis.WatchError:  # the lease was renewed, maybe by this owner
         continue
 
-  async def parked(self, run_id: str) -> str | None:
+  async def parked_checkpoint(self, run_id: str) -> str | None:
     uri = await self.r.get(key("parked", run_id))
     return uri.decode() if uri else None
 
-  # ***** checkpoints: the registry the store is kept by *****
-
-  async def saved(
-    self, uri: str, size: int, ttl: int | None = None, owned: bool = False, version: str | None = None
-  ) -> None:
-    """Record a checkpoint the store now holds. One the run owns, like a sampling session's weights or the state a stopping trainer parked, goes when the run is deleted. The rest stay until deleted, or their TTL runs out."""
-    run, cid = uri.removeprefix("tinker://").split("/", 1)
-    now, kind = time.time(), cid.split("/", 1)[0]
-    info = {
-      "checkpoint_id": cid,
-      "checkpoint_type": {"weights": "training", "sampler_weights": "sampler"}.get(kind, kind),
-      "time": now,
-    }
-    info |= {"tinker_path": uri, "size_bytes": size, "expires_at": now + ttl if ttl else None, "owned": owned}
-    info["version"] = version  # which version to wait for, when another node is still uploading it
-    p = self.r.pipeline(transaction=True)
-    p.setnx(key("ckpt_since"), now)
-    p.hset(key("ckpt", run), cid, json.dumps(info))
-    if kind != "parked":
-      p.zadd(key("ckpts"), {uri: now})
-    p.zadd(key("expiry"), {uri: now + ttl}) if ttl else p.zrem(key("expiry"), uri)
-    await p.execute()
-
-  async def checkpoint(self, uri: str) -> dict | None:
-    run, cid = uri.removeprefix("tinker://").split("/", 1)
-    info = await self.r.hget(key("ckpt", run), cid)
-    return json.loads(info) if info else None
-
-  async def checkpoints(self, run: str) -> list[dict]:
-    found = [json.loads(v) for v in (await self.r.hgetall(key("ckpt", run))).values()]
-    return sorted((c for c in found if c["checkpoint_type"] != "parked"), key=lambda c: c["time"])
-
-  async def every_checkpoint(self, limit: int, offset: int) -> tuple[list[dict], int]:
-    """A page of every run's checkpoints, newest first, and how many there are."""
-    uris = [u.decode() for u in await self.r.zrevrange(key("ckpts"), offset, offset + limit - 1)]
-    found = [await self.checkpoint(u) for u in uris]
-    return [c for c in found if c], await self.r.zcard(key("ckpts"))
-
-  async def set_ttl(self, uri: str, ttl: int | None) -> bool:
-    """Make a checkpoint expire ttl seconds from now, or never with None."""
-    if (info := await self.checkpoint(uri)) is None:
-      return False
-    run, cid = uri.removeprefix("tinker://").split("/", 1)
-    info["expires_at"] = time.time() + ttl if ttl else None
-    p = self.r.pipeline(transaction=True)
-    p.hset(key("ckpt", run), cid, json.dumps(info))
-    p.zadd(key("expiry"), {uri: info["expires_at"]}) if ttl else p.zrem(key("expiry"), uri)
-    await p.execute()
-    return True
-
-  async def forget(self, *uris: str) -> int:
-    """Take checkpoints out of the registry. The node daemons' sweeps then delete their files."""
-    p = self.r.pipeline(transaction=True)
-    for uri in uris:
-      run, cid = uri.removeprefix("tinker://").split("/", 1)
-      p.hdel(key("ckpt", run), cid)
-      p.zrem(key("ckpts"), uri)
-      p.zrem(key("expiry"), uri)
-    return sum((await p.execute())[::3]) if uris else 0
-
-  async def owned(self, run: str) -> list[str]:
-    found = [json.loads(v) for v in (await self.r.hgetall(key("ckpt", run))).values()]
-    return [c["tinker_path"] for c in found if c["owned"]]
-
-  async def due(self) -> list[str]:
-    """The checkpoints whose TTL has run out."""
-    return [u.decode() for u in await self.r.zrangebyscore(key("expiry"), 0, time.time())]
-
-  async def versions(self) -> set[str]:
-    """The version of every checkpoint in the registry, parked ones too."""
-    found = set()
-    async for k in self.r.scan_iter(match=key("ckpt", "*")):
-      found |= {json.loads(v).get("version") for v in await self.r.hvals(k)}
-    return found - {None}
-
-  async def registry_since(self) -> float | None:
-    """When the first checkpoint was registered. A sweep leaves files older than that alone."""
-    since = await self.r.get(key("ckpt_since"))
-    return float(since) if since else None
-
   # ***** worker leases *****
 
-  async def own(self, worker: str, owner: str) -> bool:
+  async def take_lease(self, worker: str, owner: str) -> bool:
     """Take the worker's lease if no trainer holds it."""
     return bool(await self.r.set(key("owner", worker), owner, nx=True, px=LEASE_MS))
 
-  async def renew(self, worker: str, owner: str) -> bool:
+  async def renew_lease(self, worker: str, owner: str) -> bool:
     """Hold the worker's lease for another LEASE_MS. False if `owner` doesn't hold it anymore."""
     return bool(await self.r.set(key("owner", worker), owner, ifeq=owner, px=LEASE_MS))
 
-  async def release(self, worker: str, owner: str) -> None:
+  async def release_lease(self, worker: str, owner: str) -> None:
     await self.r.delex(key("owner", worker), ifeq=owner)
 
-  async def owner(self, worker: str) -> str | None:
+  async def lease_owner(self, worker: str) -> str | None:
     owner = await self.r.get(key("owner", worker))
     return owner.decode() if owner else None
 
   # ***** nodes *****
 
-  async def heartbeat(self, node: str, gpus: int) -> None:
+  async def node_heartbeat(self, node: str, gpus: int) -> None:
     await self.r.hset(key("nodes"), node, json.dumps({"gpus": gpus, "until": time.time() + NODE_MS / 1000}))
 
-  async def nodes(self) -> dict[str, int]:
+  async def live_nodes(self) -> dict[str, int]:
     """The GPU count of every live node daemon, by id."""
     nodes = {k.decode(): json.loads(v) for k, v in (await self.r.hgetall(key("nodes"))).items()}
     if dead := [k for k, v in nodes.items() if v["until"] < time.time()]:
@@ -465,7 +390,7 @@ class Bus:
 
   # ***** replies *****
 
-  async def result(self, request_id: str, timeout: float) -> Reply | None:
+  async def wait_for_reply(self, request_id: str, timeout: float) -> Reply | None:
     """Wait up to `timeout` seconds for a request's reply. Reading a reply never consumes it."""
     block_ms = int(timeout * 1000) or None  # None means don't wait at all
     got = await self.r.xread({key("f", request_id): "0-0"}, count=1, block=block_ms)
@@ -475,7 +400,7 @@ class Bus:
     fields = got[0][1][0][1]
     return Reply(fields[b"ok"] == b"1", fields[b"content_type"].decode(), fields[b"body"])
 
-  async def queue(self, run_id: str) -> dict:
+  async def queued_and_in_flight(self, run_id: str) -> dict:
     """What a run has queued and in flight, read straight from its stream."""
     stream = key("q", run_id)
     p = self.r.pipeline()
@@ -498,20 +423,20 @@ class Bus:
 
   # ***** events *****
 
-  async def emit(self, _kind: str, **body) -> str:
+  async def append_event(self, _kind: str, **body) -> str:
     entry_id = await self.r.xadd(
       key("events"), {"kind": _kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
     )
     return entry_id.decode()
 
-  async def log_size(self) -> int:
+  async def event_log_size(self) -> int:
     """How many entries were ever appended to the log. It drops below what a reader folded only if Redis was flushed."""
     try:
       return (await self.r.xinfo_stream(key("events")))["entries-added"]
     except redis.ResponseError:  # no log yet
       return 0
 
-  async def events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[Event]:
+  async def read_events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[Event]:
     """The entries after stream id `after`, waiting up to block_ms for one, or not at all if it is 0."""
     got = await self.r.xread({key("events"): after}, count=count, block=block_ms or None)
     out = []

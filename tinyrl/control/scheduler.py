@@ -1,6 +1,6 @@
 """The scheduler: which worker a run joins, where each worker runs, and whose turn it is on each GPU.
 
-The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.scheduler
+The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.control.scheduler
 folds every entry into a State and appends what decide says back to the same log: placed and unplaced, granted and
 revoked. A decision changes the state only once it is folded from the log, so the state is always fold(log), and
 replaying the log rebuilds every state the scheduler saw. Each decision names the rule in RULES that made it. Run
@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from tinyrl.bus import Bus, Event, key
 from tinyrl.helpers import getenv
+from tinyrl.storage.registry import Registry
 
 # ***** workers *****
 
@@ -332,28 +333,29 @@ BATCH = 10_000  # entries read at once. It decides only once a read comes back s
 
 
 async def run(bus: Bus, quantum: float = QUANTUM) -> None:
-  state, after = State(quantum=quantum), "0-0"
+  state, after, registry = State(quantum=quantum), "0-0", Registry(bus)
   while True:
-    if await bus.log_size() < state.n:  # the log shrank, so Redis was flushed
+    if await bus.event_log_size() < state.n:  # the log shrank, so Redis was flushed
       state, after = State(quantum=quantum), "0-0"
-    events = await bus.events(after, count=BATCH, block_ms=TICK_MS)
+    events = await bus.read_events(after, count=BATCH, block_ms=TICK_MS)
     for e in events:
       state = fold(state, e)
     after = events[-1].id if events else after
     if len(events) == BATCH:
       continue
-    if lost := sorted(set(state.nodes) - set(await bus.nodes())):  # their heartbeats ran out
+    if lost := sorted(set(state.nodes) - set(await bus.live_nodes())):  # their heartbeats ran out
       for node in lost:
-        await bus.emit("node_lost", node=node)
+        await bus.append_event("node_lost", node=node)
       continue  # decide once they are folded, so nothing is placed on them
-    for session in await bus.expired():  # their clients stopped heartbeating
-      await bus.end(session)
-    await bus.forget(*await bus.due())  # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
+    for session in await bus.expired_sessions():  # their clients stopped heartbeating
+      await bus.end_session(session)
+    # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
+    await registry.unregister_checkpoints(*await registry.expired_checkpoints())
     for decision, body in decide(state, time.time()):  # folded when it is read back on the next pass
       if decision == "assigned":
-        await bus.assign(body["run"], body["worker"])
+        await bus.assign_run_to_worker(body["run"], body["worker"])
       else:
-        await bus.emit(decision, **body)
+        await bus.append_event(decision, **body)
     if events:
       await bus.r.set(key("state"), json.dumps(dataclasses.asdict(state), sort_keys=True))
 

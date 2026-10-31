@@ -14,4 +14,4 @@ COPY tinyrl tinyrl
 RUN pip install --no-cache-dir --no-deps .
 
 ENTRYPOINT []
-CMD ["python3", "-m", "tinyrl.node_daemon"]
+CMD ["python3", "-m", "tinyrl.control.node_daemon"]

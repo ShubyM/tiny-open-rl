@@ -14,10 +14,13 @@ import torch
 
 from test.helpers import RedisTest, tiny
 from test.test_wire import json_body
-from tinyrl import bus, gateway, scheduler, wire
-from tinyrl.proto import tinker_public_pb2 as pb
-from tinyrl.store import Store
-from tinyrl.trainer import Model, Trainer
+from tinyrl import bus
+from tinyrl.api import gateway, wire
+from tinyrl.api.proto import tinker_public_pb2 as pb
+from tinyrl.control import scheduler
+from tinyrl.storage.store import Store
+from tinyrl.workers.model import Model
+from tinyrl.workers.trainer import Trainer
 
 PROTO = {"content-type": wire.PROTO}
 
@@ -168,7 +171,7 @@ class TestAPI(RedisTest):
     final = f"/api/v1/training_runs/{run_id}/checkpoints/weights/final"
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": 60})).status_code, 400)
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": None})).status_code, 200)
-    self.assertEqual(await self.bus.due(), [])
+    self.assertEqual(await self.registry.expired_checkpoints(), [])
     self.assertEqual((await self.http.delete(final)).status_code, 200)
     self.assertEqual((await self.http.delete(final)).status_code, 404)
 
@@ -177,14 +180,14 @@ class TestAPI(RedisTest):
     self.assertEqual((await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"], [])
 
   async def test_a_checkpoint_leaves_the_registry_when_its_ttl_runs_out(self):
-    await self.bus.saved("tinker://r/weights/soon", 10, ttl=0.2)
-    await self.bus.saved("tinker://r/weights/later", 10, ttl=3600)
+    await self.registry.register_checkpoint("tinker://r/weights/soon", 10, ttl=0.2)
+    await self.registry.register_checkpoint("tinker://r/weights/later", 10, ttl=3600)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     for _ in range(100):
-      if await self.bus.checkpoint("tinker://r/weights/soon") is None:
+      if await self.registry.get_checkpoint("tinker://r/weights/soon") is None:
         break
       await asyncio.sleep(0.05)
-    self.assertEqual([c["checkpoint_id"] for c in await self.bus.checkpoints("r")], ["weights/later"])
+    self.assertEqual([c["checkpoint_id"] for c in await self.registry.checkpoints_of_run("r")], ["weights/later"])
 
   async def test_errors(self):
     run_id = await self.create_model()
@@ -205,7 +208,7 @@ class TestAPI(RedisTest):
     self.assertEqual(failed.status_code, 200)
     self.assertEqual(failed.json()["category"], "user")
     self.assertIn("dpo", failed.json()["error"])
-    self.assertEqual((await self.bus.run(run_id))["failed"], 1)
+    self.assertEqual((await self.bus.get_run(run_id))["failed"], 1)
 
     with patch.object(gateway, "WAIT", 0.01):
       pending = await self.post("retrieve_future", json={"request_id": f"{run_id}/1-0"})
@@ -216,10 +219,10 @@ class TestAPI(RedisTest):
     full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
     exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})
 
-    workers = [(await self.bus.run(run_id))["worker"] for run_id in (shared, also_shared, full, exclusive)]
+    workers = [(await self.bus.get_run(run_id))["worker"] for run_id in (shared, also_shared, full, exclusive)]
     self.assertEqual(workers[0], workers[1])
     self.assertEqual(len(set(workers)), 3)
-    self.assertEqual((await self.bus.run(full))["rank"], 0)
+    self.assertEqual((await self.bus.get_run(full))["rank"], 0)
     self.assertEqual((await self.post("get_info", json={"model_id": full})).json()["lora_rank"], 16)
 
   async def test_session_tags_apply_to_its_models(self):
@@ -227,8 +230,8 @@ class TestAPI(RedisTest):
     tags = ["openrl.fine_tuning_type=full", "openrl.recipe=rl"]
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
-    self.assertEqual((await self.bus.run(full))["rank"], 0)
-    self.assertEqual(await self.bus.runs(await self.worker(full)), [full])
+    self.assertEqual((await self.bus.get_run(full))["rank"], 0)
+    self.assertEqual(await self.bus.runs_in_worker(await self.worker(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -259,7 +262,7 @@ class TestAPI(RedisTest):
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     self.assertFalse((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
-    self.assertEqual(await self.bus.expired(), [])
+    self.assertEqual(await self.bus.expired_sessions(), [])
 
   async def test_training_checkpoints_are_safetensors_with_adam_moments(self):
     run_id = await self.create_model()
@@ -392,8 +395,8 @@ class TestAPI(RedisTest):
     )
     samp_id = saved.json()["sampling_session_id"]
 
-    await self.bus.heartbeat("node-1", 8)
-    await self.bus.emit("node_up", node="node-1", gpus=8, memory=0)
+    await self.bus.node_heartbeat("node-1", 8)
+    await self.bus.append_event("node_up", node="node-1", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     worker = await self.worker(run_id)
     data = await self.scheduling_until(lambda d: d["state"]["workers"].get(worker, {}).get("node"))
@@ -419,7 +422,9 @@ class TestAPI(RedisTest):
     self.fail(f"never: {data}")
 
   async def sampler_runs(self) -> list[str]:
-    return [e.body["run"] for e in await self.bus.events() if e.kind == "run_created" and e.body["role"] == "sampler"]
+    return [
+      e.body["run"] for e in await self.bus.read_events() if e.kind == "run_created" and e.body["role"] == "sampler"
+    ]
 
   async def test_only_sampling_sessions_get_a_sampler_and_it_ends_with_its_training_run(self):
     sft = await self.create_model()
@@ -438,8 +443,8 @@ class TestAPI(RedisTest):
     self.assertEqual(await self.sampler_runs(), [sid])
     sampler = await self.worker(sid)
 
-    await self.bus.heartbeat("n8", 8)
-    await self.bus.emit("node_up", node="n8", gpus=8, memory=0)
+    await self.bus.node_heartbeat("n8", 8)
+    await self.bus.append_event("node_up", node="n8", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     await self.scheduling_until(lambda d: d["state"]["workers"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})

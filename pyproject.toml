@@ -21,7 +21,7 @@ include = ["tinyrl*"]
 target-version = "py311"
 line-length = 120
 indent-width = 2
-exclude = ["tinyrl/proto"]
+exclude = ["tinyrl/api/proto"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

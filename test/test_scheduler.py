@@ -2,7 +2,7 @@ import random
 import unittest
 
 from tinyrl.bus import Event
-from tinyrl.scheduler import QUANTUM, RULES, Kind, State, budget, decide, fold, holders, settings, uses
+from tinyrl.control.scheduler import QUANTUM, RULES, Kind, State, budget, decide, fold, holders, settings, uses
 
 GIB = 1024**3
 
@@ -36,9 +36,8 @@ class Log:
     self.test, self.s, self.t, self.entries = test, State(quantum=quantum), 0.0, []
 
   def append(self, kind: str, body: dict) -> None:
-    if (
-      kind in ("run_created", "sampler_warmed") and "role" not in body
-    ):  # name the worker's kind the way main's names did
+    # name the worker's kind the way main's names did
+    if kind in ("run_created", "sampler_warmed") and "role" not in body:
       worker = body["worker"]
       role = "sampler" if worker.startswith("sampler:") else "trainer"
       rank = 0 if worker.startswith("sampler:fft:") or (role == "trainer" and not worker.startswith("lora:")) else 8

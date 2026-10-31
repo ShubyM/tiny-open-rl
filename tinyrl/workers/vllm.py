@@ -16,9 +16,9 @@ import subprocess
 
 import httpx
 
-from tinyrl import models
 from tinyrl.helpers import getenv
-from tinyrl.sampler import Out, Seq
+from tinyrl.storage import models
+from tinyrl.workers.sampler import Out, Seq
 
 VLLM_ARGS = getenv("VLLM_ARGS", "")  # more `vllm serve` flags, like --gpu-memory-utilization 0.4
 GPU_MEM = getenv("TINYRL_GPU_MEM", "")  # the share of GPU memory vLLM may use, from the scheduler's placement
@@ -113,7 +113,7 @@ class VLLM:
           raise
     raise AssertionError
 
-  async def load(self, name: str, path: str) -> None:
+  async def load_checkpoint(self, name: str, path: str) -> None:
     if name in self.loaded:
       return
     if not self.lora and self.clean and os.path.isdir(path):

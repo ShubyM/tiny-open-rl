@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 from google.protobuf.message import DecodeError
 
-from tinyrl.proto import tinker_public_pb2 as pb
+from tinyrl.api.proto import tinker_public_pb2 as pb
 
 assert sys.byteorder == "little", "the wire format is little endian"
 

@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from transformers import AutoConfig
 
-from tinyrl.estimator import estimate
+from tinyrl.control.estimator import estimate
 
 
 class FakeMeta:
@@ -12,8 +12,8 @@ class FakeMeta:
 
 
 class TestEstimator(unittest.TestCase):
-  @patch("tinyrl.estimator.AutoConfig.from_pretrained")
-  @patch("tinyrl.estimator.get_safetensors_metadata")
+  @patch("tinyrl.control.estimator.AutoConfig.from_pretrained")
+  @patch("tinyrl.control.estimator.get_safetensors_metadata")
   def test_estimate(self, mock_safetensors, mock_config):
     mock_safetensors.return_value = FakeMeta({"BF16": 10000})  # 20000 base bytes
 
