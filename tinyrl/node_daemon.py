@@ -63,6 +63,7 @@ class NodeDaemon:
     self.bus = bus
     self.store = store if store is not None else Store()
     self.swept = 0.0
+    self.uploading: asyncio.Task | None = None
     self.gpus = gpus
     self.procs: dict[str, tuple[list[int], subprocess.Popen]] = {}  # worker -> (its GPUs, its process)
     self.stopping: dict[str, subprocess.Popen] = {}  # told to stop, and maybe still on its GPUs
@@ -98,10 +99,16 @@ class NodeDaemon:
     if time.time() - self.swept > SWEEP_S:
       self.swept = time.time()
       await self.sweep()
+    if self.uploading is None or self.uploading.done():  # this node's saves go up to a bucket CKPT behind, in order
+      if self.uploading and self.uploading.exception():
+        print(f"upload failed, trying again: {self.uploading.exception()!r}", file=sys.stderr, flush=True)
+      self.uploading = asyncio.create_task(asyncio.to_thread(self.store.flush))
 
   async def sweep(self) -> None:
     """Delete the checkpoints in this node's store that the registry doesn't have: deleted, expired, or their run's.
-    Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before."""
+    Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before. It also
+    keeps the node's cache of a bucket store under CKPT_CACHE_BYTES."""
+    await asyncio.to_thread(self.store.trim)
     if (since := await self.bus.registry_since()) is None:
       return
     for uri in await asyncio.to_thread(self.store.stored):
@@ -138,6 +145,7 @@ class NodeDaemon:
         with contextlib.suppress(subprocess.TimeoutExpired):
           proc.wait(max(0.0, deadline - time.monotonic()))
         reap(proc)
+      self.store.flush()  # what they saved last
 
 
 if __name__ == "__main__":

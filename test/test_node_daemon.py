@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -181,6 +182,14 @@ class TestNodeDaemon(RedisTest):
     await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep()
     names = sorted(u.rsplit("/", 1)[1] for u in store.stored())
     self.assertEqual(names, ["before", "kept", "young"])  # older than the registry, registered, still being saved
+
+  async def test_the_node_daemon_uploads_what_its_node_saved(self):
+    store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
+    store.put("tinker://r/weights/w", {"w": torch.ones(2)})  # a trainer exits right after, leaving it to the daemon
+    daemon = NodeDaemon(self.bus, node="n", gpu_mib=0, store=store)
+    await daemon.tick()
+    await daemon.uploading
+    self.assertEqual(store.stored(), ["tinker://r/weights/w"])
 
 
 if __name__ == "__main__":
