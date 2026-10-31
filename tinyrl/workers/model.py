@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import transformers
 from peft import LoraConfig
+from peft.helpers import disable_input_dtype_casting
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
@@ -249,10 +250,12 @@ class Model:
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total = 0.0
 
-    with torch.set_grad_enabled(not forward_only):
+    # on the gpu autocast runs the adapters' matmuls in bf16 anyway, so PEFT's upcast of each layer's input to the fp32 adapter only adds casts
+    gpu = lm.device.type == "cuda"
+    with torch.set_grad_enabled(not forward_only), disable_input_dtype_casting(lm, active=gpu):
       for batch in batches(lengths, token_budget(lm)):
         x = batch_tensors([data[i] for i in batch], [lengths[i] for i in batch], lm.device)
-        with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=lm.device.type == "cuda"):
+        with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
           lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
         loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
         if not forward_only:
@@ -285,13 +288,13 @@ class Model:
 
     max_norm = adam.get("grad_clip_norm") or math.inf  # 0 means don't clip
     grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run].values(), max_norm).item()
-    if not self.lora:
-      if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # moments on the host come back to the GPU, after freeing torch's cache to make room
+    if not self.lora and torch.cuda.is_available() and any(not t.is_cuda for t in self.adam_moments()):
+      torch.cuda.empty_cache()
       self.move_tensors(self.adam_moments(), "cuda")
     optimizer.step()
     optimizer.zero_grad()
-    if not self.lora:
+    if not self.lora and not self.moments_fit():
       self.move_tensors(self.adam_moments(), "cpu")
     self.dirty.add(run)
     return {"grad_norm:mean": grad_norm}
@@ -352,6 +355,14 @@ class Model:
       if not self.lora:
         self.move_tensors(self.adam_moments(), "cpu")
     self.dirty.add(run)
+
+  def moments_fit(self) -> bool:
+    """Whether a full fine-tune's AdamW moments stay on the GPU between steps: when what's left free is at least as big as they are, so forward_backward keeps room. Otherwise they cross PCIe twice a step, 2.7 of a 2.8 s step for Gemma E2B."""
+    if not torch.cuda.is_available():
+      return True
+    size = sum(t.numel() * t.element_size() for t in self.adam_moments() if t.is_cuda)
+    free = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    return free >= size
 
   def adam_moments(self):
     return (v for opt in self.optimizers.values() for s in opt.state.values() for v in s.values() if torch.is_tensor(v))
