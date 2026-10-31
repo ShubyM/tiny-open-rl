@@ -16,6 +16,7 @@ import subprocess
 
 import httpx
 
+from tinyrl import models
 from tinyrl.helpers import getenv
 from tinyrl.sampler import Out, Seq
 
@@ -57,7 +58,9 @@ class VLLM:
     with socket.socket() as s:
       s.bind(("127.0.0.1", 0))
       port = s.getsockname()[1]
-    args = ["vllm", "serve", base, "--host", "127.0.0.1", "--port", str(port), "--enable-sleep-mode"]
+    path = await asyncio.to_thread(models.local, base)  # served under the reference's name, which requests use
+    args = ["vllm", "serve", path, "--served-model-name", base, "--host", "127.0.0.1", "--port", str(port)]
+    args += ["--enable-sleep-mode"]
     args += ["--language-model-only"] + (
       ["--enable-lora", "--max-lora-rank", "64", "--max-loras", "16", "--max-cpu-loras", "64"] if lora else []
     )
