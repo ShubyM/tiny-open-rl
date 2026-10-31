@@ -263,10 +263,6 @@ class TestStore(unittest.TestCase):
       self.assertTrue(torch.equal(got["bool"], torch.tensor([True, False])))
       self.assertTrue(torch.equal(got["sliced"], torch.ones(4, 4)[::2, ::2]))
 
-
-if __name__ == "__main__":
-  unittest.main()
-
   def test_delete_takes_every_version_and_leaves_the_neighbours(self):
     store = Store(root=tempfile.mkdtemp())
     for uri in ("tinker://r/sampler_weights/step-1", "tinker://r/sampler_weights/step-1.5", "tinker://q/weights/final"):
@@ -288,3 +284,7 @@ if __name__ == "__main__":
     self.assertGreater(store.saved_at("tinker://r/weights/final"), 0)
     store.delete("tinker://r/weights/final")
     self.assertEqual(store.stored(), [])
+
+
+if __name__ == "__main__":
+  unittest.main()
