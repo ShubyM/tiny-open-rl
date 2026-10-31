@@ -583,6 +583,18 @@ class TestTrainer(RedisTest):
     self.assertEqual([reply.ok for reply in replies], [False, True, True])
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
 
+  async def test_a_run_whose_parked_state_is_gone_still_deletes(self):
+    run = new_id()
+    await self.bus.create(Run(run, "p", "tiny", 4, lora=LORA))
+    await self.bus.r.set(f"tinyrl:parked:{run}", "tinker://gone/parked/1")  # its node lost the files
+    [request_id] = await self.submit(run, (Op.DELETE_MODEL, {}))
+    t = Trainer(self.bus, "p", Model(tiny), store=Store(root=tempfile.mkdtemp()))
+    await self.own(t)
+    while await t.step(block_ms=10):
+      pass
+    self.assertTrue((await self.bus.result(request_id, 1)).ok)
+    self.assertIsNone(await self.bus.submit(run, Op.OPTIM_STEP, b"{}"))  # deleted
+
   async def test_sampler_save_is_processed_before_other_runs_finish(self):
     store = Store(root=tempfile.mkdtemp())
     t = Trainer(self.bus, "p", Model(tiny), store=store)

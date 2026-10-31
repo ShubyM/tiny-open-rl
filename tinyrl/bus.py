@@ -154,14 +154,22 @@ class Bus:
     return [s.decode() for s in await self.r.zrangebyscore(key("seen"), 0, time.time() - SESSION_GRACE)]
 
   async def end(self, session_id: str) -> None:
-    """Delete an expired session's runs: a training run once its queued work is done, a sampling session now."""
+    """Delete an expired session's runs: a training run once its queued work is done, a sampling session now. A
+    session with a training run left is ended again SESSION_GRACE later, since the next trainer fails a delete one died
+    holding."""
+    left = False
     for run_id in (await self.session_info(session_id) or {}).get("runs", []):
       run = await self.run(run_id) or {}
-      if run.get("role") == "sampler" and await self.r.sismember(key("runs"), run_id):
+      if not await self.r.sismember(key("runs"), run_id):
+        continue
+      if run.get("role") == "sampler":
         await self.drop(run_id, run.get("worker", ""))
       elif run.get("role") == "trainer":
-        await self.submit(run_id, Op.DELETE_MODEL, b"{}")
-    await self.r.zrem(key("seen"), session_id)
+        left = bool(await self.submit(run_id, Op.DELETE_MODEL, b"{}")) or left
+    if left:
+      await self.r.zadd(key("seen"), {session_id: time.time()})
+    else:
+      await self.r.zrem(key("seen"), session_id)
 
   # ***** runs *****
 
