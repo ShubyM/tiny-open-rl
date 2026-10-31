@@ -263,6 +263,28 @@ class TestStore(unittest.TestCase):
       self.assertTrue(torch.equal(got["bool"], torch.tensor([True, False])))
       self.assertTrue(torch.equal(got["sliced"], torch.ones(4, 4)[::2, ::2]))
 
+  def test_delete_takes_every_version_and_leaves_the_neighbours(self):
+    store = Store(root=tempfile.mkdtemp())
+    for uri in ("tinker://r/sampler_weights/step-1", "tinker://r/sampler_weights/step-1.5", "tinker://q/weights/final"):
+      store.put(uri, {"w": torch.ones(4)})
+    store.put("tinker://r/sampler_weights/step-1", {"w": torch.zeros(4)})  # a second version, so there's a .prev
+    self.assertEqual(
+      sorted(store.stored()),
+      ["tinker://q/weights/final", "tinker://r/sampler_weights/step-1", "tinker://r/sampler_weights/step-1.5"],
+    )
+    store.delete("tinker://r/sampler_weights/step-1")
+    self.assertEqual(sorted(store.stored()), ["tinker://q/weights/final", "tinker://r/sampler_weights/step-1.5"])
+    self.assertTrue(all("step-1.5" in n for n in os.listdir(f"{store.base}/r/sampler_weights")))  # no orphan versions
+    self.assertTrue(torch.equal(store.get("tinker://r/sampler_weights/step-1.5")[0]["w"], torch.ones(4)))
+
+  def test_a_remote_checkpoint_is_listed_and_deleted(self):
+    store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
+    store.put("tinker://r/weights/final", {"w": torch.ones(4)})
+    self.assertEqual(store.stored(), ["tinker://r/weights/final"])
+    self.assertGreater(store.saved_at("tinker://r/weights/final"), 0)
+    store.delete("tinker://r/weights/final")
+    self.assertEqual(store.stored(), [])
+
 
 if __name__ == "__main__":
   unittest.main()
