@@ -95,7 +95,8 @@ class NodeDaemon:
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
       await self.bus.append_event(Ev.STARTED, worker=worker, node=self.id)
       self.procs[worker] = self.start_worker_process(worker, mine[worker])
-    if self.id not in self.state.nodes:  # its heartbeat ran out, or Redis lost the log, and its processes are stopping
+    # its heartbeat ran out, or Redis lost the log. Only once its processes exited, since the scheduler then grants their GPUs again
+    if self.id not in self.state.nodes and not self.procs and not self.stopping:
       await self.announce_node()
     # off the tick, so a slow sweep never holds up the heartbeat
     if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
