@@ -24,7 +24,7 @@ from peft import LoraConfig
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
-from tinyrl import wire
+from tinyrl import models, wire
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.store import Store, nbytes
@@ -173,6 +173,7 @@ def load(name: str) -> PreTrainedModel:
   trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal
   checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and
   vLLM drops an adapter whose names it can't map, without an error."""
+  name = models.local(name)
   arch = (AutoConfig.from_pretrained(name).architectures or [""])[0]
   cls = getattr(transformers, arch, AutoModelForCausalLM)
   # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create
@@ -544,6 +545,8 @@ class Trainer:
         await self.bus.forget(uri)  # the node daemons' sweeps delete it
 
   async def answer(self, cmd: Cmd) -> Reply:
+    if cmd.op == Op.DELETE_MODEL and cmd.run not in self.model.params:  # nothing here to free, and its state not needed
+      return ok({"type": cmd.op, "model_id": cmd.run})
     try:
       if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
         await self.recover(cmd)

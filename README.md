@@ -15,6 +15,9 @@ for batch in data:
 sampler_path = trainer.save_weights_for_sampler("step-100").result().path  # a PEFT adapter vLLM can load
 ```
 
+`base_model` is a hub id, or a folder of `config.json` and `*.safetensors` anywhere fsspec reaches (`gs://...`, `s3://...`,
+`/mnt/models/...`). A node fetches a bucket model once into `MODEL_CACHE`. See [models.py](tinyrl/models.py).
+
 ## Run it
 
 ```sh
@@ -110,7 +113,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/store.py) to se
 | [tinyrl/node_daemon.py](tinyrl/node_daemon.py) | 69 | places workers on node daemons, and runs the ones placed on this one |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
 
-`python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `CKPT` (the
+`python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `KEYFRAME_EVERY`, `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`,
 `ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
