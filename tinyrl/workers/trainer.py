@@ -72,8 +72,6 @@ class Trainer:
     self.store = store if store is not None else Store()
     self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.stopping: Stop | None = None
-    self.sizes: dict[str, int] = {}  # bytes each save just wrote, by request, for the checkpoint registry
-    self.wanted: dict[str, str | None] = {}  # the version each load waits for, by request
     self.turn = GpuTurn(bus, worker, bool(GPU))
 
   async def serve(self) -> None:
@@ -157,16 +155,16 @@ class Trainer:
         await self.restore_missing_run(cmd)
     except Exception as e:
       return fail(e)
+    version = None
     if cmd.op == Op.LOAD_WEIGHTS:  # the version saved last, which may be another node's, still uploading
-      uri = json.loads(cmd.body)["uri"]
-      self.wanted[cmd.request_id] = (await self.registry.get_checkpoint(uri) or {}).get("version")
-    reply = await asyncio.to_thread(self.run_command, cmd)  # off the event loop, so redis stays responsive
+      version = (await self.registry.get_checkpoint(json.loads(cmd.body)["uri"]) or {}).get("version")
+    # off the event loop, so redis stays responsive
+    reply, size = await asyncio.to_thread(self.run_command, cmd, version)
     if reply.ok and cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):  # registered before the reply lands
       args = json.loads(cmd.body)
-      size = self.sizes.pop(cmd.request_id)
-      version = self.store.versions.get(args["uri"])
+      saved = self.store.versions.get(args["uri"])
       await self.registry.register_checkpoint(
-        args["uri"], size, args.get("ttl_seconds"), args.get("owned", False), version
+        args["uri"], size, args.get("ttl_seconds"), args.get("owned", False), saved
       )
     return reply
 
@@ -238,30 +236,28 @@ class Trainer:
       await asyncio.to_thread(self.model.park_on_host)
       await self.turn.give_turn_back()
 
-  def run_command(self, cmd: Cmd) -> Reply:
-    """Run one command on the model. A failure becomes the reply, never an exception."""
-    model = self.model
+  def run_command(self, cmd: Cmd, version: str | None = None) -> tuple[Reply, int]:
+    """Run one command on the model, loading `version` of a checkpoint. Returns the reply, which a failure becomes instead of an exception, and the bytes a save wrote."""
+    model, size = self.model, 0
     try:
       if cmd.op == Op.FORWARD_BACKWARD:
         req = wire.parse(cmd.body)
         data, loss_fn, config = wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req)
         logprobs, metrics = model.forward_backward(cmd.run, data, loss_fn, config, req.forward_only)
-        return Reply(True, wire.PROTO, wire.output(logprobs, metrics))
+        return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), 0
 
       args = json.loads(cmd.body)
       match cmd.op:
         case Op.CREATE_MODEL:
           model.create_run(cmd.run, args["base_model"], args["rank"], args["lora"])
         case Op.OPTIM_STEP:
-          return ok({"type": cmd.op, "metrics": model.optim_step(cmd.run, args["adam_params"])})
+          return ok({"type": cmd.op, "metrics": model.optim_step(cmd.run, args["adam_params"])}), 0
         case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
           tensors, meta = model.training_state(cmd.run) if cmd.op == Op.SAVE_WEIGHTS else model.sampler_weights(cmd.run)
           self.store.put(args["uri"], tensors, meta)
-          self.sizes[cmd.request_id] = sum(map(nbytes, tensors.values()))
+          size = sum(map(nbytes, tensors.values()))
         case Op.LOAD_WEIGHTS:
-          model.restore_run(
-            cmd.run, *self.store.get(args["uri"], self.wanted.pop(cmd.request_id, None)), args["optimizer"]
-          )
+          model.restore_run(cmd.run, *self.store.get(args["uri"], version), args["optimizer"])
         case Op.DELETE_MODEL:
           model.delete_run(cmd.run)
         case _:
@@ -272,9 +268,9 @@ class Trainer:
         reply["path"] = args["uri"]
       if "sampling_session_id" in args:
         reply["sampling_session_id"] = args["sampling_session_id"]
-      return ok(reply)
+      return ok(reply), size
     except Exception as e:
-      return fail(e)
+      return fail(e), 0
 
 
 async def main(worker: str) -> None:
