@@ -181,6 +181,14 @@ class TestBus(RedisTest):
       self.assertEqual(await self.bus.take_commands("p", "o", block_ms=10), [])
     self.assertEqual([c.run for c in await self.bus.take_commands("p", "o", block_ms=10)], [run_id])
 
+  async def test_a_run_deleted_after_its_worker_was_listed_is_skipped_when_reclaiming(self):
+    run_id, gone = await self.new_run(), await self.new_run()
+    await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
+    await self.bus.take_commands("p", "dead", block_ms=10)  # taken, and never answered
+    await self.bus.delete_run(gone, "p")
+    with patch.object(self.bus, "runs_in_worker", AsyncMock(return_value=[gone, run_id])):  # listed before it went
+      self.assertEqual([c.run for c in await self.bus.reclaim_stranded_commands("p", "o")], [run_id])
+
   async def test_stats_and_workers_cleanup(self):
     run_unassigned = new_id()
     await self.bus.create_run(Run(id=run_unassigned, worker="", base="base", rank=1))
