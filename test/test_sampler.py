@@ -16,7 +16,7 @@ from tinyrl.api.gateway import app
 from tinyrl.bus import Op, Run
 from tinyrl.storage.store import Store
 from tinyrl.workers.sampler import Out, Sampler, Seq, encode
-from tinyrl.workers.trainer import Trainer
+from tinyrl.workers.trainer import Stop, Trainer
 from tinyrl.workers.vllm import VLLM
 
 JOB = {
@@ -189,7 +189,7 @@ class TestSampler(RedisTest):
         self.assertTrue(reply.ok, reply.body)
       self.assertIn(("sleep",), sampler.engine.calls)
     finally:
-      trainer.done = sampler.done = True
+      trainer.stopping, sampler.done = Stop.EXIT, True
       await asyncio.gather(*tasks)
     self.assertEqual(sampler.engine.calls[-1], ("close",))
 

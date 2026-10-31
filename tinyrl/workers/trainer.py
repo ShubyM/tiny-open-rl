@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import enum
 import json
 import os
 import signal
@@ -28,6 +29,11 @@ GPU = getenv("GPU", "")  # the GPU this trainer takes turns on, set by the node 
 
 
 # ***** trainer *****
+
+
+class Stop(enum.Enum):
+  EXIT = "exit"  # leave at once: another trainer has the worker, or a full fine-tune's run was deleted
+  PARK = "park"  # save every run for the worker's next trainer, then leave. What SIGTERM asks for
 
 
 def ok(body: dict) -> Reply:
@@ -65,8 +71,7 @@ class Trainer:
     self.model = model if model is not None else Model()
     self.store = store if store is not None else Store()
     self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
-    self.done = False
-    self.draining = False
+    self.stopping: Stop | None = None
     self.sizes: dict[str, int] = {}  # bytes each save just wrote, by request, for the checkpoint registry
     self.wanted: dict[str, str | None] = {}  # the version each load waits for, by request
     self.turn = GpuTurn(bus, worker, bool(GPU))
@@ -76,10 +81,10 @@ class Trainer:
     renewing = asyncio.create_task(self.keep_renewing_lease())
     try:
       await self.fail_stranded_commands(0)  # anything in flight now was taken by a trainer that died or lost the worker
-      while not self.done:
+      while self.stopping is None:
         await self.step()
         await self.fail_stranded_commands(STRANDED_MS)
-      if self.draining:
+      if self.stopping == Stop.PARK:
         await self.park_every_run()
     finally:
       renewing.cancel()
@@ -102,7 +107,7 @@ class Trainer:
     while True:  # until serve() cancels it, so the lease holds while a stopping trainer saves its runs
       await asyncio.sleep(LEASE_MS / 4000)
       if not await self.bus.renew_lease(self.worker, self.owner) and not await self.retake_lost_lease():
-        self.done = True
+        self.stopping = Stop.EXIT
         return
 
   async def retake_lost_lease(self) -> bool:
@@ -117,7 +122,7 @@ class Trainer:
 
   def stop(self) -> None:
     """Finish the batch in hand, save every run for the worker's next trainer, and exit. SIGTERM calls it."""
-    self.done = self.draining = True
+    self.stopping = self.stopping or Stop.PARK
 
   async def park_every_run(self) -> None:
     for run in list(self.model.params):
@@ -172,7 +177,7 @@ class Trainer:
 
   async def step(self, count: int = 16, block_ms: int = 1000) -> int:
     """Take the next commands from the worker and run them. Returns how many there were."""
-    if self.done:
+    if self.stopping is not None:
       return 0
     take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
     cmds = await self.bus.take_commands(self.worker, self.owner, count, take_block)
@@ -195,13 +200,14 @@ class Trainer:
         ms = (time.time() - start) * 1000
         ops.append([cmd.op, ms])
         if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
-          self.done = True  # another trainer owns the worker now
+          self.stopping = Stop.EXIT  # another trainer owns the worker now
           break
 
         if cmd.op == Op.DELETE_MODEL and reply.ok:
           await self.bus.delete_run(cmd.run, self.worker)
           await self.registry.unregister_checkpoints(*await self.registry.checkpoints_owned_by_run(cmd.run))
-          self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
+          if not self.model.lora:  # a full fine-tune's trainer exits with its run
+            self.stopping = Stop.EXIT
 
         if DEBUG:
           error = "" if reply.ok else f"  {reply.body.decode()}"
