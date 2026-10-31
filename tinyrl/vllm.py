@@ -64,6 +64,8 @@ class VLLM:
     if (tp := len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))) > 1:
       args += ["--tensor-parallel-size", str(tp)]
     env = {
+      "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",  # its FlashAttention 4 kernels compile at each start unless cached
+      "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": os.path.expanduser("~/.cache/flash-attention-cute"),
       **{k: v for k, v in os.environ.items() if k not in {"TINYRL_GPU_MEM", "TINYRL_KV_BYTES", "TINYRL_WARM_SAMPLER"}},
       "VLLM_SERVER_DEV_MODE": "1",
       "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
