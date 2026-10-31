@@ -27,7 +27,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from tinyrl import wire
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
 from tinyrl.helpers import DEBUG, getenv
-from tinyrl.store import Store
+from tinyrl.store import Store, nbytes
 from tinyrl.turns import IDLE_MS, GpuTurn
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
@@ -468,6 +468,7 @@ class Trainer:
     self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.done = False
     self.draining = False
+    self.sizes: dict[str, int] = {}  # bytes each save just wrote, by request, for the checkpoint registry
     self.turn = GpuTurn(bus, worker, bool(GPU))
 
   async def serve(self) -> None:
@@ -520,8 +521,9 @@ class Trainer:
 
   async def drain(self) -> None:
     for run in list(self.model.params):
-      uri = f"tinker://{run}/parked/{time.time_ns()}"
-      await asyncio.to_thread(self.store.put, uri, *self.model.state(run))
+      uri, (tensors, meta) = f"tinker://{run}/parked/{time.time_ns()}", self.model.state(run)
+      await asyncio.to_thread(self.store.put, uri, tensors, meta)
+      await self.bus.saved(uri, sum(map(nbytes, tensors.values())), owned=True)
       await self.bus.park(run, uri, self.worker, self.owner)
 
   async def recover(self, cmd: Cmd) -> None:
@@ -536,7 +538,8 @@ class Trainer:
     if uri:
       tensors, meta = await asyncio.to_thread(self.store.get, uri)
       await asyncio.to_thread(self.model.restore, cmd.run, tensors, meta, True)
-      await self.bus.park(cmd.run, None, self.worker, self.owner)
+      if await self.bus.park(cmd.run, None, self.worker, self.owner):
+        await self.bus.forget(uri)  # the node daemons' sweeps delete it
 
   async def answer(self, cmd: Cmd) -> Reply:
     try:
@@ -544,7 +547,12 @@ class Trainer:
         await self.recover(cmd)
     except Exception as e:
       return fail(e)
-    return await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
+    reply = await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
+    if reply.ok and cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):  # registered before the reply lands
+      args = json.loads(cmd.body)
+      size = self.sizes.pop(cmd.request_id)
+      await self.bus.saved(args["uri"], size, args.get("ttl_seconds"), args.get("owned", False))
+    return reply
 
   async def fail_stranded(self, min_idle_ms: int) -> None:
     for cmd in await self.bus.reclaim(self.worker, self.owner, min_idle_ms):
@@ -580,6 +588,7 @@ class Trainer:
 
         if cmd.op == Op.DELETE_MODEL and reply.ok:
           await self.bus.drop(cmd.run, self.worker)
+          await self.bus.forget(*await self.bus.owned(cmd.run))
           self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
 
         if DEBUG:
@@ -627,10 +636,10 @@ class Trainer:
           model.create(cmd.run, args["base_model"], args["rank"], args["lora"])
         case Op.OPTIM_STEP:
           return ok({"type": cmd.op, "metrics": model.optim_step(cmd.run, args["adam_params"])})
-        case Op.SAVE_WEIGHTS:
-          self.store.put(args["uri"], *model.state(cmd.run))
-        case Op.SAVE_WEIGHTS_FOR_SAMPLER:
-          self.store.put(args["uri"], *model.weights(cmd.run))
+        case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
+          tensors, meta = model.state(cmd.run) if cmd.op == Op.SAVE_WEIGHTS else model.weights(cmd.run)
+          self.store.put(args["uri"], tensors, meta)
+          self.sizes[cmd.request_id] = sum(map(nbytes, tensors.values()))
         case Op.LOAD_WEIGHTS:
           model.restore(cmd.run, *self.store.get(args["uri"]), args["optimizer"])
         case Op.DELETE_MODEL:

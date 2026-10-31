@@ -20,12 +20,15 @@ import time
 from tinyrl import scheduler
 from tinyrl.bus import Bus
 from tinyrl.helpers import getenv
+from tinyrl.store import Store
 
 GPUS = getenv("GPUS", 1)
 DRAIN_S = getenv(
   "DRAIN_S", 20.0
 )  # how long a stopping node daemon waits for its processes, so trainers save their runs
 TICK = getenv("TICK", 0.25)
+SWEEP_S = getenv("SWEEP_S", 60.0)  # how often it deletes the checkpoints nobody registered, or nobody wants any more
+SWEEP_GRACE_S = 600  # a checkpoint younger than this is left alone, since a save registers it only once it's written
 
 
 def gpu_memory_mib() -> int:
@@ -54,8 +57,12 @@ def reap(proc: subprocess.Popen) -> None:
 
 
 class NodeDaemon:
-  def __init__(self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None):
+  def __init__(
+    self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None, store: Store | None = None
+  ):
     self.bus = bus
+    self.store = store if store is not None else Store()
+    self.swept = 0.0
     self.gpus = gpus
     self.procs: dict[str, tuple[list[int], subprocess.Popen]] = {}  # worker -> (its GPUs, its process)
     self.stopping: dict[str, subprocess.Popen] = {}  # told to stop, and maybe still on its GPUs
@@ -88,6 +95,20 @@ class NodeDaemon:
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
       await self.bus.emit("started", worker=worker, node=self.id)
       self.procs[worker] = self.start(worker, mine[worker])
+    if time.time() - self.swept > SWEEP_S:
+      self.swept = time.time()
+      await self.sweep()
+
+  async def sweep(self) -> None:
+    """Delete the checkpoints in this node's store that the registry doesn't have: deleted, expired, or their run's.
+    Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before."""
+    if (since := await self.bus.registry_since()) is None:
+      return
+    for uri in await asyncio.to_thread(self.store.stored):
+      if await self.bus.checkpoint(uri) is None:
+        saved = await asyncio.to_thread(self.store.saved_at, uri)
+        if since < saved < time.time() - SWEEP_GRACE_S:
+          await asyncio.to_thread(self.store.delete, uri)
 
   def start(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
     """Start a worker's process on its GPUs, with the settings for its kind. This node's environment wins."""

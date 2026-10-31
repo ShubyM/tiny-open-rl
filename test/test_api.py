@@ -153,6 +153,39 @@ class TestAPI(RedisTest):
       response = await self.post("save_weights", json={"model_id": run_id, "path": bad})
       self.assertEqual(response.status_code, 400)
 
+  async def test_checkpoints_are_listed_expire_and_delete(self):
+    run_id = await self.create_model()
+    await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final", "ttl_seconds": 7200}))
+    save = {"model_id": run_id, "sampling_session_seq_id": 0}
+    await self.result(await self.post("save_weights_for_sampler", json=save))
+    listed = (await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()
+    got = [(c["checkpoint_id"], c["checkpoint_type"], c["expires_at"] is None) for c in listed["checkpoints"]]
+    self.assertEqual(got, [("weights/final", "training", False), ("sampler_weights/step-0", "sampler", True)])
+    self.assertGreater(listed["checkpoints"][0]["size_bytes"], 0)
+    every = (await self.http.get("/api/v1/checkpoints", params={"limit": 1})).json()
+    self.assertEqual((len(every["checkpoints"]), every["cursor"]["total_count"]), (1, 2))
+
+    final = f"/api/v1/training_runs/{run_id}/checkpoints/weights/final"
+    self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": 60})).status_code, 400)
+    self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": None})).status_code, 200)
+    self.assertEqual(await self.bus.due(), [])
+    self.assertEqual((await self.http.delete(final)).status_code, 200)
+    self.assertEqual((await self.http.delete(final)).status_code, 404)
+
+    await self.post("delete_model", json={"model_id": run_id})
+    await self.drain(run_id)  # the sampling session's weights are the run's, so they go with it
+    self.assertEqual((await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"], [])
+
+  async def test_a_checkpoint_leaves_the_registry_when_its_ttl_runs_out(self):
+    await self.bus.saved("tinker://r/weights/soon", 10, ttl=0.2)
+    await self.bus.saved("tinker://r/weights/later", 10, ttl=3600)
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    for _ in range(100):
+      if await self.bus.checkpoint("tinker://r/weights/soon") is None:
+        break
+      await asyncio.sleep(0.05)
+    self.assertEqual([c["checkpoint_id"] for c in await self.bus.checkpoints("r")], ["weights/later"])
+
   async def test_errors(self):
     run_id = await self.create_model()
     for path, kwargs in [

@@ -10,10 +10,13 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from test.helpers import RedisTest, new_id, tiny
 from tinyrl import scheduler
 from tinyrl.bus import Op, Run
-from tinyrl.node_daemon import NodeDaemon, reap
+from tinyrl.node_daemon import SWEEP_GRACE_S, NodeDaemon, reap
+from tinyrl.store import Store
 
 LEASE_MS = 2000
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
@@ -162,6 +165,22 @@ class TestNodeDaemon(RedisTest):
     with patch("subprocess.Popen", side_effect=spawn):
       await daemon.tick()
     self.assertIn("started", seen)
+
+  async def test_a_sweep_deletes_only_what_the_registry_lets_go(self):
+    store = Store(root=tempfile.mkdtemp())
+    old = time.time() - SWEEP_GRACE_S - 60
+    for name in ("before", "kept", "deleted", "young"):
+      store.put(f"tinker://r/weights/{name}", {"w": torch.ones(2)})
+    os.utime(store.path("tinker://r/weights/before"), (old - 3600, old - 3600), follow_symlinks=False)
+    await self.bus.saved("tinker://r/weights/kept", 8)  # the registry starts here
+    await self.bus.saved("tinker://r/weights/deleted", 8)
+    await self.bus.forget("tinker://r/weights/deleted")
+    await self.bus.r.set("tinyrl:ckpt_since", old - 1800)
+    for name in ("kept", "deleted"):
+      os.utime(store.path(f"tinker://r/weights/{name}"), (old, old), follow_symlinks=False)
+    await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep()
+    names = sorted(u.rsplit("/", 1)[1] for u in store.stored())
+    self.assertEqual(names, ["before", "kept", "young"])  # older than the registry, registered, still being saved
 
 
 if __name__ == "__main__":

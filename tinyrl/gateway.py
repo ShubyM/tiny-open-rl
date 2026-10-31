@@ -5,6 +5,7 @@ Every training call becomes a command on its run's stream, and retrieve_future w
 
 from __future__ import annotations
 
+import datetime
 import json
 import time
 import uuid
@@ -54,6 +55,11 @@ class OptimStepRequest(ModelRequest):
 class SaveRequest(ModelRequest):
   path: str | None = None
   sampling_session_seq_id: int | None = None
+  ttl_seconds: int | None = None
+
+
+class TTLRequest(BaseModel):
+  ttl_seconds: int | None = None
 
 
 class LoadRequest(ModelRequest):
@@ -63,6 +69,23 @@ class LoadRequest(ModelRequest):
 
 class FutureRequest(BaseModel):
   request_id: str
+
+
+def ttl(seconds: int | None) -> int | None:
+  """A checkpoint's TTL, which the Tinker API bounds between an hour and ten years."""
+  if seconds is not None and not 3600 <= seconds <= 10 * 365 * 24 * 3600:
+    raise HTTPException(400, "ttl_seconds must be between 3600 and 10 years")
+  return seconds
+
+
+def iso(t: float | None) -> str | None:
+  return datetime.datetime.fromtimestamp(t, datetime.UTC).isoformat() if t else None
+
+
+def public(c: dict) -> dict:
+  """A registry entry as the Tinker API's Checkpoint."""
+  keep = {k: c[k] for k in ("checkpoint_id", "checkpoint_type", "tinker_path", "size_bytes")}
+  return keep | {"time": iso(c["time"]), "expires_at": iso(c["expires_at"])}
 
 
 def checkpoint_uri(run: str, kind: str, name: str) -> str:
@@ -211,7 +234,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def save(req: SaveRequest, op: Op, kind: str):
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-    return await submit(req.model_id, op, {"uri": checkpoint_uri(req.model_id, kind, name)}, req.seq_id)
+    args = {"uri": checkpoint_uri(req.model_id, kind, name), "ttl_seconds": ttl(req.ttl_seconds)}
+    return await submit(req.model_id, op, args, req.seq_id)
 
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
   async def save_weights(req: SaveRequest):
@@ -225,12 +249,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
     uri = checkpoint_uri(req.model_id, "sampler_weights", name)
-    if req.path is None or req.sampling_session_seq_id is not None:
-      sid = await open_sampler(train["base"], uri, train.get("session", ""))
-      return await submit(
-        req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri, "sampling_session_id": sid}, req.seq_id
-      )
-    return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri}, req.seq_id)
+    args = {"uri": uri, "ttl_seconds": ttl(req.ttl_seconds)}
+    if req.path is None or req.sampling_session_seq_id is not None:  # a sampling session's weights, which its run owns
+      args |= {"sampling_session_id": await open_sampler(train["base"], uri, train.get("session", "")), "owned": True}
+    return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):
@@ -321,6 +343,30 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       "request_id": res["request_id"],
       "sample_sequence_ids": [f"{res['request_id']}:{i}" for i in range(num_samples)],
     }
+
+  # ***** checkpoints *****
+
+  @api.get("/api/v1/training_runs/{run}/checkpoints")
+  async def list_checkpoints(run: str):
+    return {"checkpoints": [public(c) for c in await bus.checkpoints(run)]}
+
+  @api.get("/api/v1/checkpoints")
+  async def list_user_checkpoints(limit: int = 100, offset: int = 0):
+    found, total = await bus.every_checkpoint(limit, offset)
+    return {
+      "checkpoints": [public(c) for c in found],
+      "cursor": {"offset": offset, "limit": limit, "total_count": total},
+    }
+
+  @api.delete("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}")
+  async def delete_checkpoint(run: str, checkpoint_id: str):
+    if not await bus.forget(f"tinker://{run}/{checkpoint_id}"):  # its files go with the next sweep
+      raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
+
+  @api.put("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}/ttl")
+  async def set_checkpoint_ttl(run: str, checkpoint_id: str, req: TTLRequest):
+    if not await bus.set_ttl(f"tinker://{run}/{checkpoint_id}", ttl(req.ttl_seconds)):
+      raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
 
   # ***** inspection *****
 
