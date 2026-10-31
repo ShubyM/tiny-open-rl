@@ -54,6 +54,31 @@ class Op(StrEnum):
   SAMPLE = "sample"
 
 
+class Ev(StrEnum):
+  """The kinds of entry in the log, tinyrl:events. See scheduler.py for what each means."""
+
+  RUN_CREATED = "run_created"
+  ASSIGNED = "assigned"
+  RUN_DELETED = "run_deleted"
+  NODE_UP = "node_up"
+  NODE_LOST = "node_lost"
+  PLACED = "placed"
+  UNPLACED = "unplaced"
+  STARTED = "started"
+  EXITED = "exited"
+  WANTS_GPU = "wants_gpu"
+  BATCH_DONE = "batch_done"
+  IDLE = "idle"
+  RELEASED = "released"
+  GRANTED = "granted"
+  REVOKED = "revoked"
+
+
+class Role(StrEnum):
+  TRAINER = "trainer"
+  SAMPLER = "sampler"
+
+
 @dataclass(frozen=True)
 class Run:
   id: str
@@ -64,7 +89,7 @@ class Run:
   model_path: str | None = None
   lora: dict = field(default_factory=dict)  # the LoRA config it was created with, to create it again elsewhere
   exclusive: bool = False
-  role: str = "trainer"
+  role: Role = Role.TRAINER
   train_run: str | None = None  # the training run a sampling session samples
 
 
@@ -108,7 +133,7 @@ class Event:
 
   id: str  # the stream id, <ms>-<n>
   t: float  # seconds, from the ms part of the id
-  kind: str
+  kind: str  # an Ev, or a kind this version doesn't know, which fold ignores
   body: dict
 
 
@@ -160,9 +185,9 @@ class Bus:
       run = await self.get_run(run_id) or {}
       if not await self.r.sismember(key("runs"), run_id):
         continue
-      if run.get("role") == "sampler":
+      if run.get("role") == Role.SAMPLER:
         await self.delete_run(run_id, run.get("worker", ""))
-      elif run.get("role") == "trainer":
+      elif run.get("role") == Role.TRAINER:
         left = bool(await self.submit_command(run_id, Op.DELETE_MODEL, b"{}")) or left
     if left:
       await self.r.zadd(key("seen"), {session_id: time.time()})
@@ -187,7 +212,7 @@ class Bus:
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
     body = {"run": run.id, "role": run.role, "base": run.base, "rank": run.rank, "exclusive": run.exclusive}
     body |= {"train_run": run.train_run} | ({"worker": run.worker} if run.worker else {})
-    p.xadd(key("events"), {"kind": "run_created", "body": json.dumps(body)})
+    p.xadd(key("events"), {"kind": Ev.RUN_CREATED, "body": json.dumps(body)})
     await p.execute()
 
   async def assign_run_to_worker(self, run: str, worker: str) -> None:
@@ -195,7 +220,7 @@ class Bus:
     p = self.r.pipeline(transaction=True)
     p.hset(key("run", run), "worker", worker)
     p.sadd(key("worker", worker), run)
-    p.xadd(key("events"), {"kind": "assigned", "body": json.dumps({"run": run, "worker": worker})})
+    p.xadd(key("events"), {"kind": Ev.ASSIGNED, "body": json.dumps({"run": run, "worker": worker})})
     await p.execute()
 
   async def get_run(self, run_id: str) -> dict | None:
@@ -234,7 +259,7 @@ class Bus:
     p.srem(key("runs"), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
     await p.execute()
-    await self.append_event("run_deleted", run=run_id, worker=worker)
+    await self.append_event(Ev.RUN_DELETED, run=run_id, worker=worker)
 
   # ***** commands *****
 
@@ -423,9 +448,9 @@ class Bus:
 
   # ***** events *****
 
-  async def append_event(self, _kind: str, **body) -> str:
+  async def append_event(self, _kind: Ev, **body) -> str:
     entry_id = await self.r.xadd(
-      key("events"), {"kind": _kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
+      key("events"), {"kind": Ev(_kind), "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
     )
     return entry_id.decode()
 

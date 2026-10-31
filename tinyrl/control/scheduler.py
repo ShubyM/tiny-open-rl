@@ -19,7 +19,7 @@ import json
 import time
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus, Event, key
+from tinyrl.bus import Bus, Ev, Event, Role, key
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 
@@ -30,7 +30,7 @@ def choose_worker(s: State, run: Run) -> str | None:
   """The worker a new run joins: the one serving its kind of run. A full fine-tune or exclusive training run is alone,
   and an exclusive run's sampling sessions share only with each other."""
   k = run.kind
-  if k.role == "trainer" and (not k.lora or k.exclusive):
+  if k.role == Role.TRAINER and (not k.lora or k.exclusive):
     return None
   return next((name for name, w in s.workers.items() if w.kind == k), None)
 
@@ -38,7 +38,7 @@ def choose_worker(s: State, run: Run) -> str | None:
 def settings(k: Kind, gpus: int, gpu_bytes: int) -> dict[str, str]:
   """The environment a worker's process starts with on a node with this many GPUs of this size."""
   env = {}
-  if k.role != "sampler":
+  if k.role != Role.SAMPLER:
     return env
   if gpus >= 2:  # samplers have GPUs of their own, so they start their engine before the first command
     env["TINYRL_WARM_SAMPLER"] = "1"
@@ -81,7 +81,7 @@ RULES = {
 class Kind:
   """What runs a worker serves. Runs of one kind share a worker."""
 
-  role: str = "trainer"
+  role: Role = Role.TRAINER
   base: str = ""
   lora: bool = False
   exclusive: bool = False
@@ -165,10 +165,10 @@ def fold(state: State, e: Event) -> State:
   b = e.body
   w = s.workers.get(b.get("worker", ""))
   match e.kind:
-    case "run_created":
+    case Ev.RUN_CREATED:
       exclusive = b.get("exclusive", False)
       k = Kind(
-        b.get("role", "trainer"),
+        Role(b.get("role", Role.TRAINER)),
         b.get("base", ""),
         b.get("rank", 0) > 0,
         exclusive,
@@ -177,46 +177,46 @@ def fold(state: State, e: Event) -> State:
       s.runs[b["run"]] = Run(k, train_run=b.get("train_run"))
       if b.get("worker"):  # created in a worker already, as tests do
         join(s, b["run"], b["worker"])
-    case "assigned" if b["run"] in s.runs:
+    case Ev.ASSIGNED if b["run"] in s.runs:
       join(s, b["run"], b["worker"])
-    case "run_deleted":  # an exclusive run's sampling sessions end with it
+    case Ev.RUN_DELETED:  # an exclusive run's sampling sessions end with it
       s.runs = {r: x for r, x in s.runs.items() if r != b["run"] and x.kind.train_run != b["run"]}
-    case "node_up":  # a node daemon (re)started, and its processes died with the old one
+    case Ev.NODE_UP:  # a node daemon (re)started, and its processes died with the old one
       s.nodes[b["node"]] = (b["gpus"], b.get("memory", 0))
       for x in s.workers.values():
         if any(node == b["node"] for node, _ in x.on):
           stop(x)
-    case "node_lost":
+    case Ev.NODE_LOST:
       s.nodes.pop(b["node"], None)
       for x in s.workers.values():
         if any(node == b["node"] for node, _ in x.on):
           stop(x)
         if x.node == b["node"]:
           x.node, x.gpus = None, ()
-    case "placed" if w:  # a process still running elsewhere keeps its GPUs and its turn until it exits
+    case Ev.PLACED if w:  # a process still running elsewhere keeps its GPUs and its turn until it exits
       w.node, w.gpus = b["node"], tuple(b["gpus"])
-    case "unplaced" if w:
+    case Ev.UNPLACED if w:
       w.node, w.gpus = None, ()
-    case "started" if w and w.node == b["node"]:
+    case Ev.STARTED if w and w.node == b["node"]:
       stop(w)
       w.on = tuple((w.node, i) for i in w.gpus)
-    case "exited" if w:
+    case Ev.EXITED if w:
       stop(w)
-    case "wants_gpu" if w and w.on:
+    case Ev.WANTS_GPU if w and w.on:
       w.idle = False
       if w.since is None and not w.asked:
         w.asked = s.n
-    case "batch_done" if w:
+    case Ev.BATCH_DONE if w:
       w.idle, w.busy = False, w.busy + b.get("seconds", 0.0)
       if w.since is not None:
         w.since += b.get("boot", 0.0)
-    case "idle" if w:
+    case Ev.IDLE if w:
       w.idle = True
-    case "released" if w:
+    case Ev.RELEASED if w:
       w.since, w.revoked = None, False
-    case "granted" if w:
+    case Ev.GRANTED if w:
       w.asked, w.since = 0, e.t
-    case "revoked" if w:
+    case Ev.REVOKED if w:
       w.revoked = True
   s.workers = {name: x for name, x in s.workers.items() if x.node or x.on or members(s, name)}
   return s
@@ -225,7 +225,7 @@ def fold(state: State, e: Event) -> State:
 # ***** decide *****
 
 
-def decide(state: State, now: float) -> list[tuple[str, dict]]:
+def decide(state: State, now: float) -> list[tuple[Ev, dict]]:
   """The decisions to append now, in order. Each is folded into a copy before the next is chosen, so one call never
   grants two workers that don't fit together, or places two workers blind to each other. Once they are folded from the
   log, deciding again returns none."""
@@ -236,26 +236,26 @@ def decide(state: State, now: float) -> list[tuple[str, dict]]:
   return out
 
 
-def next_decision(s: State, now: float) -> tuple[str, dict] | None:
+def next_decision(s: State, now: float) -> tuple[Ev, dict] | None:
   for run_id, r in sorted(s.runs.items()):
     if not r.worker:
-      return "assigned", {"run": run_id, "worker": choose_worker(s, r) or f"w{s.n + 1}"}
+      return Ev.ASSIGNED, {"run": run_id, "worker": choose_worker(s, r) or f"w{s.n + 1}"}
   for name, w in sorted(s.workers.items()):
     if w.node and not members(s, name):
-      return "unplaced", {"worker": name, "rule": "place.emptied"}
+      return Ev.UNPLACED, {"worker": name, "rule": "place.emptied"}
   unplaced = [name for name, w in s.workers.items() if w.node is None and members(s, name)]
   if unplaced and s.nodes:
-    return "placed", place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
+    return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
   for _, name in sorted((w.asked, name) for name, w in s.workers.items() if w.asked):
     if all(first_in_line(s, k) == name and fits(s, k, name) for k in keys(s.workers[name])):
-      return "granted", {"worker": name, "rule": "turn.granted"}
+      return Ev.GRANTED, {"worker": name, "rule": "turn.granted"}
   for name, w in sorted(s.workers.items()):
     if w.since is None or w.revoked or not any(first_in_line(s, k) for k in keys(w)):
       continue
     if w.idle:
-      return "revoked", {"worker": name, "rule": "turn.idle_holder_yields"}
+      return Ev.REVOKED, {"worker": name, "rule": "turn.idle_holder_yields"}
     if now >= w.since + s.quantum:
-      return "revoked", {"worker": name, "rule": "turn.quantum_expired"}
+      return Ev.REVOKED, {"worker": name, "rule": "turn.quantum_expired"}
   return None
 
 
@@ -265,7 +265,7 @@ def place(s: State, name: str) -> dict:
   load = {n: sum(w.node == n for w in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items()}
   me, trainers = s.workers[name], [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
-  near = near if me.kind.role == "sampler" and not me.kind.lora else set()  # a LoRA adapter is small to fetch
+  near = near if me.kind.role == Role.SAMPLER and not me.kind.lora else set()  # a LoRA adapter is small to fetch
   node = min(sorted(load), key=lambda n: (n not in near, load[n]))
   gpu, why, aside = choose(s, node, name)
   if aside:
@@ -285,7 +285,7 @@ def place(s: State, name: str) -> dict:
 def takes_turns(w: Worker) -> bool:
   """Whether a worker may share a GPU it doesn't fit on. A trainer parks and resumes in about a second. A sampler wakes
   its engine slowly, and an exclusive worker is alone by definition."""
-  return w.kind.role == "trainer" and not w.kind.exclusive
+  return w.kind.role == Role.TRAINER and not w.kind.exclusive
 
 
 def choose(s: State, node: str, name: str, avoid: int = -1) -> tuple[int, str, list[str]]:
@@ -345,14 +345,14 @@ async def run(bus: Bus, quantum: float = QUANTUM) -> None:
       continue
     if lost := sorted(set(state.nodes) - set(await bus.live_nodes())):  # their heartbeats ran out
       for node in lost:
-        await bus.append_event("node_lost", node=node)
+        await bus.append_event(Ev.NODE_LOST, node=node)
       continue  # decide once they are folded, so nothing is placed on them
     for session in await bus.expired_sessions():  # their clients stopped heartbeating
       await bus.end_session(session)
     # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
     await registry.unregister_checkpoints(*await registry.expired_checkpoints())
     for decision, body in decide(state, time.time()):  # folded when it is read back on the next pass
-      if decision == "assigned":
+      if decision == Ev.ASSIGNED:
         await bus.assign_run_to_worker(body["run"], body["worker"])
       else:
         await bus.append_event(decision, **body)

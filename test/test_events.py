@@ -20,6 +20,11 @@ class TestEvents(RedisTest):
     self.assertLessEqual(events[0].t, events[1].t)
     self.assertEqual([e.id for e in await self.bus.read_events(first)], [second])
 
+  async def test_a_kind_nothing_folds_cant_be_appended(self):
+    with self.assertRaises(ValueError):
+      await self.bus.append_event("grantd", worker="p")
+    self.assertEqual(await self.bus.read_events(), [])
+
   async def test_the_scheduler_assigns_new_runs_and_workers_find_them_in_redis(self):
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     for run in ("a", "b"):
