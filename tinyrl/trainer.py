@@ -470,6 +470,7 @@ class Trainer:
     self.done = False
     self.draining = False
     self.sizes: dict[str, int] = {}  # bytes each save just wrote, by request, for the checkpoint registry
+    self.wanted: dict[str, str | None] = {}  # the version each load waits for, by request
     self.turn = GpuTurn(bus, worker, bool(GPU))
 
   async def serve(self) -> None:
@@ -524,7 +525,7 @@ class Trainer:
     for run in list(self.model.params):
       uri, (tensors, meta) = f"tinker://{run}/parked/{time.time_ns()}", self.model.state(run)
       await asyncio.to_thread(self.store.put, uri, tensors, meta)
-      await self.bus.saved(uri, sum(map(nbytes, tensors.values())), owned=True)
+      await self.bus.saved(uri, sum(map(nbytes, tensors.values())), owned=True, version=self.store.versions.get(uri))
       await self.bus.park(run, uri, self.worker, self.owner)
 
   async def recover(self, cmd: Cmd) -> None:
@@ -537,7 +538,8 @@ class Trainer:
       )
     await asyncio.to_thread(self.model.create, cmd.run, run["base"], run["rank"], run.get("lora", {}))
     if uri:
-      tensors, meta = await asyncio.to_thread(self.store.get, uri)
+      version = (await self.bus.checkpoint(uri) or {}).get("version")
+      tensors, meta = await asyncio.to_thread(self.store.get, uri, version)
       await asyncio.to_thread(self.model.restore, cmd.run, tensors, meta, True)
       if await self.bus.park(cmd.run, None, self.worker, self.owner):
         await self.bus.forget(uri)  # the node daemons' sweeps delete it
@@ -550,11 +552,15 @@ class Trainer:
         await self.recover(cmd)
     except Exception as e:
       return fail(e)
+    if cmd.op == Op.LOAD_WEIGHTS:  # the version saved last, which may be another node's, still uploading
+      uri = json.loads(cmd.body)["uri"]
+      self.wanted[cmd.request_id] = (await self.bus.checkpoint(uri) or {}).get("version")
     reply = await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
     if reply.ok and cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):  # registered before the reply lands
       args = json.loads(cmd.body)
       size = self.sizes.pop(cmd.request_id)
-      await self.bus.saved(args["uri"], size, args.get("ttl_seconds"), args.get("owned", False))
+      version = self.store.versions.get(args["uri"])
+      await self.bus.saved(args["uri"], size, args.get("ttl_seconds"), args.get("owned", False), version)
     return reply
 
   async def fail_stranded(self, min_idle_ms: int) -> None:
@@ -644,7 +650,7 @@ class Trainer:
           self.store.put(args["uri"], tensors, meta)
           self.sizes[cmd.request_id] = sum(map(nbytes, tensors.values()))
         case Op.LOAD_WEIGHTS:
-          model.restore(cmd.run, *self.store.get(args["uri"]), args["optimizer"])
+          model.restore(cmd.run, *self.store.get(args["uri"], self.wanted.pop(cmd.request_id, None)), args["optimizer"])
         case Op.DELETE_MODEL:
           model.delete(cmd.run)
         case _:

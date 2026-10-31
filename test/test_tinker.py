@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import socket
@@ -61,7 +62,15 @@ class TestTinkerSDK(unittest.TestCase):
       self.assertEqual(out.returncode, 0, out.stderr[-3000:])
 
       model_id = out.stdout.split("model ")[1].split()[0]
-      self.assertTrue(os.path.exists(f"{tmp}/ckpt/{model_id}/sampler_weights/final/adapter_model.safetensors"))
+      # the node daemon uploads the node's saves to CKPT behind, under a version that _latest points at last, so wait for it
+      final = f"{tmp}/ckpt/{model_id}/sampler_weights/final"
+      for _ in range(300):
+        if os.path.exists(f"{final}/_latest"):
+          break
+        time.sleep(0.1)
+      with open(f"{final}/_latest") as f:
+        version = json.load(f)["version"]
+      self.assertTrue(os.path.exists(f"{final}/{version}/adapter_model.safetensors"))
     finally:
       for proc in procs:
         proc.terminate()
