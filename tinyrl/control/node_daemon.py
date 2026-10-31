@@ -1,6 +1,6 @@
 """Runs the trainers and samplers the scheduler placed on this node, on the GPUs it chose.
 
-python -m tinyrl.control.node_daemon replaces starting `python -m tinyrl.workers.trainer <worker>` by hand. Every node daemon heartbeats into Redis and appends node_up when it starts. It folds tinyrl:events like the scheduler does, starts a process for each worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A worker's lease still decides who serves it.
+python -m tinyrl.control.node_daemon replaces starting `python -m tinyrl.workers.trainer <worker>` by hand. Every node daemon heartbeats into Redis and appends node_up when it starts, and again if the scheduler found it lost. It folds tinyrl:events like the scheduler does, starts a process for each worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A worker's lease still decides who serves it.
 """
 
 from __future__ import annotations
@@ -62,6 +62,7 @@ class NodeDaemon:
     self.store = store if store is not None else Store()
     self.swept = 0.0
     self.uploading: asyncio.Task | None = None
+    self.sweeping: asyncio.Task | None = None
     self.gpus = gpus
     self.procs: dict[str, tuple[list[int], subprocess.Popen]] = {}  # worker -> (its GPUs, its process)
     self.stopping: dict[str, subprocess.Popen] = {}  # told to stop, and maybe still on its GPUs
@@ -94,9 +95,14 @@ class NodeDaemon:
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
       await self.bus.append_event(Ev.STARTED, worker=worker, node=self.id)
       self.procs[worker] = self.start_worker_process(worker, mine[worker])
-    if time.time() - self.swept > SWEEP_S:
+    if self.id not in self.state.nodes:  # its heartbeat ran out, or Redis lost the log, and its processes are stopping
+      await self.announce_node()
+    # off the tick, so a slow sweep never holds up the heartbeat
+    if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
+      if self.sweeping and self.sweeping.exception():
+        print(f"sweep failed, trying again: {self.sweeping.exception()!r}", file=sys.stderr, flush=True)
       self.swept = time.time()
-      await self.sweep_checkpoints()
+      self.sweeping = asyncio.create_task(self.sweep_checkpoints())
     if self.uploading is None or self.uploading.done():  # this node's saves go up to a bucket CKPT behind, in order
       if self.uploading and self.uploading.exception():
         print(f"upload failed, trying again: {self.uploading.exception()!r}", file=sys.stderr, flush=True)
