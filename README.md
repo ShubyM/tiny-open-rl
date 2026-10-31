@@ -41,6 +41,13 @@ Trainers on one GPU take turns, granted by the scheduler. Between batches, a tra
 one that has had the GPU for 30 s, yields it to a trainer that waits: it copies its weights, gradients and AdamW state to pinned host memory,
 frees the GPU, and copies them back on its next turn.
 
+### Checkpoints
+
+`CKPT` is where checkpoints live. On one machine it is a folder (`/tmp/tinyrl` unless set), and nothing leaves the
+machine. Set it to a bucket (`gs://...`, `s3://...`) to keep checkpoints past a machine, or to share them across
+machines. A save still lands in the node's `CKPT_CACHE` first and replies, and the node daemon uploads it behind, so a
+bucket never holds up a step. A sampler on the node reads the cached copy; one on another node waits for the upload.
+
 ### On Kubernetes
 
 [k8s/](k8s) runs Redis with an append-only file, the gateway, the scheduler, and a node daemon on every node labeled `tinyrl-gpu=true`.
