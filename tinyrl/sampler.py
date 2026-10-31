@@ -225,7 +225,8 @@ class Sampler:
     """The engine's name for a checkpoint, which the engine loads unless it already holds it."""
     if not uri:
       return None
-    path, version = await asyncio.to_thread(self.store.local, uri)  # a checkpoint name can be saved again
+    saved = (await self.bus.checkpoint(uri) or {}).get("version")  # another node's may still be uploading
+    path, version = await asyncio.to_thread(self.store.local, uri, saved)  # a checkpoint name can be saved again
     if (uri, version) not in self.names:
       name = f"c{len(self.names)}"
       await self.engine.load(name, path)
