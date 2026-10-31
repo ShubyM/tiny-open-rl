@@ -10,7 +10,6 @@ A full fine-tune's sampler weights change in few bf16 values a step, so its save
 from __future__ import annotations
 
 import concurrent.futures
-import contextlib
 import glob
 import hashlib
 import json
@@ -111,12 +110,14 @@ class Store:
   def __init__(self, root: str | None = None, cache: str | None = None):
     self.root = (CKPT if root is None else root).rstrip("/")
     self.remote = "://" in self.root
-    self.fs, self.base = fsspec.core.url_to_fs(self.root, auto_mkdir=True)  # a file:// URL makes folders as it writes
+    # a file:// URL makes folders as it writes. No listings cache: other nodes write the bucket, so exists() and glob() must look
+    self.fs, self.base = fsspec.core.url_to_fs(self.root, auto_mkdir=True, use_listings_cache=False)
     if not self.remote:
       self.base = os.path.realpath(self.base)
     self.cache = CKPT_CACHE if cache is None else cache
     self.pinned: torch.Tensor | None = None  # reused by every save, since pinning host memory is slow
     self.lock = threading.RLock()  # a save's tensors can be views of self.pinned until it is written
+    self.uploading = threading.Lock()
     self.versions: dict[str, str] = {}  # uri -> the version this process last saved
     self.chains: dict[str, str] = {}  # run -> the last link of its chain this process saved
 
@@ -228,7 +229,7 @@ class Store:
     finally:
       if folder:
         shutil.rmtree(folder, ignore_errors=True)
-      with contextlib.suppress(FileNotFoundError):
+      if os.path.lexists(link):  # left only if the swap failed
         os.unlink(link)
     return dest
 
@@ -241,12 +242,11 @@ class Store:
     os.replace(tmp, f"{self.cache}/latest/{hashlib.sha256(uri.encode()).hexdigest()[:32]}")
 
   def latest_version_here(self, uri: str) -> str | None:
-    with (
-      contextlib.suppress(FileNotFoundError),
-      open(f"{self.cache}/latest/{hashlib.sha256(uri.encode()).hexdigest()[:32]}") as f,
-    ):
+    pointer = f"{self.cache}/latest/{hashlib.sha256(uri.encode()).hexdigest()[:32]}"
+    if not os.path.exists(pointer):  # nothing saved on this node yet
+      return None
+    with open(pointer) as f:
       return f.read()
-    return None
 
   def upload_version(self, dest: str, version: str, names: list[str]) -> None:
     folder, rel = f"{self.cache}/{version}", dest[len(self.base) + 1 :]
@@ -255,8 +255,9 @@ class Store:
     if k:  # a link of the run's chain
       info["dir"], parent = f"{rel.split('/')[0]}/_versions/{version}", f"{self.cache}/{k}.{int(n) - 1}"
       first = ""  # the newest link before it that went up whole, if the one before it went up
-      with contextlib.suppress(FileNotFoundError), open(f"{parent}.uploaded") as f:
-        first = f.read()
+      if os.path.exists(f"{parent}.uploaded"):
+        with open(f"{parent}.uploaded") as f:
+          first = f.read()
       xor = int(n) and first and self.write_changed_bytes(parent, folder, names, f"{folder}.xor")
       if xor:
         files = [f"{folder}.xor/{x}" for x in xor] + [f for f in files if not f.endswith(".safetensors")]
@@ -265,15 +266,13 @@ class Store:
       parallel(lambda f: self.fs.put_file(f, f"{self.base}/{info['dir']}/{os.path.basename(f)}"), files)
     finally:
       shutil.rmtree(f"{folder}.xor", ignore_errors=True)
-    old = {}
-    with contextlib.suppress(FileNotFoundError):
-      old = json.loads(self.fs.cat_file(f"{dest}/_latest"))
+    old = json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
     self.fs.pipe_file(f"{dest}/_latest", json.dumps(info).encode())
     # a link stays until delete_unused_chain_links(), since other checkpoints may build on it
     if "." not in old.get("version", "."):
       stale = [f"{self.base}/{old['dir']}"] if old.get("dir") else [f"{dest}/{n}" for n in old.get("files", [])]
       for path in stale:  # the version before, which readers that started on it may still be downloading
-        with contextlib.suppress(FileNotFoundError):
+        if self.fs.exists(path):
           self.fs.rm(path, recursive=True)
     with open(f"{folder}.uploaded", "w") as f:  # beside the folder, so engines that list it never see it
       f.write(info.get("from", ""))
@@ -283,10 +282,9 @@ class Store:
     import safetensors.numpy
 
     shards = [n for n in names if n.endswith(".safetensors")]
-    try:
-      files = [(raw(f"{parent}/{n}"), raw(f"{folder}/{n}")) for n in shards]
-    except FileNotFoundError:
+    if not all(os.path.exists(f"{parent}/{n}") for n in shards):  # trimmed from this node's cache
       return None
+    files = [(raw(f"{parent}/{n}"), raw(f"{folder}/{n}")) for n in shards]
     if any(layout(was) != layout(head) or len(old) != len(new) for (was, old), (head, new) in files):
       return None
     jobs = [(i, s) for i, (_, (_, new)) in enumerate(files) for s in chunks(len(new), XOR_CHUNK)]
@@ -304,17 +302,14 @@ class Store:
 
   def upload_pending_saves(self) -> None:
     """Upload this node's saves in the order they were made. The first that fails stops the rest, so a checkpoint's _latest never goes back to an older version, and the next flush tries it again."""
-    found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
-    for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
-      version = e.name.removesuffix(".upload")
-      try:
+    with self.uploading:  # the node daemon's last call at shutdown waits for the one running behind
+      found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
+      for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
+        version = e.name.removesuffix(".upload")
         with open(e.path) as f:
           job = json.load(f)
-      except FileNotFoundError:  # another flush took it
-        continue
-      if os.path.isdir(f"{self.cache}/{version}"):
-        self.upload_version(self.path(job["uri"]), version, job["names"])
-      with contextlib.suppress(FileNotFoundError):
+        if os.path.isdir(f"{self.cache}/{version}"):
+          self.upload_version(self.path(job["uri"]), version, job["names"])
         os.unlink(e.path)
 
   # ***** get *****
@@ -323,9 +318,7 @@ class Store:
     """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again. With a version, from a store on another node, it waits for that version to land."""
     dest = self.path(uri)
     if not self.remote:
-      real = dest
-      with contextlib.suppress(OSError):
-        real = os.path.join(os.path.dirname(dest), os.readlink(dest))
+      real = os.path.join(os.path.dirname(dest), os.readlink(dest)) if os.path.islink(dest) else dest
       if not os.path.isdir(real):
         raise ValueError(f"no checkpoint at {uri}")
       with os.scandir(real) as it:
@@ -340,10 +333,7 @@ class Store:
       return f"{self.cache}/{want}", want
     deadline = time.time() + UPLOAD_WAIT_S
     while True:
-      try:
-        info = json.loads(self.fs.cat_file(f"{dest}/_latest"))
-      except FileNotFoundError:
-        info = {}
+      info = json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
       if not version or info.get("version") == version:
         break
       if time.time() > deadline:
@@ -417,7 +407,7 @@ class Store:
 
   def weight_files(self, uri: str, version: str | None = None) -> list[str]:
     folder = self.local_folder(uri, version)[0]
-    with contextlib.suppress(OSError):
+    if os.path.islink(folder):
       folder = os.path.join(os.path.dirname(folder), os.readlink(folder))
     return sorted(glob.glob(f"{folder}/*.safetensors"))
 
@@ -440,7 +430,7 @@ class Store:
     """Delete a checkpoint and every version of it this store kept."""
     dest = self.path(uri)
     if self.remote:
-      with contextlib.suppress(FileNotFoundError):
+      if self.fs.exists(dest):
         self.fs.rm(dest, recursive=True)
       return
     parent, base = os.path.split(dest)
