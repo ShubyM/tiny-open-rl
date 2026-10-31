@@ -157,6 +157,19 @@ class TestBus(RedisTest):
     self.assertEqual(session["runs"], [run_id])
     self.assertIsNone(await self.bus.session_info("nope"))
 
+  async def test_a_session_is_ended_again_until_its_training_runs_are_gone(self):
+    await self.bus.session("s")
+    run_id = await self.new_run(session="s")
+    await self.bus.end("s")
+    self.assertEqual(len(await self.bus.r.xrange(key("q", run_id))), 1)  # its delete, queued
+    self.assertIsNotNone(await self.bus.r.zscore(key("seen"), "s"))  # and the session looked at again later
+    await self.bus.r.xtrim(key("q", run_id), maxlen=0)  # a trainer took the delete and died
+    await self.bus.end("s")
+    self.assertEqual(len(await self.bus.r.xrange(key("q", run_id))), 1)
+    await self.bus.drop(run_id, "p")
+    await self.bus.end("s")
+    self.assertIsNone(await self.bus.r.zscore(key("seen"), "s"))
+
   async def test_stats_and_workers_cleanup(self):
     run_unassigned = new_id()
     await self.bus.create(Run(id=run_unassigned, worker="", base="base", rank=1))

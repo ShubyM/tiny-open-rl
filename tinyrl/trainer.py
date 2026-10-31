@@ -543,6 +543,8 @@ class Trainer:
         await self.bus.forget(uri)  # the node daemons' sweeps delete it
 
   async def answer(self, cmd: Cmd) -> Reply:
+    if cmd.op == Op.DELETE_MODEL and cmd.run not in self.model.params:  # nothing here to free, and its state not needed
+      return ok({"type": cmd.op, "model_id": cmd.run})
     try:
       if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
         await self.recover(cmd)
