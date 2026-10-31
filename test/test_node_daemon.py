@@ -173,9 +173,9 @@ class TestNodeDaemon(RedisTest):
     for name in ("before", "kept", "deleted", "young"):
       store.put(f"tinker://r/weights/{name}", {"w": torch.ones(2)})
     os.utime(store.path("tinker://r/weights/before"), (old - 3600, old - 3600), follow_symlinks=False)
-    await self.bus.saved("tinker://r/weights/kept", 8)  # the registry starts here
-    await self.bus.saved("tinker://r/weights/deleted", 8)
-    await self.bus.forget("tinker://r/weights/deleted")
+    await self.registry.saved("tinker://r/weights/kept", 8)  # the registry starts here
+    await self.registry.saved("tinker://r/weights/deleted", 8)
+    await self.registry.forget("tinker://r/weights/deleted")
     await self.bus.r.set("tinyrl:ckpt_since", old - 1800)
     for name in ("kept", "deleted"):
       os.utime(store.path(f"tinker://r/weights/{name}"), (old, old), follow_symlinks=False)
@@ -199,7 +199,7 @@ class TestNodeDaemon(RedisTest):
       )
       v.append(store.versions[f"tinker://r/sampler_weights/{step}"])
     store.flush()
-    await self.bus.saved("tinker://r/sampler_weights/1", 128, version=v[1])
+    await self.registry.saved("tinker://r/sampler_weights/1", 128, version=v[1])
     await self.bus.r.set("tinyrl:ckpt_since", 0)
     with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
       await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep()

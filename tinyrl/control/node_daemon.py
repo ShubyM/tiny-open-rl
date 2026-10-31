@@ -20,6 +20,7 @@ import time
 from tinyrl.bus import Bus
 from tinyrl.control import scheduler
 from tinyrl.helpers import getenv
+from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 
 GPUS = getenv("GPUS", 1)
@@ -61,6 +62,7 @@ class NodeDaemon:
     self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None, store: Store | None = None
   ):
     self.bus = bus
+    self.registry = Registry(bus)
     self.store = store if store is not None else Store()
     self.swept = 0.0
     self.uploading: asyncio.Task | None = None
@@ -107,14 +109,14 @@ class NodeDaemon:
   async def sweep(self) -> None:
     """Delete the checkpoints in this node's store that the registry doesn't have: deleted, expired, or their run's. Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before. Then the links of full sampler weight chains no registered checkpoint is built from. It also keeps the node's cache of a bucket store under CKPT_CACHE_BYTES."""
     await asyncio.to_thread(self.store.trim)
-    if (since := await self.bus.registry_since()) is None:
+    if (since := await self.registry.registry_since()) is None:
       return
     for uri in await asyncio.to_thread(self.store.stored):
-      if await self.bus.checkpoint(uri) is None:
+      if await self.registry.checkpoint(uri) is None:
         saved = await asyncio.to_thread(self.store.saved_at, uri)
         if since < saved < time.time() - SWEEP_GRACE_S:
           await asyncio.to_thread(self.store.delete, uri)
-    await asyncio.to_thread(self.store.collect, await self.bus.versions(), since, time.time() - SWEEP_GRACE_S)
+    await asyncio.to_thread(self.store.collect, await self.registry.versions(), since, time.time() - SWEEP_GRACE_S)
 
   def start(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
     """Start a worker's process on its GPUs, with the settings for its kind. This node's environment wins."""

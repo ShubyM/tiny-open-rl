@@ -25,6 +25,7 @@ from tinyrl.api import wire
 from tinyrl.bus import LEASE_MS, Bus, Reply
 from tinyrl.control.turns import IDLE_MS, GpuTurn
 from tinyrl.helpers import getenv
+from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 
 STRANDED_MS = 5000
@@ -96,6 +97,7 @@ class Sampler:
   ):
     module, name = ENGINE.split(":")
     self.bus = bus
+    self.registry = Registry(bus)
     self.worker = worker
     self.engine_type = engine or getattr(importlib.import_module(module), name)
     self.engine: Engine | None = None  # started by the first command, which says which base model
@@ -225,7 +227,7 @@ class Sampler:
     """The engine's name for a checkpoint, which the engine loads unless it already holds it."""
     if not uri:
       return None
-    saved = (await self.bus.checkpoint(uri) or {}).get("version")  # another node's may still be uploading
+    saved = (await self.registry.checkpoint(uri) or {}).get("version")  # another node's may still be uploading
     path, version = await asyncio.to_thread(self.store.local, uri, saved)  # a checkpoint name can be saved again
     if (uri, version) not in self.names:
       name = f"c{len(self.names)}"

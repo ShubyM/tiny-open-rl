@@ -1,6 +1,6 @@
 """Estimates memory needs per engine and GPU width before placement, ensuring admissibility.
 
-Activations are left to the dynamic token_budget in trainer.py. No static reserve is added here.
+Activations are left to the dynamic token_budget in model.py. No static reserve is added here.
 """
 
 import re

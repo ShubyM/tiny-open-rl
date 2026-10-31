@@ -19,6 +19,7 @@ from tinyrl.api import wire
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
 from tinyrl.control.turns import IDLE_MS, GpuTurn
 from tinyrl.helpers import DEBUG, getenv
+from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store, nbytes
 from tinyrl.workers.model import Model
 
@@ -59,6 +60,7 @@ def enqueue_cmds(queue: collections.deque[Cmd], cmds: list[Cmd], lora: bool) -> 
 class Trainer:
   def __init__(self, bus: Bus, worker: str, model: Model | None = None, owner: str = "", store: Store | None = None):
     self.bus = bus
+    self.registry = Registry(bus)
     self.worker = worker
     self.model = model if model is not None else Model()
     self.store = store if store is not None else Store()
@@ -121,7 +123,9 @@ class Trainer:
     for run in list(self.model.params):
       uri, (tensors, meta) = f"tinker://{run}/parked/{time.time_ns()}", self.model.state(run)
       await asyncio.to_thread(self.store.put, uri, tensors, meta)
-      await self.bus.saved(uri, sum(map(nbytes, tensors.values())), owned=True, version=self.store.versions.get(uri))
+      await self.registry.saved(
+        uri, sum(map(nbytes, tensors.values())), owned=True, version=self.store.versions.get(uri)
+      )
       await self.bus.park(run, uri, self.worker, self.owner)
 
   async def recover(self, cmd: Cmd) -> None:
@@ -134,11 +138,11 @@ class Trainer:
       )
     await asyncio.to_thread(self.model.create, cmd.run, run["base"], run["rank"], run.get("lora", {}))
     if uri:
-      version = (await self.bus.checkpoint(uri) or {}).get("version")
+      version = (await self.registry.checkpoint(uri) or {}).get("version")
       tensors, meta = await asyncio.to_thread(self.store.get, uri, version)
       await asyncio.to_thread(self.model.restore, cmd.run, tensors, meta, True)
       if await self.bus.park(cmd.run, None, self.worker, self.owner):
-        await self.bus.forget(uri)  # the node daemons' sweeps delete it
+        await self.registry.forget(uri)  # the node daemons' sweeps delete it
 
   async def answer(self, cmd: Cmd) -> Reply:
     if cmd.op == Op.DELETE_MODEL and cmd.run not in self.model.params:  # nothing here to free, and its state not needed
@@ -150,13 +154,13 @@ class Trainer:
       return fail(e)
     if cmd.op == Op.LOAD_WEIGHTS:  # the version saved last, which may be another node's, still uploading
       uri = json.loads(cmd.body)["uri"]
-      self.wanted[cmd.request_id] = (await self.bus.checkpoint(uri) or {}).get("version")
+      self.wanted[cmd.request_id] = (await self.registry.checkpoint(uri) or {}).get("version")
     reply = await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
     if reply.ok and cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):  # registered before the reply lands
       args = json.loads(cmd.body)
       size = self.sizes.pop(cmd.request_id)
       version = self.store.versions.get(args["uri"])
-      await self.bus.saved(args["uri"], size, args.get("ttl_seconds"), args.get("owned", False), version)
+      await self.registry.saved(args["uri"], size, args.get("ttl_seconds"), args.get("owned", False), version)
     return reply
 
   async def fail_stranded(self, min_idle_ms: int) -> None:
@@ -193,7 +197,7 @@ class Trainer:
 
         if cmd.op == Op.DELETE_MODEL and reply.ok:
           await self.bus.drop(cmd.run, self.worker)
-          await self.bus.forget(*await self.bus.owned(cmd.run))
+          await self.registry.forget(*await self.registry.owned(cmd.run))
           self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
 
         if DEBUG:

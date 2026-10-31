@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from tinyrl.bus import Bus, Event, key
 from tinyrl.helpers import getenv
+from tinyrl.storage.registry import Registry
 
 # ***** workers *****
 
@@ -332,7 +333,7 @@ BATCH = 10_000  # entries read at once. It decides only once a read comes back s
 
 
 async def run(bus: Bus, quantum: float = QUANTUM) -> None:
-  state, after = State(quantum=quantum), "0-0"
+  state, after, registry = State(quantum=quantum), "0-0", Registry(bus)
   while True:
     if await bus.log_size() < state.n:  # the log shrank, so Redis was flushed
       state, after = State(quantum=quantum), "0-0"
@@ -348,7 +349,9 @@ async def run(bus: Bus, quantum: float = QUANTUM) -> None:
       continue  # decide once they are folded, so nothing is placed on them
     for session in await bus.expired():  # their clients stopped heartbeating
       await bus.end(session)
-    await bus.forget(*await bus.due())  # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
+    await registry.forget(
+      *await registry.due()
+    )  # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
     for decision, body in decide(state, time.time()):  # folded when it is read back on the next pass
       if decision == "assigned":
         await bus.assign(body["run"], body["worker"])

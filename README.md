@@ -103,15 +103,21 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/storage/store.p
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/workers/sampler.py](tinyrl/workers/sampler.py) | 164 | sampling workers, through an engine that knows nothing of Redis |
-| [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | 102 | the vLLM engine: `vllm serve` over HTTP |
-| [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | 429 | the losses, token budget batching, the model, and the trainer loop |
-| [tinyrl/bus.py](tinyrl/bus.py) | 291 | runs, sessions, commands and replies on Redis |
-| [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | 270 | the Tinker HTTP API |
-| [tinyrl/api/wire.py](tinyrl/api/wire.py) | 155 | the Tinker protobuf, to numpy and back |
-| [tinyrl/storage/store.py](tinyrl/storage/store.py) | 70 | `safetensors` checkpoint store behind `put(uri)` and `get(uri)` |
-| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | 69 | places workers on node daemons, and runs the ones placed on this one |
+| [tinyrl/bus.py](tinyrl/bus.py) | 321 | runs, sessions, commands, replies, leases and the event log on Redis |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
+| [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | 303 | the Tinker HTTP API |
+| [tinyrl/api/wire.py](tinyrl/api/wire.py) | 155 | the Tinker protobuf, to numpy and back |
+| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | 258 | folds the event log, places workers on nodes and grants GPU turns |
+| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | 127 | runs the workers placed on its node, uploads its saves and sweeps its checkpoints |
+| [tinyrl/control/turns.py](tinyrl/control/turns.py) | 43 | a worker's side of taking turns on a GPU |
+| [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | 35 | how much GPU memory a worker needs |
+| [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | 221 | the trainer loop: commands in, replies out |
+| [tinyrl/workers/model.py](tinyrl/workers/model.py) | 307 | the losses, token budget batching, and the model a trainer serves |
+| [tinyrl/workers/sampler.py](tinyrl/workers/sampler.py) | 215 | sampling workers, through an engine that knows nothing of Redis |
+| [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | 151 | the vLLM engine: `vllm serve` over HTTP |
+| [tinyrl/storage/store.py](tinyrl/storage/store.py) | 395 | `safetensors` checkpoints behind `put(uri)` and `get(uri)`, on a folder or a bucket |
+| [tinyrl/storage/registry.py](tinyrl/storage/registry.py) | 69 | the checkpoints the store holds, their owners, TTLs and versions |
+| [tinyrl/storage/models.py](tinyrl/storage/models.py) | 55 | base models from the hub, a bucket or a folder |
 
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `KEYFRAME_EVERY`, `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free

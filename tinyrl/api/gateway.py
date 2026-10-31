@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from tinyrl.api import wire
 from tinyrl.bus import Bus, Op, Run, key
 from tinyrl.helpers import getenv
+from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
@@ -99,6 +100,7 @@ def checkpoint_uri(run: str, kind: str, name: str) -> str:
 
 def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   bus = bus if bus is not None else Bus()
+  registry = Registry(bus)
   store = store if store is not None else Store()
   api = FastAPI(title="tiny-open-rl")
 
@@ -348,11 +350,11 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.get("/api/v1/training_runs/{run}/checkpoints")
   async def list_checkpoints(run: str):
-    return {"checkpoints": [public(c) for c in await bus.checkpoints(run)]}
+    return {"checkpoints": [public(c) for c in await registry.checkpoints(run)]}
 
   @api.get("/api/v1/checkpoints")
   async def list_user_checkpoints(limit: int = 100, offset: int = 0):
-    found, total = await bus.every_checkpoint(limit, offset)
+    found, total = await registry.every_checkpoint(limit, offset)
     return {
       "checkpoints": [public(c) for c in found],
       "cursor": {"offset": offset, "limit": limit, "total_count": total},
@@ -360,12 +362,12 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.delete("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}")
   async def delete_checkpoint(run: str, checkpoint_id: str):
-    if not await bus.forget(f"tinker://{run}/{checkpoint_id}"):  # its files go with the next sweep
+    if not await registry.forget(f"tinker://{run}/{checkpoint_id}"):  # its files go with the next sweep
       raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
 
   @api.put("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}/ttl")
   async def set_checkpoint_ttl(run: str, checkpoint_id: str, req: TTLRequest):
-    if not await bus.set_ttl(f"tinker://{run}/{checkpoint_id}", ttl(req.ttl_seconds)):
+    if not await registry.set_ttl(f"tinker://{run}/{checkpoint_id}", ttl(req.ttl_seconds)):
       raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
 
   # ***** inspection *****

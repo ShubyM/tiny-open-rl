@@ -171,7 +171,7 @@ class TestAPI(RedisTest):
     final = f"/api/v1/training_runs/{run_id}/checkpoints/weights/final"
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": 60})).status_code, 400)
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": None})).status_code, 200)
-    self.assertEqual(await self.bus.due(), [])
+    self.assertEqual(await self.registry.due(), [])
     self.assertEqual((await self.http.delete(final)).status_code, 200)
     self.assertEqual((await self.http.delete(final)).status_code, 404)
 
@@ -180,14 +180,14 @@ class TestAPI(RedisTest):
     self.assertEqual((await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"], [])
 
   async def test_a_checkpoint_leaves_the_registry_when_its_ttl_runs_out(self):
-    await self.bus.saved("tinker://r/weights/soon", 10, ttl=0.2)
-    await self.bus.saved("tinker://r/weights/later", 10, ttl=3600)
+    await self.registry.saved("tinker://r/weights/soon", 10, ttl=0.2)
+    await self.registry.saved("tinker://r/weights/later", 10, ttl=3600)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     for _ in range(100):
-      if await self.bus.checkpoint("tinker://r/weights/soon") is None:
+      if await self.registry.checkpoint("tinker://r/weights/soon") is None:
         break
       await asyncio.sleep(0.05)
-    self.assertEqual([c["checkpoint_id"] for c in await self.bus.checkpoints("r")], ["weights/later"])
+    self.assertEqual([c["checkpoint_id"] for c in await self.registry.checkpoints("r")], ["weights/later"])
 
   async def test_errors(self):
     run_id = await self.create_model()
