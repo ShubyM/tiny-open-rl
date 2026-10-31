@@ -4,10 +4,7 @@
   gs://bucket/models/qwen3, s3://..., any fsspec URL   a folder holding config.json and *.safetensors
   /mnt/models/qwen3 or file:///mnt/models/qwen3   a folder on every node
 
-local(ref) turns one into something transformers and vLLM can load, fetching a URL once per node into MODEL_CACHE.
-A reference names fixed weights: publish new weights under a new path. With MODEL_MIRROR set, a hub model is read
-from MODEL_MIRROR/<org>/<name> when it's there, so nodes need no internet. `python -m tinyrl.models mirror <id>` puts it
-there.
+local(ref) turns one into something transformers and vLLM can load, fetching a URL once per node into MODEL_CACHE. A reference names fixed weights: publish new weights under a new path. With MODEL_MIRROR set, a hub model is read from MODEL_MIRROR/<org>/<name> when it's there, so nodes need no internet. `python -m tinyrl.models mirror <id>` puts it there.
 """
 
 from __future__ import annotations
