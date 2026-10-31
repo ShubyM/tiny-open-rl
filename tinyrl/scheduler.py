@@ -67,6 +67,7 @@ QUANTUM = getenv("QUANTUM", 30.0)  # seconds a busy holder keeps its GPUs while 
 
 RULES = {
   "place.least_loaded_node": "a worker with runs goes to the node with the fewest workers per GPU, on choose's GPU",
+  "place.near_its_trainer": "a full fine-tune's sampler goes to its trainer's node, where its weights are saved",
   "place.moved_aside": "a trainer moves to take turns with other trainers, so a sampler or exclusive worker gets a GPU",
   "place.emptied": "a worker with no runs is unplaced, which stops its process",
   "turn.granted": "a worker that asked gets its GPUs once it is first in line on each and fits next to their holders",
@@ -90,6 +91,7 @@ class Kind:
 class Run:
   kind: Kind
   worker: str = ""
+  train_run: str | None = None  # the training run a sampling session samples
 
 
 @dataclass
@@ -171,7 +173,7 @@ def fold(state: State, e: Event) -> State:
         exclusive,
         exclusive and b.get("train_run") or None,
       )
-      s.runs[b["run"]] = Run(k)
+      s.runs[b["run"]] = Run(k, train_run=b.get("train_run"))
       if b.get("worker"):  # created in a worker already, as tests do
         join(s, b["run"], b["worker"])
     case "assigned" if b["run"] in s.runs:
@@ -260,7 +262,10 @@ def place(s: State, name: str) -> dict:
   """Where a worker goes: the node with the fewest workers per GPU, and the GPU choose picks there. When trainers have
   to move out of the way first, the decision is the move of one of them, and the worker goes once its GPU is clear."""
   load = {n: sum(w.node == n for w in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items()}
-  node = min(sorted(load), key=load.get)
+  me, trainers = s.workers[name], [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
+  near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
+  near = near if me.kind.role == "sampler" and not me.kind.lora else set()  # a LoRA adapter is small to fetch
+  node = min(sorted(load), key=lambda n: (n not in near, load[n]))
   gpu, why, aside = choose(s, node, name)
   if aside:
     to, to_why, _ = choose(s, node, aside[0], avoid=gpu)
@@ -272,7 +277,8 @@ def place(s: State, name: str) -> dict:
       "rule": "place.moved_aside",
       "gpu_rule": to_why,
     }
-  return {"worker": name, "node": node, "gpus": [gpu], "rule": "place.least_loaded_node", "gpu_rule": why}
+  rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
+  return {"worker": name, "node": node, "gpus": [gpu], "rule": rule, "gpu_rule": why}
 
 
 def takes_turns(w: Worker) -> bool:
