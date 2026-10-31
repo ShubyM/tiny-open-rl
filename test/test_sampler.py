@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -10,13 +11,13 @@ import safetensors.torch
 import torch
 
 from test.helpers import FakeEngine, RedisTest, tiny
-from tinyrl import wire
+from tinyrl.api import wire
+from tinyrl.api.gateway import app
 from tinyrl.bus import Op, Run
-from tinyrl.gateway import app
-from tinyrl.sampler import Out, Sampler, Seq, encode
-from tinyrl.store import Store
-from tinyrl.trainer import Trainer
-from tinyrl.vllm import VLLM
+from tinyrl.storage.store import Store
+from tinyrl.workers.sampler import Out, Sampler, Seq, encode
+from tinyrl.workers.trainer import Trainer
+from tinyrl.workers.vllm import VLLM
 
 JOB = {
   "prompt": [1, 2, 3],
@@ -69,11 +70,11 @@ class TestSampler(RedisTest):
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://vllm")
     full = VLLM("http://vllm", "base", lora=False, client=client)
-    await full.load("c0", "/ckpt/w")
-    await full.load("c0", "/ckpt/w")  # already in place
+    await full.load_checkpoint("c0", "/ckpt/w")
+    await full.load_checkpoint("c0", "/ckpt/w")  # already in place
     engine = VLLM("http://vllm", "base", lora=True, client=client)
-    await engine.load("c0", "/ckpt/a")
-    await engine.load("c0", "/ckpt/a")
+    await engine.load_checkpoint("c0", "/ckpt/a")
+    await engine.load_checkpoint("c0", "/ckpt/a")
     await engine.sleep()
     await engine.wake()
     paths = [path for path, _ in calls]
@@ -101,7 +102,7 @@ class TestSampler(RedisTest):
         "request_id"
       ]
       await trainer.step(block_ms=0)
-      return json.loads((await self.bus.result(request_id, 1)).body)["sampling_session_id"]
+      return json.loads((await self.bus.wait_for_reply(request_id, 1)).body)["sampling_session_id"]
 
     run = (await call("create_model", {"base_model": base, "lora_config": {"rank": 4}}))["model_id"]
     trainer = Trainer(self.bus, await self.worker(run), store=store)
@@ -126,9 +127,8 @@ class TestSampler(RedisTest):
     self.assertEqual(replies[0]["prompt_logprobs"], [None, -1.0, -1.0])
 
     request_id = (await call("asample", {"base_model": base, "prompt": tokens([1, 2])}))["request_id"]
-    self.assertEqual(
-      await self.worker(request_id.split("/")[0]), sampler.worker
-    )  # base sampling joins the same sampler
+    # base sampling joins the same sampler
+    self.assertEqual(await self.worker(request_id.split("/")[0]), sampler.worker)
     await sampler.step(block_ms=0)
     self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
     calls = sampler.engine.calls
@@ -157,21 +157,21 @@ class TestSampler(RedisTest):
     self.assertIn(("load", "c0", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.engine.calls)
     await client.aclose()
 
-  @patch("tinyrl.trainer.GPU", "node-a:0")
-  @patch("tinyrl.sampler.GPU", "node-a:0")
+  @patch("tinyrl.workers.trainer.GPU", "node-a:0")
+  @patch("tinyrl.workers.sampler.GPU", "node-a:0")
   async def test_a_trainer_and_a_sampler_take_turns_on_one_gpu(self):
     await self.run_scheduler({"t1": [0], "sampler:base": [0]})
     await self.take_turns()
 
-  @patch("tinyrl.trainer.GPU", "node-a:1")
-  @patch("tinyrl.sampler.GPU", "node-a:0,node-a:1")
+  @patch("tinyrl.workers.trainer.GPU", "node-a:1")
+  @patch("tinyrl.workers.sampler.GPU", "node-a:0,node-a:1")
   async def test_a_tensor_parallel_sampler_takes_turns_on_both_its_gpus(self):
     await self.run_scheduler({"t1": [1], "sampler:base": [0, 1]})
     await self.take_turns()
 
   async def take_turns(self):
-    await self.bus.create(Run("t1", "t1", "base", 0))
-    await self.bus.create(Run("samp-1", "sampler:base", "base", 1))
+    await self.bus.create_run(Run("t1", "t1", "base", 0))
+    await self.bus.create_run(Run("samp-1", "sampler:base", "base", 1))
     model = MagicMock()
     model.optim_step.return_value = {"grad_norm:mean": 0.5}
     model.params = {"t1": {}}  # the trainer holds run t1
@@ -185,7 +185,7 @@ class TestSampler(RedisTest):
         ("samp-1", Op.SAMPLE, JOB),
         ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
       ]:
-        reply = await self.bus.result(await self.bus.submit(run, op, json.dumps(body).encode()), 5)
+        reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, json.dumps(body).encode()), 5)
         self.assertTrue(reply.ok, reply.body)
       self.assertIn(("sleep",), sampler.engine.calls)
     finally:
@@ -196,7 +196,7 @@ class TestSampler(RedisTest):
   async def test_a_sampler_batches_queued_commands_concurrently_and_loads_once(self):
     store = Store(tempfile.mkdtemp())
     store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
-    await self.bus.create(Run("samp-1", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+    await self.bus.create_run(Run("samp-1", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
     active = peak = starts = loads = 0
 
     class BatchEngine(FakeEngine):
@@ -207,12 +207,12 @@ class TestSampler(RedisTest):
         starts += 1
         return await super().start(base, lora)
 
-      async def load(self, name: str, path: str) -> None:
+      async def load_checkpoint(self, name: str, path: str) -> None:
         nonlocal loads
         await asyncio.sleep(0.01)
         if ("load", name, path) not in self.calls:
           loads += 1
-        await super().load(name, path)
+        await super().load_checkpoint(name, path)
 
       async def sample(self, job: dict, name: str | None) -> Out:
         nonlocal active, peak
@@ -224,15 +224,15 @@ class TestSampler(RedisTest):
 
     sampler = Sampler(self.bus, "sampler:base", engine=BatchEngine, store=store)
     await self.own(sampler)
-    ids = [await self.bus.submit("samp-1", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(8)]
+    ids = [await self.bus.submit_command("samp-1", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(8)]
     self.assertEqual(await sampler.step(block_ms=0), 8)
     self.assertEqual((starts, loads, peak), (1, 1, 8))
-    self.assertTrue(all([(await self.bus.result(i, 1)).ok for i in ids]))
+    self.assertTrue(all([(await self.bus.wait_for_reply(i, 1)).ok for i in ids]))
 
   async def test_vllm_retries_a_dropped_keepalive_socket(self):
     import httpx
 
-    from tinyrl.vllm import VLLM
+    from tinyrl.workers.vllm import VLLM
 
     calls = 0
 
@@ -264,22 +264,22 @@ class TestSampler(RedisTest):
     self.assertEqual(calls, 2)
     self.assertEqual(out.seqs[0].tokens, [9])
 
-  @patch("tinyrl.vllm.subprocess.Popen")
-  @patch("tinyrl.vllm.httpx.AsyncClient.get")
+  @patch("tinyrl.workers.vllm.subprocess.Popen")
+  @patch("tinyrl.workers.vllm.httpx.AsyncClient.get")
   async def test_vllm_start_compilation_config(self, mock_get, mock_popen):
     mock_popen.return_value.poll.return_value = None
     mock_get.return_value.is_success = True
 
-    from tinyrl.vllm import CUDAGRAPH_CONFIG, VLLM
+    from tinyrl.workers.vllm import CUDAGRAPH_CONFIG, VLLM
 
-    with patch("tinyrl.vllm.VLLM_ARGS", ""):
+    with patch("tinyrl.workers.vllm.VLLM_ARGS", ""):
       await (await VLLM.start("base", False)).http.aclose()
       args = mock_popen.call_args[0][0]
       self.assertIn("--compilation-config", args)
       idx = args.index("--compilation-config")
       self.assertEqual(args[idx + 1], CUDAGRAPH_CONFIG)
 
-    with patch("tinyrl.vllm.VLLM_ARGS", "--compilation-config '{}'"):
+    with patch("tinyrl.workers.vllm.VLLM_ARGS", "--compilation-config '{}'"):
       await (await VLLM.start("base", False)).http.aclose()
       args = mock_popen.call_args[0][0]
       self.assertIn("--compilation-config", args)
@@ -313,22 +313,22 @@ class TestSampler(RedisTest):
       {"w": torch.ones(1)}, f"{dir3}/model.safetensors", metadata={"meta": json.dumps({"untouched": False})}
     )
 
-    await full.load("c0", dir1)
+    await full.load_checkpoint("c0", dir1)
     self.assertEqual(calls, [])
 
-    await full.load("c1", dir2)
+    await full.load_checkpoint("c1", dir2)
     self.assertEqual(calls, [])
 
-    await full.load("c2", dir3)
+    await full.load_checkpoint("c2", dir3)
     self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache"])
 
-    await full.load("c0", dir1)
+    await full.load_checkpoint("c0", dir1)
     self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache", "/collective_rpc", "/reset_prefix_cache"])
 
   async def test_a_sampler_takes_the_commands_that_arrive_while_its_engine_boots(self):
     store = Store(tempfile.mkdtemp())
     store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
-    await self.bus.create(Run("sess", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+    await self.bus.create_run(Run("sess", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
 
     class SlowStartEngine(FakeEngine):
       @classmethod
@@ -339,12 +339,12 @@ class TestSampler(RedisTest):
     sampler = Sampler(self.bus, "sampler:base", engine=SlowStartEngine, store=store)
     await self.own(sampler)
 
-    await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())
 
     async def push_more():
       await asyncio.sleep(0.01)
-      await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
-      await self.bus.submit("sess", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())
 
     asyncio.create_task(push_more())
 
@@ -355,24 +355,24 @@ class TestSampler(RedisTest):
     store = Store(tempfile.mkdtemp())
     store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": False, "config": {}})
     store.put("tinker://r2/sampler_weights/s0", {}, {"base": "base", "lora": False, "config": {}})
-    await self.bus.create(Run("s1", "sampler:fft:base", "base", 0, model_path="tinker://r1/sampler_weights/s0"))
-    await self.bus.create(Run("s2", "sampler:fft:base", "base", 0, model_path="tinker://r2/sampler_weights/s0"))
+    await self.bus.create_run(Run("s1", "sampler:fft:base", "base", 0, model_path="tinker://r1/sampler_weights/s0"))
+    await self.bus.create_run(Run("s2", "sampler:fft:base", "base", 0, model_path="tinker://r2/sampler_weights/s0"))
 
     loads = []
 
     class RecordEngine(FakeEngine):
-      async def load(self, name: str, path: str) -> None:
+      async def load_checkpoint(self, name: str, path: str) -> None:
         loads.append((name, path))
-        await super().load(name, path)
+        await super().load_checkpoint(name, path)
 
     with patch.dict(os.environ, {"TINYRL_LORA": "0"}):
       sampler = Sampler(self.bus, "sampler:fft:base", engine=RecordEngine, store=store)
     await self.own(sampler)
 
-    await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
-    await self.bus.submit("s2", Op.SAMPLE, json.dumps(JOB).encode())
-    await self.bus.submit("s1", Op.SAMPLE, json.dumps(JOB).encode())
-    await self.bus.submit("s2", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("s2", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command("s2", Op.SAMPLE, json.dumps(JOB).encode())
 
     handled = await sampler.step(block_ms=10)
     self.assertEqual(handled, 4)
@@ -381,7 +381,7 @@ class TestSampler(RedisTest):
     first_sess = "s1" if "/r1/" in loads[0][1] else "s2"
     loads.clear()
 
-    await self.bus.submit(first_sess, Op.SAMPLE, json.dumps(JOB).encode())
+    await self.bus.submit_command(first_sess, Op.SAMPLE, json.dumps(JOB).encode())
     handled = await sampler.step(block_ms=10)
     self.assertEqual(handled, 1)
     self.assertEqual([n for n, _ in loads], ["c0"])
@@ -391,13 +391,13 @@ class TestSampler(RedisTest):
     mock_popen.return_value.poll.return_value = 0
     import os
 
-    from tinyrl.vllm import VLLM
+    from tinyrl.workers.vllm import VLLM
 
     with patch.dict(os.environ, {"TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}):
       with (
-        patch("tinyrl.vllm.VLLM_ARGS", "--gpu-memory-utilization 0.8"),
-        patch("tinyrl.vllm.GPU_MEM", "0.42"),
-        patch("tinyrl.vllm.KV_BYTES", str(16 * 1024**3)),
+        patch("tinyrl.workers.vllm.VLLM_ARGS", "--gpu-memory-utilization 0.8"),
+        patch("tinyrl.workers.vllm.GPU_MEM", "0.42"),
+        patch("tinyrl.workers.vllm.KV_BYTES", str(16 * 1024**3)),
       ):
         with self.assertRaises(RuntimeError):
           await VLLM.start("base", False)
@@ -411,7 +411,10 @@ class TestSampler(RedisTest):
     import os
 
     sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine)
-    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1", "TINYRL_BASE": "base"}), patch("tinyrl.sampler.WARM", 1):
+    with (
+      patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1", "TINYRL_BASE": "base"}),
+      patch("tinyrl.workers.sampler.WARM", 1),
+    ):
       task = asyncio.create_task(sampler.serve())
       try:
         for _ in range(50):
@@ -430,6 +433,18 @@ class TestSampler(RedisTest):
           await VLLM.start("base", False)
         self.assertNotIn("TINYRL_WARM_SAMPLER", mock_popen.call_args[1]["env"])
 
+  async def test_an_engine_that_fails_to_start_early_is_logged_and_the_sampler_keeps_going(self):
+    class Broken(FakeEngine):
+      @classmethod
+      async def start(cls, base: str, lora: bool):
+        raise RuntimeError("no GPU memory")
+
+    sampler = Sampler(self.bus, "sampler:base", engine=Broken)
+    with patch.dict(os.environ, {"TINYRL_BASE": "base"}), patch("sys.stderr", new_callable=io.StringIO) as err:
+      await sampler.warm_engine()
+    self.assertIsNone(sampler.engine)
+    self.assertIn("RuntimeError: no GPU memory", err.getvalue())
+
   def test_sampler_imports_are_clean(self):
     import subprocess
     import sys
@@ -438,7 +453,7 @@ class TestSampler(RedisTest):
       [
         sys.executable,
         "-c",
-        "import sys, tinyrl.sampler, tinyrl.vllm; "
+        "import sys, tinyrl.workers.sampler, tinyrl.workers.vllm; "
         "assert not ({'torch', 'transformers', 'peft', 'safetensors'} & set(sys.modules))",
       ],
       capture_output=True,
@@ -446,22 +461,22 @@ class TestSampler(RedisTest):
     )
     self.assertEqual(out.returncode, 0, out.stderr)
 
-  @patch("tinyrl.vllm.subprocess.Popen")
-  @patch("tinyrl.vllm.httpx.AsyncClient.get")
+  @patch("tinyrl.workers.vllm.subprocess.Popen")
+  @patch("tinyrl.workers.vllm.httpx.AsyncClient.get")
   async def test_vllm_start_kernel_config(self, mock_get, mock_popen):
     mock_popen.return_value.poll.return_value = None
     mock_get.return_value.is_success = True
 
-    from tinyrl.vllm import KERNEL_CONFIG, VLLM
+    from tinyrl.workers.vllm import KERNEL_CONFIG, VLLM
 
-    with patch("tinyrl.vllm.VLLM_ARGS", ""):
+    with patch("tinyrl.workers.vllm.VLLM_ARGS", ""):
       await (await VLLM.start("base", False)).http.aclose()
       args = mock_popen.call_args[0][0]
       self.assertIn("--kernel-config", args)
       idx = args.index("--kernel-config")
       self.assertEqual(args[idx + 1], KERNEL_CONFIG)
 
-    with patch("tinyrl.vllm.VLLM_ARGS", "--kernel-config '{\"enable_flashinfer_autotune\":true}'"):
+    with patch("tinyrl.workers.vllm.VLLM_ARGS", "--kernel-config '{\"enable_flashinfer_autotune\":true}'"):
       await (await VLLM.start("base", False)).http.aclose()
       args = mock_popen.call_args[0][0]
       self.assertIn("--kernel-config", args)

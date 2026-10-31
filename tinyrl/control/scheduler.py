@@ -1,6 +1,6 @@
 """The scheduler: which worker a run joins, where each worker runs, and whose turn it is on each GPU.
 
-The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.scheduler
+The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.control.scheduler
 folds every entry into a State and appends what decide says back to the same log: placed and unplaced, granted and
 revoked. A decision changes the state only once it is folded from the log, so the state is always fold(log), and
 replaying the log rebuilds every state the scheduler saw. Each decision names the rule in RULES that made it. Run
@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from tinyrl.bus import Bus, Event, key
 from tinyrl.helpers import getenv
+from tinyrl.storage.registry import Registry
 
 # ***** workers *****
 
@@ -67,6 +68,7 @@ QUANTUM = getenv("QUANTUM", 30.0)  # seconds a busy holder keeps its GPUs while 
 
 RULES = {
   "place.least_loaded_node": "a worker with runs goes to the node with the fewest workers per GPU, on choose's GPU",
+  "place.near_its_trainer": "a full fine-tune's sampler goes to its trainer's node, where its weights are saved",
   "place.moved_aside": "a trainer moves to take turns with other trainers, so a sampler or exclusive worker gets a GPU",
   "place.emptied": "a worker with no runs is unplaced, which stops its process",
   "turn.granted": "a worker that asked gets its GPUs once it is first in line on each and fits next to their holders",
@@ -90,6 +92,7 @@ class Kind:
 class Run:
   kind: Kind
   worker: str = ""
+  train_run: str | None = None  # the training run a sampling session samples
 
 
 @dataclass
@@ -171,7 +174,7 @@ def fold(state: State, e: Event) -> State:
         exclusive,
         exclusive and b.get("train_run") or None,
       )
-      s.runs[b["run"]] = Run(k)
+      s.runs[b["run"]] = Run(k, train_run=b.get("train_run"))
       if b.get("worker"):  # created in a worker already, as tests do
         join(s, b["run"], b["worker"])
     case "assigned" if b["run"] in s.runs:
@@ -260,7 +263,10 @@ def place(s: State, name: str) -> dict:
   """Where a worker goes: the node with the fewest workers per GPU, and the GPU choose picks there. When trainers have
   to move out of the way first, the decision is the move of one of them, and the worker goes once its GPU is clear."""
   load = {n: sum(w.node == n for w in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items()}
-  node = min(sorted(load), key=load.get)
+  me, trainers = s.workers[name], [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
+  near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
+  near = near if me.kind.role == "sampler" and not me.kind.lora else set()  # a LoRA adapter is small to fetch
+  node = min(sorted(load), key=lambda n: (n not in near, load[n]))
   gpu, why, aside = choose(s, node, name)
   if aside:
     to, to_why, _ = choose(s, node, aside[0], avoid=gpu)
@@ -272,7 +278,8 @@ def place(s: State, name: str) -> dict:
       "rule": "place.moved_aside",
       "gpu_rule": to_why,
     }
-  return {"worker": name, "node": node, "gpus": [gpu], "rule": "place.least_loaded_node", "gpu_rule": why}
+  rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
+  return {"worker": name, "node": node, "gpus": [gpu], "rule": rule, "gpu_rule": why}
 
 
 def takes_turns(w: Worker) -> bool:
@@ -326,27 +333,29 @@ BATCH = 10_000  # entries read at once. It decides only once a read comes back s
 
 
 async def run(bus: Bus, quantum: float = QUANTUM) -> None:
-  state, after = State(quantum=quantum), "0-0"
+  state, after, registry = State(quantum=quantum), "0-0", Registry(bus)
   while True:
-    if await bus.log_size() < state.n:  # the log shrank, so Redis was flushed
+    if await bus.event_log_size() < state.n:  # the log shrank, so Redis was flushed
       state, after = State(quantum=quantum), "0-0"
-    events = await bus.events(after, count=BATCH, block_ms=TICK_MS)
+    events = await bus.read_events(after, count=BATCH, block_ms=TICK_MS)
     for e in events:
       state = fold(state, e)
     after = events[-1].id if events else after
     if len(events) == BATCH:
       continue
-    if lost := sorted(set(state.nodes) - set(await bus.nodes())):  # their heartbeats ran out
+    if lost := sorted(set(state.nodes) - set(await bus.live_nodes())):  # their heartbeats ran out
       for node in lost:
-        await bus.emit("node_lost", node=node)
+        await bus.append_event("node_lost", node=node)
       continue  # decide once they are folded, so nothing is placed on them
-    for session in await bus.expired():  # their clients stopped heartbeating
-      await bus.end(session)
+    for session in await bus.expired_sessions():  # their clients stopped heartbeating
+      await bus.end_session(session)
+    # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
+    await registry.unregister_checkpoints(*await registry.expired_checkpoints())
     for decision, body in decide(state, time.time()):  # folded when it is read back on the next pass
       if decision == "assigned":
-        await bus.assign(body["run"], body["worker"])
+        await bus.assign_run_to_worker(body["run"], body["worker"])
       else:
-        await bus.emit(decision, **body)
+        await bus.append_event(decision, **body)
     if events:
       await bus.r.set(key("state"), json.dumps(dataclasses.asdict(state), sort_keys=True))
 

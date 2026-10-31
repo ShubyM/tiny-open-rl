@@ -10,6 +10,7 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from tinyrl.bus import Bus, connect
+from tinyrl.storage.registry import Registry
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -63,38 +64,39 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
     self.renewal_tasks = []
     self.bus = Bus(connect(self.url))
+    self.registry = Registry(self.bus)
     await self.bus.r.flushall()
 
   async def own(self, trainer):
     """Renew the lease as Trainer.serve does."""
-    await trainer.own()
-    self.renewal_tasks.append(asyncio.create_task(trainer.keep()))
+    await trainer.wait_for_lease()
+    self.renewal_tasks.append(asyncio.create_task(trainer.keep_renewing_lease()))
 
   async def worker(self, run: str) -> str:
     """The run's worker, once every new run is assigned the way the scheduler assigns it."""
-    from tinyrl import scheduler
+    from tinyrl.control import scheduler
 
     s = scheduler.State()
-    for e in await self.bus.events():
+    for e in await self.bus.read_events():
       s = scheduler.fold(s, e)
     for kind, body in scheduler.decide(s, 0.0):
       if kind == "assigned":
-        await self.bus.assign(body["run"], body["worker"])
-    return (await self.bus.run(run))["worker"]
+        await self.bus.assign_run_to_worker(body["run"], body["worker"])
+    return (await self.bus.get_run(run))["worker"]
 
   async def running(self, placed: dict[str, list[int]]) -> None:
     """Node n is up with these workers placed on these GPUs and their processes started, each kept by a held run."""
     gpus = 1 + max(i for worker_gpus in placed.values() for i in worker_gpus)
-    await self.bus.heartbeat("n", gpus)
-    await self.bus.emit("node_up", node="n", gpus=gpus, memory=0)
+    await self.bus.node_heartbeat("n", gpus)
+    await self.bus.append_event("node_up", node="n", gpus=gpus, memory=0)
     for worker, worker_gpus in placed.items():
-      await self.bus.emit("run_created", run=f"{worker}-held", worker=worker)
-      await self.bus.emit("placed", worker=worker, node="n", gpus=worker_gpus, rule="test")
-      await self.bus.emit("started", worker=worker, node="n")
+      await self.bus.append_event("run_created", run=f"{worker}-held", worker=worker)
+      await self.bus.append_event("placed", worker=worker, node="n", gpus=worker_gpus, rule="test")
+      await self.bus.append_event("started", worker=worker, node="n")
 
   async def run_scheduler(self, placed: dict[str, list[int]], quantum: float = 30.0) -> None:
     """Run the scheduler over these running workers, so workers that share a GPU get turns."""
-    from tinyrl import scheduler
+    from tinyrl.control import scheduler
 
     await self.running(placed)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus, quantum)))
@@ -118,7 +120,7 @@ class FakeEngine:
     engine.calls.append(("start", base, lora))
     return engine
 
-  async def load(self, name: str, path: str) -> None:
+  async def load_checkpoint(self, name: str, path: str) -> None:
     self.calls.append(("load", name, path))
 
   async def sleep(self) -> None:
@@ -131,7 +133,7 @@ class FakeEngine:
     self.calls.append(("close",))
 
   async def sample(self, job: dict, name: str | None):
-    from tinyrl.sampler import Out, Seq
+    from tinyrl.workers.sampler import Out, Seq
 
     self.calls.append(("sample", name))
     tokens = [(job["prompt"][-1] + 1 + i) % 32 for i in range(job["max_tokens"])]

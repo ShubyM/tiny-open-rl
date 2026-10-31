@@ -17,7 +17,8 @@ import subprocess
 import httpx
 
 from tinyrl.helpers import getenv
-from tinyrl.sampler import Out, Seq
+from tinyrl.storage import models
+from tinyrl.workers.sampler import Out, Seq
 
 VLLM_ARGS = getenv("VLLM_ARGS", "")  # more `vllm serve` flags, like --gpu-memory-utilization 0.4
 GPU_MEM = getenv("TINYRL_GPU_MEM", "")  # the share of GPU memory vLLM may use, from the scheduler's placement
@@ -57,7 +58,9 @@ class VLLM:
     with socket.socket() as s:
       s.bind(("127.0.0.1", 0))
       port = s.getsockname()[1]
-    args = ["vllm", "serve", base, "--host", "127.0.0.1", "--port", str(port), "--enable-sleep-mode"]
+    path = await asyncio.to_thread(models.local, base)  # served under the reference's name, which requests use
+    args = ["vllm", "serve", path, "--served-model-name", base, "--host", "127.0.0.1", "--port", str(port)]
+    args += ["--enable-sleep-mode"]
     args += ["--language-model-only"] + (
       ["--enable-lora", "--max-lora-rank", "64", "--max-loras", "16", "--max-cpu-loras", "64"] if lora else []
     )
@@ -110,7 +113,7 @@ class VLLM:
           raise
     raise AssertionError
 
-  async def load(self, name: str, path: str) -> None:
+  async def load_checkpoint(self, name: str, path: str) -> None:
     if name in self.loaded:
       return
     if not self.lora and self.clean and os.path.isdir(path):

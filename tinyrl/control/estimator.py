@@ -1,6 +1,6 @@
 """Estimates memory needs per engine and GPU width before placement, ensuring admissibility.
 
-Activations are left to the dynamic token_budget in trainer.py. No static reserve is added here.
+Activations are left to the dynamic token_budget in model.py. No static reserve is added here.
 """
 
 import re
@@ -10,7 +10,7 @@ from huggingface_hub import get_safetensors_metadata
 from peft import LoraConfig, get_peft_model
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from tinyrl.trainer import lora_targets
+from tinyrl.workers.model import lora_targets
 
 OVERHEAD = int(0.75 * 1024**3)  # measured: 529 MiB CUDA context + ~210 MiB cuBLAS, H100
 

@@ -1,20 +1,9 @@
-"""A trainer serves one worker: the LoRA adapters that share a base model, or a single full fine-tune.
-
-It takes commands from its worker's streams on the bus, runs each one on the model, and writes the reply back.
-"""
+"""The model a trainer serves: the losses, token budget batching, and one base model with its LoRA adapters or full fine-tune, which park in host memory between turns."""
 
 from __future__ import annotations
 
-import asyncio
-import collections
-import contextlib
-import json
 import math
 import os
-import signal
-import socket
-import sys
-import time
 from collections.abc import Callable
 
 import numpy as np
@@ -24,18 +13,14 @@ from peft import LoraConfig
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
-from tinyrl import wire
-from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
-from tinyrl.helpers import DEBUG, getenv
-from tinyrl.store import Store
-from tinyrl.turns import IDLE_MS, GpuTurn
+from tinyrl.api import wire
+from tinyrl.helpers import getenv
+from tinyrl.storage import models
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
 CHUNK = getenv("CHUNK", 1024)  # positions per output head chunk when computing logprobs
 GRAD_CKPT = getenv("GRAD_CKPT", 1)  # gradient checkpointing
-STRANDED_MS = 5000  # a command in flight this long while its worker's owner has nothing in flight was stranded
-GPU = getenv("GPU", "")  # the GPU this trainer takes turns on, set by the node daemon. Unset, it never takes turns
 
 # ***** losses *****
 #
@@ -173,9 +158,10 @@ def load(name: str) -> PreTrainedModel:
   trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal
   checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and
   vLLM drops an adapter whose names it can't map, without an error."""
+  name = models.local(name)
   arch = (AutoConfig.from_pretrained(name).architectures or [""])[0]
   cls = getattr(transformers, arch, AutoModelForCausalLM)
-  # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create
+  # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create_run
   if torch.cuda.is_available():
     return cls.from_pretrained(name, dtype=torch.bfloat16, device_map="auto")
   return cls.from_pretrained(name, dtype=torch.float32)
@@ -214,7 +200,7 @@ class Model:
     self.parked = False
     self.dirty: set[str] = set()
 
-  def create(self, run: str, base: str, rank: int, config: dict) -> None:
+  def create_run(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
       self.lm, self.base, self.lora = self.load(base), base, rank > 0
       if hasattr(inner := getattr(self.lm, "model", None), "language_model"):
@@ -253,7 +239,7 @@ class Model:
     for p in self.params[run].values():
       p.data = p.data.float()  # PEFT gives an adapter its base model's dtype, but master weights are fp32
 
-  def use(self, run: str) -> PreTrainedModel:
+  def activate_run(self, run: str) -> PreTrainedModel:
     """The model, with the run's adapter active."""
     if self.lm is None or run not in self.params:
       raise KeyError(f"model {run} is not on this trainer, it was deleted or its trainer restarted")
@@ -267,7 +253,7 @@ class Model:
     if loss_fn not in LOSSES:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
-    lm = self.use(run).train(not forward_only)
+    lm = self.activate_run(run).train(not forward_only)
     lengths = [min(len(d.tokens), len(d.inputs["target_tokens"])) for d in data]
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total = 0.0
@@ -289,15 +275,15 @@ class Model:
 
     return logprobs, {"loss:sum": total, "loss:mean": total / max(1, len(data))}
 
-  def optimizer(self, run: str) -> torch.optim.AdamW:
+  def adam_for_run(self, run: str) -> torch.optim.AdamW:
     if run not in self.optimizers:
       params = list(self.params[run].values())
       self.optimizers[run] = torch.optim.AdamW(params, fused=bool(params and params[0].is_cuda))
     return self.optimizers[run]
 
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
-    self.use(run)
-    optimizer = self.optimizer(run)
+    self.activate_run(run)
+    optimizer = self.adam_for_run(run)
 
     # every step brings its own hyperparameters, so a learning rate schedule just works
     for group in optimizer.param_groups:
@@ -311,17 +297,17 @@ class Model:
     if not self.lora:
       if torch.cuda.is_available():
         torch.cuda.empty_cache()
-      self.move(self.moments(), "cuda")
+      self.move_tensors(self.adam_moments(), "cuda")
     optimizer.step()
     optimizer.zero_grad()
     if not self.lora:
-      self.move(self.moments(), "cpu")
+      self.move_tensors(self.adam_moments(), "cpu")
     self.dirty.add(run)
     return {"grad_norm:mean": grad_norm}
 
-  def state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
+  def training_state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """A run's portable training checkpoint: fp32 master weights and named AdamW state, with no pickle."""
-    self.use(run)
+    self.activate_run(run)
     tensors = {name: p.detach() for name, p in self.params[run].items()}
     optim = self.optimizers.get(run)
     for name, p in self.params[run].items():
@@ -332,9 +318,9 @@ class Model:
         tensors[f"{name}.step"] = s["step"].detach()
     return tensors, {"optimizer": True}
 
-  def weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
+  def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
-    lm = self.use(run)
+    lm = self.activate_run(run)
     prefix = "base_model.model." if self.lora else ""
     tensors = {f"{prefix}{name}": p.detach().to(self.dtype) for name, p in self.params[run].items()}
     if self.lora:
@@ -349,8 +335,8 @@ class Model:
       "config": cfg,
     }
 
-  def restore(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
-    self.use(run)
+  def restore_run(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
+    self.activate_run(run)
     if optimizer and not meta.get("optimizer"):
       raise ValueError("checkpoint has no optimizer state")
     suffixes = (".exp_avg", ".exp_avg_sq", ".step")
@@ -365,7 +351,7 @@ class Model:
     self.pinned.clear()
     self.optimizers.pop(run, None)
     if optimizer and any(k.endswith(".step") for k in tensors):
-      opt = self.optimizer(run)
+      opt = self.adam_for_run(run)
       for name, p in self.params[run].items():
         opt.state[p] = {
           "exp_avg": tensors[f"{name}.exp_avg"].to(p.device, torch.float32),
@@ -373,13 +359,13 @@ class Model:
           "step": tensors[f"{name}.step"].to(p.device if opt.defaults.get("fused") else "cpu", torch.float32),
         }
       if not self.lora:
-        self.move(self.moments(), "cpu")
+        self.move_tensors(self.adam_moments(), "cpu")
     self.dirty.add(run)
 
-  def moments(self):
+  def adam_moments(self):
     return (v for opt in self.optimizers.values() for s in opt.state.values() for v in s.values() if torch.is_tensor(v))
 
-  def tensors(self, optim: bool = True):
+  def gpu_tensors(self, optim: bool = True):
     """Every tensor on the GPU: weights, buffers, gradients between forward_backward and optim_step, AdamW moments."""
     if self.lm is None:
       return
@@ -387,9 +373,9 @@ class Model:
     yield from self.lm.buffers()
     yield from (p.grad for p in self.lm.parameters() if p.grad is not None)
     if optim:
-      yield from self.moments()
+      yield from self.adam_moments()
 
-  def move(self, tensors, device: str) -> None:
+  def move_tensors(self, tensors, device: str) -> None:
     for t in tensors:
       if device == "cpu" and t.is_cuda:
         buf = self.pinned.get(id(t))
@@ -405,254 +391,25 @@ class Model:
       torch.cuda.synchronize()
       if device == "cpu":
         torch.cuda.empty_cache()
-        active = {id(x) for x in self.tensors()}
+        active = {id(x) for x in self.gpu_tensors()}
         for k in list(self.pinned.keys()):
           if k not in active:
             del self.pinned[k]
 
-  def park(self) -> None:
-    """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume() undoes it."""
-    self.move(self.tensors(), "cpu")
+  def park_on_host(self) -> None:
+    """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume_on_gpu() undoes it."""
+    self.move_tensors(self.gpu_tensors(), "cpu")
     self.parked = True
 
-  def resume(self) -> None:
-    self.move(self.tensors(optim=self.lora), "cuda")
+  def resume_on_gpu(self) -> None:
+    self.move_tensors(self.gpu_tensors(optim=self.lora), "cuda")
     self.parked = False
 
-  def delete(self, run: str) -> None:
-    lm = self.use(run)
+  def delete_run(self, run: str) -> None:
+    lm = self.activate_run(run)
     self.dirty.discard(run)
     if self.lora:
       lm.delete_adapter(run)
     del self.params[run]
     self.pinned.clear()
     self.optimizers.pop(run, None)
-
-
-# ***** trainer *****
-
-
-def ok(body: dict) -> Reply:
-  return Reply(True, wire.JSON, json.dumps(body).encode())
-
-
-def fail(error: Exception) -> Reply:
-  # a request the trainer can't take, like bad input or an unknown model, is the user's error. Anything else is ours.
-  category = "user" if isinstance(error, (ValueError, KeyError)) else "server"
-  body = {"error": f"{type(error).__name__}: {error}", "category": category}
-  return Reply(False, wire.JSON, json.dumps(body).encode())
-
-
-def enqueue_cmds(queue: collections.deque[Cmd], cmds: list[Cmd], lora: bool) -> None:
-  if not lora:
-    queue.extend(cmds)
-    return
-  blocked = {x.run for x in queue}
-  front, back = [], []
-  for c in cmds:
-    if c.op == Op.SAVE_WEIGHTS_FOR_SAMPLER and c.run not in blocked:
-      front.append(c)
-    else:
-      blocked.add(c.run)
-      back.append(c)
-  queue.extendleft(reversed(front))
-  queue.extend(back)
-
-
-class Trainer:
-  def __init__(self, bus: Bus, worker: str, model: Model | None = None, owner: str = "", store: Store | None = None):
-    self.bus = bus
-    self.worker = worker
-    self.model = model if model is not None else Model()
-    self.store = store if store is not None else Store()
-    self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
-    self.done = False
-    self.draining = False
-    self.turn = GpuTurn(bus, worker, bool(GPU))
-
-  async def serve(self) -> None:
-    await self.own()
-    renewing = asyncio.create_task(self.keep())
-    try:
-      await self.fail_stranded(0)  # anything in flight now was taken by a trainer that died or lost the worker
-      while not self.done:
-        await self.step()
-        await self.fail_stranded(STRANDED_MS)
-      if self.draining:
-        await self.drain()
-    finally:
-      renewing.cancel()
-      await self.leave()
-
-  async def leave(self) -> None:
-    """Hand the GPU back with nothing of ours left on it, then the worker to its next trainer."""
-    if self.turn.held and self.turn.shared:
-      await asyncio.to_thread(self.model.park)
-    await self.turn.give_back()
-    await self.bus.release(self.worker, self.owner)
-
-  async def own(self) -> None:
-    """Wait until this trainer owns its worker. Only the owner's replies land, see Bus.finish."""
-    while not await self.bus.own(self.worker, self.owner):
-      await asyncio.sleep(LEASE_MS / 4000)
-
-  async def keep(self) -> None:
-    """Renew the worker's lease until another trainer has it."""
-    while True:  # until serve() cancels it, so the lease holds while a stopping trainer saves its runs
-      await asyncio.sleep(LEASE_MS / 4000)
-      if not await self.bus.renew(self.worker, self.owner) and not await self.reown():
-        self.done = True
-        return
-
-  async def reown(self) -> bool:
-    """Take the worker's lease again if it ran out with nobody taking it, as it does while Redis restarts. Not if
-    another trainer has parked one of this trainer's runs since, which it only does after serving the worker."""
-    if not await self.bus.own(self.worker, self.owner):
-      return False
-    if any([await self.bus.parked(run) for run in self.model.params]):
-      await self.bus.release(self.worker, self.owner)
-      return False
-    return True
-
-  def stop(self) -> None:
-    """Finish the batch in hand, save every run for the worker's next trainer, and exit. SIGTERM calls it."""
-    self.done = self.draining = True
-
-  async def drain(self) -> None:
-    for run in list(self.model.params):
-      uri = f"tinker://{run}/parked/{time.time_ns()}"
-      await asyncio.to_thread(self.store.put, uri, *self.model.state(run))
-      await self.bus.park(run, uri, self.worker, self.owner)
-
-  async def recover(self, cmd: Cmd) -> None:
-    """Bring back a run this trainer doesn't hold: from the state its last trainer saved when it stopped, or empty, for
-    load_weights to fill. A run whose trainer died without saving it can't go on from where it was."""
-    run, uri = await self.bus.run(cmd.run), await self.bus.parked(cmd.run)
-    if not uri and cmd.op not in (Op.LOAD_WEIGHTS, Op.DELETE_MODEL):
-      raise KeyError(
-        f"model {cmd.run} lost its unsaved steps when its trainer stopped. load_state to go on from a checkpoint"
-      )
-    await asyncio.to_thread(self.model.create, cmd.run, run["base"], run["rank"], run.get("lora", {}))
-    if uri:
-      tensors, meta = await asyncio.to_thread(self.store.get, uri)
-      await asyncio.to_thread(self.model.restore, cmd.run, tensors, meta, True)
-      await self.bus.park(cmd.run, None, self.worker, self.owner)
-
-  async def answer(self, cmd: Cmd) -> Reply:
-    try:
-      if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
-        await self.recover(cmd)
-    except Exception as e:
-      return fail(e)
-    return await asyncio.to_thread(self.run, cmd)  # off the event loop, so redis stays responsive
-
-  async def fail_stranded(self, min_idle_ms: int) -> None:
-    for cmd in await self.bus.reclaim(self.worker, self.owner, min_idle_ms):
-      reply = fail(RuntimeError(f"its trainer died, or lost the worker, during {cmd.op}"))
-      await self.bus.finish(cmd, reply, self.worker, self.owner)
-
-  async def step(self, count: int = 16, block_ms: int = 1000) -> int:
-    """Take the next commands from the worker and run them. Returns how many there were."""
-    if self.done:
-      return 0
-    take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
-    cmds = await self.bus.take(self.worker, self.owner, count, take_block)
-    if not cmds:
-      await self.turn.went_idle()
-      await self.yield_gpu()
-      return 0
-    queue: collections.deque[Cmd] = collections.deque()
-    enqueue_cmds(queue, cmds, self.model.lora)
-    processed = 0
-    async with self.acquire(len(cmds)):
-      batch_start = time.time()
-      ops = []
-      while queue:
-        cmd = queue.popleft()
-        start = time.time()
-        first = await self.bus.first_reply(cmd)  # no lock needed, the worker's owner is the only writer of its seq keys
-        reply = first or await self.answer(cmd)
-        ms = (time.time() - start) * 1000
-        ops.append([cmd.op, ms])
-        if not await self.bus.finish(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
-          self.done = True  # another trainer owns the worker now
-          break
-
-        if cmd.op == Op.DELETE_MODEL and reply.ok:
-          await self.bus.drop(cmd.run, self.worker)
-          self.done = not self.model.lora  # a full fine-tune's trainer exits with its run
-
-        if DEBUG:
-          error = "" if reply.ok else f"  {reply.body.decode()}"
-          print(f"{self.worker} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
-
-        processed += 1
-        if self.model.lora and queue and (cmd.op == Op.OPTIM_STEP or queue[0].run != cmd.run):
-          if cmd.op == Op.OPTIM_STEP:
-            await asyncio.sleep(0.015)
-          more = await self.bus.take(self.worker, self.owner, count, 0)
-          enqueue_cmds(queue, more, True)
-      await self.turn.batch_done(queued=len(queue), seconds=time.time() - batch_start, ops=ops)
-    return processed
-
-  @contextlib.asynccontextmanager
-  async def acquire(self, queued: int):
-    """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back
-    after the batch if the scheduler revoked it."""
-    if await self.turn.take(queued):
-      await asyncio.to_thread(self.model.resume)
-    try:
-      yield
-    finally:
-      await self.yield_gpu()
-
-  async def yield_gpu(self) -> None:
-    if await self.turn.revoked():
-      await asyncio.to_thread(self.model.park)
-      await self.turn.give_back()
-
-  def run(self, cmd: Cmd) -> Reply:
-    """Run one command on the model. A failure becomes the reply, never an exception."""
-    model = self.model
-    try:
-      if cmd.op == Op.FORWARD_BACKWARD:
-        req = wire.parse(cmd.body)
-        data, loss_fn, config = wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req)
-        logprobs, metrics = model.forward_backward(cmd.run, data, loss_fn, config, req.forward_only)
-        return Reply(True, wire.PROTO, wire.output(logprobs, metrics))
-
-      args = json.loads(cmd.body)
-      match cmd.op:
-        case Op.CREATE_MODEL:
-          model.create(cmd.run, args["base_model"], args["rank"], args["lora"])
-        case Op.OPTIM_STEP:
-          return ok({"type": cmd.op, "metrics": model.optim_step(cmd.run, args["adam_params"])})
-        case Op.SAVE_WEIGHTS:
-          self.store.put(args["uri"], *model.state(cmd.run))
-        case Op.SAVE_WEIGHTS_FOR_SAMPLER:
-          self.store.put(args["uri"], *model.weights(cmd.run))
-        case Op.LOAD_WEIGHTS:
-          model.restore(cmd.run, *self.store.get(args["uri"]), args["optimizer"])
-        case Op.DELETE_MODEL:
-          model.delete(cmd.run)
-        case _:
-          raise ValueError(f"unknown op {cmd.op}")
-
-      reply = {"type": cmd.op, "model_id": cmd.run}
-      if "uri" in args:
-        reply["path"] = args["uri"]
-      if "sampling_session_id" in args:
-        reply["sampling_session_id"] = args["sampling_session_id"]
-      return ok(reply)
-    except Exception as e:
-      return fail(e)
-
-
-async def main(worker: str) -> None:
-  trainer = Trainer(Bus(), worker)
-  asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, trainer.stop)
-  await trainer.serve()
-
-
-if __name__ == "__main__":
-  asyncio.run(main(sys.argv[1]))

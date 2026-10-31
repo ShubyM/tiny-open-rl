@@ -5,6 +5,7 @@ Every training call becomes a command on its run's stream, and retrieve_future w
 
 from __future__ import annotations
 
+import datetime
 import json
 import time
 import uuid
@@ -15,10 +16,11 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from tinyrl import wire
+from tinyrl.api import wire
 from tinyrl.bus import Bus, Op, Run, key
 from tinyrl.helpers import getenv
-from tinyrl.store import Store
+from tinyrl.storage.registry import Registry
+from tinyrl.storage.store import Store
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
 
@@ -54,6 +56,11 @@ class OptimStepRequest(ModelRequest):
 class SaveRequest(ModelRequest):
   path: str | None = None
   sampling_session_seq_id: int | None = None
+  ttl_seconds: int | None = None
+
+
+class TTLRequest(BaseModel):
+  ttl_seconds: int | None = None
 
 
 class LoadRequest(ModelRequest):
@@ -63,6 +70,23 @@ class LoadRequest(ModelRequest):
 
 class FutureRequest(BaseModel):
   request_id: str
+
+
+def ttl(seconds: int | None) -> int | None:
+  """A checkpoint's TTL, which the Tinker API bounds between an hour and ten years."""
+  if seconds is not None and not 3600 <= seconds <= 10 * 365 * 24 * 3600:
+    raise HTTPException(400, "ttl_seconds must be between 3600 and 10 years")
+  return seconds
+
+
+def iso(t: float | None) -> str | None:
+  return datetime.datetime.fromtimestamp(t, datetime.UTC).isoformat() if t else None
+
+
+def public(c: dict) -> dict:
+  """A registry entry as the Tinker API's Checkpoint."""
+  keep = {k: c[k] for k in ("checkpoint_id", "checkpoint_type", "tinker_path", "size_bytes")}
+  return keep | {"time": iso(c["time"]), "expires_at": iso(c["expires_at"])}
 
 
 def checkpoint_uri(run: str, kind: str, name: str) -> str:
@@ -76,6 +100,7 @@ def checkpoint_uri(run: str, kind: str, name: str) -> str:
 
 def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   bus = bus if bus is not None else Bus()
+  registry = Registry(bus)
   store = store if store is not None else Store()
   api = FastAPI(title="tiny-open-rl")
 
@@ -88,7 +113,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def submit(run: str, op: Op, body: bytes | dict, seq_id: int | None = None) -> dict[str, str]:
     if isinstance(body, dict):
       body = json.dumps(body).encode()
-    request_id = await bus.submit(run, op, body, seq_id)
+    request_id = await bus.submit_command(run, op, body, seq_id)
     if request_id is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
@@ -99,11 +124,11 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
         raise ValueError(f"bad model_path {model_path}")
       uri = checkpoint_uri("x", "sampler_weights", model_path)
       train_run = uri.removeprefix("tinker://").split("/", 1)[0]
-      train = await bus.run(train_run) or {}
+      train = await bus.get_run(train_run) or {}
       if train.get("base"):
         base, lora = train["base"], train["rank"] > 0
       else:
-        meta = store.meta(uri)
+        meta = store.read_meta(uri)
         base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
       if not base:
         raise ValueError("could not resolve base_model")
@@ -117,7 +142,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     run = Run(
       sid, "", base, int(lora), session_id, model_path=uri, exclusive=exclusive, role="sampler", train_run=train_run
     )
-    await bus.create(run)
+    await bus.create_run(run)
     return sid
 
   # ***** service *****
@@ -125,7 +150,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.get("/api/v1/scheduling")
   async def scheduling():
     return {
-      "nodes": await bus.nodes(),
+      "nodes": await bus.live_nodes(),
       "state": json.loads(await bus.r.get(key("state")) or "{}"),  # the scheduler's: placements and turns
     }
 
@@ -151,28 +176,28 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def create_session(req: CreateSessionRequest | None = None):
     session_id = f"sess-{uuid.uuid4().hex[:12]}"
     req = req or CreateSessionRequest()
-    await bus.session(session_id, dict(t.partition("=")[::2] for t in req.tags) | (req.user_metadata or {}))
+    await bus.heartbeat_session(session_id, dict(t.partition("=")[::2] for t in req.tags) | (req.user_metadata or {}))
     return {"type": "create_session", "session_id": session_id}
 
   @api.post("/api/v1/session_heartbeat")
   async def session_heartbeat(req: SessionRequest):
-    await bus.session(req.session_id)
+    await bus.heartbeat_session(req.session_id)
     return {"type": "session_heartbeat"}
 
   @api.post("/api/v1/create_model")
   async def create_model(req: CreateModelRequest):
-    session = await bus.session_info(req.session_id) or {}
+    session = await bus.get_session(req.session_id) or {}
     metadata, lora = session.get("metadata", {}) | (req.user_metadata or {}), req.lora_config or {}
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
 
     run = str(uuid.uuid4())
-    await bus.create(Run(run, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive))
+    await bus.create_run(Run(run, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive))
     return await submit(run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora})
 
   @api.post("/api/v1/get_info")
   async def get_info(req: ModelRequest):
-    run = await bus.run(req.model_id)
+    run = await bus.get_run(req.model_id)
     if run is None:
       raise HTTPException(404, f"no model {req.model_id}")
 
@@ -211,7 +236,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def save(req: SaveRequest, op: Op, kind: str):
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-    return await submit(req.model_id, op, {"uri": checkpoint_uri(req.model_id, kind, name)}, req.seq_id)
+    args = {"uri": checkpoint_uri(req.model_id, kind, name), "ttl_seconds": ttl(req.ttl_seconds)}
+    return await submit(req.model_id, op, args, req.seq_id)
 
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
   async def save_weights(req: SaveRequest):
@@ -219,18 +245,16 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveRequest):
-    train = await bus.run(req.model_id)
+    train = await bus.get_run(req.model_id)
     if not train:
       raise HTTPException(404, f"no model {req.model_id}")
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
     uri = checkpoint_uri(req.model_id, "sampler_weights", name)
-    if req.path is None or req.sampling_session_seq_id is not None:
-      sid = await open_sampler(train["base"], uri, train.get("session", ""))
-      return await submit(
-        req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri, "sampling_session_id": sid}, req.seq_id
-      )
-    return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": uri}, req.seq_id)
+    args = {"uri": uri, "ttl_seconds": ttl(req.ttl_seconds)}
+    if req.path is None or req.sampling_session_seq_id is not None:  # a sampling session's weights, which its run owns
+      args |= {"sampling_session_id": await open_sampler(train["base"], uri, train.get("session", "")), "owned": True}
+    return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):
@@ -244,7 +268,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/retrieve_future")
   async def retrieve_future(req: FutureRequest, accept: str = Header("")):
-    reply = await bus.result(req.request_id, WAIT)
+    reply = await bus.wait_for_reply(req.request_id, WAIT)
     if reply is None:
       return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
     if reply.content_type == wire.PROTO and wire.PROTO not in accept:
@@ -265,13 +289,13 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def join_sampling_session(req: Request):
     data = await req.json()
     sid = data.get("sampling_session_id")
-    if not await bus.run(sid):
+    if not await bus.get_run(sid):
       raise HTTPException(404, f"no session {sid}")
-    return {"type": "join_sampling_session", "client_counter": await bus.join(sid)}
+    return {"type": "join_sampling_session", "client_counter": await bus.join_sampling_session(sid)}
 
   @api.get("/api/v1/samplers/{sampler_id}")
   async def get_sampler(sampler_id: str):
-    run = await bus.run(sampler_id)
+    run = await bus.get_run(sampler_id)
     if not run:
       raise HTTPException(404, f"no sampler {sampler_id}")
     return {"sampler_id": sampler_id, "base_model": run["base"], "model_path": run.get("model_path")}
@@ -322,18 +346,42 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       "sample_sequence_ids": [f"{res['request_id']}:{i}" for i in range(num_samples)],
     }
 
+  # ***** checkpoints *****
+
+  @api.get("/api/v1/training_runs/{run}/checkpoints")
+  async def list_checkpoints(run: str):
+    return {"checkpoints": [public(c) for c in await registry.checkpoints_of_run(run)]}
+
+  @api.get("/api/v1/checkpoints")
+  async def list_user_checkpoints(limit: int = 100, offset: int = 0):
+    found, total = await registry.page_of_checkpoints(limit, offset)
+    return {
+      "checkpoints": [public(c) for c in found],
+      "cursor": {"offset": offset, "limit": limit, "total_count": total},
+    }
+
+  @api.delete("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}")
+  async def delete_checkpoint(run: str, checkpoint_id: str):
+    if not await registry.unregister_checkpoints(f"tinker://{run}/{checkpoint_id}"):  # its files go with the next sweep
+      raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
+
+  @api.put("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}/ttl")
+  async def set_checkpoint_ttl(run: str, checkpoint_id: str, req: TTLRequest):
+    if not await registry.set_checkpoint_ttl(f"tinker://{run}/{checkpoint_id}", ttl(req.ttl_seconds)):
+      raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
+
   # ***** inspection *****
 
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
-    run = await bus.run(run_id)
+    run = await bus.get_run(run_id)
     if run is None:
       raise HTTPException(404, f"no model {run_id}")
-    return {**run, **await bus.queue(run_id)}
+    return {**run, **await bus.queued_and_in_flight(run_id)}
 
   @api.get("/api/v1/sessions/{session_id}")
   async def session_info(session_id: str):
-    session = await bus.session_info(session_id)
+    session = await bus.get_session(session_id)
     if session is None:
       raise HTTPException(404, f"no session {session_id}")
     return session
@@ -342,7 +390,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def metrics():
     """Every run's counters for Prometheus. README.md has the queries for utilization, queueing delay and fairness."""
     lines = []
-    for (worker, run), counters in (await bus.stats()).items():
+    for (worker, run), counters in (await bus.run_counters()).items():
       for name, n in counters.items():
         name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
         lines.append(f'tinyrl_{name}_total{{worker="{worker}",run="{run}"}} {n}')

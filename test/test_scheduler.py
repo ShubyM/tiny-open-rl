@@ -2,7 +2,7 @@ import random
 import unittest
 
 from tinyrl.bus import Event
-from tinyrl.scheduler import QUANTUM, RULES, Kind, State, budget, decide, fold, holders, settings, uses
+from tinyrl.control.scheduler import QUANTUM, RULES, Kind, State, budget, decide, fold, holders, settings, uses
 
 GIB = 1024**3
 
@@ -36,9 +36,8 @@ class Log:
     self.test, self.s, self.t, self.entries = test, State(quantum=quantum), 0.0, []
 
   def append(self, kind: str, body: dict) -> None:
-    if (
-      kind in ("run_created", "sampler_warmed") and "role" not in body
-    ):  # name the worker's kind the way main's names did
+    # name the worker's kind the way main's names did
+    if kind in ("run_created", "sampler_warmed") and "role" not in body:
       worker = body["worker"]
       role = "sampler" if worker.startswith("sampler:") else "trainer"
       rank = 0 if worker.startswith("sampler:fft:") or (role == "trainer" and not worker.startswith("lora:")) else 8
@@ -91,7 +90,7 @@ class TestPlacement(unittest.TestCase):
     log.node(8)
     log("run_created", run="r", worker="r")
     decided = log("sampler_warmed", worker="sampler:fft:r", train_run="r", exclusive=True)
-    self.assertEqual(decided, [("placed", "sampler:fft:r", PLACED)])
+    self.assertEqual(decided, [("placed", "sampler:fft:r", "place.near_its_trainer")])
     self.assertEqual(
       log("run_deleted", run="r", worker="r"), [("unplaced", "r", EMPTIED), ("unplaced", "sampler:fft:r", EMPTIED)]
     )
@@ -103,6 +102,17 @@ class TestPlacement(unittest.TestCase):
     for run in ("r1", "r2", "r3"):
       log("run_created", run=run, worker=run)
     self.assertEqual([log.s.workers[run].node for run in ("r1", "r2", "r3")], ["a", "b", "b"])
+
+  def test_a_full_fine_tune_s_sampler_goes_to_its_trainer_s_node(self):
+    log = Log(self)
+    log.node(1, node="a")
+    log.node(1, node="b")
+    log("run_created", run="r", worker="r")
+    log("run_created", run="q", worker="q")
+    self.assertEqual([log.s.workers[w].node for w in ("r", "q")], ["a", "b"])
+    decided = log("run_created", run="s", worker="sampler:fft:q", train_run="q")  # both nodes hold one worker
+    self.assertEqual(decided, [("placed", "sampler:fft:q", "place.near_its_trainer")])
+    self.assertEqual(log.s.workers["sampler:fft:q"].node, "b")
 
   def test_a_lost_node_s_workers_move_to_a_live_one(self):
     log = Log(self)

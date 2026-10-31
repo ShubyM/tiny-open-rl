@@ -71,7 +71,7 @@ def serving(worker: str) -> str | None:
 
 def trainers(pod: str) -> list[str]:
   ps = kubectl("exec", pod, "--", "ps", "-eo", "args", check=False)
-  return [line for line in ps.splitlines() if "tinyrl.trainer" in line or "tinyrl.sampler" in line]
+  return [line for line in ps.splitlines() if "tinyrl.workers.trainer" in line or "tinyrl.workers.sampler" in line]
 
 
 def wait(what: str, ok, timeout: float) -> float:
@@ -151,7 +151,7 @@ def main() -> None:
 
   def trainer_killed():
     pod = serving(run.worker)
-    kubectl("exec", pod, "--", "pkill", "-9", "-f", f"tinyrl.trainer {run.worker}")
+    kubectl("exec", pod, "--", "pkill", "-9", "-f", f"tinyrl.workers.trainer {run.worker}")
     restart = wait("a new trainer", lambda: any(run.worker in t for t in trainers(pod)), 15)
     error = run.fails_cleanly()
     assert "lost its unsaved steps" in error, error

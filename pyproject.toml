@@ -21,11 +21,12 @@ include = ["tinyrl*"]
 target-version = "py311"
 line-length = 120
 indent-width = 2
-exclude = ["tinyrl/proto"]
+exclude = ["tinyrl/api/proto"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = [
   "B008",  # FastAPI declares headers as default arguments
   "B905",  # zip(strict=) on zips whose lengths match by construction is noise
+  "E501",  # comments stay on one line however long. ruff format keeps code at 120
 ]
