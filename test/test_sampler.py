@@ -16,7 +16,7 @@ from tinyrl.api.gateway import app
 from tinyrl.bus import Op, Run
 from tinyrl.storage.store import Store
 from tinyrl.workers.sampler import Out, Sampler, Seq, encode
-from tinyrl.workers.trainer import Trainer
+from tinyrl.workers.trainer import Stop, Trainer
 from tinyrl.workers.vllm import VLLM
 
 JOB = {
@@ -131,7 +131,7 @@ class TestSampler(RedisTest):
     self.assertEqual(await self.worker(request_id.split("/")[0]), sampler.worker)
     await sampler.step(block_ms=0)
     self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
-    calls = sampler.engine.calls
+    calls = sampler.running.engine.calls
     self.assertEqual(calls[0], ("start", base, True))
     self.assertEqual(
       [c for c in calls if c[0] == "load"],
@@ -154,7 +154,9 @@ class TestSampler(RedisTest):
     await fft_sampler.step(block_ms=0)
     res = await client.post("/api/v1/retrieve_future", json={"request_id": request_id}, headers={"Accept": wire.PROTO})
     self.assertEqual(res.headers["content-type"], wire.PROTO)
-    self.assertIn(("load", "c0", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.engine.calls)
+    self.assertIn(
+      ("load", "c0", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.running.engine.calls
+    )
     await client.aclose()
 
   @patch("tinyrl.workers.trainer.GPU", "node-a:0")
@@ -187,11 +189,11 @@ class TestSampler(RedisTest):
       ]:
         reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, json.dumps(body).encode()), 5)
         self.assertTrue(reply.ok, reply.body)
-      self.assertIn(("sleep",), sampler.engine.calls)
+      self.assertIn(("sleep",), sampler.running.engine.calls)
     finally:
-      trainer.done = sampler.done = True
+      trainer.stopping, sampler.done = Stop.EXIT, True
       await asyncio.gather(*tasks)
-    self.assertEqual(sampler.engine.calls[-1], ("close",))
+    self.assertEqual(sampler.running.engine.calls[-1], ("close",))
 
   async def test_a_sampler_batches_queued_commands_concurrently_and_loads_once(self):
     store = Store(tempfile.mkdtemp())
@@ -418,11 +420,11 @@ class TestSampler(RedisTest):
       task = asyncio.create_task(sampler.serve())
       try:
         for _ in range(50):
-          if sampler.engine is not None:
+          if sampler.running is not None:
             break
           await asyncio.sleep(0.02)
-        self.assertIsNotNone(sampler.engine)
-        self.assertEqual(sampler.engine.calls[0], ("start", "base", True))
+        self.assertIsNotNone(sampler.running)
+        self.assertEqual(sampler.running.engine.calls[0], ("start", "base", True))
       finally:
         sampler.done = True
         await task
@@ -442,7 +444,7 @@ class TestSampler(RedisTest):
     sampler = Sampler(self.bus, "sampler:base", engine=Broken)
     with patch.dict(os.environ, {"TINYRL_BASE": "base"}), patch("sys.stderr", new_callable=io.StringIO) as err:
       await sampler.warm_engine()
-    self.assertIsNone(sampler.engine)
+    self.assertIsNone(sampler.running)
     self.assertIn("RuntimeError: no GPU memory", err.getvalue())
 
   def test_sampler_imports_are_clean(self):

@@ -20,7 +20,7 @@ from tinyrl.api import wire
 from tinyrl.bus import Op, Run
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import LOSSES, Model, batches, target_logprobs, token_budget
-from tinyrl.workers.trainer import Trainer
+from tinyrl.workers.trainer import Stop, Trainer
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -433,7 +433,23 @@ class TestTrainer(RedisTest):
 
     self.assertEqual((await self.bus.get_run(run))["steps"], 1)
     self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))  # deleted
-    self.assertFalse(t.done)  # a LoRA trainer keeps serving its worker
+    self.assertIsNone(t.stopping)  # a LoRA trainer keeps serving its worker
+
+  async def test_a_trainer_told_to_stop_during_a_batch_that_deletes_a_run_still_stops(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.DELETE_MODEL, {}))
+    t = Trainer(self.bus, "p", Model(tiny))
+    await self.own(t)
+    answer = t.answer_command
+
+    async def sigterm_then_answer(cmd):
+      t.stop()  # SIGTERM lands while the batch runs
+      return await answer(cmd)
+
+    t.answer_command = sigterm_then_answer
+    await t.step(block_ms=10)
+    self.assertEqual(t.stopping, Stop.PARK)
 
   async def test_a_new_trainer_fails_what_a_dead_one_left_in_flight(self):
     run = new_id()
@@ -442,7 +458,7 @@ class TestTrainer(RedisTest):
     await self.bus.take_commands("p", "dead", block_ms=10)  # taken, and never answered
 
     t = Trainer(self.bus, "p", Model(tiny), owner="new")
-    t.done = True  # so serve() stops right after reclaiming
+    t.stopping = Stop.EXIT  # so serve() stops right after reclaiming
     await t.serve()
 
     reply = await self.bus.wait_for_reply(request_id, 1)
@@ -457,7 +473,7 @@ class TestTrainer(RedisTest):
 
     t = Trainer(self.bus, run, Model(tiny))
     await asyncio.wait_for(t.serve(), 60)
-    self.assertTrue(t.done)
+    self.assertEqual(t.stopping, Stop.EXIT)
     self.assertEqual(await self.bus.runs_in_worker(run), [])
 
   async def test_a_run_moves_between_trainers_through_the_store(self):
@@ -542,7 +558,7 @@ class TestTrainer(RedisTest):
       # restored once, so a later crash can't bring back old state
       self.assertIsNone(await self.bus.parked_checkpoint(run))
 
-      tc.done = second.done = True
+      tc.stopping = second.stopping = Stop.EXIT
       await asyncio.gather(*serving)
 
   @patch("tinyrl.workers.trainer.LEASE_MS", 200)
@@ -551,13 +567,13 @@ class TestTrainer(RedisTest):
     await self.own(t)
     await self.bus.r.delete("tinyrl:owner:p")  # what a Redis restart longer than the lease does
     await asyncio.sleep(0.2)
-    self.assertEqual((await self.bus.lease_owner("p"), t.done), (t.owner, False))
+    self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (t.owner, None))
 
     t.model.params["r"] = {}  # but not once another trainer has served the worker and parked its run
     await self.bus.r.set("tinyrl:parked:r", "tinker://r/parked/1")
     await self.bus.r.delete("tinyrl:owner:p")
     await asyncio.sleep(0.2)
-    self.assertEqual((await self.bus.lease_owner("p"), t.done), (None, True))
+    self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (None, Stop.EXIT))
 
   async def test_a_run_whose_trainer_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     store = Store(root=tempfile.mkdtemp())
@@ -657,8 +673,7 @@ class TestTrainer(RedisTest):
 
 class TestCheckpointNames(unittest.TestCase):
   def test_a_multimodal_checkpoint_trains_under_its_own_parameter_names(self):
-    """Qwen3.5's checkpoint and vLLM name its layers model.language_model.*, its causal LM class model.layers.*. The
-    trainer loads the class the checkpoint names, so a saved adapter's weights carry names vLLM maps."""
+    """Qwen3.5's checkpoint and vLLM name its layers model.language_model.*, its causal LM class model.layers.*. The trainer loads the class the checkpoint names, so a saved adapter's weights carry names vLLM maps."""
     from safetensors import safe_open
     from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
 

@@ -29,8 +29,7 @@ def check(s: State) -> list[str]:
 
 
 class Log:
-  """Appends facts the way workers and node daemons do, then decides the way the scheduler does, folding each decision
-  back as it would read it from the log. Checks the invariants after every entry, and that nothing is decided twice."""
+  """Appends facts the way workers and node daemons do, then decides the way the scheduler does, folding each decision back as it would read it from the log. Checks the invariants after every entry, and that nothing is decided twice."""
 
   def __init__(self, test: unittest.TestCase, quantum: float = QUANTUM):
     self.test, self.s, self.t, self.entries = test, State(quantum=quantum), 0.0, []
@@ -72,7 +71,7 @@ class Log:
 
 
 GRANTED, IDLE, QUANTUM = "turn.granted", "turn.idle_holder_yields", "turn.quantum_expired"
-PLACED, EMPTIED = "place.least_loaded_node", "place.emptied"
+PLACED, EMPTIED, SPREAD = "place.least_loaded_node", "place.emptied", "place.spread"
 MIB = 2**20
 
 
@@ -268,8 +267,7 @@ class TestTurns(unittest.TestCase):
 
 class TestLog(unittest.TestCase):
   def random_log(self, rng: random.Random) -> Log:
-    """Random facts, faults included: workers restarting elsewhere, dead workers that never release, nodes restarting
-    and lost, runs coming and going."""
+    """Random facts, faults included: workers restarting elsewhere, dead workers that never release, nodes restarting and lost, runs coming and going."""
     log = Log(self)
     nodes = {f"n{i}": rng.choice([1, 2, 4, 8]) for i in range(rng.choice([1, 1, 2, 4]))}
     for node, gpus in nodes.items():
@@ -387,7 +385,7 @@ class TestWorkersAndGpus(unittest.TestCase):
   def test_a_sampler_moves_as_few_trainers_as_it_can(self):
     log = Log(self)
     log.node(2)
-    for worker, gpu, busy in (("a", 0, 1.0), ("b", 0, 1.0), ("c", 1, 5.0)):
+    for worker, gpu, busy in (("c", 1, 5.0), ("a", 0, 1.0), ("b", 0, 1.0)):
       log.worker(worker, gpus=(gpu,))
       log("batch_done", worker=worker, seconds=busy)
     log("sampler_warmed", worker="sampler:s")
@@ -424,6 +422,40 @@ class TestWorkersAndGpus(unittest.TestCase):
     self.assertEqual(gpu["sampler:fft:q"], gpu["sampler:fft:g"])
     alone = [gpu[n] for n in ("x", "g1", "sampler:q", "sampler:fft:x", "sampler:g")]
     self.assertEqual(sorted(alone + [gpu["q1"], gpu["q2"], gpu["sampler:fft:q"]]), list(range(8)))
+
+  def test_a_trainer_taking_turns_moves_to_a_gpu_once_it_empties(self):
+    log = Log(self)
+    log.node(2)
+    for worker, gpu in (("x", 1), ("a", 0), ("b", 0)):
+      log.worker(worker, gpus=(gpu,))
+    # x's process still runs on GPU 1, so nothing moves there yet
+    self.assertEqual(log("run_deleted", run="x-run", worker="x"), [("unplaced", "x", EMPTIED)])
+    self.assertEqual(log("exited", worker="x"), [("placed", "a", SPREAD)])
+    self.assertEqual([log.s.workers[n].gpus for n in ("a", "b")], [(1,), (0,)])
+    self.assertEqual(log.tick(), [])
+
+  def test_a_lora_trainer_moves_before_a_full_fine_tune_and_a_waiter_before_the_holder(self):
+    log = Log(self)
+    log.node(2)
+    for worker, gpu in (("x", 1), ("full", 0), ("lora:a", 0), ("lora:b", 0)):
+      log.worker(worker, gpus=(gpu,))
+    self.assertEqual(log("wants_gpu", worker="lora:a"), [("granted", "lora:a", GRANTED)])
+    log("run_deleted", run="x-run", worker="x")
+    self.assertEqual(log("exited", worker="x"), [("placed", "lora:b", SPREAD)])
+
+  def test_the_benchmark_s_trainers_spread_back_out_when_the_last_wave_s_workers_leave(self):
+    log = Log(self)
+    log.node(8)
+    old = [f"old{g}" for g in (0, 1, 3, 4, 5, 6, 7)]
+    for g, worker in zip((0, 1, 3, 4, 5, 6, 7), old):
+      log.worker(worker, gpus=(g,))
+    for worker in ("lora:g", "lora:q", "q1", "q2", "g1"):  # squeezed onto the one GPU left, as on the cluster
+      log.worker(worker, gpus=(2,))
+    for worker in old:
+      log("run_deleted", run=f"{worker}-run", worker=worker)
+      log("exited", worker=worker)
+    gpus = [log.s.workers[n].gpus[0] for n in ("lora:g", "lora:q", "q1", "q2", "g1")]
+    self.assertEqual(len(set(gpus)), 5)
 
   def test_random_arrivals_never_make_a_sampler_take_turns_while_trainers_could_move(self):
     rnd = random.Random(42)

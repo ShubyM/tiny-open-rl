@@ -1,9 +1,6 @@
 """Runs the trainers and samplers the scheduler placed on this node, on the GPUs it chose.
 
-python -m tinyrl.control.node_daemon replaces starting `python -m tinyrl.workers.trainer <worker>` by hand. Every node daemon heartbeats
-into Redis and appends node_up when it starts. It folds tinyrl:events like the scheduler does, starts a process for each
-worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A
-worker's lease still decides who serves it.
+python -m tinyrl.control.node_daemon replaces starting `python -m tinyrl.workers.trainer <worker>` by hand. Every node daemon heartbeats into Redis and appends node_up when it starts. It folds tinyrl:events like the scheduler does, starts a process for each worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A worker's lease still decides who serves it.
 """
 
 from __future__ import annotations
@@ -17,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from tinyrl.bus import Bus
+from tinyrl.bus import Bus, Ev
 from tinyrl.control import scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
@@ -65,6 +62,7 @@ class NodeDaemon:
     self.store = store if store is not None else Store()
     self.swept = 0.0
     self.uploading: asyncio.Task | None = None
+    self.sweeping: asyncio.Task | None = None
     self.gpus = gpus
     self.procs: dict[str, tuple[list[int], subprocess.Popen]] = {}  # worker -> (its GPUs, its process)
     self.stopping: dict[str, subprocess.Popen] = {}  # told to stop, and maybe still on its GPUs
@@ -74,7 +72,7 @@ class NodeDaemon:
 
   async def announce_node(self) -> None:
     await self.bus.node_heartbeat(self.id, self.gpus)  # first, so the scheduler never finds it up without a heartbeat
-    await self.bus.append_event("node_up", node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
+    await self.bus.append_event(Ev.NODE_UP, node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
 
   async def tick(self) -> None:
     await self.bus.node_heartbeat(self.id, self.gpus)
@@ -93,13 +91,19 @@ class NodeDaemon:
       if proc.poll() is not None:  # only now is the GPU free, so only now does its turn end
         reap(proc)
         del self.stopping[worker]
-        await self.bus.append_event("exited", worker=worker)
+        await self.bus.append_event(Ev.EXITED, worker=worker)
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
-      await self.bus.append_event("started", worker=worker, node=self.id)
+      await self.bus.append_event(Ev.STARTED, worker=worker, node=self.id)
       self.procs[worker] = self.start_worker_process(worker, mine[worker])
-    if time.time() - self.swept > SWEEP_S:
+    # its heartbeat ran out, or Redis lost the log. Only once its processes exited, since the scheduler then grants their GPUs again
+    if self.id not in self.state.nodes and not self.procs and not self.stopping:
+      await self.announce_node()
+    # off the tick, so a slow sweep never holds up the heartbeat
+    if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
+      if self.sweeping and self.sweeping.exception():
+        print(f"sweep failed, trying again: {self.sweeping.exception()!r}", file=sys.stderr, flush=True)
       self.swept = time.time()
-      await self.sweep_checkpoints()
+      self.sweeping = asyncio.create_task(self.sweep_checkpoints())
     if self.uploading is None or self.uploading.done():  # this node's saves go up to a bucket CKPT behind, in order
       if self.uploading and self.uploading.exception():
         print(f"upload failed, trying again: {self.uploading.exception()!r}", file=sys.stderr, flush=True)

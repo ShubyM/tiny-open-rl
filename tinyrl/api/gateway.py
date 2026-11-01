@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from tinyrl.api import wire
-from tinyrl.bus import Bus, Op, Run, key
+from tinyrl.bus import Bus, Op, Role, Run, key
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
@@ -140,7 +140,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     exclusive = bool(train.get("exclusive")) if train_run else False
     sid = f"samp-{uuid.uuid4().hex[:12]}"
     run = Run(
-      sid, "", base, int(lora), session_id, model_path=uri, exclusive=exclusive, role="sampler", train_run=train_run
+      sid, "", base, int(lora), session_id, model_path=uri, exclusive=exclusive, role=Role.SAMPLER, train_run=train_run
     )
     await bus.create_run(run)
     return sid

@@ -15,8 +15,7 @@ LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
 class TestLease(RedisTest):
-  """Two trainer processes and one worker. The lease decides which one serves it, even after the first comes back from a
-  pause long enough for the second to take over."""
+  """Two trainer processes and one worker. The lease decides which one serves it, even after the first comes back from a pause long enough for the second to take over."""
 
   def trainer(self, worker: str) -> subprocess.Popen:
     env = {**os.environ, "REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS)}

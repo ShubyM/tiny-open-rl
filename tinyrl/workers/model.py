@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import transformers
 from peft import LoraConfig
+from peft.helpers import disable_input_dtype_casting
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
@@ -66,9 +67,7 @@ def should_checkpoint_layers(lm: PreTrainedModel, lora: bool) -> bool:
 
 
 def token_budget(lm: PreTrainedModel) -> int:
-  """How many padded tokens one forward/backward pass can hold: TOKEN_BUDGET if it's set, otherwise as many as fit in
-  half of the free GPU memory. It's measured on every call, since memory use changes as runs come and go, and an
-  optimizer allocates its state on its first step."""
+  """How many padded tokens one forward/backward pass can hold: TOKEN_BUDGET if it's set, otherwise as many as fit in half of the free GPU memory. It's measured on every call, since memory use changes as runs come and go, and an optimizer allocates its state on its first step."""
   if TOKEN_BUDGET:
     return TOKEN_BUDGET
   if lm.device.type != "cuda":
@@ -77,8 +76,7 @@ def token_budget(lm: PreTrainedModel) -> int:
   free, _ = torch.cuda.mem_get_info(lm.device)
   free += torch.cuda.memory_reserved(lm.device) - torch.cuda.memory_allocated(lm.device)  # cached by torch, but unused
 
-  # with gradient checkpointing, a token keeps about one hidden vector per layer. 6x that covers the layer being
-  # recomputed in the backward pass, and leaves a margin.
+  # with gradient checkpointing, a token keeps about one hidden vector per layer. 6x that covers the layer being recomputed in the backward pass, and leaves a margin.
   config = lm.config.get_text_config()
   bytes_per_token = (
     (6 if getattr(lm, "is_gradient_checkpointing", False) else 64)
@@ -90,8 +88,7 @@ def token_budget(lm: PreTrainedModel) -> int:
 
 
 def batches(lengths: list[int], budget: int) -> list[list[int]]:
-  """Group sequences into passes, shortest first so a pass pads little. A sequence starts a new pass if joining the
-  current one would go over the token budget, or make the pass more than 25% padding."""
+  """Group sequences into passes, shortest first so a pass pads little. A sequence starts a new pass if joining the current one would go over the token budget, or make the pass more than 25% padding."""
   passes: list[list[int]] = []
   for i in sorted(range(len(lengths)), key=lambda i: lengths[i]):
     if passes:
@@ -132,8 +129,7 @@ def batch_tensors(data: list[wire.Datum], lengths: list[int], device: torch.devi
 def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
   """The logprob of each target token.
 
-  The model returns its hidden states instead of logits. The output head and the logsumexp then run CHUNK positions at a
-  time under checkpointing, so the [tokens, vocab] logits never exist all at once."""
+  The model returns its hidden states instead of logits. The output head and the logsumexp then run CHUNK positions at a time under checkpointing, so the [tokens, vocab] logits never exist all at once."""
   out = lm(ids, attention_mask=mask, use_cache=False, logits_to_keep=1, output_hidden_states=True)
   hidden = out.hidden_states[-1].flatten(0, 1)
   head = lm.get_output_embeddings()
@@ -154,10 +150,7 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
 
 
 def load(name: str) -> PreTrainedModel:
-  """The class the checkpoint names in its config, which is the one vLLM serves, so the weights and adapters a
-  trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal
-  checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and
-  vLLM drops an adapter whose names it can't map, without an error."""
+  """The class the checkpoint names in its config, which is the one vLLM serves, so the weights and adapters a trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and vLLM drops an adapter whose names it can't map, without an error."""
   name = models.local(name)
   arch = (AutoConfig.from_pretrained(name).architectures or [""])[0]
   cls = getattr(transformers, arch, AutoModelForCausalLM)
@@ -248,8 +241,7 @@ class Model:
     return self.lm
 
   def forward_backward(self, run: str, data: list[wire.Datum], loss_fn: str, config: dict, forward_only: bool):
-    """Run the loss over every datum, accumulating gradients unless forward_only. Returns each datum's target
-    logprobs, and the loss metrics."""
+    """Run the loss over every datum, accumulating gradients unless forward_only. Returns each datum's target logprobs, and the loss metrics."""
     if loss_fn not in LOSSES:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
@@ -258,10 +250,12 @@ class Model:
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total = 0.0
 
-    with torch.set_grad_enabled(not forward_only):
+    # on the gpu autocast runs the adapters' matmuls in bf16 anyway, so PEFT's upcast of each layer's input to the fp32 adapter only adds casts
+    gpu = lm.device.type == "cuda"
+    with torch.set_grad_enabled(not forward_only), disable_input_dtype_casting(lm, active=gpu):
       for batch in batches(lengths, token_budget(lm)):
         x = batch_tensors([data[i] for i in batch], [lengths[i] for i in batch], lm.device)
-        with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=lm.device.type == "cuda"):
+        with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
           lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
         loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
         if not forward_only:
@@ -294,13 +288,13 @@ class Model:
 
     max_norm = adam.get("grad_clip_norm") or math.inf  # 0 means don't clip
     grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run].values(), max_norm).item()
-    if not self.lora:
-      if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # moments on the host come back to the GPU, after freeing torch's cache to make room
+    if not self.lora and torch.cuda.is_available() and any(not t.is_cuda for t in self.adam_moments()):
+      torch.cuda.empty_cache()
       self.move_tensors(self.adam_moments(), "cuda")
     optimizer.step()
     optimizer.zero_grad()
-    if not self.lora:
+    if not self.lora and not self.moments_fit():
       self.move_tensors(self.adam_moments(), "cpu")
     self.dirty.add(run)
     return {"grad_norm:mean": grad_norm}
@@ -361,6 +355,14 @@ class Model:
       if not self.lora:
         self.move_tensors(self.adam_moments(), "cpu")
     self.dirty.add(run)
+
+  def moments_fit(self) -> bool:
+    """Whether a full fine-tune's AdamW moments stay on the GPU between steps: when what's left free is at least as big as they are, so forward_backward keeps room. Otherwise they cross PCIe twice a step, 2.7 of a 2.8 s step for Gemma E2B."""
+    if not torch.cuda.is_available():
+      return True
+    size = sum(t.numel() * t.element_size() for t in self.adam_moments() if t.is_cuda)
+    free = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    return free >= size
 
   def adam_moments(self):
     return (v for opt in self.optimizers.values() for s in opt.state.values() for v in s.values() if torch.is_tensor(v))
