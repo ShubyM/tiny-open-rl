@@ -167,6 +167,47 @@ class TestNodeDaemon(RedisTest):
       await daemon.tick()
     self.assertIn("started", seen)
 
+  async def test_a_slow_sweep_never_holds_up_the_heartbeat(self):
+    daemon, sweeps, done = NodeDaemon(self.bus, node="n", gpu_mib=0), [], asyncio.Event()
+
+    async def slow_sweep():
+      sweeps.append(time.time())
+      await done.wait()  # deleting a wave's checkpoints from a bucket took 85 s on the cluster
+
+    daemon.sweep_checkpoints = slow_sweep
+    with patch("tinyrl.control.node_daemon.SWEEP_S", 0):
+      await asyncio.wait_for(daemon.tick(), 5)
+      await asyncio.wait_for(daemon.tick(), 5)  # and heartbeats again while the sweep runs
+    self.assertEqual(len(sweeps), 1)  # one sweep at a time
+    done.set()
+
+  async def test_a_node_the_scheduler_found_lost_announces_itself_again(self):
+    daemon = NodeDaemon(self.bus, gpus=1, node="n", gpu_mib=0)
+    await daemon.announce_node()
+    await daemon.tick()
+    await self.bus.append_event("node_lost", node="n")  # its heartbeat ran out while it was still running
+    await daemon.tick()
+    await daemon.tick()
+    self.assertEqual([e.kind for e in await self.bus.read_events()], ["node_up", "node_lost", "node_up"])
+    self.assertIn("n", daemon.state.nodes)
+
+  async def test_a_lost_node_announces_itself_only_once_its_stopped_processes_exited(self):
+    await self.bus.create_run(Run("ra", "a", "base", 4))
+    daemon, proc = NodeDaemon(self.bus, gpus=1, node="n", gpu_mib=0), MagicMock(**{"poll.return_value": None})
+    await daemon.announce_node()
+    await self.bus.append_event("placed", worker="a", node="n", gpus=[0], rule="test")
+    with patch("subprocess.Popen", return_value=proc):
+      await daemon.tick()
+      await self.bus.append_event("node_lost", node="n")
+      await daemon.tick()
+      proc.terminate.assert_called()
+      await daemon.tick()
+      # a trainer still saving from the GPU: a node_up now would let the scheduler grant that GPU to another worker
+      self.assertEqual([e.kind for e in await self.bus.read_events()].count("node_up"), 1)
+      proc.poll.return_value = 0
+      await daemon.tick()
+    self.assertEqual([e.kind for e in await self.bus.read_events()][-2:], ["exited", "node_up"])
+
   async def test_a_sweep_deletes_only_what_the_registry_lets_go(self):
     store = Store(root=tempfile.mkdtemp())
     old = time.time() - SWEEP_GRACE_S - 60
