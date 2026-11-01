@@ -1,6 +1,6 @@
 """Runs the trainers and samplers the scheduler placed on this node, on the GPUs it chose.
 
-python -m tinyrl.control.node_daemon replaces starting `python -m tinyrl.workers.trainer <worker>` by hand. Every node daemon heartbeats into Redis and appends node_up when it starts. It folds tinyrl:events like the scheduler does, starts a process for each worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A worker's lease still decides who serves it.
+python -m tinyrl.control.node_daemon replaces starting `python -m tinyrl.workers.trainer <worker>` by hand. Every node daemon heartbeats into Redis and appends node_up when it starts, and again if the scheduler found it lost. It folds tinyrl:events like the scheduler does, starts a process for each worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A worker's lease still decides who serves it.
 """
 
 from __future__ import annotations
