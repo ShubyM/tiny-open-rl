@@ -28,8 +28,8 @@ from redis.backoff import ExponentialBackoff
 from tinyrl.helpers import getenv
 
 GROUP = "trainer"  # the consumer group every worker's trainer reads through
-LIVE_SECONDS = 120  # a session is live this long after its last heartbeat
-SESSION_GRACE = getenv("SESSION_GRACE", 180)  # and its runs are deleted this long after it
+LIVE_SECONDS = 30  # a session is live this long after its last heartbeat, which the SDK sends every 10 s
+SESSION_GRACE = getenv("SESSION_GRACE", 60)  # and its runs are deleted this long after it
 REPLY_TTL = getenv("REPLY_TTL", 3600)
 SESSION_TTL = getenv("SESSION_TTL", 7 * 24 * 3600)
 LEASE_MS = getenv("LEASE_MS", 10000)  # a trainer owns its worker this long after its last renewal
@@ -171,6 +171,10 @@ class Bus:
   async def expired_sessions(self) -> list[str]:
     """The sessions whose client stopped heartbeating SESSION_GRACE seconds ago."""
     return [s.decode() for s in await self.r.zrangebyscore(key("seen"), 0, time.time() - SESSION_GRACE)]
+
+  async def finish_session(self, session_id: str) -> None:
+    """A client finished its session: end it on the scheduler's next pass, without waiting out SESSION_GRACE."""
+    await self.r.zadd(key("seen"), {session_id: 0}, xx=True)
 
   async def end_session(self, session_id: str) -> None:
     """Delete an expired session's runs: a training run once its queued work is done, a sampling session now. A session with a training run left is ended again SESSION_GRACE later, since the next trainer fails a delete one died holding."""
