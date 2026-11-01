@@ -155,8 +155,12 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     }
 
   @api.get("/api/v1/healthz")
+  async def healthz():
+    return {"status": "ok"}
+
   @api.post("/api/v1/sessions/{session_id}/finish")
-  async def healthz(session_id: str = ""):
+  async def finish_session(session_id: str):
+    await bus.finish_session(session_id)  # the SDK's close(), and the end of a `with ServiceClient()` block
     return {"status": "ok"}
 
   @api.post("/api/v1/telemetry")
