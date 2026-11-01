@@ -65,6 +65,7 @@ RULES = {
   "place.near_its_trainer": "a full fine-tune's sampler goes to its trainer's node, where its weights are saved",
   "place.moved_aside": "a trainer moves to take turns with other trainers, so a sampler or exclusive worker gets a GPU",
   "place.emptied": "a worker with no runs is unplaced, which stops its process",
+  "place.spread": "a trainer that takes turns moves to an empty GPU on its node, so trainers share a GPU only when none is free",
   "turn.granted": "a worker that asked gets its GPUs once it is first in line on each and fits next to their holders",
   "turn.idle_holder_yields": "a holder that found no commands gives its GPUs back as soon as someone waits for one",
   "turn.quantum_expired": "a busy holder gives its GPUs back QUANTUM seconds into its turn if someone waits for one",
@@ -238,6 +239,8 @@ def next_decision(s: State, now: float) -> tuple[Ev, dict] | None:
   unplaced = [name for name, w in s.workers.items() if w.node is None and members(s, name)]
   if unplaced and s.nodes:
     return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
+  if moved := spread(s):
+    return Ev.PLACED, moved
   for _, name in sorted((w.asked, name) for name, w in s.workers.items() if w.asked):
     if all(first_in_line(s, k) == name and fits(s, k, name) for k in keys(s.workers[name])):
       return Ev.GRANTED, {"worker": name, "rule": "turn.granted"}
@@ -271,6 +274,24 @@ def place(s: State, name: str) -> dict:
     }
   rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
   return {"worker": name, "node": node, "gpus": [gpu], "rule": rule, "gpu_rule": why}
+
+
+def spread(s: State) -> dict | None:
+  """Move one trainer off a shared GPU onto an empty one on the same node. Empty means no worker is placed on it and no old process still runs on it. Only trainers that take turns move: workers that share because their memory fits stay put. LoRA trainers move first, since a full fine-tune is slow to save and restore. Then a trainer waiting for its turn moves before the one using the GPU."""
+  for node, (gpus, gpu_bytes) in sorted(s.nodes.items()):
+    there = {g: [n for n, w in s.workers.items() if w.node == node and g in w.gpus] for g in range(gpus)}
+    running = {g for w in s.workers.values() for n, g in w.on if n == node}
+    empty = [g for g in range(gpus) if not there[g] and g not in running]
+    movable = {
+      g: [n for n in names if takes_turns(s.workers[n]) and len(s.workers[n].gpus) == 1]
+      for g, names in there.items()
+      if len(names) > 1 and not fit([budget(s, s.workers[n].kind, node) for n in names], gpu_bytes)
+    }
+    if empty and (crowded := [g for g, names in movable.items() if names]):
+      g = max(crowded, key=lambda g: (len(there[g]), -g))
+      name = min(movable[g], key=lambda n: (not s.workers[n].kind.lora, s.workers[n].since is not None, n))
+      return {"worker": name, "node": node, "gpus": [empty[0]], "rule": "place.spread"}
+  return None
 
 
 def takes_turns(w: Worker) -> bool:
