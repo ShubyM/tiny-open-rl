@@ -122,13 +122,17 @@ def restore(folder: str) -> tuple[subprocess.Popen, str]:
 def restore_here(folder: str, target: str) -> None:
   """Runs as the init of fresh namespaces: give the copy its own loopback and private /tmp, /dev/shm and RUN, restore, move it onto `target`, then reap."""
   run("ip", "link", "set", "lo", "up")
-  # the snapshot may sit under /dev/shm, which the copy gets a private one of: reach it from a mount of its own first
-  os.makedirs("/mnt/tinyrl-snapshot", exist_ok=True)
-  run("mount", "--bind", folder, "/mnt/tinyrl-snapshot")
-  folder = "/mnt/tinyrl-snapshot"
-  for d in ("/tmp", "/dev/shm", RUN):
-    os.makedirs(d, exist_ok=True)
+  # private /tmp and /dev/shm, so copies don't collide on the files the snapshot recreates there, with the node's folders bound back in: the snapshot, checkpoints and models live there
+  for d in ("/tmp", "/dev/shm"):
+    os.makedirs(f"/mnt/tinyrl{d}", exist_ok=True)
+    run("mount", "--bind", d, f"/mnt/tinyrl{d}")
     run("mount", "-t", "tmpfs", "tmpfs", d)
+    for e in os.scandir(f"/mnt/tinyrl{d}"):
+      if e.is_dir(follow_symlinks=False):
+        os.makedirs(f"{d}/{e.name}")
+        run("mount", "--bind", e.path, f"{d}/{e.name}")
+  os.makedirs(RUN, exist_ok=True)
+  run("mount", "-t", "tmpfs", "tmpfs", RUN)
   for f in glob.glob(f"{folder}/keep/*"):
     shutil.copy2(f, "/dev/shm" if os.path.basename(f).startswith("link_remap.") else RUN)
   with open(f"{folder}/meta.json") as f:
