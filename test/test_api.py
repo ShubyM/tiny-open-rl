@@ -264,6 +264,20 @@ class TestAPI(RedisTest):
     self.assertFalse((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
     self.assertEqual(await self.bus.expired_sessions(), [])
 
+  async def test_a_finished_session_loses_its_runs_without_waiting_for_its_heartbeats_to_stop(self):
+    session_id = (await self.post("create_session")).json()["session_id"]
+    run_id = await self.create_model(session_id=session_id)
+    sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
+    samp_id = sampling.json()["sampling_session_id"]
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    await self.scheduling_until(lambda d: samp_id in d["state"]["runs"])
+
+    await self.post(f"sessions/{session_id}/finish", json={"reason": {"type": "success"}})
+    await self.scheduling_until(lambda d: samp_id not in d["state"]["runs"])
+    await self.drain(run_id)  # its training run goes once its queued work is done
+    self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
+    self.assertEqual(await self.bus.expired_sessions(), [])
+
   async def test_training_checkpoints_are_safetensors_with_adam_moments(self):
     run_id = await self.create_model()
     await self.result(await self.post("forward_backward", content=proto_body(run_id), headers=PROTO))
