@@ -127,8 +127,7 @@ class Store:
   # ***** put *****
 
   def copy_to_host(self, tensors: dict[str, torch.Tensor], is_cuda=lambda t: t.is_cuda) -> dict[str, torch.Tensor]:
-    """The tensors on the CPU. GPU tensors go through one pinned buffer, so the copy runs at DMA speed. When they all
-    fit, they are views of it, else each streams through it in pieces into its own host tensor."""
+    """The tensors on the CPU. GPU tensors go through one pinned buffer, so the copy runs at DMA speed. When they all fit, they are views of it, else each streams through it in pieces into its own host tensor."""
     import torch
 
     with self.lock:

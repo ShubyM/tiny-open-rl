@@ -29,8 +29,7 @@ def check(s: State) -> list[str]:
 
 
 class Log:
-  """Appends facts the way workers and node daemons do, then decides the way the scheduler does, folding each decision
-  back as it would read it from the log. Checks the invariants after every entry, and that nothing is decided twice."""
+  """Appends facts the way workers and node daemons do, then decides the way the scheduler does, folding each decision back as it would read it from the log. Checks the invariants after every entry, and that nothing is decided twice."""
 
   def __init__(self, test: unittest.TestCase, quantum: float = QUANTUM):
     self.test, self.s, self.t, self.entries = test, State(quantum=quantum), 0.0, []
@@ -268,8 +267,7 @@ class TestTurns(unittest.TestCase):
 
 class TestLog(unittest.TestCase):
   def random_log(self, rng: random.Random) -> Log:
-    """Random facts, faults included: workers restarting elsewhere, dead workers that never release, nodes restarting
-    and lost, runs coming and going."""
+    """Random facts, faults included: workers restarting elsewhere, dead workers that never release, nodes restarting and lost, runs coming and going."""
     log = Log(self)
     nodes = {f"n{i}": rng.choice([1, 2, 4, 8]) for i in range(rng.choice([1, 1, 2, 4]))}
     for node, gpus in nodes.items():

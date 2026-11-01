@@ -2,6 +2,7 @@ import asyncio
 from unittest.mock import patch
 
 from test.helpers import RedisTest
+from tinyrl.bus import key
 from tinyrl.control import scheduler
 from tinyrl.control.turns import GpuTurn
 
@@ -79,7 +80,7 @@ class TestScheduler(RedisTest):
       waiting = asyncio.create_task(b.wait_for_turn(1))
       for _ in range(5):
         await asyncio.sleep(0.05)
-        await self.bus.append_event("random_event")
+        await self.bus.r.xadd(key("events"), {"kind": "random_event", "body": "{}"})  # a kind this version doesn't know
       self.assertFalse(waiting.done())
       wants = [e for e in await self.bus.read_events() if e.kind == "wants_gpu" and e.body.get("worker") == "b"]
       self.assertEqual(len(wants), 1)

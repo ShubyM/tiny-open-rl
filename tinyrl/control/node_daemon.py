@@ -1,9 +1,6 @@
 """Runs the trainers and samplers the scheduler placed on this node, on the GPUs it chose.
 
-python -m tinyrl.control.node_daemon replaces starting `python -m tinyrl.workers.trainer <worker>` by hand. Every node daemon heartbeats
-into Redis and appends node_up when it starts. It folds tinyrl:events like the scheduler does, starts a process for each
-worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A
-worker's lease still decides who serves it.
+python -m tinyrl.control.node_daemon replaces starting `python -m tinyrl.workers.trainer <worker>` by hand. Every node daemon heartbeats into Redis and appends node_up when it starts. It folds tinyrl:events like the scheduler does, starts a process for each worker placed on it, starts it again if it dies, and stops the ones placed elsewhere or emptied. It decides nothing. A worker's lease still decides who serves it.
 """
 
 from __future__ import annotations
@@ -17,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from tinyrl.bus import Bus
+from tinyrl.bus import Bus, Ev
 from tinyrl.control import scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
@@ -74,7 +71,7 @@ class NodeDaemon:
 
   async def announce_node(self) -> None:
     await self.bus.node_heartbeat(self.id, self.gpus)  # first, so the scheduler never finds it up without a heartbeat
-    await self.bus.append_event("node_up", node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
+    await self.bus.append_event(Ev.NODE_UP, node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
 
   async def tick(self) -> None:
     await self.bus.node_heartbeat(self.id, self.gpus)
@@ -93,9 +90,9 @@ class NodeDaemon:
       if proc.poll() is not None:  # only now is the GPU free, so only now does its turn end
         reap(proc)
         del self.stopping[worker]
-        await self.bus.append_event("exited", worker=worker)
+        await self.bus.append_event(Ev.EXITED, worker=worker)
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
-      await self.bus.append_event("started", worker=worker, node=self.id)
+      await self.bus.append_event(Ev.STARTED, worker=worker, node=self.id)
       self.procs[worker] = self.start_worker_process(worker, mine[worker])
     if time.time() - self.swept > SWEEP_S:
       self.swept = time.time()

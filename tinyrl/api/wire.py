@@ -1,7 +1,6 @@
 """The Tinker wire format.
 
-forward_backward and SampleResponse travel as protobuf end to end: the gateway forwards the bytes untouched, and the
-workers read or write tensors straight to them. Every other call is JSON.
+forward_backward and SampleResponse travel as protobuf end to end: the gateway forwards the bytes untouched, and the workers read or write tensors straight to them. Every other call is JSON.
 """
 
 import sys
@@ -76,8 +75,7 @@ def loss_config(req: pb.ForwardBackwardRequest) -> dict[str, float | str]:
 
 
 def from_json(body: dict, forward_only: bool = False) -> bytes:
-  """Turn the JSON forward_backward that SDKs before 0.25 send into the same protobuf, so the trainer reads one
-  format."""
+  """Turn the JSON forward_backward that SDKs before 0.25 send into the same protobuf, so the trainer reads one format."""
   fb = body.get("forward_backward_input") or body.get("forward_input") or {}
   req = pb.ForwardBackwardRequest(
     model_id=body["model_id"],
@@ -109,8 +107,7 @@ def from_json(body: dict, forward_only: bool = False) -> bytes:
 
 
 def output(logprobs: list[np.ndarray], metrics: dict[str, float]) -> bytes:
-  """Pack each datum's logprobs into a ForwardBackwardOutput: one ArrayRecord holding every datum's values back to back,
-  sliced apart by byte offsets."""
+  """Pack each datum's logprobs into a ForwardBackwardOutput: one ArrayRecord holding every datum's values back to back, sliced apart by byte offsets."""
   out = pb.ForwardBackwardOutput(loss_fn_output_type="ArrayRecord", metrics=metrics)
   if logprobs:
     field = out.loss_fn_outputs.add(num_datums=len(logprobs)).fields["logprobs"]

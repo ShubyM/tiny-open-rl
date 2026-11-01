@@ -1,18 +1,15 @@
 """Runs, sessions, commands and replies, all on Redis.
 
-Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The trainer for a worker reads its runs'
-streams through one consumer group, so Redis itself knows:
+Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The trainer for a worker reads its runs' streams through one consumer group, so Redis itself knows:
 
   what is queued       XINFO GROUPS, the group's lag
   what is in flight    XPENDING: which trainer took each command, and how long ago
   what a dead trainer  XAUTOCLAIM, so the next trainer can fail it instead of leaving a client waiting
   left unfinished
 
-A reply is a stream with a single entry, tinyrl:f:<request_id>. XREAD from id 0 blocks until it is written and never
-consumes it, so a client can retry retrieve_future, or many clients can wait on one, and every one gets the same answer.
+A reply is a stream with a single entry, tinyrl:f:<request_id>. XREAD from id 0 blocks until it is written and never consumes it, so a client can retry retrieve_future, or many clients can wait on one, and every one gets the same answer.
 
-A worker has one owner, the trainer holding its lease, tinyrl:owner:<worker>. Replies are written in a WATCH/MULTI/EXEC
-transaction on the lease key, so a trainer that lost its worker, say after a long pause, can't answer for it.
+A worker has one owner, the trainer holding its lease, tinyrl:owner:<worker>. Replies are written in a WATCH/MULTI/EXEC transaction on the lease key, so a trainer that lost its worker, say after a long pause, can't answer for it.
 """
 
 from __future__ import annotations
@@ -54,6 +51,31 @@ class Op(StrEnum):
   SAMPLE = "sample"
 
 
+class Ev(StrEnum):
+  """The kinds of entry in the log, tinyrl:events. See scheduler.py for what each means."""
+
+  RUN_CREATED = "run_created"
+  ASSIGNED = "assigned"
+  RUN_DELETED = "run_deleted"
+  NODE_UP = "node_up"
+  NODE_LOST = "node_lost"
+  PLACED = "placed"
+  UNPLACED = "unplaced"
+  STARTED = "started"
+  EXITED = "exited"
+  WANTS_GPU = "wants_gpu"
+  BATCH_DONE = "batch_done"
+  IDLE = "idle"
+  RELEASED = "released"
+  GRANTED = "granted"
+  REVOKED = "revoked"
+
+
+class Role(StrEnum):
+  TRAINER = "trainer"
+  SAMPLER = "sampler"
+
+
 @dataclass(frozen=True)
 class Run:
   id: str
@@ -64,7 +86,7 @@ class Run:
   model_path: str | None = None
   lora: dict = field(default_factory=dict)  # the LoRA config it was created with, to create it again elsewhere
   exclusive: bool = False
-  role: str = "trainer"
+  role: Role = Role.TRAINER
   train_run: str | None = None  # the training run a sampling session samples
 
 
@@ -94,10 +116,7 @@ def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
 
 
 def connect(url: str) -> redis.Redis:
-  # a reply is waited for with a blocking read of up to 30s, and redis-py gives up on a read after 5s by default.
-  # Retrying a dropped connection for about a minute rides out a Redis restart, which keeps its data in its AOF file.
-  # Each request the gateway waits on holds a connection for that read, and redis-py's connection pool stops at 100
-  # ("Too many connections" at 400 concurrent samples): allow as many as Redis itself does (maxclients 10000)
+  # a reply is waited for with a blocking read of up to 30s, and redis-py gives up on a read after 5s by default. Retrying a dropped connection for about a minute rides out a Redis restart, which keeps its data in its AOF file. Each request the gateway waits on holds a connection for that read, and redis-py's connection pool stops at 100 ("Too many connections" at 400 concurrent samples): allow as many as Redis itself does (maxclients 10000)
   retry = Retry(ExponentialBackoff(cap=2.0, base=0.1), 30)
   return redis.from_url(url, socket_timeout=None, retry=retry, max_connections=10_000)
 
@@ -108,7 +127,7 @@ class Event:
 
   id: str  # the stream id, <ms>-<n>
   t: float  # seconds, from the ms part of the id
-  kind: str
+  kind: str  # an Ev, or a kind this version doesn't know, which fold ignores
   body: dict
 
 
@@ -160,9 +179,9 @@ class Bus:
       run = await self.get_run(run_id) or {}
       if not await self.r.sismember(key("runs"), run_id):
         continue
-      if run.get("role") == "sampler":
+      if run.get("role") == Role.SAMPLER:
         await self.delete_run(run_id, run.get("worker", ""))
-      elif run.get("role") == "trainer":
+      elif run.get("role") == Role.TRAINER:
         left = bool(await self.submit_command(run_id, Op.DELETE_MODEL, b"{}")) or left
     if left:
       await self.r.zadd(key("seen"), {session_id: time.time()})
@@ -187,7 +206,7 @@ class Bus:
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
     body = {"run": run.id, "role": run.role, "base": run.base, "rank": run.rank, "exclusive": run.exclusive}
     body |= {"train_run": run.train_run} | ({"worker": run.worker} if run.worker else {})
-    p.xadd(key("events"), {"kind": "run_created", "body": json.dumps(body)})
+    p.xadd(key("events"), {"kind": Ev.RUN_CREATED, "body": json.dumps(body)})
     await p.execute()
 
   async def assign_run_to_worker(self, run: str, worker: str) -> None:
@@ -195,7 +214,7 @@ class Bus:
     p = self.r.pipeline(transaction=True)
     p.hset(key("run", run), "worker", worker)
     p.sadd(key("worker", worker), run)
-    p.xadd(key("events"), {"kind": "assigned", "body": json.dumps({"run": run, "worker": worker})})
+    p.xadd(key("events"), {"kind": Ev.ASSIGNED, "body": json.dumps({"run": run, "worker": worker})})
     await p.execute()
 
   async def get_run(self, run_id: str) -> dict | None:
@@ -234,7 +253,7 @@ class Bus:
     p.srem(key("runs"), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
     await p.execute()
-    await self.append_event("run_deleted", run=run_id, worker=worker)
+    await self.append_event(Ev.RUN_DELETED, run=run_id, worker=worker)
 
   # ***** commands *****
 
@@ -274,9 +293,7 @@ class Bus:
   async def write_reply(
     self, cmd: Cmd, reply: Reply, worker: str, owner: str, repeat: bool = False, started: float | None = None
   ) -> bool:
-    """Write a command's reply, acknowledge the command, and count it, all at once, if `owner` still owns the worker.
-    Returns False, having written nothing, if it doesn't: another trainer took the worker over and fails the command.
-    A command run at time.time() `started` also counts its wait since it was queued, and how long it ran."""
+    """Write a command's reply, acknowledge the command, and count it, all at once, if `owner` still owns the worker. Returns False, having written nothing, if it doesn't: another trainer took the worker over and fails the command. A command run at time.time() `started` also counts its wait since it was queued, and how long it ran."""
     counts = {}
     if not repeat:
       if not reply.ok:
@@ -327,8 +344,7 @@ class Bus:
     return Reply(fields[b"ok"] == b"1", fields[b"content_type"].decode(), fields[b"body"])
 
   async def reclaim_stranded_commands(self, worker: str, owner: str, min_idle_ms: int = 0) -> list[Cmd]:
-    """Claim the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by its
-    owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the worker."""
+    """Claim the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by its owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the worker."""
     cmds = []
     for run_id in await self.runs_in_worker(worker):
       stream = key("q", run_id)
@@ -423,9 +439,9 @@ class Bus:
 
   # ***** events *****
 
-  async def append_event(self, _kind: str, **body) -> str:
+  async def append_event(self, _kind: Ev, **body) -> str:
     entry_id = await self.r.xadd(
-      key("events"), {"kind": _kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
+      key("events"), {"kind": Ev(_kind), "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
     )
     return entry_id.decode()
 
