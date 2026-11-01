@@ -348,7 +348,12 @@ class Bus:
     cmds = []
     for run_id in await self.runs_in_worker(worker):
       stream = key("q", run_id)
-      _, entries, _ = await self.r.xautoclaim(stream, GROUP, owner, min_idle_time=min_idle_ms, count=10000)
+      try:
+        _, entries, _ = await self.r.xautoclaim(stream, GROUP, owner, min_idle_time=min_idle_ms, count=10000)
+      except redis.ResponseError as e:
+        if "NOGROUP" not in str(e):
+          raise
+        continue  # a run deleted after it was listed has nothing left to claim
       cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
     return cmds
 

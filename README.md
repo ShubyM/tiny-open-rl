@@ -22,9 +22,9 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path  # a P
 
 ```sh
 pip install -e .
-redis-server &                                  # Redis 8.4 or newer
-python -m tinyrl.api.gateway &                      # the Tinker HTTP API, on :8000
-python -m tinyrl.control.scheduler &                    # decides whose turn it is on each shared GPU
+redis-server &                                          # Redis 8.4 or newer
+python -m tinyrl.api.gateway &                          # the Tinker HTTP API, on :8000
+python -m tinyrl.control.scheduler &                    # assigns runs, places workers and grants GPU turns
 python -m tinyrl.control.node_daemon                    # runs a trainer or sampler for each worker placed on it
 ```
 
@@ -37,7 +37,7 @@ its own. Worker names encode nothing.
 Run one node daemon per GPU machine (`GPUS`, default 1) and one scheduler. The scheduler places each worker that has runs
 on the node daemon with the fewest workers per GPU, on GPUs it picks, and moves a dead node daemon's workers to live ones.
 Each node daemon runs `python -m tinyrl.workers.trainer <worker>` or `python -m tinyrl.workers.sampler <worker>` for the workers placed on it,
-and starts them again if they die. A sampler starts its engine on its first command.
+and starts them again if they die. On multi-GPU nodes, a sampler starts its engine at launch. On a single GPU, it starts on its first command.
 The engine is vLLM, `vllm serve` on a local port, unless `ENGINE` names another.
 
 Trainers on one GPU take turns, granted by the scheduler. Between batches, a trainer with nothing to do, or
@@ -69,7 +69,7 @@ survives.
 sdk --http--> gateway --XADD--> tinyrl:q:<run> --XREADGROUP--> trainer --XADD--> tinyrl:f:<run>/<id> --XREAD--> gateway --> sdk
 ```
 
-Every training call is a command on its run's Redis stream, and its reply is a stream with one entry, named by the request. That's the
+Every training or sampling call is a command on its run's Redis stream, and its reply is a stream with one entry, named by the request. That's the
 whole design. Redis does the bookkeeping that would otherwise take a database, a ledger and a heartbeat.
 
 * **The queue reads itself.** A worker's trainer reads its runs' streams through one consumer group so `XINFO GROUPS` says what's queued,
@@ -85,44 +85,52 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 * **Replies land atomically.** The reply, the acknowledgement and the run's step counter are written in one transaction.
 * **One wire format.** `forward_backward` stays protobuf from the SDK to the trainer, which reads the tensors straight out of the bytes.
   Older SDKs' JSON is turned into the same protobuf at the gateway, and JSON clients get the output decoded back to JSON.
-* **One trainer.** A base model, with a PEFT adapter per run or the whole model for a single run, behind `create`, `forward_backward`,
-  `optim_step`, `state`, `weights`, `restore` and `delete`. Logprobs are computed `CHUNK` tokens at a time under checkpointing, so the
+* **One event log.** The gateway, node daemons and workers append what happened to `tinyrl:events`. The scheduler folds the log into a state and appends placements and GPU turns back to it. Node daemons fold the same log to start and stop workers.
+* **One trainer.** A base model, with a PEFT adapter per run or the whole model for a single run, behind `create_run`, `forward_backward`,
+  `optim_step`, `training_state`, `sampler_weights`, `restore_run` and `delete_run`. Logprobs are computed `CHUNK` tokens at a time under checkpointing, so the
   `[tokens, vocab]` logits never exist all at once. The optimizer updates fp32 master weights and keeps fp32 AdamW state, while the
   forward pass runs in bf16 under autocast. A LoRA run's frozen base model stays bf16.
 * **Portable checkpoints.** Training checkpoints (`save_weights`) and sampler weights (`save_weights_for_sampler`) go through
   [store.py](tinyrl/storage/store.py) behind `put(uri)` and `get(uri)` as pure `safetensors` (no `torch.save` pickle), so any trainer can
   resume a run with its exact fp32 weights and AdamW state. `CKPT` can be a bucket (`gs://...`, with `pip install .[gcs]`), so
   every node sees every checkpoint.
-* **One owner per worker.** A trainer serves a worker only while it holds the worker's lease. A WATCH/MULTI/EXEC transaction on the lease key checks the lease before any reply lands.
+* **One owner per worker.** A trainer or sampler serves a worker only while it holds the worker's lease. A WATCH/MULTI/EXEC transaction on the lease key checks the lease before any reply lands.
 
 ## Reading the code
 
 Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains the streams. Then read [gateway.py](tinyrl/api/gateway.py)
-to see how each Tinker call becomes a command, [store.py](tinyrl/storage/store.py) to see how checkpoints are stored, and
-[trainer.py](tinyrl/workers/trainer.py) to see how a command runs on the model.
+to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/scheduler.py) to see how the event log folds into placements and turns,
+[store.py](tinyrl/storage/store.py) to see how checkpoints are stored, and [trainer.py](tinyrl/workers/trainer.py) and
+[model.py](tinyrl/workers/model.py) to see how a command runs on the model.
 
 | file | lines | what's in it |
 |---|---:|---|
-| [tinyrl/bus.py](tinyrl/bus.py) | 321 | runs, sessions, commands, replies, leases and the event log on Redis |
-| [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | `getenv` |
-| [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | 303 | the Tinker HTTP API |
-| [tinyrl/api/wire.py](tinyrl/api/wire.py) | 155 | the Tinker protobuf, to numpy and back |
-| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | 258 | folds the event log, places workers on nodes and grants GPU turns |
-| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | 127 | runs the workers placed on its node, uploads its saves and sweeps its checkpoints |
-| [tinyrl/control/turns.py](tinyrl/control/turns.py) | 43 | a worker's side of taking turns on a GPU |
-| [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | 35 | how much GPU memory a worker needs |
-| [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | 221 | the trainer loop: commands in, replies out |
-| [tinyrl/workers/model.py](tinyrl/workers/model.py) | 307 | the losses, token budget batching, and the model a trainer serves |
-| [tinyrl/workers/sampler.py](tinyrl/workers/sampler.py) | 215 | sampling workers, through an engine that knows nothing of Redis |
-| [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | 210 | the vLLM engine: `vllm serve` over HTTP |
+| [tinyrl/bus.py](tinyrl/bus.py) | 350 | runs, sessions, commands, replies, leases, node heartbeats and `tinyrl:events` on Redis |
+| [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | typed `getenv` and the `DEBUG` flag |
+| [tinyrl/__init__.py](tinyrl/__init__.py) | 1 | top-level `Bus`, `Cmd`, `Reply` and `Run` exports |
+| [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | 303 | the Tinker HTTP routes for sessions, runs, checkpoints and Prometheus metrics |
+| [tinyrl/api/wire.py](tinyrl/api/wire.py) | 155 | Tinker requests and replies between protobuf, numpy and JSON |
+| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | 256 | folds the event log to assign runs, place workers and grant GPU turns |
+| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | 135 | heartbeats, runs the workers placed on its node, uploads saves and sweeps checkpoints |
+| [tinyrl/control/turns.py](tinyrl/control/turns.py) | 41 | `GpuTurn`, a worker's side of requesting, holding and yielding GPUs |
+| [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | 35 | estimates model, adapter and KV-cache memory and GPU width from headers |
+| [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | 224 | the trainer loop for leases, queued commands, GPU turns and SIGTERM saves |
+| [tinyrl/workers/model.py](tinyrl/workers/model.py) | 307 | the PyTorch and PEFT model, RL losses, token-budget batching and host parking |
+| [tinyrl/workers/sampler.py](tinyrl/workers/sampler.py) | 229 | batches sampling calls, loads checkpoints and takes turns through a Redis-free `Engine` |
+| [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | 210 | drives `vllm serve` over HTTP for completions, adapters, weight reloads and sleep |
 | [tinyrl/workers/snapshot.py](tinyrl/workers/snapshot.py) | 113 | CRIU snapshots of an asleep vLLM, restored in seconds instead of a boot |
-| [tinyrl/storage/store.py](tinyrl/storage/store.py) | 395 | `safetensors` checkpoints behind `put(uri)` and `get(uri)`, on a folder or a bucket |
-| [tinyrl/storage/registry.py](tinyrl/storage/registry.py) | 69 | the checkpoints the store holds, their owners, TTLs and versions |
-| [tinyrl/storage/models.py](tinyrl/storage/models.py) | 55 | base models from the hub, a bucket or a folder |
+| [tinyrl/storage/store.py](tinyrl/storage/store.py) | 384 | `safetensors` `put` and `get` with local `CKPT_CACHE`, bucket uploads and delta chains |
+| [tinyrl/storage/registry.py](tinyrl/storage/registry.py) | 71 | saved checkpoints on Redis with their owners, sizes, versions and TTLs |
+| [tinyrl/storage/models.py](tinyrl/storage/models.py) | 55 | base models from the hub, a bucket or a folder, cached in `MODEL_CACHE` |
+| **total** | **2709** | counted by [sz.py](sz.py), excluding generated `tinyrl/api/proto` |
 
-`python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
+`python sz.py` counts token-bearing lines the way tinygrad does, and CI caps `tinyrl/` at 2,800 lines. Outside `tinyrl/`,
+[examples/tinker_sdk.py](examples/tinker_sdk.py) trains and samples through the unmodified SDK. The rest of the repo holds
+[k8s/](k8s), the browser [simulator/](simulator/README.md), [docs/kubernetes.md](docs/kubernetes.md), and the integration suites in [test/](test).
+
+Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `KEYFRAME_EVERY`, `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`,
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`,
 `ENGINE`, `VLLM_ARGS`, `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 
 ## Telemetry
@@ -153,7 +161,7 @@ Open `simulator/index.html` in a browser; it runs locally without installing dep
 
 ```sh
 python -m unittest discover -s test -t .                             # starts its own redis-server, or set REDIS_URL
-TINKER_PYTHON=$(which python) python -m unittest test.test_tinker   # the real SDK, against redis, the gateway and a trainer as processes
+TINKER_PYTHON=$(which python) python -m unittest test.test_tinker   # runs examples/tinker_sdk.py against redis, gateway, scheduler and node_daemon
 ```
 
 Every test runs against a real `redis-server` and a real (tiny, random) Llama. Nothing is faked.
