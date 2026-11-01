@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import glob
 import hashlib
 import importlib.metadata
@@ -35,10 +36,10 @@ def site() -> str:
 
 
 def run(*args: str, log: str = "") -> None:
-  """Run a command; a failure carries the errors from its log, which is where CRIU writes them."""
+  """Run a command; a failure carries the end of its log, which is where CRIU writes its errors."""
   if subprocess.run(args, stdout=subprocess.DEVNULL).returncode:
-    errors = [line for line in open(log, errors="replace") if "Error" in line][-3:] if os.path.exists(log) else []
-    raise RuntimeError(f"{args[0]} {args[1]} failed: {''.join(errors).strip()}")
+    tail = open(log, errors="replace").readlines()[-6:] if os.path.exists(log) else []
+    raise RuntimeError(f"{args[0]} {args[1]} failed: {''.join(tail).strip()}")
 
 
 def gpus() -> list[str]:
@@ -91,11 +92,14 @@ def save(pid: int, folder: str, name: str) -> None:
   try:
     os.makedirs(f"{tmp}/keep")
     log = f"/tmp/criu-dump-{os.getpid()}.log"
-    before = set(glob.glob("/dev/shm/link_remap.*"))
-    run("criu", "dump", "-t", str(pid), "-D", tmp, *CRIU, "--log-file", log, log=log)
-    # files the image refers to that a restore consumes or checks: vLLM's unlinked semaphores, which CRIU links back as link_remap.N (moved, since the next dump reuses those names), and the server's log
-    for f in set(glob.glob("/dev/shm/link_remap.*")) - before:
-      shutil.move(f, f"{tmp}/keep/")
+    # one dump at a time on a node, so the link_remap files that appear in /dev/shm are this dump's
+    with open(f"{os.path.dirname(folder)}/.lock", "w") as lock:
+      fcntl.flock(lock, fcntl.LOCK_EX)
+      before = set(glob.glob("/dev/shm/link_remap.*"))
+      run("criu", "dump", "-t", str(pid), "-D", tmp, *CRIU, "--log-file", log, log=log)
+      # files the image refers to that a restore consumes or checks: vLLM's unlinked semaphores, which CRIU links back as link_remap.N (moved, since the next dump reuses those names), and the server's log
+      for f in set(glob.glob("/dev/shm/link_remap.*")) - before:
+        shutil.move(f, f"{tmp}/keep/")
     shutil.copy2(f"{name}.log", f"{tmp}/keep/")
     for f in glob.glob(f"{tmp}/pages-*.img"):
       run("fallocate", "--dig-holes", f)  # about a third of the image is zero pages
