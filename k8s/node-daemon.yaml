@@ -23,6 +23,9 @@ spec:
         - configMapRef: {name: tinyrl}
         env:
         - {name: GPUS, value: "1"}
+        - {name: TINYRL_SNAPSHOTS, value: /dev/shm/tinyrl-snapshots}
+        # samplers restore vLLM from CRIU snapshots, which needs the namespaces, ptrace and mounts of a privileged container
+        securityContext: {privileged: true}
         resources:
           limits: {nvidia.com/gpu: 1}
         volumeMounts:

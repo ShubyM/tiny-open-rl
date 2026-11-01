@@ -114,7 +114,8 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/storage/store.p
 | [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | 221 | the trainer loop: commands in, replies out |
 | [tinyrl/workers/model.py](tinyrl/workers/model.py) | 307 | the losses, token budget batching, and the model a trainer serves |
 | [tinyrl/workers/sampler.py](tinyrl/workers/sampler.py) | 215 | sampling workers, through an engine that knows nothing of Redis |
-| [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | 151 | the vLLM engine: `vllm serve` over HTTP |
+| [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | 210 | the vLLM engine: `vllm serve` over HTTP |
+| [tinyrl/workers/snapshot.py](tinyrl/workers/snapshot.py) | 113 | CRIU snapshots of an asleep vLLM, restored in seconds instead of a boot |
 | [tinyrl/storage/store.py](tinyrl/storage/store.py) | 395 | `safetensors` checkpoints behind `put(uri)` and `get(uri)`, on a folder or a bucket |
 | [tinyrl/storage/registry.py](tinyrl/storage/registry.py) | 69 | the checkpoints the store holds, their owners, TTLs and versions |
 | [tinyrl/storage/models.py](tinyrl/storage/models.py) | 55 | base models from the hub, a bucket or a folder |
@@ -122,7 +123,7 @@ to see how each Tinker call becomes a command, [store.py](tinyrl/storage/store.p
 `python sz.py` counts lines of code the way tinygrad does. Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `KEYFRAME_EVERY`, `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`,
-`ENGINE`, `VLLM_ARGS` and `DEBUG=1`.
+`ENGINE`, `VLLM_ARGS`, `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 
 ## Telemetry
 
