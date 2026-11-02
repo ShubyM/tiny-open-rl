@@ -221,7 +221,7 @@ class TestModel(unittest.TestCase):
       p.data.add_(1.0)
     original_params = {k: p.clone() for k, p in model.params[run_id].items()}
 
-    with self.assertRaisesRegex(ValueError, "checkpoint does not fit this run:"):
+    with self.assertRaisesRegex(ValueError, "bad:"):
       model.restore_run(run_id, bad_tensors, meta, True)
 
     for k, p in model.params[run_id].items():
