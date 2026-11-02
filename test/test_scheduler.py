@@ -507,5 +507,21 @@ class TestChooseWorker(unittest.TestCase):
     self.assertEqual(len(set(worker.values())), 3)
 
 
+class TestFold(unittest.TestCase):
+  def test_fold_mutates_state_in_place_and_returns_it(self):
+    s = State()
+    out = fold(s, Event("1", 0.0, "node_lost", {"node": "n"}))
+    self.assertIs(s, out)
+
+  def test_decide_does_not_mutate_state_it_is_given(self):
+    s = State()
+    s = fold(s, Event("1", 0.0, "node_up", {"node": "n", "gpus": 8, "memory": 80}))
+    s = fold(s, Event("2", 0.0, "run_created", {"run": "x", "role": "trainer", "base": "a", "rank": 8, "exclusive": False}))
+    s = fold(s, Event("3", 0.0, "assigned", {"run": "x", "worker": "w1"}))
+    original_n = s.n
+    decide(s, 0.0)
+    self.assertEqual(s.n, original_n)
+
+
 if __name__ == "__main__":
   unittest.main()
