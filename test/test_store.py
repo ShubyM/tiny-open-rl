@@ -415,5 +415,60 @@ class TestStore(unittest.TestCase):
     self.assertTrue(torch.equal(got, saver.get("tinker://r/sampler_weights/0")[0]["w"]))
 
 
+
+  def test_d4_uploader_deletes_preceding(self):
+    root = f"memory://tinyrl-test-d4-{uuid.uuid4()}"
+    store = Store(root=root, cache=tempfile.mkdtemp())
+    uri = "tinker://r/weights/d4"
+    store.put(uri, {"w": torch.ones(1)})
+    store.upload_pending_saves()
+    v1 = store.versions[uri]
+    self.assertTrue(store.fs.exists(f"{store.base}/r/weights/d4/{v1}"))
+    store.put(uri, {"w": torch.ones(2)})
+    store.upload_pending_saves()
+    self.assertTrue(store.fs.exists(f"{store.base}/r/weights/d4/{v1}"))
+
+  @unittest.mock.patch("tinyrl.storage.store.SHARD_BYTES", 1024)
+  @unittest.mock.patch("tinyrl.storage.store.XOR_CHUNK", 4096)
+  def test_d5_delta_cleanup_breaks_future_save(self):
+    root = f"memory://tinyrl-test-d5-{uuid.uuid4()}"
+    base_model_dir = tempfile.mkdtemp()
+    import safetensors.torch
+    safetensors.torch.save_file({"w": torch.randn(8)}, f"{base_model_dir}/model.safetensors")
+    saver = Store(root=root, cache=tempfile.mkdtemp())
+    uri_0, uri_1 = "tinker://r/sampler_weights/0", "tinker://r/sampler_weights/1"
+    meta = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{base_model_dir}"}
+    saver.put(uri_0, {"w": torch.ones(8)}, meta)
+    saver.upload_pending_saves()
+    v0 = saver.versions[uri_0]
+    saver.fs.rm(f"{saver.base}/r/_versions/{v0}", recursive=True)
+    saver.put(uri_1, {"w": torch.ones(8) * 2}, meta)
+    saver.upload_pending_saves()
+    reader = Store(root=root, cache=tempfile.mkdtemp())
+    got, _ = reader.get(uri_1)
+    self.assertTrue(torch.equal(got["w"], torch.ones(8) * 2))
+
+  def test_d_pending_upload_unregistered_is_skipped(self):
+    import asyncio
+    from tinyrl.bus import Bus
+    from tinyrl.control.node_daemon import NodeDaemon
+    store = Store(root=f"memory://test-{uuid.uuid4()}", cache=tempfile.mkdtemp())
+    bus = unittest.mock.AsyncMock(spec=Bus)
+    daemon = NodeDaemon(bus=bus, store=store)
+    daemon.registry = unittest.mock.AsyncMock()
+    daemon.registry.first_registered_at.return_value = 0.0
+    daemon.registry.get_checkpoint.return_value = None
+    daemon.registry.registered_versions.return_value = set()
+    uri = "tinker://r/weights/skip"
+    store.put(uri, {"w": torch.ones(1)})
+    v = store.versions[uri]
+    upload_file = f"{store.cache}/{v}.upload"
+    old_time = time.time() - 700
+    os.utime(upload_file, (old_time, old_time))
+    asyncio.run(daemon.sweep_checkpoints())
+    self.assertFalse(os.path.exists(upload_file))
+    self.assertFalse(os.path.exists(f"{store.cache}/{v}"))
+
+
 if __name__ == "__main__":
   unittest.main()
