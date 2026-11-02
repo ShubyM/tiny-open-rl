@@ -73,6 +73,7 @@ class Trainer:
     self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.stopping: Stop | None = None
     self.turn = GpuTurn(bus, worker, bool(GPU))
+    self.queue: collections.deque[Cmd] = collections.deque()
 
   async def serve(self) -> None:
     await self.wait_for_lease()
@@ -81,7 +82,8 @@ class Trainer:
       await self.fail_stranded_commands(0)  # anything in flight now was taken by a trainer that died or lost the worker
       while self.stopping is None:
         await self.step()
-        await self.fail_stranded_commands(STRANDED_MS)
+        if not self.queue:
+          await self.fail_stranded_commands(STRANDED_MS)
       if self.stopping == Stop.PARK:
         await self.park_every_run()
     finally:
@@ -175,20 +177,24 @@ class Trainer:
     """Take the next commands from the worker and run them. Returns how many there were."""
     if self.stopping is not None:
       return 0
-    take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
-    cmds = await self.bus.take_commands(self.worker, self.owner, count, take_block)
-    if not cmds:
-      await self.turn.report_idle()
-      await self.yield_gpu()
-      return 0
-    queue: collections.deque[Cmd] = collections.deque()
-    enqueue_cmds(queue, cmds, self.model.lora)
+    if not self.queue:
+      take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
+      cmds = await self.bus.take_commands(self.worker, self.owner, count, take_block)
+      if not cmds:
+        await self.turn.report_idle()
+        await self.yield_gpu()
+        return 0
+      enqueue_cmds(self.queue, cmds, self.model.lora)
     processed = 0
-    async with self.hold_gpu_for_batch(len(cmds)):
+    async with self.hold_gpu_for_batch(len(self.queue)):
       batch_start = time.time()
       ops = []
-      while queue:
-        cmd = queue.popleft()
+      while self.queue:
+        revoked = await self.turn.was_revoked()
+        if self.stopping is not None or revoked:
+          self._revoked = revoked
+          break
+        cmd = self.queue.popleft()
         start = time.time()
         # no lock needed, the worker's owner is the only writer of its seq keys
         first = await self.bus.reply_to_repeated_command(cmd)
@@ -210,12 +216,12 @@ class Trainer:
           print(f"{self.worker} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
 
         processed += 1
-        if self.model.lora and queue and (cmd.op == Op.OPTIM_STEP or queue[0].run != cmd.run):
+        if self.model.lora and self.queue and (cmd.op == Op.OPTIM_STEP or self.queue[0].run != cmd.run):
           if cmd.op == Op.OPTIM_STEP:
             await asyncio.sleep(0.015)
           more = await self.bus.take_commands(self.worker, self.owner, count, 0)
-          enqueue_cmds(queue, more, True)
-      await self.turn.report_batch_done(queued=len(queue), seconds=time.time() - batch_start, ops=ops)
+          enqueue_cmds(self.queue, more, True)
+      await self.turn.report_batch_done(queued=len(self.queue), seconds=time.time() - batch_start, ops=ops)
     return processed
 
   @contextlib.asynccontextmanager
@@ -229,7 +235,9 @@ class Trainer:
       await self.yield_gpu()
 
   async def yield_gpu(self) -> None:
-    if await self.turn.was_revoked():
+    revoked = getattr(self, "_revoked", False) or await self.turn.was_revoked()
+    self._revoked = False
+    if revoked:
       await asyncio.to_thread(self.model.park_on_host)
       await self.turn.give_turn_back()
 
