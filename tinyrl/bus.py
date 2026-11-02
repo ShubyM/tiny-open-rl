@@ -134,6 +134,15 @@ class Event:
 class Bus:
   def __init__(self, r: redis.Redis | None = None):
     self.r = r if r is not None else connect(getenv("REDIS_URL", "redis://localhost:6379"))
+    self._submit = self.r.register_script("""
+      local existing = redis.call('GET', KEYS[1])
+      if existing then return existing end
+      local entry_id = redis.call('XADD', KEYS[2], 'NOMKSTREAM', '*', 'op', ARGV[1], 'body', ARGV[2], 'seq', ARGV[3])
+      if not entry_id then return false end
+      local req_id = ARGV[4] .. entry_id
+      redis.call('SET', KEYS[1], req_id, 'EX', ARGV[5])
+      return req_id
+    """)
 
   # ***** sessions *****
 
@@ -263,13 +272,18 @@ class Bus:
 
   async def submit_command(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
     """Queue a command on a run's stream. Returns its request id, or None if there is no such run."""
-    # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
-    fields = {"op": op, "body": body}
     if seq_id is not None:
-      fields["seq"] = str(seq_id)
-    entry_id = await self.r.xadd(key("q", run_id), fields, nomkstream=True)
+      res = await self._submit(
+        keys=[key("seq", run_id, str(seq_id)), key("q", run_id)],
+        args=[op, body, str(seq_id), f"{run_id}/", SESSION_TTL],
+      )
+      return res.decode() if res else None
+
+    # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
+    entry_id = await self.r.xadd(key("q", run_id), {"op": op, "body": body}, nomkstream=True)
     if entry_id is None:
       return None
+
     return f"{run_id}/{entry_id.decode()}"
 
   async def take_commands(self, worker: str, owner: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
@@ -328,8 +342,6 @@ class Bus:
           p.xdel(key("q", cmd.run), cmd.entry_id)
           for name, n in counts.items():
             p.hincrby(key("run", cmd.run), name, n)
-          if not repeat and cmd.seq is not None:
-            p.set(key("seq", cmd.run, str(cmd.seq)), cmd.request_id, ex=REPLY_TTL)
           await p.execute()
           return True
       except redis.WatchError:

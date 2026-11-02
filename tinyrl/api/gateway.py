@@ -43,6 +43,7 @@ class CreateModelRequest(BaseModel):
   session_id: str = ""
   lora_config: dict[str, Any] | None = None
   user_metadata: dict[str, Any] | None = None
+  model_seq_id: int | None = None
 
 
 class ModelRequest(BaseModel):
@@ -196,9 +197,16 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
 
-    run = str(uuid.uuid4())
-    await bus.create_run(Run(run, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive))
-    return await submit(run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora})
+    if req.session_id and req.model_seq_id is not None:
+      run = f"{req.session_id}-{req.model_seq_id}"
+    else:
+      run = str(uuid.uuid4())
+
+    if not await bus.get_run(run):
+      await bus.create_run(Run(run, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive))
+    return await submit(
+      run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora}, req.model_seq_id
+    )
 
   @api.post("/api/v1/get_info")
   async def get_info(req: ModelRequest):
@@ -251,6 +259,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveRequest):
+    if req.seq_id is not None:
+      if request_id := await bus.r.get(key("seq", req.model_id, str(req.seq_id))):
+        return {"request_id": request_id.decode(), "model_id": req.model_id}
+
     train = await bus.get_run(req.model_id)
     if not train:
       raise HTTPException(404, f"no model {req.model_id}")
