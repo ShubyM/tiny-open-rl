@@ -141,12 +141,16 @@ class Trainer:
         f"model {cmd.run} lost its unsaved steps when its trainer stopped. load_state to go on from a checkpoint"
       )
     await asyncio.to_thread(self.model.create_run, cmd.run, run["base"], run["rank"], run.get("lora", {}))
-    if uri:
-      version = (await self.registry.get_checkpoint(uri) or {}).get("version")
-      tensors, meta = await asyncio.to_thread(self.store.get, uri, version)
-      await asyncio.to_thread(self.model.restore_run, cmd.run, tensors, meta, True)
-      if await self.bus.set_parked_checkpoint(cmd.run, None, self.worker, self.owner):
-        await self.registry.unregister_checkpoints(uri)  # the node daemons' sweeps delete it
+    try:
+      if uri:
+        version = (await self.registry.get_checkpoint(uri) or {}).get("version")
+        tensors, meta = await asyncio.to_thread(self.store.get, uri, version)
+        await asyncio.to_thread(self.model.restore_run, cmd.run, tensors, meta, True)
+        if await self.bus.set_parked_checkpoint(cmd.run, None, self.worker, self.owner):
+          await self.registry.unregister_checkpoints(uri)  # the node daemons' sweeps delete it
+    except Exception:
+      await asyncio.to_thread(self.model.delete_run, cmd.run)
+      raise
 
   async def answer_command(self, cmd: Cmd) -> Reply:
     if cmd.op == Op.DELETE_MODEL and cmd.run not in self.model.params:  # nothing here to free, and its state not needed
