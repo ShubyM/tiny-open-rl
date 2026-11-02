@@ -507,5 +507,35 @@ class TestChooseWorker(unittest.TestCase):
     self.assertEqual(len(set(worker.values())), 3)
 
 
+class TestFold(unittest.TestCase):
+  def test_replaying_a_log_in_place_rebuilds_the_same_state_as_folding_copies(self):
+    import copy
+
+    events = [
+      Event("1", 0.0, "node_up", {"node": "n", "gpus": 8, "memory": 80}),
+      Event("2", 0.0, "run_created", {"run": "x", "role": "trainer", "base": "a", "rank": 8, "exclusive": False}),
+      Event("3", 0.0, "assigned", {"run": "x", "worker": "w1"}),
+    ]
+    s_inplace = State()
+    s_copy = State()
+    for e in events:
+      s_inplace = fold(s_inplace, e)
+      s_copy = fold(copy.deepcopy(s_copy), e)
+    self.assertEqual(s_inplace, s_copy)
+
+  def test_decide_does_not_mutate_state_it_is_given(self):
+    import dataclasses
+
+    s = State()
+    s = fold(s, Event("1", 0.0, "node_up", {"node": "n", "gpus": 8, "memory": 80}))
+    s = fold(
+      s, Event("2", 0.0, "run_created", {"run": "x", "role": "trainer", "base": "a", "rank": 8, "exclusive": False})
+    )
+    s = fold(s, Event("3", 0.0, "assigned", {"run": "x", "worker": "w1"}))
+    original = dataclasses.asdict(s)
+    decide(s, 0.0)
+    self.assertEqual(dataclasses.asdict(s), original)
+
+
 if __name__ == "__main__":
   unittest.main()
