@@ -63,8 +63,7 @@ def mirror(model_id: str) -> str:
 
   if not MODEL_MIRROR:
     raise ValueError("set MODEL_MIRROR to the folder or bucket to copy models into")
-  dest = f"{MODEL_MIRROR.rstrip('/')}/{model_id}"
-  fs, path = fsspec.core.url_to_fs(dest)
+  fs, path = fsspec.core.url_to_fs(dest := f"{MODEL_MIRROR.rstrip('/')}/{model_id}")
   fs.put(
     f"{snapshot_download(model_id, allow_patterns=['*.json', '*.safetensors', '*.model', '*.txt'])}/",
     f"{path}/",

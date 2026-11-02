@@ -57,13 +57,13 @@ def as_bytes(t: torch.Tensor) -> torch.Tensor:
 
 
 def header(path: str) -> dict:
-  import safetensors
-
-  with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+  with __import__("safetensors").safe_open(path, framework="pt", device="cpu") as f:
     return json.loads((f.metadata() or {}).get("meta", "{}"))
 
 
 def parallel(fn, *xs):
+  if not xs or not xs[0]:
+    return []
   if len(xs[0]) <= 1:
     return [fn(*x) for x in zip(*xs)]
   with concurrent.futures.ThreadPoolExecutor(max_workers=len(xs[0])) as pool:
@@ -101,8 +101,9 @@ def sparse(old: np.ndarray, new: np.ndarray) -> tuple[bytes, int]:
 def unsparse(data: np.ndarray, z: np.ndarray) -> int:
   """Apply sparse()'s bytes to data in place, and return its CRC."""
   raw = zlib.decompress(z)
-  at = np.cumsum(np.frombuffer(raw, np.uint32, len(raw) // 5), dtype=np.int64) - 1
-  data[at] ^= np.frombuffer(raw, np.uint8, offset=len(raw) // 5 * 4)
+  data[np.cumsum(np.frombuffer(raw, np.uint32, len(raw) // 5), dtype=np.int64) - 1] ^= np.frombuffer(
+    raw, np.uint8, offset=len(raw) // 5 * 4
+  )
   return zlib.crc32(data)
 
 
@@ -161,7 +162,6 @@ class Store:
 
   def write_checkpoint_files(self, folder: str, tensors: dict[str, torch.Tensor], info: dict) -> list[str]:
     """Write a checkpoint into folder, and return its file names, with the weights last."""
-    import safetensors.torch
 
     lora, cfg, total = info.get("lora"), info.get("config"), sum(map(nbytes, tensors.values()))
     n = max(1, min(MAX_SHARDS, len(tensors))) if not lora and total >= SHARD_BYTES else 1
@@ -178,7 +178,11 @@ class Store:
       with open(f"{folder}/{name}", "w") as f:
         json.dump(obj, f)
     meta = {"meta": json.dumps(info)}
-    parallel(lambda name, shard: safetensors.torch.save_file(shard, f"{folder}/{name}", metadata=meta), weights, shards)
+    parallel(
+      lambda name, shard: __import__("safetensors.torch").torch.save_file(shard, f"{folder}/{name}", metadata=meta),
+      weights,
+      shards,
+    )
     return [*files, *weights]
 
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
@@ -285,7 +289,6 @@ class Store:
 
   def write_changed_bytes(self, parent: str, folder: str, names: list[str], out: str) -> list[str] | None:
     """Write each weights file in folder as the bytes that differ from parent's, by chunk, with the file's header and a CRC per chunk. None if the files don't line up."""
-    import safetensors.numpy
 
     shards = [n for n in names if n.endswith(".safetensors")]
     if not all(os.path.exists(f"{parent}/{n}") for n in shards):  # trimmed from this node's cache
@@ -301,7 +304,7 @@ class Store:
     for i, (name, (_, (head, _))) in enumerate(zip(shards, files)):
       mine = [d for (j, _), d in zip(jobs, done) if j == i]
       meta = {"head": head.decode(), "chunk": str(XOR_CHUNK), "crc": json.dumps([c for _, c in mine])}
-      safetensors.numpy.save_file(
+      __import__("safetensors.numpy").numpy.save_file(
         {str(k): np.frombuffer(z, np.uint8) for k, (z, _) in enumerate(mine)}, f"{out}/{name}.xor", metadata=meta
       )
     return [f"{n}.xor" for n in shards]
@@ -310,52 +313,39 @@ class Store:
     from tinyrl.storage.models import local
 
     path = local(base)
-    if not path.startswith("/") and "://" not in path and not os.path.exists(path):
-      from huggingface_hub import snapshot_download
-
-      path = snapshot_download(path, allow_patterns=["*.safetensors"])
+    if not os.path.exists(path):
+      return {}
     return {
       k: (data, v["data_offsets"], v["dtype"], v["shape"])
       for bf in glob.glob(f"{path}/*.safetensors")
-      for k, v in layout(raw(bf)[0]).items()
-      for _, data in [raw(bf)]
+      for h, data in [raw(bf)]
+      for k, v in layout(h).items()
     }
 
   def write_base_delta(self, base: str, folder: str, names: list[str], out: str) -> list[str] | None:
-    import safetensors.numpy
-
     if not (b_tens := self._base_tensors(base)):
       return None
-    shards = [n for n in names if n.endswith(".safetensors")]
-    os.makedirs(out, exist_ok=True)
-    for name in shards:
-      h, data = raw(f"{folder}/{name}")
-      tensors = {}
+    for name in (shards := [n for n in names if n.endswith(".safetensors")]):
+      os.makedirs(out, exist_ok=True)
+      h, data, t = *raw(f"{folder}/{name}"), {}
       for k, v in layout(h).items():
-        t_b = data[v["data_offsets"][0] : v["data_offsets"][1]]
-        if k in b_tens and b_tens[k][2:] == (v["dtype"], v["shape"]):
-          b_d, (b_s, b_e) = b_tens[k][:2]
-          z, crc = sparse(b_d[b_s:b_e], t_b)
-          tensors[k], tensors[f"{k}__crc"] = np.frombuffer(z, np.uint8), np.array([crc], np.int64)
-        else:
-          tensors[k] = t_b
-      safetensors.numpy.save_file(tensors, f"{out}/{name}.xor", metadata={"head": h.decode()})
+        t[k] = data[slice(*v["data_offsets"])]
+        if (
+          k in b_tens
+          and b_tens[k][2:] == (v["dtype"], v["shape"])
+          and (x := sparse(b_tens[k][0][slice(*b_tens[k][1])], t[k]))
+        ):
+          t[k], t[f"{k}__crc"] = np.frombuffer(x[0], np.uint8), np.array([x[1]], np.int64)
+      __import__("safetensors.numpy").numpy.save_file(t, f"{out}/{name}.xor", metadata={"head": h.decode()})
     return [f"{n}.xor" for n in shards]
 
   def rebuild_base_delta(self, base: str, src: str, names: list[str], folder: str) -> None:
-    import safetensors.numpy
-
     b_tens, shards = self._base_tensors(base), [n for n in names if n.endswith(".safetensors")]
-    self.download_files(src, [n for n in names if n not in shards], folder)
-    parallel(lambda a, b: self.fs.get_file(f"{src}/{a}", b), *zip(*[(f"{n}.xor", f"{folder}/{n}.xor") for n in shards]))
+    self.download_files(src, [n for n in names if n not in shards] + [f"{n}.xor" for n in shards], folder)
     for name in shards:
-      with safetensors.safe_open(f"{folder}/{name}.xor", framework="np") as f:
-        h, out_data = (
-          f.metadata()["head"].encode(),
-          np.zeros(
-            max([v["data_offsets"][1] for v in layout(f.metadata()["head"].encode()).values()], default=0), np.uint8
-          ),
-        )
+      with __import__("safetensors").safe_open(f"{folder}/{name}.xor", framework="np") as f:
+        h = f.metadata()["head"].encode()
+        out_data = np.zeros(max([v["data_offsets"][1] for v in layout(h).values()], default=0), np.uint8)
         for k, v in layout(h).items():
           s, e = v["data_offsets"]
           if f"{k}__crc" in f.keys():
@@ -367,7 +357,7 @@ class Store:
           else:
             out_data[s:e] = f.get_tensor(k).flatten().view(np.uint8)
       with open(f"{folder}/{name}", "wb") as out_f:
-        out_f.write(len(h).to_bytes(8, "little") + h + out_data)
+        out_f.write(len(h).to_bytes(8, "little") + h + out_data.tobytes())
       os.unlink(f"{folder}/{name}.xor")
 
   def upload_pending_saves(self) -> None:
@@ -417,9 +407,12 @@ class Store:
     if not any(n.endswith(".safetensors") for n in names):
       raise ValueError(f"no checkpoint at {uri}")
     src = f"{self.base}/{info['dir']}" if info.get("dir") else dest
-    frm = info.get("from", version)
-    if frm == version:
+    if (frm := info.get("from", version)) == version:
       return self.cached_folder(version, lambda tmp: self.download_files(src, names, tmp)), version
+    if frm.startswith("base:") and version == frm.split(":")[-1]:
+      return self.cached_folder(
+        version, lambda tmp: self.rebuild_base_delta(frm.split(":")[1], src, names, tmp)
+      ), version
     return self.cached_folder(
       version, lambda tmp: self.rebuild_chain_link(os.path.dirname(src), version, frm, names, tmp)
     ), version
@@ -447,12 +440,11 @@ class Store:
 
   def rebuild_chain_link(self, links: str, version: str, whole: str, names: list[str], folder: str) -> None:
     """Make a link of a chain in folder, from the newest link before it this node has, or else the newest one uploaded whole, by XORing in each link after that. The CRCs check the result is the exact bytes saved."""
-    import safetensors
 
     k, _, n = version.rpartition(".")
     wv = whole.split(":")[-1] if whole.startswith("base:") else whole
     chain = [f"{k}.{i}" for i in range(int(wv.rpartition(".")[2]), int(n) + 1)]
-    have = next(i for i in reversed(range(len(chain) - 1)) if i == 0 or os.path.isdir(f"{self.cache}/{chain[i]}"))
+    have = next((i for i in reversed(range(len(chain) - 1)) if os.path.isdir(f"{self.cache}/{chain[i]}")), 0)
     start = self.cached_folder(
       chain[have],
       lambda tmp: (
@@ -469,7 +461,7 @@ class Store:
     for link in after:
       metas, jobs = {}, []
       for name in shards:
-        with safetensors.safe_open(f"{folder}/{link}.{name}.xor", framework="np") as f:
+        with __import__("safetensors").safe_open(f"{folder}/{link}.{name}.xor", framework="np") as f:
           metas[name] = f.metadata()
           size = int(metas[name]["chunk"])
           jobs += [(name, s, f.get_tensor(str(k))) for k, s in enumerate(chunks(len(data[name]), size))]
@@ -479,10 +471,9 @@ class Store:
         raise ValueError(f"{link} rebuilt wrong")
 
     def write(name: str) -> None:
-      head = metas[name]["head"].encode()
+      h = metas[name]["head"].encode()
       with open(f"{folder}/{name}", "wb") as f:
-        f.write(len(head).to_bytes(8, "little") + head)
-        f.write(data[name])
+        f.write(len(h).to_bytes(8, "little") + h + data[name].tobytes())
 
     parallel(write, shards)
 
@@ -493,10 +484,8 @@ class Store:
     return sorted(glob.glob(f"{folder}/*.safetensors"))
 
   def get(self, uri: str, version: str | None = None) -> tuple[dict[str, torch.Tensor], dict]:
-    import safetensors
-
     def load(path: str) -> dict[str, torch.Tensor]:
-      with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+      with __import__("safetensors").safe_open(path, framework="pt", device="cpu") as f:
         return {k: f.get_tensor(k) for k in f.keys()}
 
     paths = self.weight_files(uri, version)
@@ -517,21 +506,14 @@ class Store:
     parent, base = os.path.split(dest)
     # the random suffix of a version folder has no dot, so step-1 never takes step-1.5's
     tail = len(parent) + len(base) + 3
-    versions = [p for p in glob.glob(f"{glob.escape(parent)}/.{glob.escape(base)}.*") if "." not in p[tail:]]
-    for p in [dest, *versions]:  # the link to the live version, the .prev link, and the folders they name
-      if os.path.islink(p):
-        os.unlink(p)
-      else:
-        shutil.rmtree(p, ignore_errors=True)
+    for p in [dest, *[p for p in glob.glob(f"{glob.escape(parent)}/.{glob.escape(base)}.*") if "." not in p[tail:]]]:
+      os.unlink(p) if os.path.islink(p) else shutil.rmtree(p, ignore_errors=True)
 
   def list_checkpoints(self) -> list[str]:
     """Every checkpoint in the store."""
     if self.remote:
-      return [
-        f"tinker://{p[len(self.base) + 1 : -len('/_latest')]}" for p in self.fs.glob(f"{self.base}/*/*/*/_latest")
-      ]
-    found = glob.glob(f"{glob.escape(self.base)}/*/*/*")  # glob skips the dot folders a save writes into
-    return [f"tinker://{os.path.relpath(p, self.base)}" for p in found]
+      return [f"tinker://{p[len(self.base) + 1 : -8]}" for p in self.fs.glob(f"{self.base}/*/*/*/_latest")]
+    return [f"tinker://{os.path.relpath(p, self.base)}" for p in glob.glob(f"{glob.escape(self.base)}/*/*/*")]
 
   def saved_at(self, uri: str) -> float:
     """When a checkpoint was last saved."""

@@ -186,7 +186,7 @@ class TestStore(unittest.TestCase):
           self.assertTrue(torch.equal(got["b"], ones * (val_a * 2 if val_a == 1 else val_a)))
           self.assertTrue(torch.equal(got["c"], ones * (val_a * 3 if val_a == 1 else val_a)))
         except Exception as e:
-          errors.append(e)
+          import traceback; traceback.print_exc(); errors.append(e)
 
     t = threading.Thread(target=reader, daemon=True)
     t.start()

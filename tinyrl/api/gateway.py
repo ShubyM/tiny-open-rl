@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import os
 import time
 import uuid
 from typing import Any
@@ -24,7 +23,7 @@ from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
-CKPT_TTL = int(os.environ["CKPT_TTL"]) if "CKPT_TTL" in os.environ else None
+CKPT_TTL = getenv("CKPT_TTL", 0)
 
 
 # ***** requests *****
@@ -74,11 +73,11 @@ class FutureRequest(BaseModel):
   request_id: str
 
 
-def ttl(seconds: int | None) -> int | None:
+def ttl(seconds: int | None, default: bool = True) -> int | None:
   """A checkpoint's TTL, which the Tinker API bounds between an hour and ten years."""
-  if seconds is not None and not 3600 <= seconds <= 10 * 365 * 24 * 3600:
+  if (s := seconds if seconds is not None else ((CKPT_TTL or None) if default else None)) is not None and not 3600 <= s <= 315360000:
     raise HTTPException(400, "ttl_seconds must be between 3600 and 10 years")
-  return seconds
+  return s
 
 
 def iso(t: float | None) -> str | None:
@@ -115,8 +114,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def submit(run: str, op: Op, body: bytes | dict, seq_id: int | None = None) -> dict[str, str]:
     if isinstance(body, dict):
       body = json.dumps(body).encode()
-    request_id = await bus.submit_command(run, op, body, seq_id)
-    if request_id is None:
+    if (request_id := await bus.submit_command(run, op, body, seq_id)) is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
 
@@ -242,8 +240,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def save(req: SaveRequest, op: Op, kind: str):
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-    ttl_sec = req.ttl_seconds if req.ttl_seconds is not None else CKPT_TTL
-    args = {"uri": checkpoint_uri(req.model_id, kind, name), "ttl_seconds": ttl(ttl_sec)}
+    args = {"uri": checkpoint_uri(req.model_id, kind, name), "ttl_seconds": ttl(req.ttl_seconds)}
     return await submit(req.model_id, op, args, req.seq_id)
 
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
@@ -259,8 +256,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
     uri = checkpoint_uri(req.model_id, "sampler_weights", name)
     owned = req.path is None or req.sampling_session_seq_id is not None
-    ttl_sec = req.ttl_seconds if req.ttl_seconds is not None else (None if owned else CKPT_TTL)
-    args = {"uri": uri, "ttl_seconds": ttl(ttl_sec)}
+    args = {"uri": uri, "ttl_seconds": ttl(req.ttl_seconds, not owned)}
     if owned:  # a sampling session's weights, which its run owns
       args |= {"sampling_session_id": await open_sampler(train["base"], uri, train.get("session", "")), "owned": True}
     return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
@@ -304,8 +300,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.get("/api/v1/samplers/{sampler_id}")
   async def get_sampler(sampler_id: str):
-    run = await bus.get_run(sampler_id)
-    if not run:
+    if not (run := await bus.get_run(sampler_id)):
       raise HTTPException(404, f"no sampler {sampler_id}")
     return {"sampler_id": sampler_id, "base_model": run["base"], "model_path": run.get("model_path")}
 
@@ -383,26 +378,24 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
-    run = await bus.get_run(run_id)
-    if run is None:
+    if (run := await bus.get_run(run_id)) is None:
       raise HTTPException(404, f"no model {run_id}")
     return {**run, **await bus.queued_and_in_flight(run_id)}
 
   @api.get("/api/v1/sessions/{session_id}")
   async def session_info(session_id: str):
-    session = await bus.get_session(session_id)
-    if session is None:
+    if (session := await bus.get_session(session_id)) is None:
       raise HTTPException(404, f"no session {session_id}")
     return session
 
   @api.get("/metrics")
   async def metrics():
     """Every run's counters for Prometheus. README.md has the queries for utilization, queueing delay and fairness."""
-    lines = []
-    for (worker, run), counters in (await bus.run_counters()).items():
-      for name, n in counters.items():
-        name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
-        lines.append(f'tinyrl_{name}_total{{worker="{worker}",run="{run}"}} {n}')
+    lines = [
+      f'tinyrl_{(f"{nm[:-3]}_seconds" if nm.endswith("_ms") else nm)}_total{{worker="{w}",run="{r}"}} {n / 1000 if nm.endswith("_ms") else n}'
+      for (w, r), c in (await bus.run_counters()).items()
+      for nm, n in c.items()
+    ]
     return PlainTextResponse("\n".join(lines) + "\n")
 
   return api
