@@ -248,13 +248,15 @@ class TestModel(unittest.TestCase):
     with self.assertRaises(RuntimeError):
       model.forward_backward(run_id, data, "cross_entropy", {}, False)
 
-    has_grad = any(p.grad is not None and torch.any(p.grad != 0) for p in model.params[run_id].values())
-    self.assertTrue(has_grad)
-
-    with self.assertRaisesRegex(RuntimeError, "recovery"):
-      model.optim_step(run_id, {"learning_rate": 1e-2})
+    has_grad = any(p.grad is not None for p in model.params[run_id].values())
+    self.assertFalse(has_grad)
 
     tinyrl.workers.model.target_logprobs = original
+
+    model.forward_backward(run_id, data, "cross_entropy", {}, False)
+
+    with self.assertRaisesRegex(RuntimeError, "a forward_backward failed after it began"):
+      model.optim_step(run_id, {"learning_rate": 1e-2})
 
     model.forward_backward(run_id, data, "cross_entropy", {}, False)
     model.optim_step(run_id, {"learning_rate": 1e-2})
@@ -483,11 +485,12 @@ class TestTrainer(RedisTest):
     t = Trainer(self.bus, "p", Model(tiny))
     await self.own(t)
 
+    await self.bus.set_parked_checkpoint(run_id, "tinker://p/bad", "p", t.owner)
     cmd = Cmd(
       run=run_id,
       entry_id="r1",
-      op=Op.LOAD_WEIGHTS,
-      body=json.dumps({"uri": "tinker://p/bad", "optimizer": False}).encode(),
+      op=Op.OPTIM_STEP,
+      body=b"{}",
     )
     reply = await t.answer_command(cmd)
     self.assertFalse(reply.ok)

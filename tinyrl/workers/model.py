@@ -246,11 +246,11 @@ class Model:
     if loss_fn not in LOSSES:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
-    self.needs_recovery.discard(run)
     lm = self.activate_run(run).train(not forward_only)
     lengths = [min(len(d.tokens), len(d.inputs["target_tokens"])) for d in data]
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total = 0.0
+    accumulating = False
 
     # on the gpu autocast runs the adapters' matmuls in bf16 anyway, so PEFT's upcast of each layer's input to the fp32 adapter only adds casts
     gpu = lm.device.type == "cuda"
@@ -262,6 +262,7 @@ class Model:
             lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
           loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
           if not forward_only:
+            accumulating = True
             loss.backward()
           total += loss.item()
 
@@ -272,8 +273,10 @@ class Model:
 
       return logprobs, {"loss:sum": total, "loss:mean": total / max(1, len(data))}
     except Exception:
-      if not forward_only and total > 0:
+      if accumulating:
         self.needs_recovery.add(run)
+        for p in self.params[run].values():
+          p.grad = None
       raise
 
   def adam_for_run(self, run: str) -> torch.optim.AdamW:
@@ -283,8 +286,11 @@ class Model:
     return self.optimizers[run]
 
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
-    if run in getattr(self, "needs_recovery", set()):
-      raise RuntimeError("run needs recovery")
+    if run in self.needs_recovery:
+      self.needs_recovery.remove(run)
+      raise RuntimeError(
+        "a forward_backward failed after it began; its gradients and those accumulated since the last optim_step were discarded"
+      )
     self.activate_run(run)
     optimizer = self.adam_for_run(run)
 
@@ -350,21 +356,19 @@ class Model:
       weights.pop("lm_head.weight", None)  # tied to embed_tokens
     if weights.keys() != self.params[run].keys():
       raise ValueError("checkpoint does not fit this model")
+    req_opt = optimizer and any(k.endswith(".step") for k in tensors)
     for name, p in self.params[run].items():
       if weights[name].shape != p.shape:
         raise ValueError(f"shape mismatch for {name}")
-    if optimizer and any(k.endswith(".step") for k in tensors):
-      for name in self.params[run]:
-        if not all(f"{name}.{s}" in tensors for s in ("exp_avg", "exp_avg_sq", "step")):
-          raise ValueError("missing opt")
-
-    for name, p in self.params[run].items():
+      if req_opt and not all(f"{name}.{s}" in tensors for s in ("exp_avg", "exp_avg_sq", "step")):
+        raise ValueError("missing opt")
       p.data.copy_(weights[name])
       if meta.get("internal_handoff") and f"{name}.grad" in tensors:
         p.grad = tensors[f"{name}.grad"].to(p.device)
       else:
         p.grad = None
 
+    self.needs_recovery.discard(run)
     self.pinned.clear()
     self.optimizers.pop(run, None)
     if optimizer and any(k.endswith(".step") for k in tensors):

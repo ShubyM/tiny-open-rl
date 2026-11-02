@@ -152,11 +152,9 @@ class Trainer:
   async def answer_command(self, cmd: Cmd) -> Reply:
     if cmd.op == Op.DELETE_MODEL and cmd.run not in self.model.params:  # nothing here to free, and its state not needed
       return ok({"type": cmd.op, "model_id": cmd.run})
-    created_here = False
     try:
       if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
         await self.restore_missing_run(cmd)
-        created_here = True
     except Exception as e:
       return fail(e)
     version = None
@@ -164,8 +162,6 @@ class Trainer:
       version = (await self.registry.get_checkpoint(json.loads(cmd.body)["uri"]) or {}).get("version")
     # off the event loop, so redis stays responsive
     reply, size = await asyncio.to_thread(self.run_command, cmd, version)
-    if not reply.ok and created_here:
-      await asyncio.to_thread(self.model.delete_run, cmd.run)
     if reply.ok and cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):  # registered before the reply lands
       args = json.loads(cmd.body)
       saved = self.store.versions.get(args["uri"])
