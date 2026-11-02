@@ -191,6 +191,21 @@ class Sampler:
       await self.yield_gpu()
       return 0
 
+    if block_ms:
+      await asyncio.sleep(0.02)
+      cmds += await self.bus.take_commands(self.worker, self.owner, count, 0)
+
+    runs = {}
+    for cmd in cmds:
+      if cmd.run not in runs:
+        runs[cmd.run] = await self.bus.get_run(cmd.run)
+
+    for run in runs.values():
+      if run and run.get("model_path"):
+        uri = run["model_path"]
+        saved = (await self.registry.get_checkpoint(uri) or {}).get("version")
+        await asyncio.to_thread(self.store.local_folder, uri, saved)
+
     async def one(cmd) -> list:
       start = time.time()
       first = await self.bus.reply_to_repeated_command(cmd)
@@ -210,9 +225,6 @@ class Sampler:
         except Exception:  # each command starts it again and replies with the error
           print(f"{self.worker}: the engine failed to start for a batch", file=sys.stderr, flush=True)
           traceback.print_exc()
-      if block_ms:
-        await asyncio.sleep(0.02)
-        cmds += await self.bus.take_commands(self.worker, self.owner, count, 0)
       if self.lora:
         batches = [cmds]
       else:
