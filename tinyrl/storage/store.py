@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -293,7 +294,9 @@ class Store:
     if k:  # a link of the run's chain
       info["dir"], parent = f"{rel.split('/')[0]}/_versions/{version}", f"{self.cache}/{k}.{int(n) - 1}"
       first = ""  # the newest link before it that went up whole, if the one before it went up
-      if os.path.exists(f"{parent}.uploaded"):
+      if os.path.exists(f"{parent}.uploaded") and self.fs.exists(
+        f"{self.base}/{rel.split('/')[0]}/_versions/{k}.{int(n) - 1}"
+      ):
         with open(f"{parent}.uploaded") as f:
           first = f.read()
       xor = int(n) and first and self.write_changed_bytes(parent, folder, names, f"{folder}.xor")
@@ -310,12 +313,13 @@ class Store:
       shutil.rmtree(f"{folder}.base", ignore_errors=True)
     old = json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
     self.fs.pipe_file(f"{dest}/_latest", json.dumps(info).encode())
-    # a link stays until delete_unused_chain_links(), since other checkpoints may build on it
-    if "." not in old.get("version", "."):
-      stale = [f"{self.base}/{old['dir']}"] if old.get("dir") else [f"{dest}/{n}" for n in old.get("files", [])]
-      for path in stale:  # the version before, which readers that started on it may still be downloading
-        if self.fs.exists(path):
-          self.fs.rm(path, recursive=True)
+    if "." not in version:
+      keep = {"_latest", version, old.get("version")}
+      if not old.get("dir"):
+        keep.update(old.get("files", []))
+      for e in self.fs.ls(dest, detail=False):
+        if os.path.basename(e) not in keep:
+          self.fs.rm(e, recursive=True)
     with open(f"{folder}.uploaded", "w") as f:  # beside the folder, so engines that list it never see it
       f.write(info.get("from", ""))
 
@@ -343,15 +347,26 @@ class Store:
     return [f"{n}.xor" for n in shards]
 
   def upload_pending_saves(self) -> None:
-    """Upload this node's saves in the order they were made. The first that fails stops the rest, so a checkpoint's _latest never goes back to an older version, and the next flush tries it again."""
+    """Upload this node's saves in the order they were made. A failed upload skips the rest for that URI or chain, so _latest never goes backward, and the next flush tries again."""
     with self.uploading:  # the node daemon's last call at shutdown waits for the one running behind
       found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
+      failed = set()
       for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
         version = e.name.removesuffix(".upload")
+        k = version.rpartition(".")[0] if "." in version else None
         with open(e.path) as f:
           job = json.load(f)
+        if (k and k in failed) or job["uri"] in failed:
+          continue
         if os.path.isdir(f"{self.cache}/{version}"):
-          self.upload_version(self.path(job["uri"]), version, job["names"])
+          try:
+            self.upload_version(self.path(job["uri"]), version, job["names"])
+          except Exception as exc:
+            if k:
+              failed.add(k)
+            failed.add(job["uri"])
+            print(f"upload failed for {version}, trying again: {exc!r}", file=sys.stderr, flush=True)
+            continue
         os.unlink(e.path)
 
   # ***** get *****
