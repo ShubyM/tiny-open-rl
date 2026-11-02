@@ -117,20 +117,21 @@ to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/sch
 | [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | 224 | the trainer loop for leases, queued commands, GPU turns and SIGTERM saves |
 | [tinyrl/workers/model.py](tinyrl/workers/model.py) | 307 | the PyTorch and PEFT model, RL losses, token-budget batching and host parking |
 | [tinyrl/workers/sampler.py](tinyrl/workers/sampler.py) | 229 | batches sampling calls, loads checkpoints and takes turns through a Redis-free `Engine` |
-| [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | 151 | drives `vllm serve` over HTTP for completions, adapters, weight reloads and sleep |
+| [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | 210 | drives `vllm serve` over HTTP for completions, adapters, weight reloads and sleep |
+| [tinyrl/workers/snapshot.py](tinyrl/workers/snapshot.py) | 113 | CRIU snapshots of an asleep vLLM, restored in seconds instead of a boot |
 | [tinyrl/storage/store.py](tinyrl/storage/store.py) | 384 | `safetensors` `put` and `get` with local `CKPT_CACHE`, bucket uploads and delta chains |
 | [tinyrl/storage/registry.py](tinyrl/storage/registry.py) | 71 | saved checkpoints on Redis with their owners, sizes, versions and TTLs |
 | [tinyrl/storage/models.py](tinyrl/storage/models.py) | 55 | base models from the hub, a bucket or a folder, cached in `MODEL_CACHE` |
 | **total** | **2709** | counted by [sz.py](sz.py), excluding generated `tinyrl/api/proto` |
 
-`python sz.py` counts token-bearing lines the way tinygrad does, and CI caps `tinyrl/` at 2,800 lines. Outside `tinyrl/`,
+`python sz.py` counts token-bearing lines the way tinygrad does, and CI caps `tinyrl/` at 3,000 lines. Outside `tinyrl/`,
 [examples/tinker_sdk.py](examples/tinker_sdk.py) trains and samples through the unmodified SDK. The rest of the repo holds
 [k8s/](k8s), the browser [simulator/](simulator/README.md), [docs/kubernetes.md](docs/kubernetes.md), and the integration suites in [test/](test).
 
 Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `KEYFRAME_EVERY`, `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`,
-`ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted) and `DEBUG=1`.
+`ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted), `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 
 ## Telemetry
 
