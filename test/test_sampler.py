@@ -488,5 +488,63 @@ class TestSampler(RedisTest):
       self.assertNotIn(KERNEL_CONFIG, args)
 
 
+  @patch("tinyrl.workers.sampler.GPU", "node-a:0")
+  async def test_a_sampler_stages_checkpoints_before_asking_for_its_turn(self):
+    store = Store(tempfile.mkdtemp())
+    store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
+    await self.bus.create_run(Run("samp-1", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+
+    real_local = store.local_folder
+    blocked = asyncio.Event()
+    blocking = asyncio.Event()
+
+    def blocking_local_folder(uri, version):
+      blocking.set()
+      import time
+      while not blocked.is_set():
+        time.sleep(0.01)
+      return real_local(uri, version)
+
+    store.local_folder = MagicMock(side_effect=blocking_local_folder)
+
+    sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine, store=store)
+    await self.own(sampler)
+
+    await self.bus.submit_command("samp-1", Op.SAMPLE, json.dumps(JOB).encode())
+
+    async def auto_grant():
+      from tinyrl.bus import Ev
+      while True:
+        events = await self.bus.read_events(None)
+        print("EVENTS:", [(e.kind, e.body) for e in events])
+        if any(e.kind == "wants_gpu" and e.body.get("worker") == "sampler:base" for e in events):
+          print("FOUND WANTS_GPU, GRANTING")
+          await self.run_scheduler({"sampler:base": [0]})
+          break
+        await asyncio.sleep(0.05)
+    
+    grant_task = asyncio.create_task(auto_grant())
+    task = asyncio.create_task(sampler.step(block_ms=0))
+
+    try:
+      print("WAITING FOR LOCAL FOLDER")
+      await asyncio.wait_for(blocking.wait(), timeout=2.0)
+      print("REACHED LOCAL FOLDER!")
+      
+      events = await self.bus.read_events(None)
+      asked = any(e.kind == "wants_gpu" and e.body.get("worker") == "sampler:base" for e in events)
+      self.assertFalse(asked)
+    finally:
+      blocked.set()
+      grant_task.cancel()
+      if not task.done():
+        task.cancel()
+      
+    try:
+      handled = await task
+      self.assertEqual(handled, 1)
+    except asyncio.CancelledError:
+      pass
+
 if __name__ == "__main__":
   unittest.main()
