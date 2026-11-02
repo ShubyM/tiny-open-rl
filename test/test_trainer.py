@@ -726,6 +726,42 @@ class TestTrainer(RedisTest):
     self.assertEqual(processed, 10)
     self.assertEqual(take_calls, 1)
 
+  async def test_step_runs_claimed_commands_if_stopping_after_revocation(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    t = Trainer(self.bus, "p", Model(tiny))
+    await self.own(t)
+
+    for _ in range(10):
+      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+
+    t.turn.held = True
+    t.turn.shared = True
+
+    calls = 0
+
+    async def mock_next_decision(block_ms):
+      nonlocal calls
+      calls += 1
+      if calls == 2:
+        return Ev.REVOKED
+      if not t.turn.held:
+        return Ev.GRANTED
+      return None
+
+    t.turn.next_decision = mock_next_decision
+
+    processed1 = await t.step(count=10, block_ms=10)
+    self.assertEqual(processed1, 1)
+
+    t.stop()
+
+    processed2 = await t.step(count=10, block_ms=10)
+    self.assertEqual(processed2, 9)
+
+    processed3 = await t.step(count=10, block_ms=10)
+    self.assertEqual(processed3, 0)
+
 
 class TestCheckpointNames(unittest.TestCase):
   def test_a_multimodal_checkpoint_trains_under_its_own_parameter_names(self):

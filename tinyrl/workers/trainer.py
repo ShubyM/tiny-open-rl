@@ -176,7 +176,7 @@ class Trainer:
 
   async def step(self, count: int = 16, block_ms: int = 1000) -> int:
     """Take the next commands from the worker and run them. Returns how many there were."""
-    if self.stopping is not None:
+    if self.stopping is not None and not self.queue:
       return 0
     if not self.queue:
       take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
