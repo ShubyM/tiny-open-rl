@@ -192,6 +192,7 @@ class Model:
     self.pinned: dict[int, torch.Tensor] = {}
     self.parked = False
     self.dirty: set[str] = set()
+    self.needs_recovery: set[str] = set()
 
   def create_run(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
@@ -245,6 +246,7 @@ class Model:
     if loss_fn not in LOSSES:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
+    self.needs_recovery.discard(run)
     lm = self.activate_run(run).train(not forward_only)
     lengths = [min(len(d.tokens), len(d.inputs["target_tokens"])) for d in data]
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
@@ -252,22 +254,27 @@ class Model:
 
     # on the gpu autocast runs the adapters' matmuls in bf16 anyway, so PEFT's upcast of each layer's input to the fp32 adapter only adds casts
     gpu = lm.device.type == "cuda"
-    with torch.set_grad_enabled(not forward_only), disable_input_dtype_casting(lm, active=gpu):
-      for batch in batches(lengths, token_budget(lm)):
-        x = batch_tensors([data[i] for i in batch], [lengths[i] for i in batch], lm.device)
-        with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
-          lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
-        loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
-        if not forward_only:
-          loss.backward()
-        total += loss.item()
+    try:
+      with torch.set_grad_enabled(not forward_only), disable_input_dtype_casting(lm, active=gpu):
+        for batch in batches(lengths, token_budget(lm)):
+          x = batch_tensors([data[i] for i in batch], [lengths[i] for i in batch], lm.device)
+          with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
+            lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
+          loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
+          if not forward_only:
+            loss.backward()
+          total += loss.item()
 
-        for row, i in enumerate(batch):
-          values = lp[row, : lengths[i]].detach().float()
-          # keep them finite, so a JSON client can carry them
-          logprobs[i] = torch.nan_to_num(values, nan=0.0).clamp(-9999, 9999).cpu().numpy()
+          for row, i in enumerate(batch):
+            values = lp[row, : lengths[i]].detach().float()
+            # keep them finite, so a JSON client can carry them
+            logprobs[i] = torch.nan_to_num(values, nan=0.0).clamp(-9999, 9999).cpu().numpy()
 
-    return logprobs, {"loss:sum": total, "loss:mean": total / max(1, len(data))}
+      return logprobs, {"loss:sum": total, "loss:mean": total / max(1, len(data))}
+    except Exception:
+      if not forward_only and total > 0:
+        self.needs_recovery.add(run)
+      raise
 
   def adam_for_run(self, run: str) -> torch.optim.AdamW:
     if run not in self.optimizers:
@@ -276,6 +283,8 @@ class Model:
     return self.optimizers[run]
 
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
+    if run in getattr(self, "needs_recovery", set()):
+      raise RuntimeError("run needs recovery")
     self.activate_run(run)
     optimizer = self.adam_for_run(run)
 
@@ -305,12 +314,14 @@ class Model:
     tensors = {name: p.detach() for name, p in self.params[run].items()}
     optim = self.optimizers.get(run)
     for name, p in self.params[run].items():
+      if p.grad is not None:
+        tensors[f"{name}.grad"] = p.grad.detach()
       if optim and p in optim.state:
         s = optim.state[p]
         tensors[f"{name}.exp_avg"] = s["exp_avg"].detach()
         tensors[f"{name}.exp_avg_sq"] = s["exp_avg_sq"].detach()
         tensors[f"{name}.step"] = s["step"].detach()
-    return tensors, {"optimizer": True}
+    return tensors, {"optimizer": True, "internal_handoff": True}
 
   def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
@@ -333,14 +344,26 @@ class Model:
     self.activate_run(run)
     if optimizer and not meta.get("optimizer"):
       raise ValueError("checkpoint has no optimizer state")
-    suffixes = (".exp_avg", ".exp_avg_sq", ".step")
+    suffixes = (".exp_avg", ".exp_avg_sq", ".step", ".grad")
     weights = {k.removeprefix("base_model.model."): v for k, v in tensors.items() if not k.endswith(suffixes)}
     if not self.lora and "lm_head.weight" not in self.params[run]:
       weights.pop("lm_head.weight", None)  # tied to embed_tokens
     if weights.keys() != self.params[run].keys():
       raise ValueError("checkpoint does not fit this model")
     for name, p in self.params[run].items():
+      if weights[name].shape != p.shape:
+        raise ValueError(f"shape mismatch for {name}")
+    if optimizer and any(k.endswith(".step") for k in tensors):
+      for name in self.params[run]:
+        if not all(f"{name}.{s}" in tensors for s in ("exp_avg", "exp_avg_sq", "step")):
+          raise ValueError("missing opt")
+
+    for name, p in self.params[run].items():
       p.data.copy_(weights[name])
+      if meta.get("internal_handoff") and f"{name}.grad" in tensors:
+        p.grad = tensors[f"{name}.grad"].to(p.device)
+      else:
+        p.grad = None
 
     self.pinned.clear()
     self.optimizers.pop(run, None)
@@ -410,6 +433,7 @@ class Model:
   def delete_run(self, run: str) -> None:
     lm = self.activate_run(run)
     self.dirty.discard(run)
+    self.needs_recovery.discard(run)
     if self.lora:
       lm.delete_adapter(run)
     del self.params[run]
