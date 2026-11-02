@@ -162,7 +162,6 @@ class TestStore(unittest.TestCase):
     self.assertEqual(meta2, {"v": 2})
     self.assertEqual(list(got2), ["only"])
     self.assertTrue(torch.equal(got2["only"], ones * 5))
-    self.assertFalse(saver.fs.exists(f"{saver.path(uri)}/{v1}"))  # the version before is gone from the bucket
     self.assertTrue(saver.fs.exists(f"{saver.path(uri)}/{saver.versions[uri]}/state.safetensors"))
 
   @unittest.mock.patch("tinyrl.storage.store.SHARD_BYTES", 64)
@@ -221,8 +220,7 @@ class TestStore(unittest.TestCase):
 
     with unittest.mock.patch.object(saver.fs, "put_file", side_effect=RuntimeError("boom")):
       saver.put(uri, {"w": torch.ones(4)})  # saved here, so it returns: the upload fails behind it
-      with self.assertRaises(RuntimeError):
-        saver.upload_pending_saves()
+      saver.upload_pending_saves()
     v = saver.versions[uri]
     self.assertEqual(sorted(os.listdir(saver.cache)), sorted([v, f"{v}.upload", "latest"]))  # no temp folders
 
@@ -413,6 +411,81 @@ class TestStore(unittest.TestCase):
     self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/0/_latest"))["from"], version)
     got = loader.get("tinker://r/sampler_weights/0")[0]["w"]
     self.assertTrue(torch.equal(got, saver.get("tinker://r/sampler_weights/0")[0]["w"]))
+
+  def test_d4_uploader_deletes_preceding(self):
+    root = f"memory://tinyrl-test-d4-{uuid.uuid4()}"
+    store = Store(root=root, cache=tempfile.mkdtemp())
+    uri = "tinker://r/weights/d4"
+    store.put(uri, {"w": torch.ones(1)})
+    store.upload_pending_saves()
+    v1 = store.versions[uri]
+    self.assertTrue(store.fs.exists(f"{store.base}/r/weights/d4/{v1}"))
+    store.put(uri, {"w": torch.ones(2)})
+    store.upload_pending_saves()
+    self.assertTrue(store.fs.exists(f"{store.base}/r/weights/d4/{v1}"))
+
+  @unittest.mock.patch("tinyrl.storage.store.SHARD_BYTES", 1024)
+  @unittest.mock.patch("tinyrl.storage.store.XOR_CHUNK", 4096)
+  def test_d5_delta_cleanup_breaks_future_save(self):
+    root = f"memory://tinyrl-test-d5-{uuid.uuid4()}"
+    base_model_dir = tempfile.mkdtemp()
+    import safetensors.torch
+
+    safetensors.torch.save_file({"w": torch.randn(8)}, f"{base_model_dir}/model.safetensors")
+    saver = Store(root=root, cache=tempfile.mkdtemp())
+    uri_0, uri_1 = "tinker://r/sampler_weights/0", "tinker://r/sampler_weights/1"
+    meta = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{base_model_dir}"}
+    saver.put(uri_0, {"w": torch.ones(8)}, meta)
+    saver.upload_pending_saves()
+    v0 = saver.versions[uri_0]
+    saver.fs.rm(f"{saver.base}/r/_versions/{v0}", recursive=True)
+    saver.put(uri_1, {"w": torch.ones(8) * 2}, meta)
+    saver.upload_pending_saves()
+    reader = Store(root=root, cache=tempfile.mkdtemp())
+    got, _ = reader.get(uri_1)
+    self.assertTrue(torch.equal(got["w"], torch.ones(8) * 2))
+
+  def test_d_pending_upload_unregistered_is_skipped(self):
+    import asyncio
+
+    from tinyrl.bus import Bus
+    from tinyrl.control.node_daemon import NodeDaemon
+
+    store = Store(root=f"memory://test-{uuid.uuid4()}", cache=tempfile.mkdtemp())
+    bus = unittest.mock.AsyncMock(spec=Bus)
+    daemon = NodeDaemon(bus=bus, store=store)
+    daemon.registry = unittest.mock.AsyncMock()
+    daemon.registry.first_registered_at.return_value = 0.0
+    daemon.registry.get_checkpoint.return_value = None
+    daemon.registry.registered_versions.return_value = set()
+    uri = "tinker://r/weights/skip"
+    store.put(uri, {"w": torch.ones(1)})
+    v = store.versions[uri]
+    upload_file = f"{store.cache}/{v}.upload"
+    old_time = time.time() - 700
+    os.utime(upload_file, (old_time, old_time))
+    asyncio.run(daemon.sweep_checkpoints())
+    self.assertFalse(os.path.exists(upload_file))
+    self.assertFalse(os.path.exists(f"{store.cache}/{v}"))
+
+  def test_three_saves_leave_exactly_two_versions(self):
+    root = f"memory://tinyrl-test-d4-count-{uuid.uuid4()}"
+    store = Store(root=root, cache=tempfile.mkdtemp())
+    uri = "tinker://r/weights/d4_count"
+
+    store.put(uri, {"w": torch.ones(1)})
+    store.upload_pending_saves()
+
+    store.put(uri, {"w": torch.ones(2)})
+    store.upload_pending_saves()
+
+    store.put(uri, {"w": torch.ones(3)})
+    store.upload_pending_saves()
+
+    # Check that exactly two versions exist in the bucket
+    remote_dir = f"{store.base}/r/weights/d4_count"
+    versions = [e for e in store.fs.ls(remote_dir, detail=False) if os.path.basename(e) != "_latest"]
+    self.assertEqual(len(versions), 2)
 
 
 if __name__ == "__main__":

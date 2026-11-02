@@ -58,6 +58,8 @@ def chunk_tokens(chunk: pb.Chunk) -> np.ndarray:
 def loss_input(tensor: pb.Tensor) -> np.ndarray:
   if tensor.WhichOneof("encoding") == "sparse_csr":
     raise ValueError("sparse tensors are not supported")
+  if len(tensor.shape) > 1:
+    raise ValueError(f"expected 1-D tensor, got shape {list(tensor.shape)}")
   return to_numpy(tensor.dtype, tensor.dense)
 
 

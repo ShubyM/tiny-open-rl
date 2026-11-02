@@ -487,6 +487,81 @@ class TestSampler(RedisTest):
       self.assertEqual(args.count("--kernel-config"), 1)
       self.assertNotIn(KERNEL_CONFIG, args)
 
+  @patch("tinyrl.workers.sampler.GPU", "node-a:0")
+  async def test_a_sampler_stages_checkpoints_before_asking_for_its_turn(self):
+    store = Store(tempfile.mkdtemp())
+    store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
+    await self.bus.create_run(Run("samp-1", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+
+    real_local = store.local_folder
+    blocked = asyncio.Event()
+    blocking = asyncio.Event()
+
+    loop = asyncio.get_running_loop()
+
+    def blocking_local_folder(uri, version):
+      loop.call_soon_threadsafe(blocking.set)
+      import time
+
+      while not blocked.is_set():
+        time.sleep(0.01)
+      return real_local(uri, version)
+
+    store.local_folder = MagicMock(side_effect=blocking_local_folder)
+
+    sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine, store=store)
+    await self.own(sampler)
+
+    await self.bus.submit_command("samp-1", Op.SAMPLE, json.dumps(JOB).encode())
+
+    async def auto_grant():
+      while True:
+        events = await self.bus.read_events("0-0")
+        if any(e.kind == "wants_gpu" and e.body.get("worker") == "sampler:base" for e in events):
+          await self.run_scheduler({"sampler:base": [0]})
+          break
+        await asyncio.sleep(0.05)
+
+    grant_task = asyncio.create_task(auto_grant())
+    task = asyncio.create_task(sampler.step(block_ms=0))
+
+    try:
+      await asyncio.wait_for(blocking.wait(), timeout=2.0)
+      events = await self.bus.read_events("0-0")
+      asked = any(e.kind == "wants_gpu" and e.body.get("worker") == "sampler:base" for e in events)
+      self.assertFalse(asked)
+    finally:
+      blocked.set()
+      grant_task.cancel()
+      if not task.done():
+        task.cancel()
+
+    try:
+      handled = await task
+      self.assertEqual(handled, 1)
+    except asyncio.CancelledError:
+      pass
+
 
 if __name__ == "__main__":
   unittest.main()
+
+  async def test_a_run_whose_checkpoint_fails_to_stage_still_gets_an_error_reply_and_the_sampler_keeps_serving(self):
+    store = Store(tempfile.mkdtemp())
+    await self.bus.create_run(Run("samp-1", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
+
+    def failing_local_folder(uri, version):
+      raise RuntimeError("bucket error")
+
+    store.local_folder = MagicMock(side_effect=failing_local_folder)
+
+    sampler = Sampler(self.bus, "sampler:base", engine=FakeEngine, store=store)
+    await self.own(sampler)
+
+    cmd_id = await self.bus.submit_command("samp-1", Op.SAMPLE, json.dumps(JOB).encode())
+    handled = await sampler.step(block_ms=0)
+    self.assertEqual(handled, 1)
+
+    reply = await self.bus.wait_for_reply(cmd_id, 1)
+    self.assertFalse(reply.ok)
+    self.assertIn("RuntimeError: bucket error", json.loads(reply.body)["error"])

@@ -191,6 +191,22 @@ class Sampler:
       await self.yield_gpu()
       return 0
 
+    runs = {}
+    for cmd in cmds:
+      if cmd.run not in runs:
+        runs[cmd.run] = await self.bus.get_run(cmd.run)
+
+    async def stage(run):
+      if run and run.get("model_path"):
+        uri = run["model_path"]
+        saved = (await self.registry.get_checkpoint(uri) or {}).get("version")
+        try:
+          await asyncio.to_thread(self.store.local_folder, uri, saved)
+        except Exception:
+          pass  # run_sample will raise and reply with the real error
+
+    await asyncio.gather(*(stage(r) for r in runs.values()))
+
     async def one(cmd) -> list:
       start = time.time()
       first = await self.bus.reply_to_repeated_command(cmd)

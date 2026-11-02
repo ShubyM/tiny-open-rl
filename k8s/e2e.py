@@ -89,13 +89,18 @@ class Run:
   def __init__(self, client: tinker.ServiceClient, tok, name: str):
     self.name = name
     self.tc = client.create_lora_training_client(MODEL, rank=8, seed=0, user_metadata={"openrl.exclusive": "true"})
-    self.worker = self.tc.model_id  # an exclusive run has a worker of its own, named by its id
+    self.run_id = self.tc.model_id
     ids = tok.encode("tinyrl keeps training when its pods, nodes and Redis go away.", add_special_tokens=False)
     self.datum = types.Datum(
       model_input=types.ModelInput.from_ints(ids[:-1]),
       loss_fn_inputs={"target_tokens": ids[1:], "weights": [1.0] * (len(ids) - 1)},
     )
     self.steps = 0
+
+  @property
+  def worker(self):
+    w = redis("HGET", f"tinyrl:run:{self.run_id}", "worker")
+    return w if w else self.run_id
 
   def step(self) -> float:
     fb = self.tc.forward_backward([self.datum], "cross_entropy")
@@ -104,7 +109,7 @@ class Run:
     return fb.result().metrics["loss:sum"]
 
   def server_steps(self) -> int:
-    return int(redis("HGET", f"tinyrl:run:{self.worker}", "steps"))
+    return int(redis("HGET", f"tinyrl:run:{self.run_id}", "steps"))
 
   def fails_cleanly(self) -> str:
     try:
@@ -170,7 +175,7 @@ def main() -> None:
     time.sleep(15)  # down longer than the 10 s worker lease, so every lease runs out
     kubectl("scale", "statefulset/redis", "--replicas=1")
     c, r = both_step()
-    assert redis("EXISTS", f"tinyrl:run:{run.worker}") == "1"
+    assert redis("EXISTS", f"tinyrl:run:{run.run_id}") == "1"
     return f"runs survived, and both stepped after the restart (losses {c:.3f}, {r:.3f})"
 
   def node_drained():
@@ -178,7 +183,7 @@ def main() -> None:
     node = daemons()[pod]
     kubectl("taint", "node", node, "tinyrl-e2e-drain=true:NoExecute")  # evicts the node daemon, as a Spot notice does
     try:
-      wait("the run parked", lambda: redis("EXISTS", f"tinyrl:parked:{run.worker}") == "1", 40)
+      wait("the run parked", lambda: redis("EXISTS", f"tinyrl:parked:{run.run_id}") == "1", 40)
       moved = wait("the worker moved", lambda: serving(run.worker) not in (None, pod), 90)
       c, r = both_step()
       gap = abs(r - c) / c

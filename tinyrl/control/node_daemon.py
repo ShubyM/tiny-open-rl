@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -125,6 +127,19 @@ class NodeDaemon:
       since,
       time.time() - SWEEP_GRACE_S,
     )
+    if os.path.isdir(self.store.cache):
+      for e in list(os.scandir(self.store.cache)):
+        if e.name.endswith(".upload") and since < e.stat().st_mtime < time.time() - SWEEP_GRACE_S:
+          try:
+            with open(e.path) as f:
+              uri = json.load(f)["uri"]
+          except Exception:
+            continue
+          if await self.registry.get_checkpoint(uri) is None:
+            version = e.name.removesuffix(".upload")
+            await asyncio.to_thread(shutil.rmtree, f"{self.store.cache}/{version}", ignore_errors=True)
+            with contextlib.suppress(OSError):
+              await asyncio.to_thread(os.unlink, e.path)
 
   def start_worker_process(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
     """Start a worker's process on its GPUs, with the settings for its kind. This node's environment wins."""
