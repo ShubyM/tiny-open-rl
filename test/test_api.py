@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import glob
 import json
 import os
@@ -277,6 +278,27 @@ class TestAPI(RedisTest):
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     self.assertEqual(await self.bus.expired_sessions(), [])
+
+  async def test_a_checkpoint_saved_without_a_ttl_gets_the_deployment_default_unless_its_run_owns_it(self):
+    run_id = await self.create_model()
+    with patch("tinyrl.api.gateway.CKPT_TTL", 3600):
+      await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "kept"}))
+      await self.result(
+        await self.post("save_weights_for_sampler", json={"model_id": run_id, "sampling_session_seq_id": 0})
+      )
+      await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "own", "ttl_seconds": 7200}))
+    ckpts = {
+      c["checkpoint_id"]: c
+      for c in (await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"]
+    }
+    left = {
+      k: datetime.datetime.fromisoformat(c["expires_at"]).timestamp() - time.time()
+      for k, c in ckpts.items()
+      if c["expires_at"]
+    }
+    self.assertAlmostEqual(left["weights/kept"], 3600, delta=60)
+    self.assertAlmostEqual(left["weights/own"], 7200, delta=60)
+    self.assertIsNone(next(c for k, c in ckpts.items() if k.startswith("sampler_weights/"))["expires_at"])
 
   async def test_training_checkpoints_are_safetensors_with_adam_moments(self):
     run_id = await self.create_model()
