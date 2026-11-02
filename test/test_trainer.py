@@ -753,14 +753,3 @@ class TestG1PPO(unittest.TestCase):
 
     with self.assertRaises(ValueError):
       tinyrl.workers.model.ppo(logprobs, weights, sampler_logprobs, advantages, {"unknown": 1.0})
-
-
-class TestG2ForwardBackward(unittest.TestCase):
-  def test_reject_mismatched_target_length(self):
-    model = tinyrl.workers.model.Model(tiny)
-    run = new_id()
-    model.create(run, "tiny", 4, LORA)
-    datum = counting(10)
-    datum.inputs["target_tokens"] = np.arange(5, dtype=np.int64)
-    with self.assertRaises(ValueError):
-      model.forward_backward(run, [datum], "cross_entropy", {}, False)

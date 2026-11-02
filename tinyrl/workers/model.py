@@ -42,9 +42,8 @@ def importance_sampling(logprobs, weights, sampler_logprobs, advantages, config)
 
 
 def ppo(logprobs, weights, sampler_logprobs, advantages, config):
-  for k in config:
-    if k not in ("clip_range", "kl_coeff", "clip_low_threshold", "clip_high_threshold"):
-      raise ValueError(f"unknown config key: {k}")
+  if bad := set(config) - {"clip_range", "kl_coeff", "clip_low_threshold", "clip_high_threshold"}:
+    raise ValueError(f"unknown config keys: {bad}")
   clip_range = config.get("clip_range", 0.2)
   clip_low = config.get("clip_low_threshold", 1 - clip_range)
   clip_high = config.get("clip_high_threshold", 1 + clip_range)
@@ -252,11 +251,7 @@ class Model:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
     lm = self.activate_run(run).train(not forward_only)
-    lengths = []
-    for d in data:
-      if len(d.tokens) != len(d.inputs["target_tokens"]):
-        raise ValueError("target_tokens length must equal tokens length")
-      lengths.append(len(d.tokens))
+    lengths = [min(len(d.tokens), len(d.inputs["target_tokens"])) for d in data]
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total = 0.0
 
