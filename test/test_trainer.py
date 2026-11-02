@@ -17,7 +17,7 @@ import tinyrl.workers.model
 from test.helpers import RedisTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl.api import wire
-from tinyrl.bus import Op, Run
+from tinyrl.bus import Ev, Op, Run
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import LOSSES, Model, batches, target_logprobs, token_budget
 from tinyrl.workers.trainer import Stop, Trainer
@@ -669,6 +669,51 @@ class TestTrainer(RedisTest):
     self.assertEqual(await t.step(count=16, block_ms=10), 3)
     self.assertTrue(all([(await self.bus.wait_for_reply(rid, 1)).ok for rid in pipelined]))
     self.assertEqual((await self.bus.get_run(causal))["steps"], 2)
+
+  async def test_step_returns_after_current_command_when_turn_revoked(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    t = Trainer(self.bus, "p", Model(tiny))
+    await self.own(t)
+
+    for _ in range(10):
+      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+
+    t.turn.held = True
+    t.turn.shared = True
+    calls = 0
+
+    async def mock_next_decision(block_ms):
+      nonlocal calls
+      calls += 1
+      if calls == 2:
+        return Ev.REVOKED
+      return None
+
+    t.turn.next_decision = mock_next_decision
+
+    processed = await t.step(count=10, block_ms=10)
+    self.assertEqual(processed, 1)
+
+  async def test_step_returns_after_current_command_when_stopping(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    t = Trainer(self.bus, "p", Model(tiny))
+    await self.own(t)
+
+    for _ in range(10):
+      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+
+    orig_answer = t.answer_command
+
+    async def answer(cmd):
+      t.stop()
+      return await orig_answer(cmd)
+
+    t.answer_command = answer
+
+    processed = await t.step(count=10, block_ms=10)
+    self.assertEqual(processed, 1)
 
 
 class TestCheckpointNames(unittest.TestCase):
