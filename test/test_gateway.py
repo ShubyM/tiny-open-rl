@@ -68,6 +68,31 @@ class TestGatewayDedupe(RedisTest):
     ttl = await self.bus.r.ttl(key("seq", run_id, "42"))
     self.assertGreater(ttl, 3600)  # should be SESSION_TTL (7 days)
 
+  async def test_submit_command_is_atomic(self):
+    body = {"base_model": "tiny", "session_id": "sess-2", "model_seq_id": 2}
+    r = await self.http.post("/api/v1/create_model", json=body)
+    run_id = r.json()["model_id"]
+
+    import asyncio
+
+    save_req = {"model_id": run_id, "sampling_session_seq_id": 0, "seq_id": 42}
+    results = await asyncio.gather(
+      self.http.post("/api/v1/save_weights_for_sampler", json=save_req),
+      self.http.post("/api/v1/save_weights_for_sampler", json=save_req),
+    )
+
+    self.assertEqual(results[0].status_code, 200)
+    self.assertEqual(results[1].status_code, 200)
+    self.assertEqual(results[0].json()["request_id"], results[1].json()["request_id"])
+
+    stream = await self.bus.r.xrange(f"tinyrl:q:{run_id}", "-", "+")
+    # Only the initial CREATE_MODEL and one SAVE_WEIGHTS_FOR_SAMPLER should be in the queue.
+    # But wait, CREATE_MODEL has no seq_id? Oh wait, CREATE_MODEL has req.model_seq_id which we passed as seq_id!
+    # So there should be 1 CREATE_MODEL and 1 SAVE_WEIGHTS_FOR_SAMPLER.
+    self.assertEqual(len(stream), 2)
+    self.assertEqual(stream[0][1][b"op"], b"create_model")
+    self.assertEqual(stream[1][1][b"op"], b"save_weights_for_sampler")
+
 
 if __name__ == "__main__":
   unittest.main()
