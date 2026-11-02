@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import time
 import uuid
 from typing import Any
@@ -23,6 +24,7 @@ from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
+CKPT_TTL = int(os.environ["CKPT_TTL"]) if "CKPT_TTL" in os.environ else None
 
 
 # ***** requests *****
@@ -240,7 +242,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def save(req: SaveRequest, op: Op, kind: str):
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-    args = {"uri": checkpoint_uri(req.model_id, kind, name), "ttl_seconds": ttl(req.ttl_seconds)}
+    ttl_sec = req.ttl_seconds if req.ttl_seconds is not None else CKPT_TTL
+    args = {"uri": checkpoint_uri(req.model_id, kind, name), "ttl_seconds": ttl(ttl_sec)}
     return await submit(req.model_id, op, args, req.seq_id)
 
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
@@ -255,8 +258,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
     uri = checkpoint_uri(req.model_id, "sampler_weights", name)
-    args = {"uri": uri, "ttl_seconds": ttl(req.ttl_seconds)}
-    if req.path is None or req.sampling_session_seq_id is not None:  # a sampling session's weights, which its run owns
+    owned = req.path is None or req.sampling_session_seq_id is not None
+    ttl_sec = req.ttl_seconds if req.ttl_seconds is not None else (None if owned else CKPT_TTL)
+    args = {"uri": uri, "ttl_seconds": ttl(ttl_sec)}
+    if owned:  # a sampling session's weights, which its run owns
       args |= {"sampling_session_id": await open_sampler(train["base"], uri, train.get("session", "")), "owned": True}
     return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
 

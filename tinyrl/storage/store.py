@@ -258,6 +258,13 @@ class Store:
         with open(f"{parent}.uploaded") as f:
           first = f.read()
       xor = int(n) and first and self.write_changed_bytes(parent, folder, names, f"{folder}.xor")
+      if (
+        not xor
+        and (shards := [nm for nm in names if nm.endswith(".safetensors")])
+        and (base := header(f"{folder}/{shards[0]}").get("base"))
+      ):
+        if xor := self.write_base_delta(base, folder, names, f"{folder}.xor"):
+          first = f"base:{base}:{version}"
       if xor:
         files = [f"{folder}.xor/{x}" for x in xor] + [f for f in files if not f.endswith(".safetensors")]
       info["from"] = first if xor else version
@@ -299,12 +306,78 @@ class Store:
       )
     return [f"{n}.xor" for n in shards]
 
+  def _base_tensors(self, base: str) -> dict:
+    from tinyrl.storage.models import local
+
+    path = local(base)
+    if not path.startswith("/") and "://" not in path and not os.path.exists(path):
+      from huggingface_hub import snapshot_download
+
+      path = snapshot_download(path, allow_patterns=["*.safetensors"])
+    return {
+      k: (data, v["data_offsets"], v["dtype"], v["shape"])
+      for bf in glob.glob(f"{path}/*.safetensors")
+      for k, v in layout(raw(bf)[0]).items()
+      for _, data in [raw(bf)]
+    }
+
+  def write_base_delta(self, base: str, folder: str, names: list[str], out: str) -> list[str] | None:
+    import safetensors.numpy
+
+    if not (b_tens := self._base_tensors(base)):
+      return None
+    shards = [n for n in names if n.endswith(".safetensors")]
+    os.makedirs(out, exist_ok=True)
+    for name in shards:
+      h, data = raw(f"{folder}/{name}")
+      tensors = {}
+      for k, v in layout(h).items():
+        t_b = data[v["data_offsets"][0] : v["data_offsets"][1]]
+        if k in b_tens and b_tens[k][2:] == (v["dtype"], v["shape"]):
+          b_d, (b_s, b_e) = b_tens[k][:2]
+          z, crc = sparse(b_d[b_s:b_e], t_b)
+          tensors[k], tensors[f"{k}__crc"] = np.frombuffer(z, np.uint8), np.array([crc], np.int64)
+        else:
+          tensors[k] = t_b
+      safetensors.numpy.save_file(tensors, f"{out}/{name}.xor", metadata={"head": h.decode()})
+    return [f"{n}.xor" for n in shards]
+
+  def rebuild_base_delta(self, base: str, src: str, names: list[str], folder: str) -> None:
+    import safetensors.numpy
+
+    b_tens, shards = self._base_tensors(base), [n for n in names if n.endswith(".safetensors")]
+    self.download_files(src, [n for n in names if n not in shards], folder)
+    parallel(lambda a, b: self.fs.get_file(f"{src}/{a}", b), *zip(*[(f"{n}.xor", f"{folder}/{n}.xor") for n in shards]))
+    for name in shards:
+      with safetensors.safe_open(f"{folder}/{name}.xor", framework="np") as f:
+        h, out_data = (
+          f.metadata()["head"].encode(),
+          np.zeros(
+            max([v["data_offsets"][1] for v in layout(f.metadata()["head"].encode()).values()], default=0), np.uint8
+          ),
+        )
+        for k, v in layout(h).items():
+          s, e = v["data_offsets"]
+          if f"{k}__crc" in f.keys():
+            b_d, (b_s, b_e) = b_tens[k][:2]
+            b_b = np.array(b_d[b_s:b_e])
+            if unsparse(b_b, f.get_tensor(k).tobytes()) != int(f.get_tensor(f"{k}__crc")[0]):
+              raise ValueError(f"{k} rebuilt wrong")
+            out_data[s:e] = b_b
+          else:
+            out_data[s:e] = f.get_tensor(k).flatten().view(np.uint8)
+      with open(f"{folder}/{name}", "wb") as out_f:
+        out_f.write(len(h).to_bytes(8, "little") + h + out_data)
+      os.unlink(f"{folder}/{name}.xor")
+
   def upload_pending_saves(self) -> None:
     """Upload this node's saves in the order they were made. The first that fails stops the rest, so a checkpoint's _latest never goes back to an older version, and the next flush tries it again."""
     with self.uploading:  # the node daemon's last call at shutdown waits for the one running behind
-      found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
-      for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
-        version = e.name.removesuffix(".upload")
+      for e in sorted(
+        [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else [],
+        key=lambda e: (e.stat().st_mtime_ns, e.name),
+      ):
+        version = e.name[:-7]
         with open(e.path) as f:
           job = json.load(f)
         if os.path.isdir(f"{self.cache}/{version}"):
@@ -344,10 +417,11 @@ class Store:
     if not any(n.endswith(".safetensors") for n in names):
       raise ValueError(f"no checkpoint at {uri}")
     src = f"{self.base}/{info['dir']}" if info.get("dir") else dest
-    if info.get("from", version) == version:
+    frm = info.get("from", version)
+    if frm == version:
       return self.cached_folder(version, lambda tmp: self.download_files(src, names, tmp)), version
     return self.cached_folder(
-      version, lambda tmp: self.rebuild_chain_link(os.path.dirname(src), version, info["from"], names, tmp)
+      version, lambda tmp: self.rebuild_chain_link(os.path.dirname(src), version, frm, names, tmp)
     ), version
 
   def cached_folder(self, version: str, fill) -> str:
@@ -376,9 +450,17 @@ class Store:
     import safetensors
 
     k, _, n = version.rpartition(".")
-    chain = [f"{k}.{i}" for i in range(int(whole.rpartition(".")[2]), int(n) + 1)]
+    wv = whole.split(":")[-1] if whole.startswith("base:") else whole
+    chain = [f"{k}.{i}" for i in range(int(wv.rpartition(".")[2]), int(n) + 1)]
     have = next(i for i in reversed(range(len(chain) - 1)) if i == 0 or os.path.isdir(f"{self.cache}/{chain[i]}"))
-    start = self.cached_folder(chain[have], lambda tmp: self.download_files(f"{links}/{chain[have]}", names, tmp))
+    start = self.cached_folder(
+      chain[have],
+      lambda tmp: (
+        self.rebuild_base_delta(whole.split(":")[1], f"{links}/{chain[have]}", names, tmp)
+        if whole.startswith("base:") and chain[have] == wv
+        else self.download_files(f"{links}/{chain[have]}", names, tmp)
+      ),
+    )
     shards, after = [n for n in names if n.endswith(".safetensors")], chain[have + 1 :]
     self.download_files(f"{links}/{version}", [n for n in names if n not in shards], folder)
     pairs = [(f"{link}/{name}.xor", f"{folder}/{link}.{name}.xor") for link in after for name in shards]

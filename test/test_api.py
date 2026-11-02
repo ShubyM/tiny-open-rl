@@ -156,6 +156,23 @@ class TestAPI(RedisTest):
       response = await self.post("save_weights", json={"model_id": run_id, "path": bad})
       self.assertEqual(response.status_code, 400)
 
+
+  @patch("tinyrl.api.gateway.CKPT_TTL", 3600)
+  async def test_default_ckpt_ttl(self):
+    run_id = await self.create_model()
+    # A checkpoint saved without TTL gets the default
+    saved = (await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "with-default-ttl"}))).json()
+    self.assertEqual(saved["path"], f"tinker://{run_id}/weights/with-default-ttl")
+    ckpts = (await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"]
+    self.assertTrue(ckpts[0]["expires_at"] is not None)
+
+    # An owned checkpoint gets None, not the default
+    save = {"model_id": run_id, "sampling_session_seq_id": 0}
+    sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
+    ckpts = (await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"]
+    owned_ckpt = next(c for c in ckpts if "sampler_weights" in c["tinker_path"])
+    self.assertIsNone(owned_ckpt["expires_at"])
+
   async def test_checkpoints_are_listed_expire_and_delete(self):
     run_id = await self.create_model()
     await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final", "ttl_seconds": 7200}))
