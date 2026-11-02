@@ -738,3 +738,27 @@ class TestCheckpointNames(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+class TestG1PPO(unittest.TestCase):
+  def test_ppo_clip_and_reject(self):
+    logprobs = torch.tensor([1.0])
+    weights = torch.tensor([1.0])
+    sampler_logprobs = torch.tensor([0.0])
+    advantages = torch.tensor([1.0])
+    
+    config = {"clip_low_threshold": 0.9, "clip_high_threshold": 1.1}
+    loss_actual = trainer.ppo(logprobs, weights, sampler_logprobs, advantages, config)
+    self.assertAlmostEqual(loss_actual.item(), -1.1, places=3)
+
+    with self.assertRaises(ValueError):
+      trainer.ppo(logprobs, weights, sampler_logprobs, advantages, {"unknown": 1.0})
+
+class TestG2ForwardBackward(unittest.TestCase):
+  def test_reject_mismatched_target_length(self):
+    model = trainer.Model(tiny)
+    run = new_id()
+    model.create(run, "tiny", 4, LORA)
+    datum = counting(10)
+    datum.inputs["target_tokens"] = np.arange(5, dtype=np.int64)
+    with self.assertRaises(ValueError):
+      model.forward_backward(run, [datum], "cross_entropy", {}, False)
