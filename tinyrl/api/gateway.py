@@ -5,6 +5,7 @@ Every training call becomes a command on its run's stream, and retrieve_future w
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import time
@@ -41,6 +42,7 @@ class CreateSessionRequest(BaseModel):
 class CreateModelRequest(BaseModel):
   base_model: str
   session_id: str = ""
+  model_seq_id: int | None = None
   lora_config: dict[str, Any] | None = None
   user_metadata: dict[str, Any] | None = None
 
@@ -111,15 +113,19 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   api.add_exception_handler(ValueError, bad_request)
   api.add_exception_handler(KeyError, bad_request)
 
-  async def submit(run: str, op: Op, body: bytes | dict, seq_id: int | None = None) -> dict[str, str]:
+  async def submit(
+    run: str, op: Op, body: bytes | dict, seq_id: int | str | None = None, create: Run | None = None
+  ) -> dict[str, str]:
     if isinstance(body, dict):
       body = json.dumps(body).encode()
-    request_id = await bus.submit_command(run, op, body, seq_id)
+    request_id = await bus.submit_command(run, op, body, seq_id, create)
     if request_id is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
 
-  async def open_sampler(base_model: str | None, model_path: str | None, session_id: str = "") -> str:
+  async def sampler_run(
+    base_model: str | None, model_path: str | None, session_id: str = "", seq_id: int | None = None
+  ) -> Run:
     if model_path:
       if not model_path.startswith("tinker://"):
         raise ValueError(f"bad model_path {model_path}")
@@ -129,7 +135,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       if train.get("base"):
         base, lora = train["base"], train["rank"] > 0
       else:
-        meta = store.read_meta(uri)
+        version = (await registry.get_checkpoint(uri) or {}).get("version")
+        meta = await asyncio.to_thread(store.read_meta, uri, version)
         base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
       if not base:
         raise ValueError("could not resolve base_model")
@@ -139,12 +146,14 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       base, lora, uri, train_run = base_model, True, None, None
 
     exclusive = bool(train.get("exclusive")) if train_run else False
-    sid = f"samp-{uuid.uuid4().hex[:12]}"
-    run = Run(
+    sid = (
+      f"samp-{uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([session_id, seq_id])).hex}"
+      if session_id and seq_id is not None
+      else f"samp-{uuid.uuid4().hex}"
+    )
+    return Run(
       sid, "", base, int(lora), session_id, model_path=uri, exclusive=exclusive, role=Role.SAMPLER, train_run=train_run
     )
-    await bus.create_run(run)
-    return sid
 
   # ***** service *****
 
@@ -196,9 +205,15 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
 
-    run = str(uuid.uuid4())
-    await bus.create_run(Run(run, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive))
-    return await submit(run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora})
+    run_id = (
+      str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([req.session_id, req.model_seq_id])))
+      if req.session_id and req.model_seq_id is not None
+      else str(uuid.uuid4())
+    )
+    run = Run(run_id, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive)
+    return await submit(
+      run_id, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora}, "create", run
+    )
 
   @api.post("/api/v1/get_info")
   async def get_info(req: ModelRequest):
@@ -241,9 +256,17 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def save(req: SaveRequest, op: Op, kind: str):
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-    kept = req.ttl_seconds if req.ttl_seconds is not None else CKPT_TTL or None
-    args = {"uri": checkpoint_uri(req.model_id, kind, name), "ttl_seconds": ttl(kept)}
-    return await submit(req.model_id, op, args, req.seq_id)
+    uri = checkpoint_uri(req.model_id, kind, name)
+    owned = op == Op.SAVE_WEIGHTS_FOR_SAMPLER and (req.path is None or req.sampling_session_seq_id is not None)
+    kept = req.ttl_seconds if req.ttl_seconds is not None or owned else CKPT_TTL or None
+    args, sampler = {"uri": uri, "ttl_seconds": ttl(kept)}, None
+    if owned:
+      train = await bus.get_run(req.model_id)
+      if not train:
+        raise HTTPException(404, f"no model {req.model_id}")
+      sampler = await sampler_run(train["base"], uri, train.get("session", ""), req.sampling_session_seq_id)
+      args |= {"sampling_session_id": sampler.id, "owned": True}
+    return await submit(req.model_id, op, args, req.seq_id, sampler)
 
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
   async def save_weights(req: SaveRequest):
@@ -251,19 +274,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveRequest):
-    train = await bus.get_run(req.model_id)
-    if not train:
-      raise HTTPException(404, f"no model {req.model_id}")
-    seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
-    name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-    uri = checkpoint_uri(req.model_id, "sampler_weights", name)
-    # a sampling session's weights, which its run owns
-    owned = req.path is None or req.sampling_session_seq_id is not None
-    kept = req.ttl_seconds if req.ttl_seconds is not None or owned else CKPT_TTL or None
-    args = {"uri": uri, "ttl_seconds": ttl(kept)}
-    if owned:
-      args |= {"sampling_session_id": await open_sampler(train["base"], uri, train.get("session", "")), "owned": True}
-    return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
+    return await save(req, Op.SAVE_WEIGHTS_FOR_SAMPLER, "sampler_weights")
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):
@@ -279,7 +290,12 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def retrieve_future(req: FutureRequest, accept: str = Header("")):
     reply = await bus.wait_for_reply(req.request_id, WAIT)
     if reply is None:
-      return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
+      run, _, entry = req.request_id.rpartition("/")
+      if run and await bus.r.xrange(key("q", run), min=entry, max=entry, count=1):
+        return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
+      reply = await bus.wait_for_reply(req.request_id, 0)  # completion can race the queue check
+      if reply is None:
+        return JSONResponse({"error": "future expired or unknown", "request_id": req.request_id}, status_code=404)
     if reply.content_type == wire.PROTO and wire.PROTO not in accept:
       if req.request_id.startswith("samp-"):
         return wire.sample_json(reply.body)
@@ -291,8 +307,11 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.post("/api/v1/create_sampling_session")
   async def create_sampling_session(req: Request):
     data = await req.json()
-    sid = await open_sampler(data.get("base_model"), data.get("model_path"), data.get("session_id", ""))
-    return {"type": "create_sampling_session", "sampling_session_id": sid}
+    run = await sampler_run(
+      data.get("base_model"), data.get("model_path"), data.get("session_id", ""), data.get("sampling_session_seq_id")
+    )
+    await bus.create_run(run)
+    return {"type": "create_sampling_session", "sampling_session_id": run.id}
 
   @api.post("/api/v1/join_sampling_session")
   async def join_sampling_session(req: Request):
@@ -330,7 +349,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       if not (1 <= last_n <= len(tokens) - 1):
         raise ValueError("prompt_logprobs_last_n must be between 1 and len(tokens) - 1")
 
-    sid = data.get("sampling_session_id") or await open_sampler(data.get("base_model"), data.get("model_path"))
+    sampler = (
+      None if data.get("sampling_session_id") else await sampler_run(data.get("base_model"), data.get("model_path"))
+    )
+    sid = data.get("sampling_session_id") or sampler.id
 
     num_samples = int(data.get("num_samples", 1))
     params = data.get("sampling_params", {})
@@ -349,7 +371,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       "topk_sample": int(data.get("topk_sample_logprobs", 0)),
     }
 
-    res = await submit(sid, Op.SAMPLE, job, data.get("seq_id"))
+    res = await submit(sid, Op.SAMPLE, job, data.get("seq_id"), sampler)
     return {
       "request_id": res["request_id"],
       "sample_sequence_ids": [f"{res['request_id']}:{i}" for i in range(num_samples)],

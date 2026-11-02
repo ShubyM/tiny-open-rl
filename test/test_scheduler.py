@@ -136,7 +136,7 @@ class TestPlacement(unittest.TestCase):
     log("sampler_warmed", worker="sampler:fft:Gemma")
     log("sampler_warmed", worker="sampler:Qwen")
     log("sampler_warmed", worker="sampler:fft:Llama", exclusive=True)
-    shares = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}
+    shares = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_GPU_MEM": "0.42"}
     alone = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_KV_BYTES": str(24 * 1024**3)}
     placed = {name: (p.gpus, settings(p.kind, 8, 81559 * MIB)) for name, p in log.s.workers.items()}
     self.assertEqual(

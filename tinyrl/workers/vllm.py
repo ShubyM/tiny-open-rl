@@ -64,6 +64,9 @@ class VLLM:
 
   @classmethod
   async def start(cls, base: str, lora: bool) -> VLLM:
+    extra = shlex.split(VLLM_ARGS)
+    if GPU_MEM and (KV_BYTES or any(a.split("=", 1)[0] == "--kv-cache-memory-bytes" for a in extra)):
+      raise ValueError("an explicit KV cache overrides the scheduler's GPU memory budget")
     path = await asyncio.to_thread(models.local, base)  # served under the reference's name, which requests use
     flags = ["--enable-sleep-mode", "--language-model-only"]
     flags += ["--enable-lora", "--max-lora-rank", "64", "--max-loras", "16", "--max-cpu-loras", "64"] if lora else []
@@ -76,7 +79,6 @@ class VLLM:
       "VLLM_SERVER_DEV_MODE": "1",
       "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
     }
-    extra = shlex.split(VLLM_ARGS)
     if not any(
       a == "--compilation-config" or a.startswith("--compilation-config=") or a.startswith("-O") for a in extra
     ):

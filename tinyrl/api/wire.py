@@ -58,7 +58,10 @@ def chunk_tokens(chunk: pb.Chunk) -> np.ndarray:
 def loss_input(tensor: pb.Tensor) -> np.ndarray:
   if tensor.WhichOneof("encoding") == "sparse_csr":
     raise ValueError("sparse tensors are not supported")
-  return to_numpy(tensor.dtype, tensor.dense)
+  values = to_numpy(tensor.dtype, tensor.dense)
+  if list(tensor.shape) != [len(values)]:
+    raise ValueError(f"expected a 1-D tensor of length {len(values)}, got shape {list(tensor.shape)}")
+  return values
 
 
 def to_numpy(dtype: int, raw: bytes) -> np.ndarray:
@@ -97,7 +100,11 @@ def from_json(body: dict, forward_only: bool = False) -> bytes:
         value = {"data": value}
       is_int = value.get("dtype", "int64" if name == "target_tokens" else "float32") == "int64"
       array = np.array(value["data"], np.int64 if is_int else np.float32)
-      tensor = pb.Tensor(dense=array.tobytes(), dtype=pb.DTYPE_INT64 if is_int else pb.DTYPE_FLOAT32, shape=array.shape)
+      tensor = pb.Tensor(
+        dense=array.tobytes(),
+        dtype=pb.DTYPE_INT64 if is_int else pb.DTYPE_FLOAT32,
+        shape=value.get("shape", array.shape),
+      )
       datum.loss_fn_inputs[name].CopyFrom(tensor)
 
   return req.SerializeToString()

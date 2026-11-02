@@ -112,14 +112,20 @@ class FakeEngine:
 
   def __init__(self):
     self.calls = []
+    self.loaded: set[str] = set()
+    self.lora = True
 
   @classmethod
   async def start(cls, base: str, lora: bool) -> "FakeEngine":
     engine = cls()
+    engine.lora = lora
     engine.calls.append(("start", base, lora))
     return engine
 
   async def load_checkpoint(self, name: str, path: str) -> None:
+    if name in self.loaded:
+      return
+    self.loaded = self.loaded | {name} if self.lora else {name}
     self.calls.append(("load", name, path))
 
   async def sleep(self) -> None:

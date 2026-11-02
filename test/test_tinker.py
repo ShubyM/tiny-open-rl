@@ -43,6 +43,7 @@ class TestTinkerSDK(unittest.TestCase):
       **os.environ,
       "REDIS_URL": f"unix://{tmp}/redis.sock",
       "PORT": str(port),
+      "WAIT": "0.1",
       "CKPT": f"file://{tmp}/ckpt",  # a URL, so checkpoints go through upload and download as they do on GCS
       "CKPT_CACHE": f"{tmp}/cache",
       "ENGINE": "test.helpers:FakeEngine",  # the sampler's engine, since CI has no GPU for vLLM
@@ -56,29 +57,58 @@ class TestTinkerSDK(unittest.TestCase):
       wait_until_up(f"http://127.0.0.1:{port}/api/v1/healthz")
 
       sdk_env = {**env, "BASE_URL": f"http://127.0.0.1:{port}", "BASE_MODEL": base}
+      script = "\n".join(
+        [
+          "import os, runpy, sys, json, httpx, redis",
+          "from unittest.mock import patch",
+          "scope = runpy.run_path(sys.argv[1])",
+          "second = scope['client'].create_lora_training_client(base_model=os.environ['BASE_MODEL'], rank=8)",
+          "assert 'loss:sum' in second.forward_backward([scope['datum']], 'cross_entropy').result().metrics",
+          "second.optim_step(scope['types'].AdamParams(learning_rate=1e-3)).result()",
+          # Expire a completed result before the SDK receives it. HTTP 410 would tell it to retry the operation.
+          "r = redis.from_url(os.environ['REDIS_URL'])",
+          "send, submissions = httpx.AsyncClient.send, []",
+          "async def expire(self, request, *args, **kwargs):",
+          "  if request.url.path.endswith('/optim_step'): submissions.append(request)",
+          "  response = await send(self, request, *args, **kwargs)",
+          "  if request.url.path.endswith('/retrieve_future') and response.status_code == 200:",
+          "    await response.aread()",
+          "    if response.json().get('type') != 'try_again':",
+          "      r.delete('tinyrl:f:' + json.loads(request.content)['request_id'])",
+          "      response = await send(self, request, *args, **kwargs)",
+          "  return response",
+          "with patch.object(httpx.AsyncClient, 'send', expire):",
+          "  try: second.optim_step(scope['types'].AdamParams(learning_rate=1e-3)).result(timeout=15)",
+          "  except ValueError as e: assert 'status 404' in str(e), e",
+          "  else: raise AssertionError('expired future must fail')",
+          "assert len(submissions) == 1, 'expired future must not resubmit its operation'",
+        ]
+      )
       out = subprocess.run(
-        [os.environ["TINKER_PYTHON"], EXAMPLE], env=sdk_env, capture_output=True, text=True, timeout=300
+        [os.environ["TINKER_PYTHON"], "-c", script, EXAMPLE], env=sdk_env, capture_output=True, text=True, timeout=300
       )
       print(out.stdout)
       self.assertEqual(out.returncode, 0, out.stderr[-3000:])
 
       model_id = out.stdout.split("model ")[1].split()[0]
-      # the node daemon uploads the node's saves to CKPT behind, under a version that _latest points at last, so wait for it
+      # The node daemon publishes each immutable version's manifest after its files finish uploading.
       final = f"{tmp}/ckpt/{model_id}/sampler_weights/final"
       for _ in range(300):
-        if os.path.exists(f"{final}/_latest"):
+        if manifests := sorted(pathlib.Path(final).glob("*.json")):
           break
         time.sleep(0.1)
-      with open(f"{final}/_latest") as f:
-        version = json.load(f)["version"]
-      self.assertTrue(os.path.exists(f"{final}/{version}/adapter_model.safetensors"))
+      self.assertTrue(manifests, "sampler checkpoint never finished uploading")
+      with manifests[-1].open() as f:
+        manifest = json.load(f)
+      self.assertTrue(os.path.exists(f"{tmp}/ckpt/{manifest['dir']}/adapter_model.safetensors"))
     finally:
-      for proc in procs:
+      for proc in reversed(procs):
         proc.terminate()
         try:
           proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
           proc.kill()
+          proc.wait()
 
 
 if __name__ == "__main__":

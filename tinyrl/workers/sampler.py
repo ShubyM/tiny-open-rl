@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import importlib
 import json
 import os
@@ -15,7 +16,7 @@ import socket
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
@@ -57,6 +58,8 @@ class Out:
 
 
 class Engine(Protocol):
+  loaded: set[str]  # adapters resident in the engine, or its current full checkpoint
+
   @classmethod
   async def start(cls, base: str, lora: bool) -> Engine: ...
   # an adapter, or a full fine-tune's weights in place
@@ -65,16 +68,6 @@ class Engine(Protocol):
   async def sleep(self) -> None: ...
   async def wake(self) -> None: ...
   async def close(self) -> None: ...
-
-
-@dataclass
-class Running:
-  """A started engine and the checkpoints it loaded, which go with it."""
-
-  engine: Engine
-  # (uri, version) -> the engine's name for that checkpoint
-  names: dict[tuple[str, str], str] = field(default_factory=dict)
-  loaded: str | None = None  # the checkpoint loaded last: a full fine-tune's, whose weights are in place
 
 
 def topk(rows: list[dict[int, float] | None], k: int) -> tuple[np.ndarray, np.ndarray]:
@@ -110,7 +103,7 @@ class Sampler:
     self.registry = Registry(bus)
     self.worker = worker
     self.engine_type = engine or getattr(importlib.import_module(module), name)
-    self.running: Running | None = None  # started by the first command, which says which base model
+    self.running: Engine | None = None  # started by the first command, which says which base model
     self.store = store if store is not None else Store()
     self.lora = os.getenv("TINYRL_LORA", "1") != "0"
     self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
@@ -129,7 +122,7 @@ class Sampler:
         if self.running is None:
           try:
             start = time.time()
-            self.running = Running(await self.engine_type.start(base, self.lora))
+            self.running = await self.engine_type.start(base, self.lora)
             boot = time.time() - start
             await self.turn.report_batch_done(queued=0, seconds=boot, boot=boot, ops=[])
           except Exception:  # its first command starts it again and replies with the error
@@ -149,7 +142,7 @@ class Sampler:
     finally:
       renewing.cancel()
       if self.running:
-        await self.running.engine.close()
+        await self.running.close()
       await self.turn.give_turn_back()
       await self.bus.release_lease(self.worker, self.owner)
 
@@ -161,19 +154,11 @@ class Sampler:
     while not self.done:
       await asyncio.sleep(LEASE_MS / 4000)
       if not await self.bus.renew_lease(self.worker, self.owner) and not await self.bus.take_lease(
-        self.worker, self.owner
+        self.worker, self.owner, recover=True
       ):
         # another sampler took the worker. A lease that expired untaken, as in a Redis restart, is taken again
         self.done = True
         return
-
-  async def start_engine_for_session(self, session: str) -> None:
-    if self.running is None:
-      run = await self.bus.get_run(session)
-      if run:
-        async with self.loading:
-          if self.running is None:
-            self.running = Running(await self.engine_type.start(run["base"], self.lora))
 
   async def fail_stranded_commands(self, min_idle_ms: int) -> None:
     for cmd in await self.bus.reclaim_stranded_commands(self.worker, self.owner, min_idle_ms):
@@ -190,88 +175,77 @@ class Sampler:
       await self.turn.report_idle()
       await self.yield_gpu()
       return 0
+    runs = {run: await self.bus.get_run(run) for run in {cmd.run for cmd in cmds}}
+    with contextlib.ExitStack() as files:
 
-    async def one(cmd) -> list:
-      start = time.time()
-      first = await self.bus.reply_to_repeated_command(cmd)
-      reply = first or await self.run_sample(cmd.run, json.loads(cmd.body))
-      ms = (time.time() - start) * 1000
-      if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
-        self.done = True
-      return [cmd.op, ms]
+      async def prepare(run):
+        if run is None:
+          raise ValueError("no sampling session")
+        checkpoint = None
+        if uri := run["model_path"]:
+          version = (await self.registry.get_checkpoint(uri) or {}).get("version")
+          name = hashlib.sha256(f"{uri}/{version}".encode()).hexdigest()
+          if self.lora and self.running and name in self.running.loaded:
+            return run, ("", name)
+          async with self.loading:
+            await self.yield_gpu(force=True)  # release a retained turn before checkpoint I/O, too
+          hold = self.store.hold(uri, version)
+          path, version = await asyncio.to_thread(hold.__enter__)
+          files.push(hold)
+          checkpoint = path, hashlib.sha256(f"{uri}/{version}".encode()).hexdigest()
+        return run, checkpoint
 
-    async with self.hold_gpu_for_batch(len(cmds)):
-      batch_start = time.time()
-      boot = 0.0
-      if self.running is None:
-        try:
-          await self.start_engine_for_session(cmds[0].run)
-          boot = time.time() - batch_start
-        except Exception:  # each command starts it again and replies with the error
-          print(f"{self.worker}: the engine failed to start for a batch", file=sys.stderr, flush=True)
-          traceback.print_exc()
-      if block_ms:
-        await asyncio.sleep(0.02)
-        cmds += await self.bus.take_commands(self.worker, self.owner, count, 0)
-      if self.lora:
-        batches = [cmds]
-      else:
-        by_run: dict[str, list] = {}
-        [by_run.setdefault(c.run, []).append(c) for c in cmds]
-        batches = list(by_run.values())
-      ops = []
-      for batch in batches:
-        if not self.done:
-          ops.extend(await asyncio.gather(*(one(c) for c in batch)))
+      prepared = dict(zip(runs, await asyncio.gather(*(prepare(run) for run in runs.values()), return_exceptions=True)))
 
-      await self.turn.report_batch_done(
-        queued=len(cmds) - len(ops), seconds=time.time() - batch_start, boot=boot, ops=ops
-      )
+      async def one(cmd) -> list:
+        start, ready = time.time(), prepared[cmd.run]
+        reply = fail(ready) if isinstance(ready, Exception) else await self.run_sample(*ready, cmd.body)
+        ms = (time.time() - start) * 1000
+        if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, started=start):
+          self.done = True
+        return [cmd.op, ms]
+
+      bad = [cmd for cmd in cmds if isinstance(prepared[cmd.run], Exception)]
+      await asyncio.gather(*(one(cmd) for cmd in bad))
+      ready = [cmd for cmd in cmds if not isinstance(prepared[cmd.run], Exception)]
+      if ready and not self.done:
+        async with self.hold_gpu_for_batch(len(ready)):
+          batch_start = time.time()
+          by_run: dict[str, list] = {}
+          for cmd in ready:
+            by_run.setdefault("" if self.lora else cmd.run, []).append(cmd)
+          ops = []
+          for batch in by_run.values():
+            ops.extend(await asyncio.gather(*(one(cmd) for cmd in batch)))
+          await self.turn.report_batch_done(queued=0, seconds=time.time() - batch_start, ops=ops)
     return len(cmds)
 
-  async def run_sample(self, session: str, job: dict) -> Reply:
+  async def run_sample(self, run: dict, checkpoint: tuple[str, str] | None, body: bytes) -> Reply:
     try:
-      run = await self.bus.get_run(session)
-      if run is None:
-        raise ValueError(f"no sampling session {session}")
+      job, name = json.loads(body), checkpoint[1] if checkpoint else None
       async with self.loading:
         if self.running is None:
-          self.running = Running(await self.engine_type.start(run["base"], self.lora))
-        name = await self.load_checkpoint(self.running, run["model_path"])
-      return Reply(True, wire.PROTO, encode(job, await self.running.engine.sample(job, name)))
+          self.running = await self.engine_type.start(run["base"], self.lora)
+        if checkpoint and name not in self.running.loaded:
+          await self.running.load_checkpoint(name, checkpoint[0])
+      return Reply(True, wire.PROTO, encode(job, await self.running.sample(job, name)))
     except Exception as e:
       return fail(e)
-
-  async def load_checkpoint(self, running: Running, uri: str | None) -> str | None:
-    """The engine's name for a checkpoint, which the engine loads unless it already holds it."""
-    if not uri:
-      return None
-    saved = (await self.registry.get_checkpoint(uri) or {}).get("version")  # another node's may still be uploading
-    path, version = await asyncio.to_thread(self.store.local_folder, uri, saved)  # a checkpoint name can be saved again
-    if (uri, version) not in running.names:
-      name = f"c{len(running.names)}"
-      await running.engine.load_checkpoint(name, path)
-      running.names[(uri, version)] = name
-      running.loaded = name
-    elif not self.lora and running.loaded != running.names[(uri, version)]:
-      await running.engine.load_checkpoint(running.names[(uri, version)], path)
-      running.loaded = running.names[(uri, version)]
-    return running.names[(uri, version)]
 
   @contextlib.asynccontextmanager
   async def hold_gpu_for_batch(self, queued: int):
     """Hold the GPU for one batch. Waits for this sampler's turn and wakes its engine, then gives the turn back after the batch if the scheduler revoked it."""
     if await self.turn.wait_for_turn(queued) and self.running:
-      await self.running.engine.wake()
+      await self.running.wake()
     try:
       yield
     finally:
       await self.yield_gpu()
 
-  async def yield_gpu(self) -> None:
-    if await self.turn.was_revoked():
+  async def yield_gpu(self, force: bool = False) -> None:
+    if self.turn.held and self.turn.shared and (force or await self.turn.was_revoked()):
       if self.running:
-        await self.running.engine.sleep()
+        await self.running.sleep()
       await self.turn.give_turn_back()
 
 

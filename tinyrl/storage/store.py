@@ -2,7 +2,9 @@
 
 Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors + config.json, sharded with a model.safetensors.index.json when large).
 
-CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. upload_pending_saves() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node waits for the version it wants to land, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
+CKPT is a local directory, or a URL like gs://bucket/prefix. put writes an immutable version and returns its id; the caller publishes that id in the registry under its worker lease. A remote store first writes into CKPT_CACHE. The node daemon uploads the files and then <uri>/<version>.json, so readers wait for exactly the version they requested. An upload cannot overwrite another version's manifest. A node lost before its uploads finish loses those versions.
+
+Historical versions remain readable until their logical checkpoint is deleted. Sweeps retain the ancestors of every remaining manifest and the chains of active writers. Cache readers hold a shared file lock while loading, so a concurrent trim cannot remove their files. Old _latest manifests and local checkpoint directories are readable for upgrades; new saves never write mutable pointers.
 
 A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named <keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0 goes up as the bytes that changed from the base model if this node has it, else whole, and every link whose parent didn't upload goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC per chunk, and a node rebuilds a link from the newest one it has. delete_unused_chain_links() deletes the links nothing is built from.
 """
@@ -10,11 +12,13 @@ A full fine-tune's sampler weights change in few bf16 values a step, so its save
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import fcntl
 import glob
-import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -66,7 +70,7 @@ def header(path: str) -> dict:
 def parallel(fn, *xs):
   if len(xs[0]) <= 1:
     return [fn(*x) for x in zip(*xs)]
-  with concurrent.futures.ThreadPoolExecutor(max_workers=len(xs[0])) as pool:
+  with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1, len(xs[0]))) as pool:
     return list(pool.map(fn, *xs))
 
 
@@ -84,11 +88,6 @@ def layout(head: bytes) -> dict:
 
 def chunks(n: int, size: int) -> list[slice]:
   return [slice(i, min(i + size, n)) for i in range(0, n, size)]
-
-
-def threads(fn, *xs) -> list:
-  with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as pool:
-    return list(pool.map(fn, *xs))  # zlib and numpy let go of the GIL
 
 
 def sparse(old: np.ndarray, new: np.ndarray) -> tuple[bytes, int]:
@@ -153,15 +152,17 @@ class Store:
     self.fs, self.base = fsspec.core.url_to_fs(self.root, auto_mkdir=True, use_listings_cache=False)
     if not self.remote:
       self.base = os.path.realpath(self.base)
-    self.cache = CKPT_CACHE if cache is None else cache
+    self.cache = (CKPT_CACHE if cache is None else cache) if self.remote else f"{self.base}/_versions"
     self.pinned: torch.Tensor | None = None  # reused by every save, since pinning host memory is slow
     self.lock = threading.RLock()  # a save's tensors can be views of self.pinned until it is written
     self.uploading = threading.Lock()
-    self.versions: dict[str, str] = {}  # uri -> the version this process last saved
     self.chains: dict[str, str] = {}  # run -> the last link of its chain this process saved
 
   def path(self, uri: str) -> str:
-    return f"{self.base}/{uri.removeprefix('tinker://')}"
+    path = uri.removeprefix("tinker://")
+    if not uri.startswith("tinker://") or any(p in ("", ".", "..") for p in path.split("/")):
+      raise ValueError(f"invalid checkpoint URI {uri}")
+    return f"{self.base}/{path}"
 
   # ***** put *****
 
@@ -221,79 +222,47 @@ class Store:
     return [*files, *weights]
 
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
+    """Write an immutable version locally. Its returned id is published by the caller under its worker lease."""
     dest = self.path(uri)
-    if self.remote:
-      os.makedirs(self.cache, exist_ok=True)
-      folder, version = tempfile.mkdtemp(dir=self.cache), uuid.uuid4().hex[:16]
-      if (meta or {}).get("config") and not (meta or {}).get("lora"):  # a full fine-tune's sampler weights
-        run = uri.removeprefix("tinker://").split("/")[0]
-        k, _, n = self.chains.get(run, "").rpartition(".")
-        version = self.chains[run] = f"{k}.{int(n) + 1}" if k and int(n) + 1 < KEYFRAME_EVERY else f"{version}.0"
-      try:
-        with self.lock:
-          names = self.write_checkpoint_files(folder, self.copy_to_host(tensors), dict(meta or {}))
-        os.rename(folder, f"{self.cache}/{version}")
-      finally:
-        shutil.rmtree(folder, ignore_errors=True)
-      self.record_latest_version(uri, version)
-      self.versions[uri] = version
-      with open(f"{self.cache}/{version}.upload.tmp", "w") as f:
-        json.dump({"uri": uri, "names": names}, f)
-      # upload_pending_saves() takes it from here
-      os.replace(f"{self.cache}/{version}.upload.tmp", f"{self.cache}/{version}.upload")
-      return dest
-    parent, base = os.path.dirname(dest), os.path.basename(dest)
-    os.makedirs(parent, exist_ok=True)
-    folder = tempfile.mkdtemp(dir=parent, prefix=f".{base}.")
-    link, prev = f"{folder}.link", f"{parent}/.{base}.prev"
+    os.makedirs(self.cache, exist_ok=True)
+    folder, version = tempfile.mkdtemp(dir=self.cache), f"{time.time_ns():020d}-{uuid.uuid4().hex[:8]}"
+    if self.remote and (meta or {}).get("config") and not (meta or {}).get("lora"):
+      run = uri.removeprefix("tinker://").split("/")[0]
+      k, _, n = self.chains.get(run, "").rpartition(".")
+      version = self.chains[run] = f"{k}.{int(n) + 1}" if k and int(n) + 1 < KEYFRAME_EVERY else f"{version}.0"
     try:
       with self.lock:
-        self.write_checkpoint_files(folder, self.copy_to_host(tensors), dict(meta or {}))
-        cur = os.readlink(dest) if os.path.islink(dest) else None
-        stale = os.readlink(prev) if os.path.islink(prev) else None
-        os.symlink(os.path.basename(folder), link)
-        if os.path.isdir(dest) and not os.path.islink(dest):
-          os.rename(dest, f"{folder}.old")
-          os.replace(link, dest)
-          shutil.rmtree(f"{folder}.old", ignore_errors=True)
-        else:
-          os.replace(link, dest)
-        if cur:
-          os.symlink(cur, link)
-          os.replace(link, prev)
-        folder = ""
-      if stale and stale != cur:
-        shutil.rmtree(f"{parent}/{stale}", ignore_errors=True)
+        names = self.write_checkpoint_files(folder, self.copy_to_host(tensors), dict(meta or {}))
+        with open(f"{folder}/.uri", "w") as f:
+          f.write(uri)
+        names.append(".uri")
+        os.rename(folder, f"{self.cache}/{version}")
+      if self.remote:
+        with open(f"{self.cache}/{version}.upload.tmp", "w") as f:
+          json.dump({"uri": uri, "names": names}, f)
+        os.replace(f"{self.cache}/{version}.upload.tmp", f"{self.cache}/{version}.upload")
+      else:
+        os.makedirs(dest, exist_ok=True)
+        with open(f"{self.cache}/{version}.json.tmp", "w") as f:
+          json.dump({"version": version, "dir": f"_versions/{version}", "files": names}, f)
+        os.replace(f"{self.cache}/{version}.json.tmp", f"{dest}/{version}.json")
     finally:
-      if folder:
-        shutil.rmtree(folder, ignore_errors=True)
-      if os.path.lexists(link):  # left only if the swap failed
-        os.unlink(link)
-    return dest
-
-  def record_latest_version(self, uri: str, version: str) -> None:
-    """Record on this node which version of a checkpoint it saved last, for this node's other processes."""
-    os.makedirs(f"{self.cache}/latest", exist_ok=True)
-    tmp = f"{self.cache}/latest/.{uuid.uuid4().hex}"
-    with open(tmp, "w") as f:
-      f.write(version)
-    os.replace(tmp, f"{self.cache}/latest/{hashlib.sha256(uri.encode()).hexdigest()[:32]}")
-
-  def latest_version_here(self, uri: str) -> str | None:
-    pointer = f"{self.cache}/latest/{hashlib.sha256(uri.encode()).hexdigest()[:32]}"
-    if not os.path.exists(pointer):  # nothing saved on this node yet
-      return None
-    with open(pointer) as f:
-      return f.read()
+      shutil.rmtree(folder, ignore_errors=True)
+    return version
 
   def upload_version(self, dest: str, version: str, names: list[str]) -> None:
     folder, rel = f"{self.cache}/{version}", dest[len(self.base) + 1 :]
-    info, files = {"version": version, "dir": f"{rel}/{version}", "files": names}, [f"{folder}/{n}" for n in names]
+    info, files = (
+      {"version": version, "dir": f"{rel.split('/')[0]}/_versions/{version}", "files": names},
+      [f"{folder}/{n}" for n in names],
+    )
     k, _, n = version.rpartition(".")
     if k:  # a link of the run's chain
-      info["dir"], parent = f"{rel.split('/')[0]}/_versions/{version}", f"{self.cache}/{k}.{int(n) - 1}"
+      parent = f"{self.cache}/{k}.{int(n) - 1}"
       first = ""  # the newest link before it that went up whole, if the one before it went up
-      if os.path.exists(f"{parent}.uploaded"):
+      if os.path.exists(f"{parent}.uploaded") and self.fs.exists(
+        f"{self.base}/{rel.split('/')[0]}/_versions/{k}.{int(n) - 1}"
+      ):
         with open(f"{parent}.uploaded") as f:
           first = f.read()
       xor = int(n) and first and self.write_changed_bytes(parent, folder, names, f"{folder}.xor")
@@ -308,14 +277,7 @@ class Store:
     finally:
       shutil.rmtree(f"{folder}.xor", ignore_errors=True)
       shutil.rmtree(f"{folder}.base", ignore_errors=True)
-    old = json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
-    self.fs.pipe_file(f"{dest}/_latest", json.dumps(info).encode())
-    # a link stays until delete_unused_chain_links(), since other checkpoints may build on it
-    if "." not in old.get("version", "."):
-      stale = [f"{self.base}/{old['dir']}"] if old.get("dir") else [f"{dest}/{n}" for n in old.get("files", [])]
-      for path in stale:  # the version before, which readers that started on it may still be downloading
-        if self.fs.exists(path):
-          self.fs.rm(path, recursive=True)
+    self.fs.pipe_file(f"{dest}/{version}.json", json.dumps(info).encode())
     with open(f"{folder}.uploaded", "w") as f:  # beside the folder, so engines that list it never see it
       f.write(info.get("from", ""))
 
@@ -330,7 +292,7 @@ class Store:
     if any(layout(was) != layout(head) or len(old) != len(new) for (was, old), (head, new) in files):
       return None
     jobs = [(i, s) for i, (_, (_, new)) in enumerate(files) for s in chunks(len(new), XOR_CHUNK)]
-    done = threads(
+    done = parallel(
       lambda i, s: sparse(files[i][0][1][s], files[i][1][1][s]), [i for i, _ in jobs], [s for _, s in jobs]
     )
     os.makedirs(out, exist_ok=True)
@@ -343,57 +305,90 @@ class Store:
     return [f"{n}.xor" for n in shards]
 
   def upload_pending_saves(self) -> None:
-    """Upload this node's saves in the order they were made. The first that fails stops the rest, so a checkpoint's _latest never goes back to an older version, and the next flush tries it again."""
-    with self.uploading:  # the node daemon's last call at shutdown waits for the one running behind
-      found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
-      for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
-        version = e.name.removesuffix(".upload")
-        with open(e.path) as f:
-          job = json.load(f)
-        if os.path.isdir(f"{self.cache}/{version}"):
-          self.upload_version(self.path(job["uri"]), version, job["names"])
-        os.unlink(e.path)
+    """Upload each immutable version independently. A missing delta parent makes that version a whole checkpoint."""
+    with self.uploading, self.cache_lock():
+      for version, job in self.pending_saves():
+        try:
+          if os.path.isdir(f"{self.cache}/{version}"):
+            self.upload_version(self.path(job["uri"]), version, job["names"])
+          os.unlink(f"{self.cache}/{version}.upload")
+        except Exception as exc:
+          print(f"upload failed for {version}, trying again: {exc!r}", file=sys.stderr, flush=True)
+
+  def pending_saves(self) -> list[tuple[str, dict]]:
+    found = []
+    for p in sorted(glob.glob(f"{self.cache}/*.upload")):
+      with open(p) as f:
+        found.append((p.rsplit("/", 1)[-1].removesuffix(".upload"), json.load(f)))
+    return found
 
   # ***** get *****
 
   def local_folder(self, uri: str, version: str | None = None) -> tuple[str, str]:
-    """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again. With a version, from a store on another node, it waits for that version to land."""
+    """Resolve an exact immutable version; a missing version waits for its own manifest, never for a latest pointer."""
     dest = self.path(uri)
-    if not self.remote:
-      real = os.path.join(os.path.dirname(dest), os.readlink(dest)) if os.path.islink(dest) else dest
-      if not os.path.isdir(real):
-        raise ValueError(f"no checkpoint at {uri}")
-      with os.scandir(real) as it:
-        stats = sorted((e.name, s.st_size, s.st_mtime_ns) for e in it for s in [e.stat()])
-      if not any(n.endswith(".safetensors") for n, _, _ in stats):
-        raise ValueError(f"no checkpoint at {uri}")
-      return dest, hashlib.blake2b(repr((real, stats)).encode(), digest_size=8).hexdigest()
-    # without a version: the one this node saved last, else the bucket's
-    want = version or self.latest_version_here(uri)
-    if want and os.path.isdir(f"{self.cache}/{want}"):
-      os.utime(f"{self.cache}/{want}")  # so trim_cache() takes the ones nobody read for longest
-      return f"{self.cache}/{want}", want
-    deadline = time.time() + UPLOAD_WAIT_S
-    while True:
-      info = json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
-      if not version or info.get("version") == version:
-        break
-      if time.time() > deadline:
+    if version is not None and (version in ("", ".", "..") or "/" in version or "\\" in version):
+      raise ValueError("invalid checkpoint version")
+    info = None
+    if version is None:
+      versions = [p.rsplit("/", 1)[-1][:-5] for p in self.fs.glob(f"{dest}/[0-9]*.json")]
+      versions += [v for v, job in self.pending_saves() if job["uri"] == uri]
+      if not versions:
+        if not self.remote and glob.glob(f"{dest}/*.safetensors"):
+          return os.path.realpath(dest), os.path.basename(os.path.realpath(dest))
+        if not self.fs.exists(f"{dest}/_latest"):
+          raise ValueError(f"no checkpoint at {uri}")
+        info = json.loads(self.fs.cat_file(f"{dest}/_latest"))  # read checkpoints written before immutable manifests
+      version = (
+        max(versions, key=lambda v: (v.partition(".")[0], int(v.partition(".")[2] or -1)))
+        if versions
+        else info["version"]
+      )
+    folder, manifest = f"{self.cache}/{version}", f"{dest}/{version}.json"
+    if os.path.isfile(f"{folder}/.uri"):
+      with open(f"{folder}/.uri") as f:
+        if f.read() != uri:
+          raise ValueError("checkpoint version belongs to another URI")
+      os.utime(folder)
+      return folder, version
+    deadline = time.monotonic() + UPLOAD_WAIT_S
+    while info is None and not self.fs.exists(manifest):
+      if self.fs.exists(f"{dest}/_latest"):
+        old = json.loads(self.fs.cat_file(f"{dest}/_latest"))
+        if old.get("version") == version:
+          info = old
+          break
+      if not self.remote or time.monotonic() > deadline:
         raise ValueError(f"version {version} of {uri} never landed")
-      time.sleep(0.5)  # another node is still uploading it
-    if not info:
-      raise ValueError(f"no checkpoint at {uri}")
-    version, names = info["version"], info["files"]
+      time.sleep(0.05)
+    info = info or json.loads(self.fs.cat_file(manifest))
+    names, src = info["files"], f"{self.base}/{info['dir']}"
     if not any(n.endswith(".safetensors") for n in names):
       raise ValueError(f"no checkpoint at {uri}")
-    src = f"{self.base}/{info['dir']}" if info.get("dir") else dest
     if info.get("from", version) == version:
-      return self.cached_folder(version, lambda tmp: self.download_files(src, names, tmp)), version
+      return self.cached_folder(version, lambda tmp: self.download_files(src, names, tmp), uri), version
     return self.cached_folder(
-      version, lambda tmp: self.rebuild_chain_link(os.path.dirname(src), version, info["from"], names, tmp)
+      version, lambda tmp: self.rebuild_chain_link(os.path.dirname(src), version, info["from"], names, tmp), uri
     ), version
 
-  def cached_folder(self, version: str, fill) -> str:
+  @contextlib.contextmanager
+  def cache_lock(self, exclusive: bool = False):
+    os.makedirs(self.cache, exist_ok=True)
+    with open(f"{self.cache}/.readers", "a") as lock:
+      try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB if exclusive else fcntl.LOCK_SH)
+      except BlockingIOError:
+        yield False
+      else:
+        yield True
+
+  @contextlib.contextmanager
+  def hold(self, uri: str, version: str | None = None):
+    """Pin local files against another process trimming this cache while an engine or trainer reads them."""
+    with self.cache_lock():
+      yield self.local_folder(uri, version)
+
+  def cached_folder(self, version: str, fill, uri: str | None = None) -> str:
     """This node's folder for a version, which fill(folder) makes the first time."""
     folder = f"{self.cache}/{version}"
     if not os.path.isdir(folder):
@@ -409,6 +404,9 @@ class Store:
         open(f"{folder}.uploaded", "w").close()  # the bucket has it, so trim_cache() may drop it here
       finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    if uri and not os.path.isfile(f"{folder}/.uri"):
+      with open(f"{folder}/.uri", "w") as f:
+        f.write(uri)
     return folder
 
   def download_files(self, src: str, names: list[str], folder: str) -> None:
@@ -446,7 +444,7 @@ class Store:
           size = int(metas[name]["chunk"])
           jobs += [(name, s, f.get_tensor(str(k))) for k, s in enumerate(chunks(len(data[name]), size))]
         os.unlink(f"{folder}/{link}.{name}.xor")
-      crcs = threads(lambda name, s, z: (name, unsparse(data[name][s], z)), *zip(*jobs)) if jobs else []
+      crcs = parallel(lambda name, s, z: (name, unsparse(data[name][s], z)), *zip(*jobs)) if jobs else []
       if any([c for n, c in crcs if n == name] != json.loads(metas[name]["crc"]) for name in shards):
         raise ValueError(f"{link} rebuilt wrong")
 
@@ -458,12 +456,6 @@ class Store:
 
     parallel(write, shards)
 
-  def weight_files(self, uri: str, version: str | None = None) -> list[str]:
-    folder = self.local_folder(uri, version)[0]
-    if os.path.islink(folder):
-      folder = os.path.join(os.path.dirname(folder), os.readlink(folder))
-    return sorted(glob.glob(f"{folder}/*.safetensors"))
-
   def get(self, uri: str, version: str | None = None) -> tuple[dict[str, torch.Tensor], dict]:
     import safetensors
 
@@ -471,65 +463,92 @@ class Store:
       with safetensors.safe_open(path, framework="pt", device="cpu") as f:
         return {k: f.get_tensor(k) for k in f.keys()}
 
-    paths = self.weight_files(uri, version)
-    return {k: v for s in parallel(load, paths) for k, v in s.items()}, header(paths[0])
+    with self.hold(uri, version) as (folder, _):
+      paths = sorted(glob.glob(f"{folder}/*.safetensors"))
+      return {k: v for s in parallel(load, paths) for k, v in s.items()}, header(paths[0])
 
-  def read_meta(self, uri: str) -> dict:
-    return header(self.weight_files(uri)[0])
+  def read_meta(self, uri: str, version: str | None = None) -> dict:
+    with self.hold(uri, version) as (folder, _):
+      return header(sorted(glob.glob(f"{folder}/*.safetensors"))[0])
 
   # ***** delete *****
 
   def delete(self, uri: str) -> None:
-    """Delete a checkpoint and every version of it this store kept."""
-    dest = self.path(uri)
-    if self.remote:
-      if self.fs.exists(dest):
-        self.fs.rm(dest, recursive=True)
-      return
-    parent, base = os.path.split(dest)
-    # the random suffix of a version folder has no dot, so step-1 never takes step-1.5's
-    tail = len(parent) + len(base) + 3
-    versions = [p for p in glob.glob(f"{glob.escape(parent)}/.{glob.escape(base)}.*") if "." not in p[tail:]]
-    for p in [dest, *versions]:  # the link to the live version, the .prev link, and the folders they name
-      if os.path.islink(p):
-        os.unlink(p)
-      else:
-        shutil.rmtree(p, ignore_errors=True)
+    """Remove manifests and pending uploads. Version files are collected after their run no longer needs them."""
+    with self.uploading, self.cache_lock(exclusive=True) as available:
+      if not available:
+        return
+      for version, job in self.pending_saves():
+        if job["uri"] == uri:
+          os.unlink(f"{self.cache}/{version}.upload")
+          shutil.rmtree(f"{self.cache}/{version}", ignore_errors=True)
+      if self.fs.exists(self.path(uri)):
+        self.fs.rm(self.path(uri), recursive=True)
 
   def list_checkpoints(self) -> list[str]:
-    """Every checkpoint in the store."""
-    if self.remote:
-      return [
-        f"tinker://{p[len(self.base) + 1 : -len('/_latest')]}" for p in self.fs.glob(f"{self.base}/*/*/*/_latest")
-      ]
-    found = glob.glob(f"{glob.escape(self.base)}/*/*/*")  # glob skips the dot folders a save writes into
-    return [f"tinker://{os.path.relpath(p, self.base)}" for p in found]
+    found = {
+      f"tinker://{p[len(self.base) + 1 :].rsplit('/', 1)[0]}"
+      for p in self.fs.glob(f"{self.base}/*/*/*/*.json")
+      if "/_versions/" not in p
+    }
+    found |= {f"tinker://{p[len(self.base) + 1 : -8]}" for p in self.fs.glob(f"{self.base}/*/*/*/_latest")}
+    return sorted(found | {job["uri"] for _, job in self.pending_saves()})
 
   def saved_at(self, uri: str) -> float:
-    """When a checkpoint was last saved."""
-    if self.remote:
-      return self.fs.modified(f"{self.path(uri)}/_latest").timestamp()
-    return os.lstat(self.path(uri)).st_mtime
+    times = [self.fs.modified(p).timestamp() for p in self.fs.glob(f"{self.path(uri)}/*.json")]
+    if not self.remote and os.path.exists(self.path(uri)):
+      times = [os.stat(self.path(uri)).st_mtime]
+    elif not times and self.fs.exists(f"{self.path(uri)}/_latest"):
+      times = [self.fs.modified(f"{self.path(uri)}/_latest").timestamp()]
+    times += [os.stat(f"{self.cache}/{v}.upload").st_mtime for v, job in self.pending_saves() if job["uri"] == uri]
+    return max(times, default=0)
 
-  def delete_unused_chain_links(self, live: set[str], since: float, before: float) -> None:
-    """Delete the links of chains that none of the live versions is built from, uploaded between since and before."""
-    keep = {f"{k}.{i}" for v in live if "." in v for k, _, n in [v.rpartition(".")] for i in range(int(n) + 1)}
-    for links in self.fs.glob(f"{self.base}/*/_versions/*") if self.remote else []:
-      if links.rsplit("/", 1)[1] not in keep and (files := self.fs.ls(links, detail=False)):
-        if since < self.fs.modified(files[0]).timestamp() < before:
-          self.fs.rm(links, recursive=True)
+  def delete_unused_chain_links(
+    self, live: set[str], since: float, before: float, active_runs: set[str] = frozenset()
+  ) -> None:
+    """Keep a running writer's chain and every retained checkpoint's ancestors; collect only retired runs' unreferenced links."""
+    with self.cache_lock(exclusive=True) as available:
+      if not available:
+        return
+      keep = {f"{k}.{i}" for v in live if "." in v for k, _, n in [v.rpartition(".")] for i in range(int(n) + 1)} | live
+      for manifest in self.fs.glob(f"{self.base}/*/*/*/*.json"):
+        if "/_versions/" in manifest:
+          continue
+        version = manifest.rsplit("/", 1)[-1][:-5]
+        keep |= (
+          {version}
+          if "." not in version
+          else {f"{version.rpartition('.')[0]}.{i}" for i in range(int(version.rpartition(".")[2]) + 1)}
+        )
+      for links in self.fs.glob(f"{self.base}/*/_versions/*") if self.remote else self.fs.glob(f"{self.cache}/*"):
+        version = links.rsplit("/", 1)[-1]
+        run = links[len(self.base) + 1 :].split("/")[0]
+        if not self.remote and os.path.isfile(f"{links}/.uri"):
+          with open(f"{links}/.uri") as f:
+            run = f.read().removeprefix("tinker://").split("/")[0]
+        if (
+          self.fs.isdir(links)
+          and version not in keep
+          and run not in active_runs
+          and (files := self.fs.ls(links, detail=False))
+        ):
+          if since < self.fs.modified(files[0]).timestamp() < before:
+            self.fs.rm(links, recursive=True)
 
   def trim_cache(self) -> None:
-    """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the bucket has: a version still uploading stays."""
-    if not os.path.isdir(self.cache):
+    """Trim uploaded versions while no process is reading this cache; pending saves always stay."""
+    if not self.remote or not os.path.isdir(self.cache):
       return
-    limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2
-    found = [e for e in os.scandir(self.cache) if e.is_dir() and os.path.exists(f"{e.path}.uploaded")]
-    size = {e.path: sum(f.stat().st_size for f in os.scandir(e.path)) for e in found}
-    total = sum(size.values())
-    for e in sorted(found, key=lambda e: e.stat().st_mtime):
-      if total <= limit:
-        break
-      shutil.rmtree(e.path, ignore_errors=True)
-      os.unlink(f"{e.path}.uploaded")
-      total -= size[e.path]
+    with self.cache_lock(exclusive=True) as available:
+      if not available:
+        return
+      limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2
+      found = [e for e in os.scandir(self.cache) if e.is_dir() and os.path.exists(f"{e.path}.uploaded")]
+      size = {e.path: sum(f.stat().st_size for f in os.scandir(e.path)) for e in found}
+      total = sum(size.values())
+      for e in sorted(found, key=lambda e: e.stat().st_mtime):
+        if total <= limit:
+          break
+        shutil.rmtree(e.path, ignore_errors=True)
+        os.unlink(f"{e.path}.uploaded")
+        total -= size[e.path]

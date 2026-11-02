@@ -23,6 +23,19 @@ def json_body(n: int = 3, loss_fn: str = "cross_entropy", **config) -> dict:
 
 
 class TestRequests(unittest.TestCase):
+  def test_tensor_shape_must_describe_all_dense_values(self):
+    for shape in ([2, 2], [3], [], [0]):
+      tensor = pb.Tensor(dtype=pb.DTYPE_FLOAT32, dense=np.ones(4, np.float32).tobytes(), shape=shape)
+      with self.subTest(shape=shape), self.assertRaises(ValueError):
+        wire.loss_input(tensor)
+    np.testing.assert_equal(
+      wire.loss_input(pb.Tensor(dtype=pb.DTYPE_FLOAT32, dense=np.ones(4, np.float32).tobytes(), shape=[4])), np.ones(4)
+    )
+    body = json_body()
+    body["forward_backward_input"]["data"][0]["loss_fn_inputs"]["weights"]["shape"] = [1, 3]
+    with self.assertRaises(ValueError):
+      wire.datums(wire.parse(wire.from_json(body)))
+
   def test_json_becomes_the_same_protobuf(self):
     req = wire.parse(wire.from_json(json_body(clip_range=0.3, mode="x")))
     self.assertEqual(req.model_id, "m")

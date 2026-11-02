@@ -238,13 +238,30 @@ class TestNodeDaemon(RedisTest):
       store.put(
         f"tinker://r/sampler_weights/{step}", {"w": torch.full((64,), float(step))}, {"config": {"model_type": "x"}}
       )
-      v.append(store.versions[f"tinker://r/sampler_weights/{step}"])
+      v.append(store.local_folder(f"tinker://r/sampler_weights/{step}")[1])
     store.upload_pending_saves()
     await self.registry.register_checkpoint("tinker://r/sampler_weights/1", 128, version=v[1])
     await self.bus.r.set("tinyrl:ckpt_since", 0)
     with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
       await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
     self.assertEqual(sorted(p.rsplit("/", 1)[1] for p in store.fs.glob(f"{store.base}/r/_versions/*")), v[:2])
+
+  async def test_an_active_sampler_keeps_its_source_runs_versions_after_checkpoint_deletion(self):
+    await self.bus.create_run(
+      Run("sampling", "sampler", "base", 0, model_path="tinker://imported/sampler_weights/s", train_run="trainer")
+    )
+    await self.bus.r.set("tinyrl:ckpt_since", 0)
+    for root in (tempfile.mkdtemp(), f"memory://tinyrl-test/{uuid.uuid4()}"):
+      store, paths = Store(root, cache=tempfile.mkdtemp()), []
+      for run in ("trainer", "imported"):
+        uri = f"tinker://{run}/sampler_weights/s"
+        version = store.put(uri, {"w": torch.ones(64)}, {"config": {"model_type": "x"}})
+        store.upload_pending_saves()
+        paths.append(f"{store.base}/{run}/_versions/{version}" if store.remote else f"{store.cache}/{version}")
+        store.delete(uri)
+      with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
+        await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
+      self.assertTrue(all(store.fs.exists(path) for path in paths))
 
 
 if __name__ == "__main__":

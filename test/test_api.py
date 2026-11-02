@@ -146,7 +146,10 @@ class TestAPI(RedisTest):
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
     self.assertEqual(sampler["path"], f"tinker://{run_id}/sampler_weights/step-0")
-    with open(f"{self.store.path(sampler['path'])}/adapter_config.json") as f:
+    folder, _ = self.store.local_folder(
+      sampler["path"], (await self.registry.get_checkpoint(sampler["path"]))["version"]
+    )
+    with open(f"{folder}/adapter_config.json") as f:
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}
@@ -212,8 +215,8 @@ class TestAPI(RedisTest):
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 1)
 
     with patch.object(gateway, "WAIT", 0.01):
-      pending = await self.post("retrieve_future", json={"request_id": f"{run_id}/1-0"})
-      self.assertEqual(pending.json()["type"], "try_again")
+      missing = await self.post("retrieve_future", json={"request_id": f"{run_id}/1-0"})
+      self.assertEqual(missing.status_code, 404)
 
   async def test_workers(self):
     shared, also_shared = await self.create_model(), await self.create_model()
@@ -307,8 +310,8 @@ class TestAPI(RedisTest):
 
     saved = (await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final_pin"}))).json()
 
-    folder = self.store.path(saved["path"])
-    files = os.listdir(folder)
+    folder, _ = self.store.local_folder(saved["path"], (await self.registry.get_checkpoint(saved["path"]))["version"])
+    files = [f for f in os.listdir(folder) if f != ".uri"]  # immutable cache provenance, not tensor payload
     self.assertTrue(all(f.endswith(".safetensors") for f in files), f"Found non-safetensors files: {files}")
 
     found_exp_avg = False
@@ -338,7 +341,7 @@ class TestAPI(RedisTest):
       saved = (
         await self.result(await self.post("save_weights_for_sampler", json={"model_id": full_run, "path": "sampler"}))
       ).json()
-    folder = self.store.path(saved["path"])
+    folder, _ = self.store.local_folder(saved["path"], (await self.registry.get_checkpoint(saved["path"]))["version"])
 
     tensor_count = 0
     for f in glob.glob(f"{folder}/*.safetensors"):

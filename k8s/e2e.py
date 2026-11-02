@@ -89,13 +89,18 @@ class Run:
   def __init__(self, client: tinker.ServiceClient, tok, name: str):
     self.name = name
     self.tc = client.create_lora_training_client(MODEL, rank=8, seed=0, user_metadata={"openrl.exclusive": "true"})
-    self.worker = self.tc.model_id  # an exclusive run has a worker of its own, named by its id
+    self.run_id = self.tc.model_id
     ids = tok.encode("tinyrl keeps training when its pods, nodes and Redis go away.", add_special_tokens=False)
     self.datum = types.Datum(
       model_input=types.ModelInput.from_ints(ids[:-1]),
       loss_fn_inputs={"target_tokens": ids[1:], "weights": [1.0] * (len(ids) - 1)},
     )
     self.steps = 0
+
+  @property
+  def worker(self):
+    wait(f"worker assignment for {self.run_id}", lambda: redis("HGET", f"tinyrl:run:{self.run_id}", "worker"), 60)
+    return redis("HGET", f"tinyrl:run:{self.run_id}", "worker")
 
   def step(self) -> float:
     fb = self.tc.forward_backward([self.datum], "cross_entropy")
@@ -104,7 +109,7 @@ class Run:
     return fb.result().metrics["loss:sum"]
 
   def server_steps(self) -> int:
-    return int(redis("HGET", f"tinyrl:run:{self.worker}", "steps"))
+    return int(redis("HGET", f"tinyrl:run:{self.run_id}", "steps"))
 
   def fails_cleanly(self) -> str:
     try:

@@ -42,10 +42,18 @@ def importance_sampling(logprobs, weights, sampler_logprobs, advantages, config)
 
 
 def ppo(logprobs, weights, sampler_logprobs, advantages, config):
-  clip, kl_coeff = config.get("clip_range", 0.2), config.get("kl_coeff", 0.0)
+  if bad := set(config) - {"clip_range", "kl_coeff", "clip_low_threshold", "clip_high_threshold"}:
+    raise ValueError(f"unknown PPO config keys: {bad}")
+  if any(not isinstance(x, (int, float)) or not math.isfinite(x) for x in config.values()):
+    raise ValueError("PPO config values must be finite numbers")
+  clip = config.get("clip_range", 0.2)
+  low, high = config.get("clip_low_threshold", 1 - clip), config.get("clip_high_threshold", 1 + clip)
+  kl_coeff = config.get("kl_coeff", 0.0)
+  if not 0 <= low <= high or kl_coeff < 0:
+    raise ValueError("PPO clipping thresholds must be finite and ordered, and kl_coeff nonnegative")
   log_ratio = (logprobs - sampler_logprobs).clamp(-20, 20)
   ratio = log_ratio.exp()
-  objective = torch.min(ratio * advantages, ratio.clamp(1 - clip, 1 + clip) * advantages)
+  objective = torch.min(ratio * advantages, ratio.clamp(low, high) * advantages)
   kl = (ratio - 1) - log_ratio
   return -(objective - kl_coeff * kl) * weights
 
@@ -246,58 +254,95 @@ class Model:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
     lm = self.activate_run(run).train(not forward_only)
-    lengths = [min(len(d.tokens), len(d.inputs["target_tokens"])) for d in data]
+    lengths = [len(d.tokens) for d in data]
+    for d, n in zip(data, lengths):
+      if not n or d.tokens.shape != (n,) or "target_tokens" not in d.inputs:
+        raise ValueError("each datum needs a nonempty token sequence and target_tokens")
+      if set(d.inputs) - {"target_tokens", "weights", "logprobs", "advantages"}:
+        raise ValueError("unsupported loss inputs")
+      if any(x.shape != (n,) or not np.isfinite(x).all() for x in d.inputs.values()):
+        raise ValueError("loss inputs must be finite 1-D arrays with one value per input token")
+      if any(
+        x.dtype.kind not in "iu" or np.any(x < 0) or np.any(x >= lm.config.get_text_config().vocab_size)
+        for x in (d.tokens, d.inputs["target_tokens"])
+      ):
+        raise ValueError("input and target tokens must be integer vocabulary indices")
+    if loss_fn != "ppo" and config:
+      raise ValueError(f"{loss_fn} has no loss config")
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total = 0.0
 
     # on the gpu autocast runs the adapters' matmuls in bf16 anyway, so PEFT's upcast of each layer's input to the fp32 adapter only adds casts
     gpu = lm.device.type == "cuda"
-    with torch.set_grad_enabled(not forward_only), disable_input_dtype_casting(lm, active=gpu):
-      for batch in batches(lengths, token_budget(lm)):
-        x = batch_tensors([data[i] for i in batch], [lengths[i] for i in batch], lm.device)
-        with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
-          lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
-        loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
-        if not forward_only:
-          loss.backward()
-        total += loss.item()
+    accumulating = False
+    try:
+      with torch.set_grad_enabled(not forward_only), disable_input_dtype_casting(lm, active=gpu):
+        for batch in batches(lengths, token_budget(lm)):
+          x = batch_tensors([data[i] for i in batch], [lengths[i] for i in batch], lm.device)
+          with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
+            lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
+          loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
+          if not forward_only:
+            accumulating = True
+            loss.backward()
+          total += loss.item()
 
-        for row, i in enumerate(batch):
-          values = lp[row, : lengths[i]].detach().float()
-          # keep them finite, so a JSON client can carry them
-          logprobs[i] = torch.nan_to_num(values, nan=0.0).clamp(-9999, 9999).cpu().numpy()
+          for row, i in enumerate(batch):
+            values = lp[row, : lengths[i]].detach().float()
+            # keep them finite, so a JSON client can carry them
+            logprobs[i] = torch.nan_to_num(values, nan=0.0).clamp(-9999, 9999).cpu().numpy()
+    except Exception as e:
+      if accumulating:
+        self.delete_run(run)
+        raise RuntimeError(
+          "backward failed after mutation; this run lost its unsaved state, load_state to recover"
+        ) from e
+      raise
 
     return logprobs, {"loss:sum": total, "loss:mean": total / max(1, len(data))}
 
-  def adam_for_run(self, run: str) -> torch.optim.AdamW:
-    if run not in self.optimizers:
-      params = list(self.params[run].values())
-      self.optimizers[run] = torch.optim.AdamW(params, fused=bool(params and params[0].is_cuda))
-    return self.optimizers[run]
+  def adam_for_run(self, run: str, **config) -> torch.optim.AdamW:
+    params = list(self.params[run].values())
+    optimizer = torch.optim.AdamW(params, fused=bool(params and params[0].is_cuda), **config)
+    if run in self.optimizers:
+      optimizer.state = self.optimizers[run].state
+    self.optimizers[run] = optimizer
+    return optimizer
 
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
     self.activate_run(run)
-    optimizer = self.adam_for_run(run)
-
-    # every step brings its own hyperparameters, so a learning rate schedule just works
-    for group in optimizer.param_groups:
-      group["lr"] = adam.get("learning_rate", 1e-4)
-      group["betas"] = (adam.get("beta1", 0.9), adam.get("beta2", 0.95))
-      group["eps"] = adam.get("eps", 1e-12)
-      group["weight_decay"] = adam.get("weight_decay", 0.0)
-
+    if set(adam) - {"learning_rate", "beta1", "beta2", "eps", "weight_decay", "grad_clip_norm"}:
+      raise ValueError("unknown Adam parameters")
+    if any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in adam.values()):
+      raise ValueError("Adam parameters must be finite numbers")
     max_norm = adam.get("grad_clip_norm") or math.inf  # 0 means don't clip
-    grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run].values(), max_norm).item()
-    # moments on the host come back to the GPU, after freeing torch's cache to make room
-    if not self.lora and torch.cuda.is_available() and any(not t.is_cuda for t in self.adam_moments()):
-      torch.cuda.empty_cache()
-      self.move_tensors(self.adam_moments(), "cuda")
-    optimizer.step()
-    optimizer.zero_grad()
-    if not self.lora and not self.moments_fit():
-      self.move_tensors(self.adam_moments(), "cpu")
-    self.dirty.add(run)
-    return {"grad_norm:mean": grad_norm}
+    if max_norm < 0:
+      raise ValueError("grad_clip_norm must be nonnegative")
+    optimizer = self.adam_for_run(
+      run,
+      lr=adam.get("learning_rate", 1e-4),
+      betas=(adam.get("beta1", 0.9), adam.get("beta2", 0.95)),
+      eps=adam.get("eps", 1e-12),
+      weight_decay=adam.get("weight_decay", 0.0),
+    )  # Adam validates each command's hyperparameters before any gradients or state change.
+
+    try:
+      grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run].values(), max_norm, error_if_nonfinite=True).item()
+      # moments on the host come back to the GPU, after freeing torch's cache to make room
+      if not self.lora and torch.cuda.is_available() and any(not t.is_cuda for t in self.adam_moments()):
+        torch.cuda.empty_cache()
+        self.move_tensors(self.adam_moments(), "cuda")
+      optimizer.step()
+      optimizer.zero_grad()
+      if not self.lora and not self.moments_fit():
+        self.move_tensors(self.adam_moments(), "cpu")
+      self.dirty.add(run)
+      return {"grad_norm:mean": grad_norm}
+    except Exception as e:
+      self.delete_run(run)
+      raise RuntimeError(
+        "optimizer failed after mutation; this run lost its unsaved state, load_state to recover"
+      ) from e
 
   def training_state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """A run's portable training checkpoint: fp32 master weights and named AdamW state, with no pickle."""
@@ -305,11 +350,10 @@ class Model:
     tensors = {name: p.detach() for name, p in self.params[run].items()}
     optim = self.optimizers.get(run)
     for name, p in self.params[run].items():
-      if optim and p in optim.state:
-        s = optim.state[p]
-        tensors[f"{name}.exp_avg"] = s["exp_avg"].detach()
-        tensors[f"{name}.exp_avg_sq"] = s["exp_avg_sq"].detach()
-        tensors[f"{name}.step"] = s["step"].detach()
+      if p.grad is not None:
+        tensors[f"{name}.grad"] = p.grad.detach()
+      if optim:
+        tensors |= {f"{name}.{key}": t.detach() for key, t in optim.state.get(p, {}).items()}
     return tensors, {"optimizer": True}
 
   def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
@@ -329,32 +373,54 @@ class Model:
       "config": cfg,
     }
 
-  def restore_run(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
+  def restore_run(
+    self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool, gradients: bool = False
+  ) -> None:
     self.activate_run(run)
     if optimizer and not meta.get("optimizer"):
       raise ValueError("checkpoint has no optimizer state")
-    suffixes = (".exp_avg", ".exp_avg_sq", ".step")
-    weights = {k.removeprefix("base_model.model."): v for k, v in tensors.items() if not k.endswith(suffixes)}
+    suffixes = (".exp_avg", ".exp_avg_sq", ".step", ".grad")
+    tensors = {k.removeprefix("base_model.model."): v for k, v in tensors.items()}
     if not self.lora and "lm_head.weight" not in self.params[run]:
-      weights.pop("lm_head.weight", None)  # tied to embed_tokens
-    if weights.keys() != self.params[run].keys():
+      tensors.pop("lm_head.weight", None)  # tied to embed_tokens
+    allowed = {name + s for name in self.params[run] for s in ("", *suffixes)}
+    if not self.params[run].keys() <= tensors.keys() or tensors.keys() - allowed:
       raise ValueError("checkpoint does not fit this model")
     for name, p in self.params[run].items():
-      p.data.copy_(weights[name])
-
-    self.pinned.clear()
-    self.optimizers.pop(run, None)
-    if optimizer and any(k.endswith(".step") for k in tensors):
-      opt = self.adam_for_run(run)
+      for suffix in ("", *suffixes):
+        if (t := tensors.get(name + suffix)) is not None:
+          if not t.is_floating_point() or t.shape != (() if suffix == ".step" else p.shape):
+            raise ValueError(f"checkpoint shape or dtype mismatch for {name + suffix}")
+          if suffix == ".step" and (not math.isfinite(t.item()) or t.item() < 0 or t.item() % 1):
+            raise ValueError(f"invalid optimizer step for {name}")
+      if (
+        optimizer
+        and any(name + s in tensors for s in suffixes[:3])
+        and not all(name + s in tensors for s in suffixes[:3])
+      ):
+        raise ValueError(f"incomplete optimizer state for {name}")
+    try:
       for name, p in self.params[run].items():
-        opt.state[p] = {
-          "exp_avg": tensors[f"{name}.exp_avg"].to(p.device, torch.float32),
-          "exp_avg_sq": tensors[f"{name}.exp_avg_sq"].to(p.device, torch.float32),
-          "step": tensors[f"{name}.step"].to(p.device if opt.defaults.get("fused") else "cpu", torch.float32),
-        }
-      if not self.lora:
-        self.move_tensors(self.adam_moments(), "cpu")
-    self.dirty.add(run)
+        p.data.copy_(tensors[name])
+        p.grad = tensors[f"{name}.grad"].to(p, copy=True) if gradients and f"{name}.grad" in tensors else None
+      self.pinned.clear()
+      self.optimizers.pop(run, None)
+      if optimizer and any(k.endswith(".step") for k in tensors):
+        opt = self.adam_for_run(run)
+        for name, p in self.params[run].items():
+          if f"{name}.step" in tensors:
+            opt.state[p] = {
+              s: tensors[f"{name}.{s}"].to(
+                p.device if s != "step" or opt.defaults.get("fused") else "cpu", torch.float32, copy=True
+              )
+              for s in ("exp_avg", "exp_avg_sq", "step")
+            }
+        if not self.lora:
+          self.move_tensors(self.adam_moments(), "cpu")
+      self.dirty.add(run)
+    except Exception:
+      self.delete_run(run)
+      raise
 
   def moments_fit(self) -> bool:
     """Whether a full fine-tune's AdamW moments stay on the GPU between steps: when what's left free is at least as big as they are, so forward_backward keeps room. Otherwise they cross PCIe twice a step, 2.7 of a 2.8 s step for Gemma E2B."""

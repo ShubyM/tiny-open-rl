@@ -109,6 +109,96 @@ class TestBus(RedisTest):
     )
     self.assertEqual(await self.bus.take_commands("p", "new", block_ms=10), [])
 
+  async def test_planned_handoff_preserves_unstarted_commands_before_newer_work(self):
+    run = await self.new_run()
+    requests = [await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}", i) for i in range(3)]
+    first, second = await self.bus.take_commands("p", "w0", count=2, block_ms=0)
+    await self.bus.write_reply(first, ok(), "p", "w0")
+    self.assertTrue(await self.bus.return_commands("p", "w0", [second]))
+    await self.bus.release_lease("p", "w0")
+    await self.bus.take_lease("p", "next")
+    self.assertEqual(await self.bus.reclaim_stranded_commands("p", "next"), [])
+    [resumed] = await self.bus.take_commands("p", "next", block_ms=0)
+    self.assertEqual(resumed.request_id, requests[1])
+    await self.bus.write_reply(resumed, ok(), "p", "next")
+    [last] = await self.bus.take_commands("p", "next", block_ms=0)
+    self.assertEqual(last.request_id, requests[2])
+
+  async def test_a_stale_owner_cannot_return_someone_elses_claim(self):
+    run = await self.new_run()
+    await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}")
+    cmds = await self.bus.take_commands("p", "w0", block_ms=0)
+    await self.bus.release_lease("p", "w0")
+    await self.bus.take_lease("p", "next")
+    self.assertFalse(await self.bus.return_commands("p", "w0", cmds))
+    self.assertEqual(await self.bus.reclaim_stranded_commands("p", "next"), cmds)
+
+  async def test_checkpoint_publication_and_reply_require_the_same_current_owner(self):
+    run = await self.new_run()
+    request = await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
+    [cmd] = await self.bus.take_commands("p", "w0", block_ms=0)
+    checkpoint = {"uri": f"tinker://{run}/weights/s", "size": 12, "version": "v1"}
+    await self.bus.release_lease("p", "w0")
+    await self.bus.take_lease("p", "next")
+    self.assertFalse(await self.bus.write_reply(cmd, ok(), "p", "w0", checkpoint=checkpoint))
+    self.assertIsNone(await self.registry.get_checkpoint(checkpoint["uri"]))
+    self.assertIsNone(await self.bus.wait_for_reply(request, 0))
+    self.assertTrue(await self.bus.write_reply(cmd, ok(), "p", "next", checkpoint=checkpoint))
+    self.assertEqual((await self.registry.get_checkpoint(checkpoint["uri"]))["version"], "v1")
+    self.assertIsNotNone(await self.bus.wait_for_reply(request, 0))
+
+  async def test_all_fenced_writes_retry_a_renewal_without_duplicating_effects(self):
+    for operation in ("reply", "park", "return"):
+      with self.subTest(operation=operation):
+        run = await self.new_run()
+        await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}")
+        [cmd] = await self.bus.take_commands("p", "w0", block_ms=0)
+        checkpoint = {"uri": f"tinker://{run}/parked/s", "size": 12, "version": "v1"}
+        pipeline = self.bus.r.pipeline(transaction=True)
+        get = pipeline.get
+
+        async def renewed(k, get=get):
+          value = await get(k)
+          await self.bus.renew_lease("p", "w0")
+          return value
+
+        pipeline.get = renewed
+        with patch.object(self.bus.r, "pipeline", side_effect=[pipeline, self.bus.r.pipeline(transaction=True)]):
+          if operation == "reply":
+            self.assertTrue(await self.bus.write_reply(cmd, ok(), "p", "w0", checkpoint=checkpoint))
+          elif operation == "park":
+            self.assertTrue(await self.bus.set_parked_checkpoint(run, checkpoint["uri"], "p", "w0", checkpoint))
+          else:
+            self.assertTrue(await self.bus.return_commands("p", "w0", [cmd]))
+        if operation == "reply":
+          self.assertEqual((await self.bus.get_run(run))["steps"], 1)
+          self.assertEqual((await self.registry.get_checkpoint(checkpoint["uri"]))["version"], "v1")
+        elif operation == "park":
+          self.assertEqual(await self.bus.parked_checkpoint(run), checkpoint["uri"])
+          self.assertEqual((await self.registry.get_checkpoint(checkpoint["uri"]))["version"], "v1")
+          await self.bus.write_reply(cmd, ok(), "p", "w0")
+        else:
+          [returned] = await self.bus.take_commands("p", "w0", block_ms=0)
+          self.assertEqual(returned, cmd)
+          await self.bus.write_reply(cmd, ok(), "p", "w0")
+
+  async def test_replaced_lease_during_publication_does_not_publish_a_parked_checkpoint(self):
+    run = await self.new_run()
+    checkpoint = {"uri": f"tinker://{run}/parked/s", "size": 12, "version": "v1"}
+    pipeline = self.bus.r.pipeline(transaction=True)
+    get = pipeline.get
+
+    async def replaced(k):
+      value = await get(k)
+      await self.bus.r.set(key("owner", "p"), "next")
+      return value
+
+    pipeline.get = replaced
+    with patch.object(self.bus.r, "pipeline", side_effect=[pipeline, self.bus.r.pipeline(transaction=True)]):
+      self.assertFalse(await self.bus.set_parked_checkpoint(run, checkpoint["uri"], "p", "w0", checkpoint))
+    self.assertIsNone(await self.bus.parked_checkpoint(run))
+    self.assertIsNone(await self.registry.get_checkpoint(checkpoint["uri"]))
+
   async def test_every_run_in_a_worker_is_served_each_take(self):
     a, b, other = await self.new_run(), await self.new_run(), await self.new_run("other")
     for run_id in (a, a, a, b, other):
@@ -146,6 +236,29 @@ class TestBus(RedisTest):
     await self.bus.release_lease("p", "w0")
     self.assertTrue(await self.bus.take_lease("p", "next"))
 
+  async def test_a_paused_owner_cannot_recover_after_its_replacement_dies_unsaved(self):
+    run = await self.new_run()
+    request = await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}")
+    [cmd] = await self.bus.take_commands("p", "w0", block_ms=0)
+    await self.bus.r.delete(key("owner", "p"))
+    self.assertTrue(await self.bus.take_lease("p", "next"))
+    failed = Reply(False, "application/json", b'{"error":"previous owner lost the worker"}')
+    self.assertTrue(await self.bus.write_reply(cmd, failed, "p", "next"))
+    await self.bus.r.delete(key("owner", "p"))  # next dies without parking anything
+    self.assertFalse(await self.bus.take_lease("p", "w0", recover=True))
+    self.assertFalse(await self.bus.write_reply(cmd, ok(), "p", "w0"))
+    self.assertEqual(await self.bus.wait_for_reply(request, 0), failed)
+    self.assertIsNone(await self.bus.lease_owner("p"))
+
+  async def test_lease_recovery_survives_untaken_expiry_and_redis_flush(self):
+    self.assertFalse(await self.bus.take_lease("p", "zombie"))  # a failed contender must not replace history
+    await self.bus.r.delete(key("owner", "p"))
+    self.assertTrue(await self.bus.take_lease("p", "w0", recover=True))
+    self.assertEqual(await self.bus.r.ttl(key("last_owner", "p")), -1)
+    await self.bus.r.flushdb()
+    self.assertTrue(await self.bus.take_lease("p", "w0", recover=True))
+    self.assertEqual(await self.bus.lease_owner("p"), "w0")
+
   async def test_a_dead_node_daemon_stops_counting(self):
     await self.bus.node_heartbeat("node-a", 2)
     await self.bus.r.hset("tinyrl:nodes", "node-b", '{"gpus": 8, "until": 0}')
@@ -180,6 +293,18 @@ class TestBus(RedisTest):
     with patch.object(self.bus, "runs_in_worker", AsyncMock(return_value=[run_id, gone])):  # listed before it went
       self.assertEqual(await self.bus.take_commands("p", "o", block_ms=10), [])
     self.assertEqual([c.run for c in await self.bus.take_commands("p", "o", block_ms=10)], [run_id])
+
+  async def test_deleting_another_run_does_not_drop_a_claim_resumed_from_handoff(self):
+    run, gone = await self.new_run(), await self.new_run()
+    await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}")
+    [cmd] = await self.bus.take_commands("p", "w0", block_ms=0)
+    await self.bus.return_commands("p", "w0", [cmd])
+    await self.bus.delete_run(gone, "p")
+    with (
+      patch.object(self.bus, "runs_in_worker", AsyncMock(return_value=[run, gone])),
+      patch("tinyrl.bus.random.shuffle"),
+    ):
+      self.assertEqual(await self.bus.take_commands("p", "w0", block_ms=0), [cmd])
 
   async def test_a_run_deleted_after_its_worker_was_listed_is_skipped_when_reclaiming(self):
     run_id, gone = await self.new_run(), await self.new_run()

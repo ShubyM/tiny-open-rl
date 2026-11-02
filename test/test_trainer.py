@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import torch
@@ -54,6 +54,20 @@ def same(a, b) -> bool:
 
 
 class TestForwardPass(unittest.TestCase):
+  def test_ppo_uses_explicit_asymmetric_thresholds_and_rejects_unknown_config(self):
+    values = (torch.tensor([0.5, 1.5]).log(), torch.ones(2), torch.zeros(2), torch.tensor([-1.0, 1.0]))
+    torch.testing.assert_close(
+      LOSSES["ppo"](*values, {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2}), torch.tensor([0.8, -1.2])
+    )
+    for config in (
+      {"typo": 0.5},
+      {"clip_low_threshold": 2, "clip_high_threshold": 1},
+      {"kl_coeff": float("nan")},
+      {"clip_range": "bad"},
+    ):
+      with self.subTest(config=config), self.assertRaises(ValueError):
+        LOSSES["ppo"](*values, config)
+
   def test_batches(self):
     self.assertEqual(batches([5, 5, 5], 100), [[0, 1, 2]])
     self.assertEqual(batches([5, 5, 5], 10), [[0, 1], [2]])
@@ -185,6 +199,140 @@ class CudaMock(torch.Tensor):
 
 
 class TestModel(unittest.TestCase):
+  def test_restore_validates_all_requested_state_before_changing_live_tensors(self):
+    model, (run,) = lora_runs()
+    train(model, run, steps=1)
+    model.forward_backward(run, [counting(4)], "cross_entropy", {}, False)
+    state, meta = model.training_state(run)
+    state = {name: t.clone() for name, t in state.items()}
+    names = list(model.params[run])
+    before = copy.deepcopy(model.optimizers[run].state_dict())
+    for suffix, bad in (
+      ("", torch.zeros(1)),
+      (".grad", torch.zeros(1)),
+      (".exp_avg", torch.zeros(1)),
+      (".step", torch.zeros(2)),
+      (".step", torch.tensor(-1.0)),
+      (".step", torch.tensor(float("nan"))),
+      (".step", torch.tensor(0.5)),
+      ("", torch.zeros_like(state[names[-1]], dtype=torch.int64)),
+    ):
+      with self.subTest(suffix=suffix, shape=bad.shape, dtype=bad.dtype):
+        changed = {**state, names[0]: state[names[0]] + 100, names[-1] + suffix: bad}
+        with self.assertRaises(ValueError):
+          model.restore_run(run, changed, meta, optimizer=True, gradients=True)
+        self.assertTrue(
+          all(
+            torch.equal(p, state[n]) and torch.equal(p.grad, state[n + ".grad"]) for n, p in model.params[run].items()
+          )
+        )
+        torch.testing.assert_close(model.optimizers[run].state_dict(), before)
+    missing = dict(state)
+    del missing[names[-1] + ".exp_avg_sq"]
+    with self.assertRaises(ValueError):
+      model.restore_run(run, missing, meta, True)
+    self.assertTrue(all(torch.equal(p, state[n]) for n, p in model.params[run].items()))
+
+  def test_handoff_restores_accumulation_and_user_loads_clear_it(self):
+    for rank in (0, 4):
+      source, restored, run = Model(tiny), Model(tiny), new_id()
+      source.create_run(run, "tiny", rank, LORA)
+      train(source, run, steps=1)
+      source.forward_backward(run, [counting(7)], "cross_entropy", {}, False)
+      tensors, meta = source.training_state(run)
+      tensors = {n: t.clone() for n, t in tensors.items()}
+      self.assertNotIn("internal_handoff", meta)
+      restored.create_run(run, "tiny", rank, LORA)
+      restored.restore_run(run, tensors, meta, optimizer=True, gradients=True)
+      self.assertTrue(all(torch.equal(p.grad, source.params[run][n].grad) for n, p in restored.params[run].items()))
+      source.optim_step(run, {"learning_rate": 1e-2})
+      restored.optim_step(run, {"learning_rate": 1e-2})
+      self.assertTrue(same(source.params[run], restored.params[run]))
+      for optimizer in (False, True):
+        restored.forward_backward(run, [counting(5)], "cross_entropy", {}, False)
+        restored.restore_run(run, tensors, meta, optimizer=optimizer)
+        self.assertTrue(all(p.grad is None for p in restored.params[run].values()))
+
+  def test_bad_input_is_rejected_before_any_datum_accumulates(self):
+    model, (run,) = lora_runs()
+    model.forward_backward(run, [counting(4)], "cross_entropy", {}, False)
+    before = [p.grad.clone() for p in model.params[run].values()]
+    for bad in (
+      counting(4, weights=np.ones(3)),
+      wire.Datum(np.arange(4), {"target_tokens": np.arange(3)}),
+      counting(4, advantages=np.array([1, 2, 3, np.nan])),
+      wire.Datum(np.arange(4), {"target_tokens": np.array([1, 2, 3, 96])}),
+    ):
+      with self.assertRaises(ValueError):
+        model.forward_backward(run, [counting(3), bad], "cross_entropy", {}, False)
+      self.assertTrue(same(before, [p.grad for p in model.params[run].values()]))
+
+  def test_partial_backward_invalidates_only_its_run_until_explicit_reload(self):
+    model, (run, other) = lora_runs(2)
+    model.forward_backward(other, [counting(4)], "cross_entropy", {}, False)
+    untouched = [p.grad.clone() for p in model.params[other].values()]
+    original, calls = target_logprobs, 0
+
+    def fail_second(*args):
+      nonlocal calls
+      calls += 1
+      if calls == 2:
+        raise RuntimeError("failed second microbatch")
+      return original(*args)
+
+    data = [counting(n, logprobs=np.zeros(n), advantages=np.ones(n)) for n in (4, 5)]
+    with (
+      patch("tinyrl.workers.model.TOKEN_BUDGET", 1),
+      patch("tinyrl.workers.model.target_logprobs", side_effect=fail_second),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "load_state"):
+        model.forward_backward(run, data, "ppo", {}, False)  # a negative first loss still mutates gradients
+    self.assertNotIn(run, model.params)
+    self.assertTrue(same(untouched, [p.grad for p in model.params[other].values()]))
+    with self.assertRaises(KeyError):
+      model.optim_step(run, {})
+    with self.assertRaises(KeyError):
+      model.forward_backward(run, [counting(3)], "cross_entropy", {}, True)
+
+  def test_partial_optimizer_failure_cannot_leave_a_run_usable(self):
+    model, (run,) = lora_runs()
+    model.forward_backward(run, [counting(4)], "cross_entropy", {}, False)
+
+    def fail_after_update():
+      next(iter(model.params[run].values())).data.add_(1)
+      raise RuntimeError("optimizer failed")
+
+    optimizer = model.adam_for_run(run)
+    with (
+      patch.object(model, "adam_for_run", return_value=optimizer),
+      patch.object(optimizer, "step", side_effect=fail_after_update),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "load_state"):
+        model.optim_step(run, {})
+    self.assertNotIn(run, model.params)
+
+  def test_invalid_adam_parameters_preserve_weights_gradients_and_moments(self):
+    model, (run,) = lora_runs()
+    train(model, run, steps=1)
+    model.forward_backward(run, [counting(4)], "cross_entropy", {}, False)
+    before, _ = model.training_state(run)
+    before = {n: t.clone() for n, t in before.items()}
+    for config in (
+      {"learning_rate": -1},
+      {"beta1": 1},
+      {"beta2": -1},
+      {"eps": -1},
+      {"weight_decay": -1},
+      {"grad_clip_norm": -1},
+      {"learning_rate": float("nan")},
+      {"beta1": "bad"},
+      {"beta3": 0.9},
+    ):
+      with self.subTest(config=config), self.assertRaises(ValueError):
+        model.optim_step(run, config)
+      after, _ = model.training_state(run)
+      self.assertTrue(all(torch.equal(t, after[n]) for n, t in before.items()))
+
   @patch("torch.cuda.is_available", return_value=True)
   @patch("torch.cuda.synchronize")
   @patch("torch.cuda.empty_cache")
@@ -369,7 +517,8 @@ class TestModel(unittest.TestCase):
 
     model, (lora_run,) = lora_runs()
     train(model, lora_run, steps=3)
-    lora_dir = store.put(f"tinker://{lora_run}/sampler_weights/final", *model.sampler_weights(lora_run))
+    lora_uri = f"tinker://{lora_run}/sampler_weights/final"
+    lora_dir = store.local_folder(lora_uri, store.put(lora_uri, *model.sampler_weights(lora_run)))[0]
     with torch.no_grad():
       torch.testing.assert_close(
         PeftModel.from_pretrained(tiny(), lora_dir).eval()(ids).logits,
@@ -379,7 +528,8 @@ class TestModel(unittest.TestCase):
     fft, fft_run = Model(tiny), new_id()
     fft.create_run(fft_run, "tiny", 0, {})
     train(fft, fft_run, steps=3)
-    fft_dir = store.put(f"tinker://{fft_run}/sampler_weights/final", *fft.sampler_weights(fft_run))
+    fft_uri = f"tinker://{fft_run}/sampler_weights/final"
+    fft_dir = store.local_folder(fft_uri, store.put(fft_uri, *fft.sampler_weights(fft_run)))[0]
     with torch.no_grad():
       torch.testing.assert_close(
         LlamaForCausalLM.from_pretrained(fft_dir).eval()(ids).logits,
@@ -401,6 +551,73 @@ class TestModel(unittest.TestCase):
 
 
 class TestTrainer(RedisTest):
+  async def test_failed_initial_load_does_not_install_fresh_state(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    t = Trainer(self.bus, "p", Model(tiny), store=Store(root=tempfile.mkdtemp()))
+    await self.own(t)
+    ids = await self.submit(
+      run,
+      (Op.LOAD_WEIGHTS, {"uri": f"tinker://{run}/weights/missing", "optimizer": True}),
+      (Op.OPTIM_STEP, {"adam_params": {}}),
+    )
+    await t.step(block_ms=10)
+    self.assertEqual([(await self.bus.wait_for_reply(i, 1)).ok for i in ids], [False, False])
+    self.assertNotIn(run, t.model.params)
+
+  async def test_stop_and_revoke_return_unstarted_commands_with_their_original_futures(self):
+    run, store = new_id(), Store(root=tempfile.mkdtemp())
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    ids = await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      (Op.FORWARD_BACKWARD, proto_body(run)),
+      (Op.OPTIM_STEP, {"adam_params": {}}),
+    )
+    first = Trainer(self.bus, "p", Model(tiny), store=store)
+    first.turn.shared, first.turn.held = True, True
+    answer = first.answer_command
+
+    async def stop_after_command(cmd):
+      result = await answer(cmd)
+      first.stop()
+      return result
+
+    first.answer_command = stop_after_command
+    first.turn.was_revoked = AsyncMock(side_effect=lambda: first.stopping is not None and first.turn.held)
+    await asyncio.wait_for(first.serve(), 5)
+    self.assertFalse(first.turn.held)
+    self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
+    self.assertIsNone(await self.bus.wait_for_reply(ids[1], 0))
+    second = Trainer(self.bus, "p", Model(tiny), store=store)
+    await self.own(second)
+    await second.fail_stranded_commands(0)
+    self.assertEqual(await second.step(block_ms=10), 2)
+    self.assertTrue(all([(await self.bus.wait_for_reply(i, 1)).ok for i in ids]))
+
+  async def test_stop_while_waiting_for_gpu_returns_the_unstarted_create(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    [request_id] = await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    first = Trainer(self.bus, "p", Model(tiny))
+    first.turn.shared, first.turn.held = True, False
+    task = asyncio.create_task(first.serve())
+    try:
+      for _ in range(100):
+        if first.queue:
+          break
+        await asyncio.sleep(0.01)
+      self.assertTrue(first.queue)
+      first.stop()
+      await asyncio.wait_for(task, 2)
+      second = Trainer(self.bus, "p", Model(tiny))
+      await self.own(second)
+      await second.fail_stranded_commands(0)
+      self.assertEqual(await second.step(block_ms=10), 1)
+      self.assertTrue((await self.bus.wait_for_reply(request_id, 1)).ok)
+    finally:
+      task.cancel()
+
   async def submit(self, run: str, *cmds: tuple[Op, dict | bytes]) -> list[str]:
     request_ids = []
     for op, body in cmds:
@@ -565,15 +782,31 @@ class TestTrainer(RedisTest):
   async def test_a_trainer_takes_its_lease_again_when_redis_loses_it(self):
     t = Trainer(self.bus, "p", Model(tiny))
     await self.own(t)
-    await self.bus.r.delete("tinyrl:owner:p")  # what a Redis restart longer than the lease does
+    await self.bus.r.delete("tinyrl:owner:p")  # the lease expired while nobody else took it
     await asyncio.sleep(0.2)
     self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (t.owner, None))
 
-    t.model.params["r"] = {}  # but not once another trainer has served the worker and parked its run
-    await self.bus.r.set("tinyrl:parked:r", "tinker://r/parked/1")
-    await self.bus.r.delete("tinyrl:owner:p")
+    await self.bus.r.flushdb()  # Redis restarts without persistence
     await asyncio.sleep(0.2)
-    self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (None, Stop.EXIT))
+    self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (t.owner, None))
+
+  @patch("tinyrl.workers.trainer.LEASE_MS", 200)
+  async def test_a_stale_trainer_exits_after_its_replacement_dies_without_parking(self):
+    first, second = (Trainer(self.bus, "p", Model(tiny)) for _ in range(2))
+    run = new_id()
+    first.model.create_run(run, "tiny", 4, LORA)
+    await first.wait_for_lease()
+    await self.bus.r.delete("tinyrl:owner:p")  # first is paused past its lease
+    await second.wait_for_lease()
+    second.model.create_run(run, "tiny", 4, LORA)
+    second.model.forward_backward(run, [counting(8)], "cross_entropy", {}, False)
+    second.model.optim_step(run, {"learning_rate": 1e-2})
+    self.assertFalse(same(first.model.params[run], second.model.params[run]))
+    await self.bus.r.delete("tinyrl:owner:p")  # second dies without leaving a parked checkpoint
+    self.assertIsNone(await self.bus.parked_checkpoint(run))
+
+    await asyncio.wait_for(first.keep_renewing_lease(), 1)  # first wakes with stale model state
+    self.assertEqual((await self.bus.lease_owner("p"), first.stopping), (None, Stop.EXIT))
 
   async def test_a_run_whose_trainer_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     store = Store(root=tempfile.mkdtemp())

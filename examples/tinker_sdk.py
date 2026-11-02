@@ -56,12 +56,13 @@ prompt_lps = sampler_client.compute_logprobs(
 is_datum = types.Datum(
   model_input=types.ModelInput.from_ints(prompt_tokens + list(seq.tokens)[:-1]),
   loss_fn_inputs={
-    "target_tokens": list(seq.tokens),
-    "logprobs": list(seq.logprobs),
-    "advantages": [1.0] * len(seq.tokens),
-    "weights": [1.0] * len(seq.tokens),
+    "target_tokens": prompt_tokens[1:] + list(seq.tokens),
+    "logprobs": [0.0] * (len(prompt_tokens) - 1) + list(seq.logprobs),
+    "advantages": [0.0] * (len(prompt_tokens) - 1) + [1.0] * len(seq.tokens),
+    "weights": [0.0] * (len(prompt_tokens) - 1) + [1.0] * len(seq.tokens),
   },
 )
 fwdbwd_is = trainer.forward_backward([is_datum], "importance_sampling")
 optim_is = trainer.optim_step(types.AdamParams(learning_rate=1e-3))
 print(f"importance_sampling loss {fwdbwd_is.result().metrics['loss:sum']:.4f}")
+optim_is.result()

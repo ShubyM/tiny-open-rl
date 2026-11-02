@@ -131,13 +131,16 @@ class TestSampler(RedisTest):
     self.assertEqual(await self.worker(request_id.split("/")[0]), sampler.worker)
     await sampler.step(block_ms=0)
     self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
-    calls = sampler.running.engine.calls
+    calls = sampler.running.calls
+    loaded_name = next(iter(sampler.running.loaded))
     self.assertEqual(calls[0], ("start", base, True))
     self.assertEqual(
       [c for c in calls if c[0] == "load"],
-      [("load", "c0", store.path(f"tinker://{run}/sampler_weights/step-0"))],
+      [("load", loaded_name, store.local_folder(f"tinker://{run}/sampler_weights/step-0")[0])],
     )
-    self.assertEqual([c for c in calls if c[0] == "sample"], [("sample", "c0"), ("sample", None)])  # the retry ran once
+    self.assertEqual(
+      [c for c in calls if c[0] == "sample"], [("sample", loaded_name), ("sample", None)]
+    )  # the retry ran once
 
     fft = (await call("create_model", {"base_model": base, "user_metadata": {"openrl.fine_tuning_type": "full"}}))[
       "model_id"
@@ -155,7 +158,8 @@ class TestSampler(RedisTest):
     res = await client.post("/api/v1/retrieve_future", json={"request_id": request_id}, headers={"Accept": wire.PROTO})
     self.assertEqual(res.headers["content-type"], wire.PROTO)
     self.assertIn(
-      ("load", "c0", store.path(f"tinker://{fft}/sampler_weights/step-0")), fft_sampler.running.engine.calls
+      ("load", next(iter(fft_sampler.running.loaded)), store.local_folder(f"tinker://{fft}/sampler_weights/step-0")[0]),
+      fft_sampler.running.calls,
     )
     await client.aclose()
 
@@ -189,11 +193,11 @@ class TestSampler(RedisTest):
       ]:
         reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, json.dumps(body).encode()), 5)
         self.assertTrue(reply.ok, reply.body)
-      self.assertIn(("sleep",), sampler.running.engine.calls)
+      self.assertIn(("sleep",), sampler.running.calls)
     finally:
       trainer.stopping, sampler.done = Stop.EXIT, True
       await asyncio.gather(*tasks)
-    self.assertEqual(sampler.running.engine.calls[-1], ("close",))
+    self.assertEqual(sampler.running.calls[-1], ("close",))
 
   async def test_a_sampler_batches_queued_commands_concurrently_and_loads_once(self):
     store = Store(tempfile.mkdtemp())
@@ -327,7 +331,7 @@ class TestSampler(RedisTest):
     await full.load_checkpoint("c0", dir1)
     self.assertEqual(calls, ["/collective_rpc", "/reset_prefix_cache", "/collective_rpc", "/reset_prefix_cache"])
 
-  async def test_a_sampler_takes_the_commands_that_arrive_while_its_engine_boots(self):
+  async def test_commands_arriving_during_boot_are_prepared_on_the_next_batch(self):
     store = Store(tempfile.mkdtemp())
     store.put("tinker://r1/sampler_weights/s0", {}, {"base": "base", "lora": True, "config": {}})
     await self.bus.create_run(Run("sess", "sampler:base", "base", 1, model_path="tinker://r1/sampler_weights/s0"))
@@ -351,7 +355,8 @@ class TestSampler(RedisTest):
     asyncio.create_task(push_more())
 
     handled = await sampler.step(block_ms=200)
-    self.assertEqual(handled, 3)
+    self.assertEqual(handled, 1)
+    self.assertEqual(await sampler.step(block_ms=0), 2)
 
   async def test_sampler_step_groups_non_exclusive_fft_interleaved(self):
     store = Store(tempfile.mkdtemp())
@@ -379,14 +384,15 @@ class TestSampler(RedisTest):
     handled = await sampler.step(block_ms=10)
     self.assertEqual(handled, 4)
 
-    self.assertEqual([n for n, _ in loads], ["c0", "c1"])
-    first_sess = "s1" if "/r1/" in loads[0][1] else "s2"
+    self.assertEqual(len({n for n, _ in loads}), 2)
+    first_name = loads[0][0]
+    first_sess = "s1" if loads[0][1] == store.local_folder("tinker://r1/sampler_weights/s0")[0] else "s2"
     loads.clear()
 
     await self.bus.submit_command(first_sess, Op.SAMPLE, json.dumps(JOB).encode())
     handled = await sampler.step(block_ms=10)
     self.assertEqual(handled, 1)
-    self.assertEqual([n for n, _ in loads], ["c0"])
+    self.assertEqual([n for n, _ in loads], [first_name])
 
   @patch("subprocess.Popen")
   async def test_vllm_start_appends_memory_and_kv_args_from_environ(self, mock_popen):
@@ -395,17 +401,18 @@ class TestSampler(RedisTest):
 
     from tinyrl.workers.vllm import VLLM
 
-    with patch.dict(os.environ, {"TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}):
+    with patch.dict(os.environ, {"TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": ""}):
       with (
         patch("tinyrl.workers.vllm.VLLM_ARGS", "--gpu-memory-utilization 0.8"),
         patch("tinyrl.workers.vllm.GPU_MEM", "0.42"),
-        patch("tinyrl.workers.vllm.KV_BYTES", str(16 * 1024**3)),
+        patch("tinyrl.workers.vllm.KV_BYTES", ""),
       ):
         with self.assertRaises(RuntimeError):
           await VLLM.start("base", False)
         args = mock_popen.call_args[0][0]
         child_env = mock_popen.call_args[1]["env"]
-        self.assertEqual(args[-4:], ["--gpu-memory-utilization", "0.42", "--kv-cache-memory-bytes", str(16 * 1024**3)])
+        self.assertEqual(args[-2:], ["--gpu-memory-utilization", "0.42"])
+        self.assertNotIn("--kv-cache-memory-bytes", args)
         self.assertNotIn("TINYRL_GPU_MEM", child_env)
         self.assertNotIn("TINYRL_KV_BYTES", child_env)
 
@@ -424,7 +431,7 @@ class TestSampler(RedisTest):
             break
           await asyncio.sleep(0.02)
         self.assertIsNotNone(sampler.running)
-        self.assertEqual(sampler.running.engine.calls[0], ("start", "base", True))
+        self.assertEqual(sampler.running.calls[0], ("start", "base", True))
       finally:
         sampler.done = True
         await task
@@ -486,6 +493,66 @@ class TestSampler(RedisTest):
       self.assertEqual(args[idx + 1], '{"enable_flashinfer_autotune":true}')
       self.assertEqual(args.count("--kernel-config"), 1)
       self.assertNotIn(KERNEL_CONFIG, args)
+
+  async def test_a_sampler_uses_the_version_it_prepared_even_when_the_alias_changes(self):
+    store, uri = Store(tempfile.mkdtemp()), "tinker://r/sampler_weights/s0"
+    first = store.put(uri, {}, {"base": "base", "lora": True, "config": {}})
+    second = store.put(uri, {}, {"base": "base", "lora": True, "config": {}})
+    await self.registry.register_checkpoint(uri, 0, version=first)
+    await self.bus.create_run(Run("s", "sampler", "base", 1, model_path=uri))
+    sampler = Sampler(self.bus, "sampler", engine=FakeEngine, store=store)
+    await self.own(sampler)
+    registry = self.registry
+
+    class Turn:
+      held, shared = False, True
+
+      async def wait_for_turn(self, queued):
+        taken, self.held = not self.held, True
+        await registry.register_checkpoint(uri, 0, version=second)
+        return taken
+
+      async def was_revoked(self):
+        return False
+
+      async def give_turn_back(self):
+        self.held = False
+
+      async def report_batch_done(self, **kwargs):
+        pass
+
+    sampler.turn = Turn()
+    local_folder = store.local_folder
+
+    def staged(*args):
+      self.assertFalse(sampler.turn.held, "bucket/cache preparation must precede the GPU turn")
+      return local_folder(*args)
+
+    with patch.object(store, "local_folder", side_effect=staged) as stage:
+      for _ in range(3):
+        command = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
+        self.assertEqual(await sampler.step(block_ms=0), 1)
+        self.assertTrue((await self.bus.wait_for_reply(command, 1)).ok)
+      self.assertEqual(stage.call_count, 2)  # first and second versions; loaded weights need no new preparation
+    loads = [call for call in sampler.running.calls if call[0] == "load"]
+    self.assertEqual([call[2] for call in loads], [local_folder(uri, first)[0], local_folder(uri, second)[0]])
+
+  async def test_a_staging_error_replies_before_gpu_acquisition_and_later_samples_still_work(self):
+    store, uri = Store(tempfile.mkdtemp()), "tinker://r/sampler_weights/missing"
+    await self.bus.create_run(Run("bad", "sampler", "base", 1, model_path=uri))
+    await self.bus.create_run(Run("good", "sampler", "base", 1))
+    sampler = Sampler(self.bus, "sampler", engine=FakeEngine, store=store)
+    await self.own(sampler)
+    bad = await self.bus.submit_command("bad", Op.SAMPLE, json.dumps(JOB).encode())
+    with patch.object(store, "local_folder", side_effect=RuntimeError("download failed")):
+      with patch.object(
+        sampler.turn, "wait_for_turn", side_effect=AssertionError("GPU requested for failed preparation")
+      ):
+        self.assertEqual(await sampler.step(block_ms=0), 1)
+    self.assertFalse((await self.bus.wait_for_reply(bad, 1)).ok)
+    good = await self.bus.submit_command("good", Op.SAMPLE, json.dumps(JOB).encode())
+    self.assertEqual(await sampler.step(block_ms=0), 1)
+    self.assertTrue((await self.bus.wait_for_reply(good, 1)).ok)
 
 
 if __name__ == "__main__":

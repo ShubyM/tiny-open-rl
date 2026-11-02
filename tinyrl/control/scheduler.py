@@ -1,8 +1,8 @@
 """The scheduler: which worker a run joins, where each worker runs, and whose turn it is on each GPU.
 
-The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.control.scheduler folds every entry into a State and appends what decide says back to the same log: placed and unplaced, granted and revoked. A decision changes the state only once it is folded from the log, so the state is always fold(log), and replaying the log rebuilds every state the scheduler saw. Each decision names the rule in RULES that made it. Run exactly one. A restarted scheduler folds the whole log again and carries on, since its earlier decisions are in it.
+The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.control.scheduler folds every entry into a State and appends what decide says back to the same log: placed and unplaced, granted and revoked. A decision changes the state only once it is folded from the log. Each decision names the rule in RULES that made it. Run exactly one. A state snapshot and its stream cursor are saved before the covered prefix is trimmed; restarted or lagging readers rebuild from that snapshot and the remaining log.
 
-Everything here but run is a pure function. The gateway records what a run needs, choose_worker picks its worker, and node daemons fold the log to learn what to run.
+Each log reader owns and updates its state. decide copies it once before trying decisions. The gateway records what a run needs, choose_worker picks its worker, and node daemons fold the log to learn what to run.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def settings(k: Kind, gpus: int, gpu_bytes: int) -> dict[str, str]:
   if gpus >= 2:  # samplers have GPUs of their own, so they start their engine before the first command
     env["TINYRL_WARM_SAMPLER"] = "1"
   if gpu_bytes >= 64 * 2**30 and not k.lora and not k.exclusive:
-    env.update(TINYRL_GPU_MEM="0.42", TINYRL_KV_BYTES=str(16 * 1024**3))
+    env["TINYRL_GPU_MEM"] = "0.42"
   elif gpu_bytes >= 64 * 2**30:
     env["TINYRL_KV_BYTES"] = str(24 * 1024**3)
   return env
@@ -51,7 +51,9 @@ def budget(s: State, k: Kind, node: str | None) -> int:
 
 def fit(memory: list[int], gpu_bytes: int) -> bool:
   """Whether workers with these memory budgets can share a GPU. Every budget has to be known, and 0 means unknown."""
-  return len(memory) == 1 or (gpu_bytes > 0 and all(memory) and sum(memory) <= gpu_bytes)
+  return (len(memory) == 1 and (not gpu_bytes or memory[0] <= gpu_bytes)) or (
+    gpu_bytes > 0 and all(memory) and sum(memory) <= gpu_bytes
+  )
 
 
 # ***** state *****
@@ -101,6 +103,7 @@ class Worker:
   revoked: bool = False  # told to give its GPUs back
   idle: bool = False  # its worker found no commands since its last batch
   busy: float = 0.0  # seconds its batches took, so far
+  instance: str = ""  # the process that started this worker; late messages from its predecessor are ignored
 
 
 @dataclass
@@ -154,11 +157,14 @@ def stop(w: Worker) -> None:
 
 
 def fold(state: State, e: Event) -> State:
-  """The state after entry e. Never changes the state it is given, and ignores entries it doesn't know."""
-  s = copy.deepcopy(state)
+  """Apply an entry in place, ignoring unknown kinds and facts from an old process."""
+  s = state
   s.n += 1
   b = e.body
   w = s.workers.get(b.get("worker", ""))
+  if w and e.kind in (Ev.EXITED, Ev.WANTS_GPU, Ev.BATCH_DONE, Ev.IDLE, Ev.RELEASED, Ev.GRANTED, Ev.REVOKED):
+    if b.get("instance", "") != w.instance:
+      return s
   match e.kind:
     case Ev.RUN_CREATED:
       exclusive = b.get("exclusive", False)
@@ -195,6 +201,7 @@ def fold(state: State, e: Event) -> State:
     case Ev.STARTED if w and w.node == b["node"]:
       stop(w)
       w.on = tuple((w.node, i) for i in w.gpus)
+      w.instance = b.get("instance", "")
     case Ev.EXITED if w:
       stop(w)
     case Ev.WANTS_GPU if w and w.on:
@@ -222,8 +229,10 @@ def fold(state: State, e: Event) -> State:
 
 def decide(state: State, now: float) -> list[tuple[Ev, dict]]:
   """The decisions to append now, in order. Each is folded into a copy before the next is chosen, so one call never grants two workers that don't fit together, or places two workers blind to each other. Once they are folded from the log, deciding again returns none."""
-  s, out = state, []
+  s, out = copy.deepcopy(state), []
   while d := next_decision(s, now):
+    if d[0] in (Ev.GRANTED, Ev.REVOKED):
+      d[1]["instance"] = s.workers[d[1]["worker"]].instance
     s = fold(s, Event("", now, *d))
     out.append(d)
   return out
@@ -237,8 +246,9 @@ def next_decision(s: State, now: float) -> tuple[Ev, dict] | None:
     if w.node and not members(s, name):
       return Ev.UNPLACED, {"worker": name, "rule": "place.emptied"}
   unplaced = [name for name, w in s.workers.items() if w.node is None and members(s, name)]
-  if unplaced and s.nodes:
-    return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
+  for name in sorted(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)):
+    if s.nodes and (placed := place(s, name)):
+      return Ev.PLACED, placed
   if moved := spread(s):
     return Ev.PLACED, moved
   for _, name in sorted((w.asked, name) for name, w in s.workers.items() if w.asked):
@@ -254,26 +264,31 @@ def next_decision(s: State, now: float) -> tuple[Ev, dict] | None:
   return None
 
 
-def place(s: State, name: str) -> dict:
+def place(s: State, name: str) -> dict | None:
   """Where a worker goes: the node with the fewest workers per GPU, and the GPU choose picks there. When trainers have to move out of the way first, the decision is the move of one of them, and the worker goes once its GPU is clear."""
   load = {n: sum(w.node == n for w in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items()}
   me, trainers = s.workers[name], [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
   near = near if me.kind.role == Role.SAMPLER and not me.kind.lora else set()  # a LoRA adapter is small to fetch
-  node = min(sorted(load), key=lambda n: (n not in near, load[n]))
-  gpu, why, aside = choose(s, node, name)
-  if aside:
-    to, to_why, _ = choose(s, node, aside[0], avoid=gpu)
-    return {
-      "worker": aside[0],
-      "node": node,
-      "gpus": [to],
-      "for": name,
-      "rule": "place.moved_aside",
-      "gpu_rule": to_why,
-    }
-  rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
-  return {"worker": name, "node": node, "gpus": [gpu], "rule": rule, "gpu_rule": why}
+  for node in sorted(load, key=lambda n: (n not in near, load[n], n)):
+    if (choice := choose(s, node, name)) is None:
+      continue
+    gpu, why, aside = choice
+    if aside:
+      if (moved := choose(s, node, aside[0], avoid=gpu)) is None:
+        continue
+      to, to_why, _ = moved
+      return {
+        "worker": aside[0],
+        "node": node,
+        "gpus": [to],
+        "for": name,
+        "rule": "place.moved_aside",
+        "gpu_rule": to_why,
+      }
+    rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
+    return {"worker": name, "node": node, "gpus": [gpu], "rule": rule, "gpu_rule": why}
+  return None
 
 
 def spread(s: State) -> dict | None:
@@ -299,7 +314,7 @@ def takes_turns(w: Worker) -> bool:
   return w.kind.role == Role.TRAINER and not w.kind.exclusive
 
 
-def choose(s: State, node: str, name: str, avoid: int = -1) -> tuple[int, str, list[str]]:
+def choose(s: State, node: str, name: str, avoid: int = -1) -> tuple[int, str, list[str]] | None:
   """The GPU on a node a worker goes to, why, and the trainers it moves out of the way. An exclusive worker is alone, and others stay off its GPU. A worker takes an empty GPU, or one its memory budget fits on next to the workers there, and a worker with a budget fills such a GPU before it takes an empty one. With neither, a worker that takes turns takes them with the least busy trainers. One that doesn't takes those trainers' GPU, and they move elsewhere."""
   gpus, gpu_bytes = s.nodes[node]
   me, memory = s.workers[name], budget(s, s.workers[name].kind, node)
@@ -320,18 +335,24 @@ def choose(s: State, node: str, name: str, avoid: int = -1) -> tuple[int, str, l
   def trainers_only(g: int) -> bool:
     return bool(there[g]) and all(takes_turns(w) for _, w in there[g])
 
-  options = [g for g in range(gpus) if g != avoid]
+  options = [g for g in range(gpus) if g != avoid and not any(w.kind.exclusive for _, w in there[g])]
+  if not options or not fit([memory], gpu_bytes):
+    return None
   if fitting := [g for g in options if fits_on(g)]:
     g = min(fitting, key=lambda g: (bool(there[g]) != bool(memory), g))
     return g, "fits_next_to_others" if there[g] else "empty_gpu", []
   busy = {g: sum(w.busy for _, w in there[g]) for g in options}
+  if me.kind.exclusive and len(options) == 1:
+    return None
   if takes_turns(me) or len(options) == 1:  # with one GPU there is nowhere to move to
     g = min(options, key=lambda g: (not trainers_only(g), busy[g], g))
     return g, "takes_turns", []
   # as few moves as it can, LoRA trainers first, since a full fine-tune saves its weights and AdamW state far slower
   lora = {g: all(w.kind.lora for _, w in there[g]) for g in options}
   g = min(options, key=lambda g: (not trainers_only(g), len(there[g]), not lora[g], busy[g], g))
-  return (g, "moves_trainers_aside", sorted(n for n, _ in there[g])) if trainers_only(g) else (g, "takes_turns", [])
+  if trainers_only(g):
+    return g, "moves_trainers_aside", sorted(n for n, _ in there[g])
+  return None if me.kind.exclusive else (g, "takes_turns", [])
 
 
 # ***** the loop *****
@@ -340,16 +361,36 @@ TICK_MS = getenv("TICK_MS", 100)  # how long it waits for an entry before it che
 BATCH = 10_000  # entries read at once. It decides only once a read comes back short, so never from half the log
 
 
+async def read_log(bus: Bus, state: State, after: str, block_ms: int = 0) -> tuple[State, str, int]:
+  """Resume from a snapshot when the covered log prefix has gone, then fold the next batch."""
+  first = await bus.r.xrange(key("events"), count=1)
+  if (
+    not first
+    or await bus.event_log_size() < state.n
+    or tuple(map(int, after.split("-"))) < tuple(map(int, first[0][0].decode().split("-")))
+  ):
+    saved = json.loads(await bus.r.get(key("state")) or "{}")
+    after = saved.pop("after", "0-0")
+    state = State(quantum=state.quantum)
+    if after != "0-0":
+      saved["runs"] = {r: Run(**(v | {"kind": Kind(**v["kind"])})) for r, v in saved["runs"].items()}
+      saved["workers"] = {
+        w: Worker(**(v | {"kind": Kind(**v["kind"]), "gpus": tuple(v["gpus"]), "on": tuple(map(tuple, v["on"]))}))
+        for w, v in saved["workers"].items()
+      }
+      saved["nodes"] = {n: tuple(v) for n, v in saved["nodes"].items()}
+      state = State(**saved)
+  events = await bus.read_events(after, count=BATCH, block_ms=block_ms)
+  for e in events:
+    fold(state, e)
+  return state, events[-1].id if events else after, len(events)
+
+
 async def run(bus: Bus, quantum: float = QUANTUM) -> None:
   state, after, registry = State(quantum=quantum), "0-0", Registry(bus)
   while True:
-    if await bus.event_log_size() < state.n:  # the log shrank, so Redis was flushed
-      state, after = State(quantum=quantum), "0-0"
-    events = await bus.read_events(after, count=BATCH, block_ms=TICK_MS)
-    for e in events:
-      state = fold(state, e)
-    after = events[-1].id if events else after
-    if len(events) == BATCH:
+    state, after, read = await read_log(bus, state, after, TICK_MS)
+    if read == BATCH:
       continue
     if lost := sorted(set(state.nodes) - set(await bus.live_nodes())):  # their heartbeats ran out
       for node in lost:
@@ -364,8 +405,11 @@ async def run(bus: Bus, quantum: float = QUANTUM) -> None:
         await bus.assign_run_to_worker(body["run"], body["worker"])
       else:
         await bus.append_event(decision, **body)
-    if events:
-      await bus.r.set(key("state"), json.dumps(dataclasses.asdict(state), sort_keys=True))
+    if read:
+      async with bus.r.pipeline(transaction=True) as p:
+        p.set(key("state"), json.dumps(dataclasses.asdict(state) | {"after": after}, sort_keys=True))
+        p.xtrim(key("events"), minid=after, approximate=True)
+        await p.execute()
 
 
 if __name__ == "__main__":

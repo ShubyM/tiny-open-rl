@@ -5,7 +5,9 @@ The worker appends facts to tinyrl:events: wants_gpu, batch_done, idle, released
 
 from __future__ import annotations
 
-from tinyrl.bus import Bus, Ev
+import json
+
+from tinyrl.bus import Bus, Ev, key
 from tinyrl.helpers import getenv
 
 # how long a worker holding its GPU waits for commands before it reports idle, so waiters don't wait
@@ -15,6 +17,7 @@ IDLE_MS = getenv("IDLE_MS", 150)
 class GpuTurn:
   def __init__(self, bus: Bus, worker: str, shared: bool):
     self.bus, self.worker, self.shared = bus, worker, shared
+    self.instance = getenv("TINYRL_PROCESS", "")
     self.held = not shared  # with no GPU to share there is nothing to take turns on
     self.idle = False
     self.after: str | None = None  # the last log entry read. None until its first ask, so it never reads older ones
@@ -23,8 +26,7 @@ class GpuTurn:
     """Wait for a grant. True if this call took the turn, so the worker brings its tensors back to the GPU."""
     if self.held:
       return False
-    asked = await self.bus.append_event(Ev.WANTS_GPU, worker=self.worker, queued=queued)
-    self.after = self.after or asked
+    self.after = await self.bus.append_event(Ev.WANTS_GPU, worker=self.worker, instance=self.instance, queued=queued)
     while await self.next_decision(5000) != Ev.GRANTED:
       pass
     self.held = True
@@ -36,24 +38,40 @@ class GpuTurn:
   async def report_batch_done(self, **report) -> None:
     self.idle = False
     if self.shared:
-      await self.bus.append_event(Ev.BATCH_DONE, worker=self.worker, **report)
+      await self.bus.append_event(Ev.BATCH_DONE, worker=self.worker, instance=self.instance, **report)
 
   async def report_idle(self) -> None:
     if self.held and self.shared and not self.idle:
       self.idle = True
-      await self.bus.append_event(Ev.IDLE, worker=self.worker)
+      await self.bus.append_event(Ev.IDLE, worker=self.worker, instance=self.instance)
 
   async def give_turn_back(self) -> None:
     if self.held and self.shared:
       self.held = False
-      await self.bus.append_event(Ev.RELEASED, worker=self.worker)
+      await self.bus.append_event(Ev.RELEASED, worker=self.worker, instance=self.instance)
 
   async def next_decision(self, block_ms: int) -> str | None:
     """The next decision about this worker in the log, reading past everything else. None once it has read it all, after waiting up to block_ms for a new entry."""
+    saved = json.loads(await self.bus.r.get(key("state")) or "{}")
+    if saved.get("after") and tuple(map(int, saved["after"].split("-"))) >= tuple(
+      map(int, (self.after or "0-0").split("-"))
+    ):
+      self.after = saved["after"]  # recover before newer unrelated events advance past a trimmed grant
+      w = saved.get("workers", {}).get(self.worker, {})
+      if w.get("instance", "") != self.instance:
+        raise RuntimeError("this worker process was replaced")
+      if self.held and w.get("revoked"):
+        return Ev.REVOKED
+      if not self.held and w.get("since") is not None:
+        return Ev.GRANTED
     while events := await self.bus.read_events(self.after, count=100, block_ms=block_ms):
       block_ms = 0
       for e in events:
         self.after = e.id
-        if e.kind in (Ev.GRANTED, Ev.REVOKED) and e.body["worker"] == self.worker:
+        if (
+          e.kind in (Ev.GRANTED, Ev.REVOKED)
+          and e.body["worker"] == self.worker
+          and e.body.get("instance", "") == self.instance
+        ):
           return e.kind
     return None

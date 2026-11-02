@@ -1,14 +1,14 @@
 # tinyrl on Kubernetes
 
-**Status.** Portable `safetensors` checkpoints (`store.py`), one owner per worker, per-run telemetry (`GET /metrics`), a
-single-node process supervisor (`node_daemon.py`), load-based LoRA worker sharding, cooperative GPU time-slicing to
-pinned host memory, and samplers (`sampler.py`) are built. Multi-node placement, live run migration, `/dev/shm` + peer `Store` tiers, and
-Spot drain do not exist yet. Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
+**Status.** This document is a design proposal, not a description of every implemented path. The current system has
+Redis stream scheduling across node daemons, process-fenced GPU turns, graceful trainer handoff, per-run command
+telemetry, and immutable checkpoint versions with local caching and asynchronous bucket upload. See [README](../README.md)
+for the implemented behavior and upgrade requirements.
 
-Today [`node_daemon.py`](../tinyrl/control/node_daemon.py) runs on one machine and starts a trainer for every worker that has runs,
-while [`gateway.py`](../tinyrl/api/gateway.py) picks each LoRA run's worker once at creation time. Nothing places workers across
-multiple GPU nodes, sizes them up front, moves runs off hot or dying Spot nodes, or scales burst nodes with load. This is
-the design for the piece that does, on GKE.
+Compatible LoRA runs currently share one worker; capacity-aware replication, model-size admission, per-owner service
+accounting, live run migration, `/dev/shm` + peer store tiers, and load-driven node scaling remain proposals below.
+The scheduler places workers, and each node daemon starts and stops its placed processes. Figures marked measured
+are historical measurements from an H100 and an L4 on GKE, driver 580; they have not been rerun for the current changes.
 
 ## The idea
 
@@ -398,9 +398,14 @@ takes the leases of its GPUs, so the gang parks and resumes together, and each r
 the `ref` is a list. The trainer tears down NCCL communicators before parking and rebuilds them after. DRA earns a place
 here only for RDMA NICs, if GKE multi-networking doesn't already cover them.
 
-## Estimator
+## Proposed placement admission
 
-No model-size tables. Before a run's first placement, the estimator reads its exact byte requirement using `huggingface_hub.get_safetensors_metadata` (without downloading) for base weights, and building the LoRA config on the `meta` device to count adapter parameters. [trainer.py](../tinyrl/workers/trainer.py) keeps fp32 master weights, so a full fine-tune holds 16 bytes per parameter at peak (weights, gradients and two AdamW moments). A LoRA worker holds base bytes plus 16 per adapter parameter of each run. Samplers hold base bytes plus one maximum-length KV sequence. Overhead is fixed at 0.75 GB per process.
+The earlier `estimator.py` had no runtime caller and has been removed. Admission should be added at placement when it
+actually constrains a decision. The proposed estimate uses `huggingface_hub.get_safetensors_metadata` for base tensor
+bytes and a LoRA config on the `meta` device for adapter parameter counts. The training model keeps fp32 master weights:
+weights, gradients and two AdamW moments total 16 bytes per trainable parameter before activations and overhead.
+A sampler also needs its KV cache. These are capacity estimates; allocator, activation and runtime overhead must be
+measured and admitted separately rather than described as an exact byte requirement.
 
 Measured on an H100, 1 run each:
 
@@ -411,7 +416,8 @@ Measured on an H100, 1 run each:
 | Qwen3-30B-A3B | 30,532,122,624 | identical | |
 | Qwen3-32B | 32,762,123,264 | identical | |
 
-Activations are left to the dynamic [`token_budget`](../tinyrl/workers/trainer.py) parameter. Once running, the trainer writes measured bytes to `tinyrl:load:<worker>` every minute, and the scheduler and node daemon use that from then on.
+Activations use the dynamic [`token_budget`](../tinyrl/workers/model.py) parameter. Publishing measured worker memory
+back into placement remains part of the proposal; the current trainer does not write a `tinyrl:load:<worker>` record.
 
 ## One owner per worker
 

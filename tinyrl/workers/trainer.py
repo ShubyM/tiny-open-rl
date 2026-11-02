@@ -73,6 +73,7 @@ class Trainer:
     self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.stopping: Stop | None = None
     self.turn = GpuTurn(bus, worker, bool(GPU))
+    self.queue: collections.deque[Cmd] = collections.deque()
 
   async def serve(self) -> None:
     await self.wait_for_lease()
@@ -81,9 +82,12 @@ class Trainer:
       await self.fail_stranded_commands(0)  # anything in flight now was taken by a trainer that died or lost the worker
       while self.stopping is None:
         await self.step()
-        await self.fail_stranded_commands(STRANDED_MS)
+        if not self.queue:
+          await self.fail_stranded_commands(STRANDED_MS)
       if self.stopping == Stop.PARK:
         await self.park_every_run()
+        await self.bus.return_commands(self.worker, self.owner, list(self.queue))
+        self.queue.clear()
     finally:
       renewing.cancel()
       await self.release_gpu_and_worker()
@@ -109,62 +113,100 @@ class Trainer:
         return
 
   async def retake_lost_lease(self) -> bool:
-    """Take the worker's lease again if it ran out with nobody taking it, as it does while Redis restarts. Not if another trainer has parked one of this trainer's runs since, which it only does after serving the worker."""
-    if not await self.bus.take_lease(self.worker, self.owner):
-      return False
-    if any([await self.bus.parked_checkpoint(run) for run in self.model.params]):
-      await self.bus.release_lease(self.worker, self.owner)
-      return False
-    return True
+    """Keep live state only if nobody else has owned this worker since our lease expired."""
+    return await self.bus.take_lease(self.worker, self.owner, recover=True)
 
   def stop(self) -> None:
-    """Finish the batch in hand, save every run for the worker's next trainer, and exit. SIGTERM calls it."""
+    """Finish the current command, save every run, and return unstarted commands. SIGTERM calls it."""
     self.stopping = self.stopping or Stop.PARK
 
   async def park_every_run(self) -> None:
     for run in list(self.model.params):
       uri, (tensors, meta) = f"tinker://{run}/parked/{time.time_ns()}", self.model.training_state(run)
-      await asyncio.to_thread(self.store.put, uri, tensors, meta)
-      await self.registry.register_checkpoint(
-        uri, sum(map(nbytes, tensors.values())), owned=True, version=self.store.versions.get(uri)
+      version = await asyncio.to_thread(self.store.put, uri, tensors, meta)
+      await self.bus.set_parked_checkpoint(
+        run,
+        uri,
+        self.worker,
+        self.owner,
+        checkpoint={"uri": uri, "size": sum(map(nbytes, tensors.values())), "owned": True, "version": version},
       )
-      await self.bus.set_parked_checkpoint(run, uri, self.worker, self.owner)
 
-  async def restore_missing_run(self, cmd: Cmd) -> None:
-    """Bring back a run this trainer doesn't hold: from the state its last trainer saved when it stopped, or empty, for load_weights to fill. A run whose trainer died without saving it can't go on from where it was."""
-    run, uri = await self.bus.get_run(cmd.run), await self.bus.parked_checkpoint(cmd.run)
-    if not uri and cmd.op not in (Op.LOAD_WEIGHTS, Op.DELETE_MODEL):
+  async def load_run(self, cmd: Cmd) -> None:
+    """Fetch a whole checkpoint before installing a missing run. Explicit loads reset accumulation; handoffs preserve it."""
+    run, parked = await self.bus.get_run(cmd.run), await self.bus.parked_checkpoint(cmd.run)
+    args = json.loads(cmd.body) if cmd.op == Op.LOAD_WEIGHTS else {"uri": parked, "optimizer": True}
+    if not args["uri"]:
       raise KeyError(
         f"model {cmd.run} lost its unsaved steps when its trainer stopped. load_state to go on from a checkpoint"
       )
-    await asyncio.to_thread(self.model.create_run, cmd.run, run["base"], run["rank"], run.get("lora", {}))
-    if uri:
-      version = (await self.registry.get_checkpoint(uri) or {}).get("version")
-      tensors, meta = await asyncio.to_thread(self.store.get, uri, version)
-      await asyncio.to_thread(self.model.restore_run, cmd.run, tensors, meta, True)
-      if await self.bus.set_parked_checkpoint(cmd.run, None, self.worker, self.owner):
-        await self.registry.unregister_checkpoints(uri)  # the node daemons' sweeps delete it
-
-  async def answer_command(self, cmd: Cmd) -> Reply:
-    if cmd.op == Op.DELETE_MODEL and cmd.run not in self.model.params:  # nothing here to free, and its state not needed
-      return ok({"type": cmd.op, "model_id": cmd.run})
+    version = (await self.registry.get_checkpoint(args["uri"]) or {}).get("version")
+    tensors, meta = await asyncio.to_thread(self.store.get, args["uri"], version)
+    created = cmd.run not in self.model.params
+    if created:
+      await asyncio.to_thread(self.model.create_run, cmd.run, run["base"], run["rank"], run.get("lora", {}))
     try:
-      if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
-        await self.restore_missing_run(cmd)
-    except Exception as e:
-      return fail(e)
-    version = None
-    if cmd.op == Op.LOAD_WEIGHTS:  # the version saved last, which may be another node's, still uploading
-      version = (await self.registry.get_checkpoint(json.loads(cmd.body)["uri"]) or {}).get("version")
-    # off the event loop, so redis stays responsive
-    reply, size = await asyncio.to_thread(self.run_command, cmd, version)
-    if reply.ok and cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):  # registered before the reply lands
-      args = json.loads(cmd.body)
-      saved = self.store.versions.get(args["uri"])
-      await self.registry.register_checkpoint(
-        args["uri"], size, args.get("ttl_seconds"), args.get("owned", False), saved
+      await asyncio.to_thread(
+        self.model.restore_run, cmd.run, tensors, meta, args["optimizer"], cmd.op != Op.LOAD_WEIGHTS
       )
-    return reply
+    except Exception:
+      if created and cmd.run in self.model.params:
+        await asyncio.to_thread(self.model.delete_run, cmd.run)
+      raise
+    if parked:
+      if await self.bus.set_parked_checkpoint(cmd.run, None, self.worker, self.owner):
+        await self.registry.unregister_checkpoints(parked)  # the node daemons' sweeps delete it
+
+  async def answer_command(self, cmd: Cmd) -> tuple[Reply, dict | None]:
+    """Execute one accepted command; publish a save's version with its lease-fenced reply."""
+    model, saved = self.model, None
+    try:
+      if cmd.op not in (Op.CREATE_MODEL, Op.LOAD_WEIGHTS, Op.DELETE_MODEL) and cmd.run not in model.params:
+        await self.load_run(cmd)
+      if cmd.op == Op.FORWARD_BACKWARD:
+        req = wire.parse(cmd.body)
+        logprobs, metrics = await asyncio.to_thread(
+          model.forward_backward,
+          cmd.run,
+          wire.datums(req),
+          req.loss_fn or "cross_entropy",
+          wire.loss_config(req),
+          req.forward_only,
+        )
+        return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), None
+      args = json.loads(cmd.body)
+      reply = {"type": cmd.op, "model_id": cmd.run}
+      match cmd.op:
+        case Op.CREATE_MODEL:
+          await asyncio.to_thread(model.create_run, cmd.run, args["base_model"], args["rank"], args["lora"])
+        case Op.OPTIM_STEP:
+          reply["metrics"] = await asyncio.to_thread(model.optim_step, cmd.run, args["adam_params"])
+        case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
+          tensors, meta = await asyncio.to_thread(
+            model.training_state if cmd.op == Op.SAVE_WEIGHTS else model.sampler_weights, cmd.run
+          )
+          version = await asyncio.to_thread(self.store.put, args["uri"], tensors, meta)
+          saved = {
+            "uri": args["uri"],
+            "size": sum(map(nbytes, tensors.values())),
+            "ttl": args.get("ttl_seconds"),
+            "owned": args.get("owned", False),
+            "version": version,
+          }
+        case Op.LOAD_WEIGHTS:
+          await self.load_run(cmd)
+        case Op.DELETE_MODEL:
+          if cmd.run in model.params:
+            await asyncio.to_thread(model.delete_run, cmd.run)
+        case _:
+          raise ValueError(f"unknown op {cmd.op}")
+      if "uri" in args:
+        reply["path"] = args["uri"]
+      if "sampling_session_id" in args:
+        reply["sampling_session_id"] = args["sampling_session_id"]
+      return ok(reply), saved
+    except Exception as e:
+      return fail(e), None
 
   async def fail_stranded_commands(self, min_idle_ms: int) -> None:
     for cmd in await self.bus.reclaim_stranded_commands(self.worker, self.owner, min_idle_ms):
@@ -175,27 +217,34 @@ class Trainer:
     """Take the next commands from the worker and run them. Returns how many there were."""
     if self.stopping is not None:
       return 0
-    take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
-    cmds = await self.bus.take_commands(self.worker, self.owner, count, take_block)
-    if not cmds:
-      await self.turn.report_idle()
-      await self.yield_gpu()
-      return 0
-    queue: collections.deque[Cmd] = collections.deque()
-    enqueue_cmds(queue, cmds, self.model.lora)
+    if not self.queue:
+      take_block = min(block_ms, IDLE_MS) if self.turn.held and GPU else block_ms
+      cmds = await self.bus.take_commands(self.worker, self.owner, count, take_block)
+      if not cmds:
+        await self.turn.report_idle()
+        await self.yield_gpu()
+        return 0
+      enqueue_cmds(self.queue, cmds, self.model.lora)
     processed = 0
-    async with self.hold_gpu_for_batch(len(cmds)):
+    waiting = asyncio.create_task(self.turn.wait_for_turn(len(self.queue)))
+    try:
+      while self.stopping is None and not waiting.done():
+        await asyncio.wait([waiting], timeout=0.1)
+      if self.stopping is not None:
+        return 0
+      if await waiting:
+        await asyncio.to_thread(self.model.resume_on_gpu)
       batch_start = time.time()
       ops = []
-      while queue:
-        cmd = queue.popleft()
+      while self.queue and self.stopping is None:
+        if await self.yield_gpu():
+          break
+        cmd = self.queue.popleft()
         start = time.time()
-        # no lock needed, the worker's owner is the only writer of its seq keys
-        first = await self.bus.reply_to_repeated_command(cmd)
-        reply = first or await self.answer_command(cmd)
+        reply, checkpoint = await self.answer_command(cmd)
         ms = (time.time() - start) * 1000
         ops.append([cmd.op, ms])
-        if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
+        if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, started=start, checkpoint=checkpoint):
           self.stopping = Stop.EXIT  # another trainer owns the worker now
           break
 
@@ -210,64 +259,27 @@ class Trainer:
           print(f"{self.worker} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms{error}")
 
         processed += 1
-        if self.model.lora and queue and (cmd.op == Op.OPTIM_STEP or queue[0].run != cmd.run):
+        if self.stopping is not None:
+          break
+        if self.model.lora and self.queue and (cmd.op == Op.OPTIM_STEP or self.queue[0].run != cmd.run):
           if cmd.op == Op.OPTIM_STEP:
             await asyncio.sleep(0.015)
           more = await self.bus.take_commands(self.worker, self.owner, count, 0)
-          enqueue_cmds(queue, more, True)
-      await self.turn.report_batch_done(queued=len(queue), seconds=time.time() - batch_start, ops=ops)
+          enqueue_cmds(self.queue, more, True)
+      await self.turn.report_batch_done(queued=len(self.queue), seconds=time.time() - batch_start, ops=ops)
+    finally:
+      waiting.cancel()
+      with contextlib.suppress(asyncio.CancelledError):
+        await waiting
+      await self.yield_gpu()
     return processed
 
-  @contextlib.asynccontextmanager
-  async def hold_gpu_for_batch(self, queued: int):
-    """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back after the batch if the scheduler revoked it."""
-    if await self.turn.wait_for_turn(queued):
-      await asyncio.to_thread(self.model.resume_on_gpu)
-    try:
-      yield
-    finally:
-      await self.yield_gpu()
-
-  async def yield_gpu(self) -> None:
+  async def yield_gpu(self) -> bool:
     if await self.turn.was_revoked():
       await asyncio.to_thread(self.model.park_on_host)
       await self.turn.give_turn_back()
-
-  def run_command(self, cmd: Cmd, version: str | None = None) -> tuple[Reply, int]:
-    """Run one command on the model, loading `version` of a checkpoint. Returns the reply, which a failure becomes instead of an exception, and the bytes a save wrote."""
-    model, size = self.model, 0
-    try:
-      if cmd.op == Op.FORWARD_BACKWARD:
-        req = wire.parse(cmd.body)
-        data, loss_fn, config = wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req)
-        logprobs, metrics = model.forward_backward(cmd.run, data, loss_fn, config, req.forward_only)
-        return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), 0
-
-      args = json.loads(cmd.body)
-      match cmd.op:
-        case Op.CREATE_MODEL:
-          model.create_run(cmd.run, args["base_model"], args["rank"], args["lora"])
-        case Op.OPTIM_STEP:
-          return ok({"type": cmd.op, "metrics": model.optim_step(cmd.run, args["adam_params"])}), 0
-        case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
-          tensors, meta = model.training_state(cmd.run) if cmd.op == Op.SAVE_WEIGHTS else model.sampler_weights(cmd.run)
-          self.store.put(args["uri"], tensors, meta)
-          size = sum(map(nbytes, tensors.values()))
-        case Op.LOAD_WEIGHTS:
-          model.restore_run(cmd.run, *self.store.get(args["uri"], version), args["optimizer"])
-        case Op.DELETE_MODEL:
-          model.delete_run(cmd.run)
-        case _:
-          raise ValueError(f"unknown op {cmd.op}")
-
-      reply = {"type": cmd.op, "model_id": cmd.run}
-      if "uri" in args:
-        reply["path"] = args["uri"]
-      if "sampling_session_id" in args:
-        reply["sampling_session_id"] = args["sampling_session_id"]
-      return ok(reply), size
-    except Exception as e:
-      return fail(e), 0
+      return True
+    return False
 
 
 async def main(worker: str) -> None:

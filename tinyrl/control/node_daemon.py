@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from tinyrl.bus import Bus, Ev
+from tinyrl.bus import Bus, Ev, key
 from tinyrl.control import scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
@@ -66,6 +66,7 @@ class NodeDaemon:
     self.gpus = gpus
     self.procs: dict[str, tuple[list[int], subprocess.Popen]] = {}  # worker -> (its GPUs, its process)
     self.stopping: dict[str, subprocess.Popen] = {}  # told to stop, and maybe still on its GPUs
+    self.instances: dict[str, str] = {}
     self.id = node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.state, self.after = scheduler.State(), "0-0"
@@ -76,12 +77,10 @@ class NodeDaemon:
 
   async def tick(self) -> None:
     await self.bus.node_heartbeat(self.id, self.gpus)
-    if await self.bus.event_log_size() < self.state.n:  # the log shrank, so Redis was flushed
-      self.state, self.after = scheduler.State(), "0-0"
-    while events := await self.bus.read_events(self.after):
-      for e in events:
-        self.state = scheduler.fold(self.state, e)
-      self.after = events[-1].id
+    while True:
+      self.state, self.after, read = await scheduler.read_log(self.bus, self.state, self.after)
+      if read < scheduler.BATCH:
+        break
     mine = {n: p for n, p in self.state.workers.items() if p.node == self.id and scheduler.members(self.state, n)}
     for worker, (gpus, proc) in list(self.procs.items()):
       if proc.poll() is not None or worker not in mine or list(mine[worker].gpus) != gpus:
@@ -91,9 +90,10 @@ class NodeDaemon:
       if proc.poll() is not None:  # only now is the GPU free, so only now does its turn end
         reap(proc)
         del self.stopping[worker]
-        await self.bus.append_event(Ev.EXITED, worker=worker)
+        await self.bus.append_event(Ev.EXITED, worker=worker, instance=self.instances.pop(worker, ""))
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
-      await self.bus.append_event(Ev.STARTED, worker=worker, node=self.id)
+      self.instances[worker] = os.urandom(8).hex()
+      await self.bus.append_event(Ev.STARTED, worker=worker, node=self.id, instance=self.instances[worker])
       self.procs[worker] = self.start_worker_process(worker, mine[worker])
     # its heartbeat ran out, or Redis lost the log. Only once its processes exited, since the scheduler then grants their GPUs again
     if self.id not in self.state.nodes and not self.procs and not self.stopping:
@@ -119,22 +119,30 @@ class NodeDaemon:
         saved = await asyncio.to_thread(self.store.saved_at, uri)
         if since < saved < time.time() - SWEEP_GRACE_S:
           await asyncio.to_thread(self.store.delete, uri)
+    active = {r.decode() for r in await self.bus.r.smembers(key("runs"))}
+    for run in await asyncio.gather(*(self.bus.get_run(r) for r in active)):
+      if run:
+        active.update(
+          ref.removeprefix("tinker://").split("/")[0] for ref in (run.get("train_run"), run.get("model_path")) if ref
+        )
     await asyncio.to_thread(
       self.store.delete_unused_chain_links,
       await self.registry.registered_versions(),
       since,
       time.time() - SWEEP_GRACE_S,
+      active,
     )
 
   def start_worker_process(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
-    """Start a worker's process on its GPUs, with the settings for its kind. This node's environment wins."""
+    """Start a worker on its placed GPUs. Scheduler memory settings must match the budgets used to admit it."""
     gpus, k = list(p.gpus), p.kind
-    env = {**scheduler.settings(k, self.gpus, self.gpu_mib * 2**20), **os.environ}
+    env = {**os.environ, **scheduler.settings(k, self.gpus, self.gpu_mib * 2**20)}
     env["CUDA_VISIBLE_DEVICES"], env["GPU"] = (
       ",".join(map(str, gpus)),
       ",".join(f"{socket.gethostname()}:{g}" for g in gpus),
     )
     env["TINYRL_LORA"], env["TINYRL_BASE"] = str(int(k.lora)), k.base
+    env["TINYRL_PROCESS"] = self.instances.get(worker, "")
     mod = f"tinyrl.workers.{k.role}"
     if mod == "tinyrl.workers.trainer":
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")

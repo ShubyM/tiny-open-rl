@@ -9,6 +9,7 @@ import unittest
 
 from test.helpers import RedisTest, new_id, tiny
 from tinyrl.bus import GROUP, Op, Reply, Run, key
+from tinyrl.storage.store import Store
 
 LEASE_MS = 2000
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
@@ -83,7 +84,9 @@ class TestLease(RedisTest):
       proc.terminate()
       self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
       uri = await self.bus.parked_checkpoint(run)
-      self.assertTrue(os.path.exists(f"{ckpt}/{uri.removeprefix('tinker://')}/state.safetensors"))
+      version = (await self.registry.get_checkpoint(uri))["version"]
+      folder, _ = Store(ckpt).local_folder(uri, version)
+      self.assertTrue(os.path.exists(f"{folder}/state.safetensors"))
       self.assertIsNone(await self.bus.lease_owner(worker))  # released, so the next trainer starts at once
     finally:
       if proc.poll() is None:
