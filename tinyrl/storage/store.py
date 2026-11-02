@@ -4,7 +4,7 @@ Tensors are stored in safetensors with JSON metadata in the header, never torch.
 
 CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. upload_pending_saves() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node waits for the version it wants to land, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
 
-A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named <keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0, and every link whose parent didn't upload, goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC per chunk, and a node rebuilds a link from the newest one it has. delete_unused_chain_links() deletes the links nothing is built from.
+A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named <keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0 goes up as the bytes that changed from the base model if this node has it, else whole, and every link whose parent didn't upload goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC per chunk, and a node rebuilds a link from the newest one it has. delete_unused_chain_links() deletes the links nothing is built from.
 """
 
 from __future__ import annotations
@@ -104,6 +104,45 @@ def unsparse(data: np.ndarray, z: np.ndarray) -> int:
   at = np.cumsum(np.frombuffer(raw, np.uint32, len(raw) // 5), dtype=np.int64) - 1
   data[at] ^= np.frombuffer(raw, np.uint8, offset=len(raw) // 5 * 4)
   return zlib.crc32(data)
+
+
+def base_files(ref: str) -> list[str]:
+  """The base model's safetensors files on this node, never fetching a hub model. Empty if they aren't here."""
+  from tinyrl.storage import models
+
+  path = models.local(ref) if ref else ""
+  if path and not os.path.isdir(path):
+    from huggingface_hub import snapshot_download
+
+    try:
+      path = snapshot_download(path, local_files_only=True)
+    except Exception:  # not in this node's hub cache
+      return []
+  return sorted(glob.glob(f"{path}/*.safetensors")) if path else []
+
+
+def lay_out_base(heads: dict[str, bytes], out: str) -> bool:
+  """Write the run's base model into files laid out like these weights files' headers: each tensor from the base tensor of the same name, dtype and shape, else zeros. A link then goes up as what changed from the base, so the bucket holds the base once. False if the base isn't on this node."""
+  meta = json.loads(json.loads(next(iter(heads.values()))).get("__metadata__", {}).get("meta", "{}"))
+  found = {
+    k: (data, v) for f in base_files(meta.get("base", "")) for head, data in [raw(f)] for k, v in layout(head).items()
+  }
+  if not found:
+    return False
+  os.makedirs(out, exist_ok=True)
+  for name, head in heads.items():
+    tensors, size = layout(head), 8 + len(head)
+    with open(f"{out}/{name}", "wb") as f:
+      f.write(len(head).to_bytes(8, "little") + head)
+      f.truncate(size + max((v["data_offsets"][1] for v in tensors.values()), default=0))
+    if os.path.getsize(f"{out}/{name}") > size:
+      data = np.memmap(f"{out}/{name}", np.uint8, "r+", offset=size)
+      for k, v in tensors.items():
+        if (b := found.get(k)) and (b[1]["dtype"], b[1]["shape"]) == (v["dtype"], v["shape"]):
+          (s, e), (bs, be) = v["data_offsets"], b[1]["data_offsets"]
+          data[s:e] = b[0][bs:be]
+      data.flush()
+  return True
 
 
 class Store:
@@ -258,6 +297,9 @@ class Store:
         with open(f"{parent}.uploaded") as f:
           first = f.read()
       xor = int(n) and first and self.write_changed_bytes(parent, folder, names, f"{folder}.xor")
+      heads = {name: raw(f"{folder}/{name}")[0] for name in names if name.endswith(".safetensors")}
+      if not int(n) and lay_out_base(heads, f"{folder}.base"):
+        xor, first = self.write_changed_bytes(f"{folder}.base", folder, names, f"{folder}.xor"), "base"
       if xor:
         files = [f"{folder}.xor/{x}" for x in xor] + [f for f in files if not f.endswith(".safetensors")]
       info["from"] = first if xor else version
@@ -265,6 +307,7 @@ class Store:
       parallel(lambda f: self.fs.put_file(f, f"{self.base}/{info['dir']}/{os.path.basename(f)}"), files)
     finally:
       shutil.rmtree(f"{folder}.xor", ignore_errors=True)
+      shutil.rmtree(f"{folder}.base", ignore_errors=True)
     old = json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
     self.fs.pipe_file(f"{dest}/_latest", json.dumps(info).encode())
     # a link stays until delete_unused_chain_links(), since other checkpoints may build on it
@@ -372,18 +415,29 @@ class Store:
     parallel(lambda n: self.fs.get_file(f"{src}/{n}", f"{folder}/{n}"), names)
 
   def rebuild_chain_link(self, links: str, version: str, whole: str, names: list[str], folder: str) -> None:
-    """Make a link of a chain in folder, from the newest link before it this node has, or else the newest one uploaded whole, by XORing in each link after that. The CRCs check the result is the exact bytes saved."""
+    """Make a link of a chain in folder, from the newest link before it this node has, or else the newest one uploaded whole, or the base model, by XORing in each link after that. The CRCs check the result is the exact bytes saved."""
     import safetensors
 
     k, _, n = version.rpartition(".")
-    chain = [f"{k}.{i}" for i in range(int(whole.rpartition(".")[2]), int(n) + 1)]
-    have = next(i for i in reversed(range(len(chain) - 1)) if i == 0 or os.path.isdir(f"{self.cache}/{chain[i]}"))
-    start = self.cached_folder(chain[have], lambda tmp: self.download_files(f"{links}/{chain[have]}", names, tmp))
+    chain = [f"{k}.{i}" for i in range(0 if whole == "base" else int(whole.rpartition(".")[2]), int(n) + 1)]
+    cached = [i for i in range(len(chain) - 1) if os.path.isdir(f"{self.cache}/{chain[i]}")]
+    from_base = whole == "base" and not cached  # a chain whose link 0 went up as its changes from the base model
+    have = -1 if from_base else (cached or [0])[-1]
     shards, after = [n for n in names if n.endswith(".safetensors")], chain[have + 1 :]
     self.download_files(f"{links}/{version}", [n for n in names if n not in shards], folder)
     pairs = [(f"{link}/{name}.xor", f"{folder}/{link}.{name}.xor") for link in after for name in shards]
     parallel(lambda a, b: self.fs.get_file(f"{links}/{a}", b), *zip(*pairs))
+    if from_base:
+      heads = {}
+      for name in shards:
+        with safetensors.safe_open(f"{folder}/{chain[0]}.{name}.xor", framework="np") as f:
+          heads[name] = f.metadata()["head"].encode()
+      if not lay_out_base(heads, start := f"{folder}.base"):
+        raise ValueError(f"{version} is built on its base model, which isn't on this node")
+    else:
+      start = self.cached_folder(chain[have], lambda tmp: self.download_files(f"{links}/{chain[have]}", names, tmp))
     data = dict(zip(shards, parallel(lambda name: np.array(raw(f"{start}/{name}")[1]), shards)))
+    shutil.rmtree(f"{folder}.base", ignore_errors=True)
     for link in after:
       metas, jobs = {}, []
       for name in shards:

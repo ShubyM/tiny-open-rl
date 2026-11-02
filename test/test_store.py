@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 import tempfile
@@ -373,6 +374,45 @@ class TestStore(unittest.TestCase):
     self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/3/_latest"))["from"], v[3])
     self.assertTrue(torch.equal(loader.get("tinker://r/sampler_weights/3")[0]["w"], torch.full((64,), 3.0)))
     self.assertTrue(torch.equal(loader.get("tinker://r/sampler_weights/1")[0]["w"], torch.full((64,), 1.0)))
+
+  def test_link_0_goes_up_as_its_changes_from_the_base_model_and_another_node_rebuilds_exactly(self):
+    import safetensors.torch
+
+    root, base = f"memory://tinyrl-test/{uuid.uuid4()}", tempfile.mkdtemp()
+    w = torch.randn(128, 128).to(torch.bfloat16)
+    safetensors.torch.save_file({"w": w.clone(), "b": torch.ones(8)}, f"{base}/model.safetensors")
+    saver = Store(root, cache=tempfile.mkdtemp())
+    meta, uris = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{base}"}, []
+    with patch("tinyrl.storage.store.SHARD_BYTES", 1024), patch("tinyrl.storage.store.XOR_CHUNK", 4096):
+      for step in range(2):
+        w.view(-1)[step::101] *= 2  # a step changes a few values
+        uris.append(f"tinker://r/sampler_weights/{step}")
+        # "new" isn't in the base, so it goes up as all its bytes
+        saver.put(uris[-1], {"w": w.clone(), "b": torch.ones(8), "new": torch.randn(8)}, meta)
+      saver.upload_pending_saves()
+    versions = [saver.versions[u] for u in uris]
+    self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/0/_latest"))["from"], "base")
+    self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/1/_latest"))["from"], "base")
+    whole = sum(os.path.getsize(f) for f in glob.glob(f"{saver.cache}/{versions[0]}/*.safetensors"))
+    self.assertLess(saver.fs.du(f"{saver.base}/r/_versions/{versions[0]}"), whole / 4)
+
+    for uri, version in zip(uris, versions):  # each on a node that has nothing cached
+      folder = Store(root, cache=tempfile.mkdtemp()).local_folder(uri, version)[0]
+      for name in os.listdir(f"{saver.cache}/{version}"):
+        with open(f"{saver.cache}/{version}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
+          self.assertEqual(a.read(), b.read())
+      self.assertEqual(glob.glob(f"{os.path.dirname(folder)}/*.base"), [])
+
+  def test_link_0_goes_up_whole_without_the_base_model_on_the_node(self):
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
+    meta = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{tempfile.mkdtemp()}/missing"}
+    saver.put("tinker://r/sampler_weights/0", {"w": torch.randn(64)}, meta)
+    saver.upload_pending_saves()
+    version = saver.versions["tinker://r/sampler_weights/0"]
+    self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/0/_latest"))["from"], version)
+    got = loader.get("tinker://r/sampler_weights/0")[0]["w"]
+    self.assertTrue(torch.equal(got, saver.get("tinker://r/sampler_weights/0")[0]["w"]))
 
 
 if __name__ == "__main__":
