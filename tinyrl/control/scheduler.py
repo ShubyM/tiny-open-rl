@@ -154,8 +154,8 @@ def stop(w: Worker) -> None:
 
 
 def fold(state: State, e: Event) -> State:
-  """The state after entry e. Never changes the state it is given, and ignores entries it doesn't know."""
-  s = copy.deepcopy(state)
+  """The state after entry e. Mutates and returns the state."""
+  s = state
   s.n += 1
   b = e.body
   w = s.workers.get(b.get("worker", ""))
@@ -222,7 +222,7 @@ def fold(state: State, e: Event) -> State:
 
 def decide(state: State, now: float) -> list[tuple[Ev, dict]]:
   """The decisions to append now, in order. Each is folded into a copy before the next is chosen, so one call never grants two workers that don't fit together, or places two workers blind to each other. Once they are folded from the log, deciding again returns none."""
-  s, out = state, []
+  s, out = copy.deepcopy(state), []
   while d := next_decision(s, now):
     s = fold(s, Event("", now, *d))
     out.append(d)
