@@ -217,8 +217,15 @@ class TestModel(unittest.TestCase):
         del bad_tensors[k]
         break
 
-    with self.assertRaises(ValueError):
+    for p in model.params[run_id].values():
+      p.data.add_(1.0)
+    original_params = {k: p.clone() for k, p in model.params[run_id].items()}
+
+    with self.assertRaisesRegex(ValueError, "checkpoint does not fit this run:"):
       model.restore_run(run_id, bad_tensors, meta, True)
+
+    for k, p in model.params[run_id].items():
+      self.assertTrue(torch.equal(p, original_params[k]))
 
   def test_a5_partial_gradients(self):
     model, run_id = Model(tiny), new_id()

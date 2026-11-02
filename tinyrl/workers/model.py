@@ -357,11 +357,14 @@ class Model:
     if weights.keys() != self.params[run].keys():
       raise ValueError("checkpoint does not fit this model")
     req_opt = optimizer and any(k.endswith(".step") for k in tensors)
+    if bad := [
+      n
+      for n, p in self.params[run].items()
+      if weights[n].shape != p.shape
+      or (req_opt and not all(f"{n}.{s}" in tensors for s in ("exp_avg", "exp_avg_sq", "step")))
+    ]:
+      raise ValueError(f"checkpoint does not fit this run: {bad[:3]}")
     for name, p in self.params[run].items():
-      if weights[name].shape != p.shape:
-        raise ValueError(f"shape mismatch for {name}")
-      if req_opt and not all(f"{name}.{s}" in tensors for s in ("exp_avg", "exp_avg_sq", "step")):
-        raise ValueError("missing opt")
       p.data.copy_(weights[name])
       if meta.get("internal_handoff") and f"{name}.grad" in tensors:
         p.grad = tensors[f"{name}.grad"].to(p.device)
