@@ -830,3 +830,18 @@ class TestCheckpointNames(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestG1PPO(unittest.TestCase):
+  def test_ppo_clip_and_reject(self):
+    logprobs = torch.tensor([1.0])
+    weights = torch.tensor([1.0])
+    sampler_logprobs = torch.tensor([0.0])
+    advantages = torch.tensor([1.0])
+
+    config = {"clip_low_threshold": 0.9, "clip_high_threshold": 1.1}
+    loss_actual = tinyrl.workers.model.ppo(logprobs, weights, sampler_logprobs, advantages, config)
+    self.assertAlmostEqual(loss_actual.item(), -1.1, places=3)
+
+    with self.assertRaises(ValueError):
+      tinyrl.workers.model.ppo(logprobs, weights, sampler_logprobs, advantages, {"unknown": 1.0})
