@@ -263,6 +263,10 @@ class Bus:
 
   async def submit_command(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
     """Queue a command on a run's stream. Returns its request id, or None if there is no such run."""
+    if seq_id is not None:
+      if request_id := await self.r.get(key("seq", run_id, str(seq_id))):
+        return request_id.decode()
+
     # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
     fields = {"op": op, "body": body}
     if seq_id is not None:
@@ -270,7 +274,11 @@ class Bus:
     entry_id = await self.r.xadd(key("q", run_id), fields, nomkstream=True)
     if entry_id is None:
       return None
-    return f"{run_id}/{entry_id.decode()}"
+
+    request_id = f"{run_id}/{entry_id.decode()}"
+    if seq_id is not None:
+      await self.r.set(key("seq", run_id, str(seq_id)), request_id, ex=SESSION_TTL, nx=True)
+    return request_id
 
   async def take_commands(self, worker: str, owner: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
     """The next commands for a worker's trainer: up to `count` from each run that has work."""
@@ -328,8 +336,6 @@ class Bus:
           p.xdel(key("q", cmd.run), cmd.entry_id)
           for name, n in counts.items():
             p.hincrby(key("run", cmd.run), name, n)
-          if not repeat and cmd.seq is not None:
-            p.set(key("seq", cmd.run, str(cmd.seq)), cmd.request_id, ex=REPLY_TTL)
           await p.execute()
           return True
       except redis.WatchError:
