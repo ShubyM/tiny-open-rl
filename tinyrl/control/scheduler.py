@@ -230,20 +230,36 @@ def decide(state: State, now: float) -> list[tuple[Ev, dict]]:
 
 
 def next_decision(s: State, now: float) -> tuple[Ev, dict] | None:
+  """The first decision of the first step that has one: runs get workers, workers without runs leave their GPUs, workers get GPUs, trainers spread onto empty GPUs, then workers get and give back turns."""
+  return next((d for step in (assign, unplace, place_next, spread, grant, revoke) if (d := step(s, now))), None)
+
+
+def assign(s: State, now: float) -> tuple[Ev, dict] | None:
   for run_id, r in sorted(s.runs.items()):
     if not r.worker:
       return Ev.ASSIGNED, {"run": run_id, "worker": choose_worker(s, r) or f"w{s.n + 1}"}
+
+
+def unplace(s: State, now: float) -> tuple[Ev, dict] | None:
   for name, w in sorted(s.workers.items()):
     if w.node and not members(s, name):
       return Ev.UNPLACED, {"worker": name, "rule": "place.emptied"}
+
+
+def place_next(s: State, now: float) -> tuple[Ev, dict] | None:
+  """Place one worker that has runs and no GPU, exclusive ones first."""
   unplaced = [name for name, w in s.workers.items() if w.node is None and members(s, name)]
   if unplaced and s.nodes:
     return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
-  if moved := spread(s):
-    return Ev.PLACED, moved
+
+
+def grant(s: State, now: float) -> tuple[Ev, dict] | None:
   for _, name in sorted((w.asked, name) for name, w in s.workers.items() if w.asked):
     if all(first_in_line(s, k) == name and fits(s, k, name) for k in keys(s.workers[name])):
       return Ev.GRANTED, {"worker": name, "rule": "turn.granted"}
+
+
+def revoke(s: State, now: float) -> tuple[Ev, dict] | None:
   for name, w in sorted(s.workers.items()):
     if w.since is None or w.revoked or not any(first_in_line(s, k) for k in keys(w)):
       continue
@@ -251,7 +267,6 @@ def next_decision(s: State, now: float) -> tuple[Ev, dict] | None:
       return Ev.REVOKED, {"worker": name, "rule": "turn.idle_holder_yields"}
     if now >= w.since + s.quantum:
       return Ev.REVOKED, {"worker": name, "rule": "turn.quantum_expired"}
-  return None
 
 
 def place(s: State, name: str) -> dict:
@@ -276,7 +291,7 @@ def place(s: State, name: str) -> dict:
   return {"worker": name, "node": node, "gpus": [gpu], "rule": rule, "gpu_rule": why}
 
 
-def spread(s: State) -> dict | None:
+def spread(s: State, now: float) -> tuple[Ev, dict] | None:
   """Move one trainer off a shared GPU onto an empty one on the same node. Empty means no worker is placed on it and no old process still runs on it. Only trainers that take turns move: workers that share because their memory fits stay put. LoRA trainers move first, since a full fine-tune is slow to save and restore. Then a trainer waiting for its turn moves before the one using the GPU."""
   for node, (gpus, gpu_bytes) in sorted(s.nodes.items()):
     there = {g: [n for n, w in s.workers.items() if w.node == node and g in w.gpus] for g in range(gpus)}
@@ -290,8 +305,7 @@ def spread(s: State) -> dict | None:
     if empty and (crowded := [g for g, names in movable.items() if names]):
       g = max(crowded, key=lambda g: (len(there[g]), -g))
       name = min(movable[g], key=lambda n: (not s.workers[n].kind.lora, s.workers[n].since is not None, n))
-      return {"worker": name, "node": node, "gpus": [empty[0]], "rule": "place.spread"}
-  return None
+      return Ev.PLACED, {"worker": name, "node": node, "gpus": [empty[0]], "rule": "place.spread"}
 
 
 def takes_turns(w: Worker) -> bool:
