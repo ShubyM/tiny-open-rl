@@ -712,8 +712,19 @@ class TestTrainer(RedisTest):
 
     t.answer_command = answer
 
+    orig_take = t.bus.take_commands
+    take_calls = 0
+
+    async def mock_take(*args, **kwargs):
+      nonlocal take_calls
+      take_calls += 1
+      return await orig_take(*args, **kwargs)
+
+    t.bus.take_commands = mock_take
+
     processed = await t.step(count=10, block_ms=10)
-    self.assertEqual(processed, 1)
+    self.assertEqual(processed, 10)
+    self.assertEqual(take_calls, 1)
 
 
 class TestCheckpointNames(unittest.TestCase):

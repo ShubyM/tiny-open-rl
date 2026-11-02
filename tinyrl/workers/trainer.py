@@ -74,6 +74,7 @@ class Trainer:
     self.stopping: Stop | None = None
     self.turn = GpuTurn(bus, worker, bool(GPU))
     self.queue: collections.deque[Cmd] = collections.deque()
+    self.revoked_turn = False
 
   async def serve(self) -> None:
     await self.wait_for_lease()
@@ -190,9 +191,8 @@ class Trainer:
       batch_start = time.time()
       ops = []
       while self.queue:
-        revoked = await self.turn.was_revoked()
-        if self.stopping is not None or revoked:
-          self._revoked = revoked
+        self.revoked_turn = self.revoked_turn or await self.turn.was_revoked()
+        if self.revoked_turn:
           break
         cmd = self.queue.popleft()
         start = time.time()
@@ -217,10 +217,11 @@ class Trainer:
 
         processed += 1
         if self.model.lora and self.queue and (cmd.op == Op.OPTIM_STEP or self.queue[0].run != cmd.run):
-          if cmd.op == Op.OPTIM_STEP:
-            await asyncio.sleep(0.015)
-          more = await self.bus.take_commands(self.worker, self.owner, count, 0)
-          enqueue_cmds(self.queue, more, True)
+          if self.stopping is None and not self.revoked_turn:
+            if cmd.op == Op.OPTIM_STEP:
+              await asyncio.sleep(0.015)
+            more = await self.bus.take_commands(self.worker, self.owner, count, 0)
+            enqueue_cmds(self.queue, more, True)
       await self.turn.report_batch_done(queued=len(self.queue), seconds=time.time() - batch_start, ops=ops)
     return processed
 
@@ -235,8 +236,8 @@ class Trainer:
       await self.yield_gpu()
 
   async def yield_gpu(self) -> None:
-    revoked = getattr(self, "_revoked", False) or await self.turn.was_revoked()
-    self._revoked = False
+    revoked = self.revoked_turn or await self.turn.was_revoked()
+    self.revoked_turn = False
     if revoked:
       await asyncio.to_thread(self.model.park_on_host)
       await self.turn.give_turn_back()
