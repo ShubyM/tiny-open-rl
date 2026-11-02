@@ -2,7 +2,7 @@
 
 The gateway, node daemons and workers append facts to one log, tinyrl:events: what happened. python -m tinyrl.control.scheduler folds every entry into a State and appends what decide says back to the same log: placed and unplaced, granted and revoked. A decision changes the state only once it is folded from the log, so the state is always fold(log), and replaying the log rebuilds every state the scheduler saw. Each decision names the rule in RULES that made it. Run exactly one. A restarted scheduler folds the whole log again and carries on, since its earlier decisions are in it.
 
-Everything here but run is a pure function. The gateway records what a run needs, choose_worker picks its worker, and node daemons fold the log to learn what to run.
+Everything here but run and fold is a pure function. The gateway records what a run needs, choose_worker picks its worker, and node daemons fold the log to learn what to run.
 """
 
 from __future__ import annotations
@@ -154,7 +154,7 @@ def stop(w: Worker) -> None:
 
 
 def fold(state: State, e: Event) -> State:
-  """The state after entry e. Mutates and returns the state."""
+  """The state after entry e. Changes and returns the state it is given, and ignores entries it doesn't know."""
   s = state
   s.n += 1
   b = e.body
