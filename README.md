@@ -123,7 +123,7 @@ to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/sch
 | [tinyrl/storage/models.py](tinyrl/storage/models.py) | 55 | base models from the hub, a bucket or a folder, cached in `MODEL_CACHE` |
 | **total** | **2709** | counted by [sz.py](sz.py), excluding generated `tinyrl/api/proto` |
 
-`python sz.py` counts token-bearing lines the way tinygrad does, and CI caps `tinyrl/` at 2,800 lines. Outside `tinyrl/`,
+`python sz.py` counts token-bearing lines the way tinygrad does, and CI caps `tinyrl/` at 3,000 lines. Outside `tinyrl/`,
 [examples/tinker_sdk.py](examples/tinker_sdk.py) trains and samples through the unmodified SDK. The rest of the repo holds
 [k8s/](k8s), the browser [simulator/](simulator/README.md), [docs/kubernetes.md](docs/kubernetes.md), and the integration suites in [test/](test).
 
