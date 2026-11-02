@@ -110,13 +110,10 @@ class TestOutputs(unittest.TestCase):
 if __name__ == "__main__":
   unittest.main()
 
+
 class TestG2Wire(unittest.TestCase):
   def test_2d_reject(self):
     array_2d = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int64)
-    tensor = pb.Tensor(
-        dense=array_2d.tobytes(),
-        dtype=pb.DTYPE_INT64,
-        shape=array_2d.shape
-    )
+    tensor = pb.Tensor(dense=array_2d.tobytes(), dtype=pb.DTYPE_INT64, shape=array_2d.shape)
     with self.assertRaisesRegex(ValueError, "shape"):
-        wire.loss_input(tensor)
+      wire.loss_input(tensor)

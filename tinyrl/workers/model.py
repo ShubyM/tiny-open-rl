@@ -42,10 +42,16 @@ def importance_sampling(logprobs, weights, sampler_logprobs, advantages, config)
 
 
 def ppo(logprobs, weights, sampler_logprobs, advantages, config):
-  clip, kl_coeff = config.get("clip_range", 0.2), config.get("kl_coeff", 0.0)
+  for k in config:
+    if k not in ("clip_range", "kl_coeff", "clip_low_threshold", "clip_high_threshold"):
+      raise ValueError(f"unknown config key: {k}")
+  clip_range = config.get("clip_range", 0.2)
+  clip_low = config.get("clip_low_threshold", 1 - clip_range)
+  clip_high = config.get("clip_high_threshold", 1 + clip_range)
+  kl_coeff = config.get("kl_coeff", 0.0)
   log_ratio = (logprobs - sampler_logprobs).clamp(-20, 20)
   ratio = log_ratio.exp()
-  objective = torch.min(ratio * advantages, ratio.clamp(1 - clip, 1 + clip) * advantages)
+  objective = torch.min(ratio * advantages, ratio.clamp(clip_low, clip_high) * advantages)
   kl = (ratio - 1) - log_ratio
   return -(objective - kl_coeff * kl) * weights
 
@@ -246,7 +252,11 @@ class Model:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
     lm = self.activate_run(run).train(not forward_only)
-    lengths = [min(len(d.tokens), len(d.inputs["target_tokens"])) for d in data]
+    lengths = []
+    for d in data:
+      if len(d.tokens) != len(d.inputs["target_tokens"]):
+        raise ValueError("target_tokens length must equal tokens length")
+      lengths.append(len(d.tokens))
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total = 0.0
 
