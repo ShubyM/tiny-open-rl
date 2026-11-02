@@ -468,6 +468,25 @@ class TestStore(unittest.TestCase):
     self.assertFalse(os.path.exists(upload_file))
     self.assertFalse(os.path.exists(f"{store.cache}/{v}"))
 
+  def test_three_saves_leave_exactly_two_versions(self):
+    root = f"memory://tinyrl-test-d4-count-{uuid.uuid4()}"
+    store = Store(root=root, cache=tempfile.mkdtemp())
+    uri = "tinker://r/weights/d4_count"
+
+    store.put(uri, {"w": torch.ones(1)})
+    store.upload_pending_saves()
+
+    store.put(uri, {"w": torch.ones(2)})
+    store.upload_pending_saves()
+
+    store.put(uri, {"w": torch.ones(3)})
+    store.upload_pending_saves()
+
+    # Check that exactly two versions exist in the bucket
+    remote_dir = f"{store.base}/r/weights/d4_count"
+    versions = [e for e in store.fs.ls(remote_dir, detail=False) if os.path.basename(e) != "_latest"]
+    self.assertEqual(len(versions), 2)
+
 
 if __name__ == "__main__":
   unittest.main()
