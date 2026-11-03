@@ -332,7 +332,7 @@ class Model:
         tensors[f"{name}.exp_avg"] = s["exp_avg"].detach()
         tensors[f"{name}.exp_avg_sq"] = s["exp_avg_sq"].detach()
         tensors[f"{name}.step"] = s["step"].detach()
-    return tensors, {"optimizer": True, "internal_handoff": True}
+    return tensors, {"optimizer": True}
 
   def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
@@ -351,7 +351,9 @@ class Model:
       "config": cfg,
     }
 
-  def restore_run(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
+  def restore_run(
+    self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool, *, gradients: bool = False
+  ) -> None:
     self.activate_run(run)
     if optimizer and not meta.get("optimizer"):
       raise ValueError("checkpoint has no optimizer state")
@@ -368,8 +370,8 @@ class Model:
         raise ValueError(f"bad: {n}")
     for name, p in self.params[run].items():
       p.data.copy_(weights[name])
-      if meta.get("internal_handoff") and f"{name}.grad" in tensors:
-        p.grad = tensors[f"{name}.grad"].to(p.device)
+      if gradients and f"{name}.grad" in tensors:
+        p.grad = tensors[f"{name}.grad"].to(p, copy=True)
       else:
         p.grad = None
 

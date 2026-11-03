@@ -109,6 +109,12 @@ class Reply:
   content_type: str
   body: bytes
 
+  @classmethod
+  def error(cls, error: Exception) -> Reply:
+    category = "user" if isinstance(error, (ValueError, KeyError)) else "server"
+    body = {"error": f"{type(error).__name__}: {error}", "category": category}
+    return cls(False, "application/json", json.dumps(body).encode())
+
 
 def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
   seq = int(fields[b"seq"]) if b"seq" in fields else None
@@ -359,9 +365,8 @@ class Bus:
     fields = got[0][1]
     return Reply(fields[b"ok"] == b"1", fields[b"content_type"].decode(), fields[b"body"])
 
-  async def reclaim_stranded_commands(self, worker: str, owner: str, min_idle_ms: int = 0) -> list[Cmd]:
-    """Claim the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by its owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the worker."""
-    cmds = []
+  async def fail_stranded_commands(self, worker: str, owner: str, min_idle_ms: int = 0) -> None:
+    """Fail commands left in flight for at least min_idle_ms. Called by the owner with nothing in flight itself; replies are fenced by its lease."""
     for run_id in await self.runs_in_worker(worker):
       stream = key("q", run_id)
       try:
@@ -370,8 +375,10 @@ class Bus:
         if "NOGROUP" not in str(e):
           raise
         continue  # a run deleted after it was listed has nothing left to claim
-      cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
-    return cmds
+      for entry_id, fields in entries:
+        cmd = parse_cmd(run_id, entry_id, fields)
+        reply = Reply.error(RuntimeError(f"its worker died, or lost the worker, during {cmd.op}"))
+        await self.write_reply(cmd, reply, worker, owner)
 
   # ***** parked runs: the state a stopping trainer saved, for the next trainer to restore *****
 
@@ -398,9 +405,18 @@ class Bus:
 
   # ***** worker leases *****
 
-  async def take_lease(self, worker: str, owner: str) -> bool:
-    """Take the worker's lease if no trainer holds it."""
-    return bool(await self.r.set(key("owner", worker), owner, nx=True, px=LEASE_MS))
+  async def take_lease(self, worker: str, owner: str, recover: bool = False) -> bool:
+    """Take an empty lease; resume existing state only if no other owner served the worker since."""
+    script = """
+      local previous = redis.call('GET', KEYS[2])
+      if ARGV[3] == '1' and previous and previous ~= ARGV[1] then return 0 end
+      if not redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return 0 end
+      redis.call('SET', KEYS[2], ARGV[1])
+      return 1
+    """
+    return bool(
+      await self.r.eval(script, 2, key("owner", worker), key("last_owner", worker), owner, LEASE_MS, int(recover))
+    )
 
   async def renew_lease(self, worker: str, owner: str) -> bool:
     """Hold the worker's lease for another LEASE_MS. False if `owner` doesn't hold it anymore."""

@@ -185,22 +185,25 @@ class CudaMock(torch.Tensor):
 
 
 class TestModel(unittest.TestCase):
-  def test_a1_and_a2_gradients(self):
-    model, run_id = Model(tiny), new_id()
-    model.create_run(run_id, "tiny", 0, {})
-    model.activate_run(run_id)
-    for p in model.params[run_id].values():
-      p.grad = torch.ones_like(p.data) * 0.5
+  def test_only_an_explicit_handoff_restores_accumulated_gradients(self):
+    for rank in (0, 4):
+      model, run = Model(tiny), new_id()
+      model.create_run(run, "tiny", rank, LORA)
+      for p in model.params[run].values():
+        p.grad = torch.full_like(p, 0.5)
+      tensors, meta = model.training_state(run)
 
-    tensors, meta = model.training_state(run_id)
-    self.assertTrue(any("grad" in name for name in tensors.keys()))
+      model.restore_run(run, tensors, meta, optimizer=True, gradients=True)
+      for name, p in model.params[run].items():
+        self.assertTrue(torch.equal(p.grad, tensors[f"{name}.grad"]))
+        self.assertNotEqual(p.grad.data_ptr(), tensors[f"{name}.grad"].data_ptr())
 
-    model.restore_run(run_id, tensors, meta, True)
-    self.assertTrue(any(p.grad is not None for p in model.params[run_id].values()))
-
-    meta["internal_handoff"] = False
-    model.restore_run(run_id, tensors, meta, True)
-    self.assertFalse(any(p.grad is not None for p in model.params[run_id].values()))
+      meta["internal_handoff"] = True  # legacy checkpoint metadata cannot opt a user load into resuming gradients
+      for optimizer in (True, False):
+        for p in model.params[run].values():
+          p.grad = torch.ones_like(p)
+        model.restore_run(run, tensors, meta, optimizer=optimizer)
+        self.assertTrue(all(p.grad is None for p in model.params[run].values()))
 
   def test_a4_mixed_state(self):
     model, run_id = Model(tiny), new_id()
@@ -504,6 +507,76 @@ class TestTrainer(RedisTest):
 
     self.assertNotIn(run_id, t.model.params)
 
+  async def test_a_handoff_between_backward_and_step_preserves_the_update(self):
+    store = Store(root=tempfile.mkdtemp())
+    for rank in (0, 4):
+      run, worker = new_id(), f"p-{rank}"
+      await self.bus.create_run(Run(run, worker, "tiny", rank, lora=LORA))
+      first = Trainer(self.bus, worker, Model(tiny), store=store)
+      await self.own(first)
+      first.model.create_run(run, "tiny", rank, LORA)
+      train(first.model, run, steps=2)
+      first.model.forward_backward(run, [counting(8)], "cross_entropy", {}, False)
+      await first.park_every_run()
+      parked = await self.bus.parked_checkpoint(run)
+      adam = {"learning_rate": 1e-2}
+      first.model.optim_step(run, adam)  # the uninterrupted update to compare with
+      await self.bus.release_lease(worker, first.owner)
+
+      second = Trainer(self.bus, worker, Model(tiny), store=store)
+      await self.own(second)
+      reply = await second.answer_command(Cmd(run, "1-0", Op.OPTIM_STEP, json.dumps({"adam_params": adam}).encode()))
+      self.assertTrue(reply.ok, reply.body)
+      self.assertTrue(same(first.model.params[run], second.model.params[run]), f"rank {rank}")
+      torch.testing.assert_close(
+        first.model.optimizers[run].state_dict()["state"], second.model.optimizers[run].state_dict()["state"]
+      )
+      self.assertIsNone(await self.bus.parked_checkpoint(run))
+      self.assertIsNone(await self.registry.get_checkpoint(parked))
+
+  async def test_user_load_replaces_broken_parked_state_and_clears_gradients(self):
+    store = Store(root=tempfile.mkdtemp())
+    model, (run,) = lora_runs()
+    train(model, run, steps=2)
+    model.forward_backward(run, [counting(8)], "cross_entropy", {}, False)
+    tensors, meta = model.training_state(run)
+    uri, parked = f"tinker://{run}/weights/saved", f"tinker://{run}/parked/missing"
+    store.put(uri, tensors, {**meta, "internal_handoff": True})  # a checkpoint written by an older trainer
+    await self.registry.register_checkpoint(uri, 0, version=store.versions.get(uri))
+    await self.registry.register_checkpoint(parked, 0, owned=True)
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    t = Trainer(self.bus, "p", Model(tiny), store=store)
+    await self.own(t)
+    await self.bus.set_parked_checkpoint(run, parked, "p", t.owner)
+
+    for optimizer in (True, False):
+      for p in t.model.params.get(run, {}).values():
+        p.grad = torch.ones_like(p)
+      args = {"uri": uri, "optimizer": optimizer}
+      reply = await t.answer_command(Cmd(run, "1-0", Op.LOAD_WEIGHTS, json.dumps(args).encode()))
+      self.assertTrue(reply.ok, reply.body)
+      self.assertTrue(same(model.params[run], t.model.params[run]))
+      self.assertTrue(all(p.grad is None for p in t.model.params[run].values()))
+      self.assertEqual(run in t.model.optimizers, optimizer)
+      self.assertIsNone(await self.bus.parked_checkpoint(run))
+      self.assertIsNone(await self.registry.get_checkpoint(parked))
+
+  async def test_a_failed_user_load_never_leaves_a_missing_run_ready_to_train(self):
+    run, store = new_id(), Store(root=tempfile.mkdtemp())
+    bad = f"tinker://{run}/weights/bad"
+    store.put(bad, {"wrong_weight": torch.zeros(1)}, {"optimizer": True})
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    t = Trainer(self.bus, "p", Model(tiny), store=store)
+    await self.own(t)
+    parked = f"tinker://{run}/parked/missing"
+    await self.bus.set_parked_checkpoint(run, parked, "p", t.owner)
+    for uri in (f"tinker://{run}/weights/missing", bad):
+      args = {"uri": uri, "optimizer": True}
+      reply = await t.answer_command(Cmd(run, "1-0", Op.LOAD_WEIGHTS, json.dumps(args).encode()))
+      self.assertFalse(reply.ok)
+      self.assertNotIn(run, t.model.params)
+      self.assertEqual(await self.bus.parked_checkpoint(run), parked)
+
   async def submit(self, run: str, *cmds: tuple[Op, dict | bytes]) -> list[str]:
     request_ids = []
     for op, body in cmds:
@@ -672,9 +745,9 @@ class TestTrainer(RedisTest):
     await asyncio.sleep(0.2)
     self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (t.owner, None))
 
-    t.model.params["r"] = {}  # but not once another trainer has served the worker and parked its run
-    await self.bus.r.set("tinyrl:parked:r", "tinker://r/parked/1")
-    await self.bus.r.delete("tinyrl:owner:p")
+    await self.bus.release_lease("p", t.owner)
+    self.assertTrue(await self.bus.take_lease("p", "next"))  # another trainer served it, without parking any runs
+    await self.bus.release_lease("p", "next")
     await asyncio.sleep(0.2)
     self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (None, Stop.EXIT))
 
