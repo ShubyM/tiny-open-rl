@@ -117,10 +117,13 @@ class NodeDaemon:
     if (since := await self.registry.first_registered_at()) is None:
       return
     for uri in await asyncio.to_thread(self.store.list_checkpoints):
-      if await self.registry.get_checkpoint(uri) is None:
-        saved = await asyncio.to_thread(self.store.saved_at, uri)
-        if since < saved < time.time() - SWEEP_GRACE_S:
-          await asyncio.to_thread(self.store.delete, uri)
+      try:
+        if await self.registry.get_checkpoint(uri) is None:
+          saved = await asyncio.to_thread(self.store.saved_at, uri)
+          if since < saved < time.time() - SWEEP_GRACE_S:
+            await asyncio.to_thread(self.store.delete, uri)
+      except Exception as e:  # one checkpoint it can't read or delete mustn't stop the rest of the sweep
+        print(f"sweep could not delete {uri}, trying again next sweep: {e!r}", file=sys.stderr, flush=True)
     await asyncio.to_thread(
       self.store.delete_unused_chain_links,
       await self.registry.registered_versions(),
