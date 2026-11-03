@@ -5,6 +5,7 @@ The worker appends facts to tinyrl:events: wants_gpu, batch_done, idle, released
 
 from __future__ import annotations
 
+from tinyrl import spans
 from tinyrl.bus import Bus, Ev
 from tinyrl.helpers import getenv
 
@@ -36,17 +37,17 @@ class GpuTurn:
   async def report_batch_done(self, **report) -> None:
     self.idle = False
     if self.shared:
-      await self.bus.append_event(Ev.BATCH_DONE, worker=self.worker, **report)
+      await self.bus.append_event(Ev.BATCH_DONE, worker=self.worker, spans=spans.report(), **report)
 
   async def report_idle(self) -> None:
     if self.held and self.shared and not self.idle:
       self.idle = True
-      await self.bus.append_event(Ev.IDLE, worker=self.worker)
+      await self.bus.append_event(Ev.IDLE, worker=self.worker, spans=spans.report())
 
   async def give_turn_back(self) -> None:
     if self.held and self.shared:
       self.held = False
-      await self.bus.append_event(Ev.RELEASED, worker=self.worker)
+      await self.bus.append_event(Ev.RELEASED, worker=self.worker, spans=spans.report())
 
   async def next_decision(self, block_ms: int) -> str | None:
     """The next decision about this worker in the log, reading past everything else. None once it has read it all, after waiting up to block_ms for a new entry."""

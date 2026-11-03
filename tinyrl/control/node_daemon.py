@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 
+from tinyrl import spans
 from tinyrl.bus import Bus, Ev
 from tinyrl.control import scheduler
 from tinyrl.helpers import getenv
@@ -88,15 +89,18 @@ class NodeDaemon:
     for worker, (gpus, proc) in list(self.procs.items()):
       if proc.poll() is not None or worker not in mine or list(mine[worker].gpus) != gpus:
         proc.terminate()
+        proc.stop_asked = time.time()  # so its exit reports how long stopping took
         self.stopping[worker] = self.procs.pop(worker)[1]
     for worker, proc in list(self.stopping.items()):
       if proc.poll() is not None:  # only now is the GPU free, so only now does its turn end
         reap(proc)
         del self.stopping[worker]
-        await self.bus.append_event(Ev.EXITED, worker=worker)
+        await self.bus.append_event(Ev.EXITED, worker=worker, stopping=round(time.time() - proc.stop_asked, 3))
     for worker in sorted(set(mine) - set(self.procs) - set(self.stopping)):
       await self.bus.append_event(Ev.STARTED, worker=worker, node=self.id)
       self.procs[worker] = self.start_worker_process(worker, mine[worker])
+    if left := spans.report():  # its own, like uploads
+      await self.bus.append_event(Ev.SPANS, node=self.id, spans=left)
     # its heartbeat ran out, or Redis lost the log. Only once its processes exited, since the scheduler then grants their GPUs again
     if self.id not in self.state.nodes and not self.procs and not self.stopping:
       await self.announce_node()

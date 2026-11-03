@@ -25,20 +25,21 @@ async def read_events(since: float, until: float) -> list:
 
 
 def system_view(events: list, t0: float) -> list:
-  """Chrome trace events for the log: pid 1, a thread per worker, named by its role, base model and runs."""
+  """Chrome trace events for the log: pid 1, a thread per worker (named by its role, base model and runs) and per node daemon."""
   us = lambda t: (t - t0) * 1e6  # noqa: E731
   runs, worker_runs, tids, out = {}, collections.defaultdict(set), {}, []
-  open_spans = collections.defaultdict(dict)  # worker -> span name -> start
+  opened = collections.defaultdict(dict)  # worker -> name of a span the log opens -> its start
+  reported = collections.defaultdict(list)  # worker, or "node <id>" -> the spans its process reported
 
-  def tid(w: str) -> int:
-    return tids.setdefault(w, len(tids) + 1)
+  def tid(w: str, lane: int = 0) -> int:
+    return tids.setdefault((w, lane), len(tids) + 1)
 
-  def span(w: str, name: str, start: float, end: float, args: dict | None = None) -> None:
+  def span(w: str, name: str, start: float, end: float, args: dict | None = None, lane: int = 0) -> None:
     out.append(
       {
         "ph": "X",
         "pid": 1,
-        "tid": tid(w),
+        "tid": tid(w, lane),
         "name": name,
         "ts": us(start),
         "dur": max(0.0, (end - start) * 1e6),
@@ -48,42 +49,81 @@ def system_view(events: list, t0: float) -> list:
 
   for e in events:
     b, w = e.body, e.body.get("worker")
+    reported[w or f"node {b.get('node')}"] += b.get("spans", [])
     if e.kind == "run_created":
       runs[b["run"]] = b
     if e.kind == "assigned" and b.get("run") in runs:
       worker_runs[w].add(b["run"])
     if not w:
       continue
-    spans = open_spans[w]
+    o = opened[w]
     match e.kind:
       case "started":
-        spans["process"] = e.t
-      case "exited" if "process" in spans:
-        span(w, "process", spans.pop("process"), e.t)
-      case "wants_gpu" if "wait" not in spans and "turn" not in spans:
-        spans["wait"] = e.t
+        o["process"] = e.t
+      case "exited" if "process" in o:
+        span(w, "process", o.pop("process"), e.t)
+        if b.get("stopping"):
+          span(w, "stopping", e.t - b["stopping"], e.t)
+      case "wants_gpu" if "wait" not in o and "turn" not in o:
+        o["wait"] = e.t
       case "granted":
-        if "wait" in spans:
-          span(w, "wait for turn", spans.pop("wait"), e.t)
-        spans["turn"] = e.t
-      case "released" if "turn" in spans:
-        span(w, "turn", spans.pop("turn"), e.t)
+        if "wait" in o:
+          span(w, "wait for turn", o.pop("wait"), e.t)
+        o["turn"] = e.t
+      case "released" if "turn" in o:
+        span(w, "turn", o.pop("turn"), e.t)
       case "batch_done":
         start = e.t - b.get("seconds", 0.0)
         span(w, "batch", start, e.t, {"queued": b.get("queued")})
-        at = start
-        for op, ms in b.get("ops", []):  # in the order they ran, back to back
-          span(w, op, at, at + ms / 1000)
-          at += ms / 1000
+        for op, ms in b.get("ops", []):  # logs from before spans: commands in the order they ran, back to back
+          span(w, op, start, start + ms / 1000)
+          start += ms / 1000
       case "placed" | "unplaced" | "revoked" | "idle":
-        out.append({"ph": "i", "s": "t", "pid": 1, "tid": tid(w), "name": e.kind, "ts": us(e.t), "args": b})
-  for w, n in tids.items():
+        out.append(
+          {
+            "ph": "i",
+            "s": "t",
+            "pid": 1,
+            "tid": tid(w),
+            "name": e.kind,
+            "ts": us(e.t),
+            "args": {k: v for k, v in b.items() if k != "spans"},
+          }
+        )
+  for (
+    w,
+    got,
+  ) in (
+    reported.items()
+  ):  # spans nest by time; ones that overlap without nesting, like concurrent samples, get lanes of their own
+    lanes: list[list[float]] = []  # per lane, the ends of the spans still open on it
+    for name, start, seconds in sorted(got, key=lambda x: (x[1], -x[2])):
+      end = start + seconds
+      for ends in lanes:
+        while ends and ends[-1] <= start:
+          ends.pop()
+      lane = next((i for i, ends in enumerate(lanes) if not ends or end <= ends[-1]), len(lanes))
+      if lane == len(lanes):
+        lanes.append([])
+      lanes[lane].append(end)
+      span(w, name, start, end, lane=lane)
+  for (w, lane), n in tids.items():
     rs = [runs[r] for r in worker_runs[w] if r in runs]
     r = rs[0] if rs else {}
     label = (
-      f"{w} {r.get('role', '?')} {r.get('base', '').split('/')[-1]} {'lora' if r.get('rank') else 'full'} x{len(rs)}"
+      w
+      if w.startswith("node ")
+      else f"{w} {r.get('role', '?')} {r.get('base', '').split('/')[-1]} {'lora' if r.get('rank') else 'full'} x{len(rs)}"
     )
-    out.append({"ph": "M", "pid": 1, "tid": n, "name": "thread_name", "args": {"name": label}})
+    out.append(
+      {
+        "ph": "M",
+        "pid": 1,
+        "tid": n,
+        "name": "thread_name",
+        "args": {"name": label + (f" (overlap {lane})" if lane else "")},
+      }
+    )
   out.append({"ph": "M", "pid": 1, "name": "process_name", "args": {"name": "tinyrl event log"}})
   return out
 

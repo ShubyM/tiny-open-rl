@@ -14,6 +14,7 @@ from peft.helpers import disable_input_dtype_casting
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
+from tinyrl import spans
 from tinyrl.api import wire
 from tinyrl.helpers import getenv
 from tinyrl.storage import models
@@ -154,6 +155,7 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
 # ***** model *****
 
 
+@spans.timed
 def load(name: str) -> PreTrainedModel:
   """The class the checkpoint names in its config, which is the one vLLM serves, so the weights and adapters a trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and vLLM drops an adapter whose names it can't map, without an error."""
   name = models.local(name)
@@ -319,6 +321,7 @@ class Model:
     self.dirty.add(run)
     return {"grad_norm:mean": grad_norm}
 
+  @spans.timed
   def training_state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """A run's portable training checkpoint: fp32 master weights and named AdamW state, with no pickle."""
     self.activate_run(run)
@@ -334,6 +337,7 @@ class Model:
         tensors[f"{name}.step"] = s["step"].detach()
     return tensors, {"optimizer": True, "internal_handoff": True}
 
+  @spans.timed
   def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
     lm = self.activate_run(run)
@@ -351,6 +355,7 @@ class Model:
       "config": cfg,
     }
 
+  @spans.timed
   def restore_run(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
     self.activate_run(run)
     if optimizer and not meta.get("optimizer"):
@@ -409,6 +414,7 @@ class Model:
     if optim:
       yield from self.adam_moments()
 
+  @spans.timed
   def move_tensors(self, tensors, device: str) -> None:
     for t in tensors:
       if device == "cpu" and t.is_cuda:
@@ -430,11 +436,13 @@ class Model:
           if k not in active:
             del self.pinned[k]
 
+  @spans.timed
   def park_on_host(self) -> None:
     """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume_on_gpu() undoes it."""
     self.move_tensors(self.gpu_tensors(), "cpu")
     self.parked = True
 
+  @spans.timed
   def resume_on_gpu(self) -> None:
     self.move_tensors(self.gpu_tensors(optim=self.lora), "cuda")
     self.parked = False

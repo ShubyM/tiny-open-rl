@@ -16,12 +16,11 @@ import socket
 import sys
 import time
 
-from torch.profiler import record_function
-
+from tinyrl import spans
 from tinyrl.api import wire
-from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
+from tinyrl.bus import LEASE_MS, Bus, Cmd, Ev, Op, Reply
 from tinyrl.control.turns import IDLE_MS, GpuTurn
-from tinyrl.helpers import DEBUG, getenv, profiled
+from tinyrl.helpers import DEBUG, getenv
 from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store, nbytes
 from tinyrl.workers.model import Model
@@ -99,6 +98,8 @@ class Trainer:
       await asyncio.to_thread(self.model.park_on_host)
     await self.turn.give_turn_back()
     await self.bus.release_lease(self.worker, self.owner)
+    if left := spans.report():
+      await self.bus.append_event(Ev.SPANS, worker=self.worker, spans=left)
 
   async def wait_for_lease(self) -> None:
     """Wait until this trainer owns its worker. Only the owner's replies land, see Bus.write_reply."""
@@ -195,7 +196,6 @@ class Trainer:
     processed = 0
     async with self.hold_gpu_for_batch(len(self.queue)):
       batch_start = time.time()
-      ops = []
       while self.queue:
         self.revoked_turn = self.revoked_turn or await self.turn.was_revoked()
         if self.revoked_turn:
@@ -204,10 +204,9 @@ class Trainer:
         start = time.time()
         # no lock needed, the worker's owner is the only writer of its seq keys
         first = await self.bus.reply_to_repeated_command(cmd)
-        with record_function(cmd.op):  # a range per command in a TINYRL_PROFILE trace
+        with spans.span(cmd.op):
           reply = first or await self.answer_command(cmd)
         ms = (time.time() - start) * 1000
-        ops.append([cmd.op, ms])
         if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
           self.stopping = Stop.EXIT  # another trainer owns the worker now
           break
@@ -229,15 +228,14 @@ class Trainer:
               await asyncio.sleep(0.015)
             more = await self.bus.take_commands(self.worker, self.owner, count, 0)
             enqueue_cmds(self.queue, more, True)
-      await self.turn.report_batch_done(queued=len(self.queue), seconds=time.time() - batch_start, ops=ops)
+      await self.turn.report_batch_done(queued=len(self.queue), seconds=time.time() - batch_start)
     return processed
 
   @contextlib.asynccontextmanager
   async def hold_gpu_for_batch(self, queued: int):
     """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back after the batch if the scheduler revoked it."""
     if await self.turn.wait_for_turn(queued):
-      with record_function("resume_on_gpu"):
-        await asyncio.to_thread(self.model.resume_on_gpu)
+      await asyncio.to_thread(self.model.resume_on_gpu)
     try:
       yield
     finally:
@@ -247,8 +245,7 @@ class Trainer:
     revoked = self.revoked_turn or await self.turn.was_revoked()
     self.revoked_turn = False
     if revoked:
-      with record_function("park_on_host"):
-        await asyncio.to_thread(self.model.park_on_host)
+      await asyncio.to_thread(self.model.park_on_host)
       await self.turn.give_turn_back()
 
   def run_command(self, cmd: Cmd, version: str | None = None) -> tuple[Reply, int]:
@@ -291,7 +288,7 @@ class Trainer:
 async def main(worker: str) -> None:
   trainer = Trainer(Bus(), worker)
   asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, trainer.stop)
-  with profiled(f"trainer-{worker}"):
+  with spans.profiled(f"trainer-{worker}"):
     await trainer.serve()
 
 

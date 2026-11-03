@@ -69,6 +69,7 @@ class Ev(StrEnum):
   RELEASED = "released"
   GRANTED = "granted"
   REVOKED = "revoked"
+  SPANS = "spans"  # a process's spans that no other entry of its carried, as it exits, and a node daemon's own
 
 
 class Role(StrEnum):

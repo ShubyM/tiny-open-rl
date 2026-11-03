@@ -20,6 +20,7 @@ from typing import Protocol
 
 import numpy as np
 
+from tinyrl import spans
 from tinyrl.api import wire
 from tinyrl.bus import LEASE_MS, Bus, Reply
 from tinyrl.control.turns import IDLE_MS, GpuTurn
@@ -131,7 +132,7 @@ class Sampler:
             start = time.time()
             self.running = Running(await self.engine_type.start(base, self.lora))
             boot = time.time() - start
-            await self.turn.report_batch_done(queued=0, seconds=boot, boot=boot, ops=[])
+            await self.turn.report_batch_done(queued=0, seconds=boot, boot=boot)
           except Exception:  # its first command starts it again and replies with the error
             print(f"{self.worker}: the engine failed to start ahead of its commands", file=sys.stderr, flush=True)
             traceback.print_exc()
@@ -207,14 +208,12 @@ class Sampler:
 
     await asyncio.gather(*(stage(r) for r in runs.values()))
 
-    async def one(cmd) -> list:
+    async def one(cmd) -> None:
       start = time.time()
       first = await self.bus.reply_to_repeated_command(cmd)
       reply = first or await self.run_sample(cmd.run, json.loads(cmd.body))
-      ms = (time.time() - start) * 1000
       if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
         self.done = True
-      return [cmd.op, ms]
 
     async with self.hold_gpu_for_batch(len(cmds)):
       batch_start = time.time()
@@ -235,16 +234,16 @@ class Sampler:
         by_run: dict[str, list] = {}
         [by_run.setdefault(c.run, []).append(c) for c in cmds]
         batches = list(by_run.values())
-      ops = []
+      ran = 0
       for batch in batches:
         if not self.done:
-          ops.extend(await asyncio.gather(*(one(c) for c in batch)))
+          await asyncio.gather(*(one(c) for c in batch))
+          ran += len(batch)
 
-      await self.turn.report_batch_done(
-        queued=len(cmds) - len(ops), seconds=time.time() - batch_start, boot=boot, ops=ops
-      )
+      await self.turn.report_batch_done(queued=len(cmds) - ran, seconds=time.time() - batch_start, boot=boot)
     return len(cmds)
 
+  @spans.timed
   async def run_sample(self, session: str, job: dict) -> Reply:
     try:
       run = await self.bus.get_run(session)

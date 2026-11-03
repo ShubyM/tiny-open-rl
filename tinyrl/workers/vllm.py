@@ -17,7 +17,8 @@ import traceback
 
 import httpx
 
-from tinyrl.helpers import PROFILE, getenv
+from tinyrl import spans
+from tinyrl.helpers import getenv
 from tinyrl.storage import models
 from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
@@ -63,6 +64,7 @@ class VLLM:
     self.clean: bool = True
 
   @classmethod
+  @spans.timed
   async def start(cls, base: str, lora: bool) -> VLLM:
     path = await asyncio.to_thread(models.local, base)  # served under the reference's name, which requests use
     flags = ["--enable-sleep-mode", "--language-model-only"]
@@ -88,11 +90,9 @@ class VLLM:
     if KV_BYTES and not any(a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra):
       extra += ["--kv-cache-memory-bytes", KV_BYTES]
     flags += extra
-    if PROFILE:  # its engine records ops and kernels from boot to close, into the folder trainers write theirs to
-      flags += [
-        "--profiler-config",
-        json.dumps({"profiler": "torch", "torch_profiler_dir": PROFILE, "torch_profiler_with_stack": False}),
-      ]
+    if spans.PROFILE:  # its engine records ops and kernels from boot to close, into the folder trainers write theirs to
+      config = {"profiler": "torch", "torch_profiler_dir": spans.PROFILE, "torch_profiler_with_stack": False}
+      flags += ["--profiler-config", json.dumps(config)]
 
     def serve(*listen: str) -> list[str]:
       return ["vllm", "serve", path, "--served-model-name", base, *listen, *flags]
@@ -103,13 +103,13 @@ class VLLM:
         port = s.getsockname()[1]
       server = subprocess.Popen(serve("--host", "127.0.0.1", "--port", str(port)), env=env)
       engine = await cls(f"http://127.0.0.1:{port}", base, lora, server).ready()
-      if PROFILE:
+      if spans.PROFILE:
         await engine.post("/start_profile")
       return engine
 
     # a multi-GPU server's NCCL communicators must be suspended before a snapshot, which isn't done yet
     # a profiled server boots, since a profiler can't be carried through a snapshot
-    if not snapshot.SNAPSHOTS or tp > 1 or PROFILE:
+    if not snapshot.SNAPSHOTS or tp > 1 or spans.PROFILE:
       return await boot()
 
     folder = os.path.join(snapshot.SNAPSHOTS, await asyncio.to_thread(snapshot.key, serve()))
@@ -144,6 +144,7 @@ class VLLM:
       return await boot()
 
   @classmethod
+  @spans.timed
   async def restore(cls, folder: str, base: str, lora: bool) -> VLLM:
     """Restore a snapshot of vLLM asleep at level 2, then wake it with its weights read again from the model files."""
     namespaces, sock = await asyncio.to_thread(snapshot.restore, folder)
@@ -168,7 +169,7 @@ class VLLM:
     raise RuntimeError(f"vllm serve exited with {self.server.returncode}")
 
   async def close(self) -> None:
-    if PROFILE and self.server and self.server.poll() is None:
+    if spans.PROFILE and self.server and self.server.poll() is None:
       with contextlib.suppress(httpx.HTTPError):
         await self.post("/stop_profile")  # writes its trace
     if self.server:
@@ -193,6 +194,7 @@ class VLLM:
           raise
     raise AssertionError
 
+  @spans.timed
   async def load_checkpoint(self, name: str, path: str) -> None:
     if name in self.loaded:
       return
@@ -214,9 +216,11 @@ class VLLM:
       self.clean = False
       self.loaded = {name}
 
+  @spans.timed
   async def sleep(self) -> None:
     await self.post("/sleep", params={"level": 1})
 
+  @spans.timed
   async def wake(self) -> None:
     await self.post("/wake_up")
 
