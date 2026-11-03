@@ -190,6 +190,39 @@ class TestBus(RedisTest):
     self.assertEqual(await self.bus.lease_owner("p"), "w0")
     self.assertEqual(await self.bus.r.pttl(key("last_owner", "p")), -1)
 
+  async def test_concurrent_lease_takes_have_one_winner_and_matching_history(self):
+    await self.bus.release_lease("p", "w0")
+    owners = ["first", "second"]
+    taken = await asyncio.gather(*(self.bus.take_lease("p", owner) for owner in owners))
+    self.assertEqual(sum(taken), 1)
+    winner = owners[taken.index(True)]
+    self.assertEqual(await self.bus.lease_owner("p"), winner)
+    self.assertEqual(await self.bus.r.get(key("last_owner", "p")), winner.encode())
+
+  async def test_recovery_rejects_an_owner_that_acquires_and_releases_before_its_commit(self):
+    await self.bus.r.pexpire(key("owner", "p"), 0)
+    rival = Bus(connect(self.url))
+    self.addAsyncCleanup(rival.r.aclose)
+    pipeline = self.bus.r.pipeline(transaction=True)
+    execute, intervened = pipeline.execute, False
+
+    async def execute_after_takeover():
+      nonlocal intervened
+      if not intervened:
+        intervened = True
+        self.assertTrue(await rival.take_lease("p", "next"))
+        await rival.release_lease("p", "next")
+      return await execute()
+
+    # The recovery has read an empty lease and its own history; another owner serves before its commit.
+    with (
+      patch.object(self.bus.r, "pipeline", return_value=pipeline),
+      patch.object(pipeline, "execute", execute_after_takeover),
+    ):
+      self.assertFalse(await self.bus.take_lease("p", "w0", recover=True))
+    self.assertIsNone(await self.bus.lease_owner("p"))
+    self.assertEqual(await self.bus.r.get(key("last_owner", "p")), b"next")
+
   async def test_an_owner_cannot_recover_after_an_intervening_owner_also_expires(self):
     await self.bus.r.pexpire(key("owner", "p"), 0)
     self.assertTrue(await self.bus.take_lease("p", "next"))

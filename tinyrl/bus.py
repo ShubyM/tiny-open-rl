@@ -407,16 +407,22 @@ class Bus:
 
   async def take_lease(self, worker: str, owner: str, recover: bool = False) -> bool:
     """Take an empty lease; resume existing state only if no other owner served the worker since."""
-    script = """
-      local previous = redis.call('GET', KEYS[2])
-      if ARGV[3] == '1' and previous and previous ~= ARGV[1] then return 0 end
-      if not redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return 0 end
-      redis.call('SET', KEYS[2], ARGV[1])
-      return 1
-    """
-    return bool(
-      await self.r.eval(script, 2, key("owner", worker), key("last_owner", worker), owner, LEASE_MS, int(recover))
-    )
+    k, last = key("owner", worker), key("last_owner", worker)
+    while True:
+      try:
+        async with self.r.pipeline(transaction=True) as p:
+          await p.watch(k, last)
+          current, previous = await p.mget(k, last)
+          if current is not None or (recover and previous not in (None, owner.encode())):
+            await p.unwatch()
+            return False
+          p.multi()
+          p.set(k, owner, px=LEASE_MS)
+          p.set(last, owner)
+          await p.execute()
+          return True
+      except redis.WatchError:
+        continue
 
   async def renew_lease(self, worker: str, owner: str) -> bool:
     """Hold the worker's lease for another LEASE_MS. False if `owner` doesn't hold it anymore."""
