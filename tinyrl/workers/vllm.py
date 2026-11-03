@@ -17,7 +17,7 @@ import traceback
 
 import httpx
 
-from tinyrl.helpers import getenv
+from tinyrl.helpers import PROFILE, getenv
 from tinyrl.storage import models
 from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
@@ -88,6 +88,11 @@ class VLLM:
     if KV_BYTES and not any(a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra):
       extra += ["--kv-cache-memory-bytes", KV_BYTES]
     flags += extra
+    if PROFILE:  # its engine records ops and kernels from boot to close, into the folder trainers write theirs to
+      flags += [
+        "--profiler-config",
+        json.dumps({"profiler": "torch", "torch_profiler_dir": PROFILE, "torch_profiler_with_stack": False}),
+      ]
 
     def serve(*listen: str) -> list[str]:
       return ["vllm", "serve", path, "--served-model-name", base, *listen, *flags]
@@ -97,10 +102,14 @@ class VLLM:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
       server = subprocess.Popen(serve("--host", "127.0.0.1", "--port", str(port)), env=env)
-      return await cls(f"http://127.0.0.1:{port}", base, lora, server).ready()
+      engine = await cls(f"http://127.0.0.1:{port}", base, lora, server).ready()
+      if PROFILE:
+        await engine.post("/start_profile")
+      return engine
 
     # a multi-GPU server's NCCL communicators must be suspended before a snapshot, which isn't done yet
-    if not snapshot.SNAPSHOTS or tp > 1:
+    # a profiled server boots, since a profiler can't be carried through a snapshot
+    if not snapshot.SNAPSHOTS or tp > 1 or PROFILE:
       return await boot()
 
     folder = os.path.join(snapshot.SNAPSHOTS, await asyncio.to_thread(snapshot.key, serve()))
@@ -159,6 +168,9 @@ class VLLM:
     raise RuntimeError(f"vllm serve exited with {self.server.returncode}")
 
   async def close(self) -> None:
+    if PROFILE and self.server and self.server.poll() is None:
+      with contextlib.suppress(httpx.HTTPError):
+        await self.post("/stop_profile")  # writes its trace
     if self.server:
       if self.server.args[0] == "unshare":
         self.server.kill()  # a restored server's namespaces end with their root, which blocks SIGTERM

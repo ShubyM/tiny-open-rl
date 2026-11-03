@@ -16,10 +16,12 @@ import socket
 import sys
 import time
 
+from torch.profiler import record_function
+
 from tinyrl.api import wire
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
 from tinyrl.control.turns import IDLE_MS, GpuTurn
-from tinyrl.helpers import DEBUG, getenv
+from tinyrl.helpers import DEBUG, getenv, profiled
 from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store, nbytes
 from tinyrl.workers.model import Model
@@ -202,7 +204,8 @@ class Trainer:
         start = time.time()
         # no lock needed, the worker's owner is the only writer of its seq keys
         first = await self.bus.reply_to_repeated_command(cmd)
-        reply = first or await self.answer_command(cmd)
+        with record_function(cmd.op):  # a range per command in a TINYRL_PROFILE trace
+          reply = first or await self.answer_command(cmd)
         ms = (time.time() - start) * 1000
         ops.append([cmd.op, ms])
         if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
@@ -233,7 +236,8 @@ class Trainer:
   async def hold_gpu_for_batch(self, queued: int):
     """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back after the batch if the scheduler revoked it."""
     if await self.turn.wait_for_turn(queued):
-      await asyncio.to_thread(self.model.resume_on_gpu)
+      with record_function("resume_on_gpu"):
+        await asyncio.to_thread(self.model.resume_on_gpu)
     try:
       yield
     finally:
@@ -243,7 +247,8 @@ class Trainer:
     revoked = self.revoked_turn or await self.turn.was_revoked()
     self.revoked_turn = False
     if revoked:
-      await asyncio.to_thread(self.model.park_on_host)
+      with record_function("park_on_host"):
+        await asyncio.to_thread(self.model.park_on_host)
       await self.turn.give_turn_back()
 
   def run_command(self, cmd: Cmd, version: str | None = None) -> tuple[Reply, int]:
@@ -286,7 +291,8 @@ class Trainer:
 async def main(worker: str) -> None:
   trainer = Trainer(Bus(), worker)
   asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, trainer.stop)
-  await trainer.serve()
+  with profiled(f"trainer-{worker}"):
+    await trainer.serve()
 
 
 if __name__ == "__main__":
