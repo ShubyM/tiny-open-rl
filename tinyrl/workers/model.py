@@ -291,7 +291,7 @@ class Model:
           loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
           if not forward_only:
             accumulating = True
-            loss.backward()
+            (loss * world).backward()  # FSDP averages gradients over ranks, and the loss is a sum
           total += loss.item()
 
           for row, i in enumerate(batch):
@@ -300,9 +300,6 @@ class Model:
             logprobs[i] = torch.nan_to_num(values, nan=0.0).clamp(-9999, 9999).cpu().numpy()
 
       if world > 1:
-        for p in self.params[run].values() if not forward_only else ():
-          if p.grad is not None:
-            p.grad.mul_(world)
         dist.all_gather_object(gathered := [None] * world, (total, [(i, logprobs[i]) for i in mine]))
         total = sum(t for t, _ in gathered)
         for i, lp_i in (x for _, items in gathered for x in items):

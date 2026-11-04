@@ -270,9 +270,7 @@ def revoke(s: State, now: float) -> tuple[Ev, dict] | None:
 def place(s: State, name: str) -> dict:
   """Where a worker goes: the node with the fewest workers per GPU, and the GPUs choose picks there. When trainers have to move out of the way first, the decision is the move of one of them, and the worker goes once its GPUs are clear."""
   me = s.workers[name]
-  load = {
-    n: sum(w.node == n for w in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items() if gpus >= me.kind.gpus
-  }
+  load = {n: sum(w.node == n for w in s.workers.values()) / g for n, (g, _) in s.nodes.items() if g >= me.kind.gpus}
   trainers = [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
   near = near if me.kind.role == Role.SAMPLER and not me.kind.lora else set()  # a LoRA adapter is small to fetch
