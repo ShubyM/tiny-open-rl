@@ -218,8 +218,6 @@ class Model:
         for child in [c for c, _ in inner.named_children() if c != "language_model"]:
           setattr(inner, child, None)
       self.dtype = self.lm.dtype
-      if torch.cuda.is_available() and apply_liger:  # a model FSDP will shard is still on the host here
-        apply_liger(model=self.lm, cross_entropy=False, fused_linear_cross_entropy=False)
       if not self.lora:
         self.lm.float()  # a full fine-tune updates fp32 master weights. Its forward pass runs in bf16, under autocast
       if should_checkpoint_layers(self.lm, self.lora):
@@ -228,9 +226,11 @@ class Model:
           self.lm.enable_input_require_grads()  # with the embeddings frozen, checkpointed layers need a gradient path
       if dist.is_initialized():  # FSDP2 over its default unnamed mesh, which PEFT sizes adapters for at full width
         mp = MixedPrecisionPolicy(reduce_dtype=torch.float32)
-        for layer in [m for m in self.lm.modules() if type(m).__name__ in self.lm._no_split_modules]:
+        for layer in [m for m in self.lm.modules() if type(m).__name__ in (self.lm._no_split_modules or ())]:
           fully_shard(layer, mp_policy=mp)
         fully_shard(self.lm, mp_policy=mp)
+      if self.lm.device.type == "cuda" and apply_liger:  # after FSDP, which moves a host-loaded model to the GPU
+        apply_liger(model=self.lm, cross_entropy=False, fused_linear_cross_entropy=False)
 
     if base != self.base or (rank > 0) != self.lora:
       raise ValueError(f"this trainer does {'lora' if self.lora else 'full'} fine-tuning of {self.base}")
@@ -302,8 +302,8 @@ class Model:
 
       if world > 1:
         for p in self.params[run].values() if self.lora and not forward_only else ():
-          dist.all_reduce(p.grad)  # FSDP doesn't manage adapters added after it wrapped the model
-          p.grad.div_(world)
+          if p.grad is not None:  # FSDP doesn't manage adapters added after it wrapped the model
+            dist.all_reduce(p.grad.div_(world))
         dist.all_gather_object(gathered := [None] * world, (total, [(i, logprobs[i]) for i in mine]))
         total = sum(t for t, _ in gathered)
         for i, lp_i in (x for _, items in gathered for x in items):
