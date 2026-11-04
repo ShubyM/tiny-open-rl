@@ -282,6 +282,22 @@ proc.wait()
       with contextlib.suppress(OSError):
         os.kill(child_pid, 9)
 
+  async def test_a_single_gpu_trainer_process_serves_and_stops_on_sigterm(self):
+    env = {**os.environ, "REDIS_URL": self.url, "CUDA_VISIBLE_DEVICES": ""}
+    env.pop("LOCAL_RANK", None)
+    proc = subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", "solo"], env=env)
+    try:
+      for _ in range(200):
+        if await self.bus.lease_owner("solo") or proc.poll() is not None:
+          break
+        await asyncio.sleep(0.1)
+      self.assertIsNotNone(await self.bus.lease_owner("solo"), "the trainer took its worker's lease")
+      proc.terminate()
+      self.assertEqual(proc.wait(30), 0)
+    finally:
+      if proc.poll() is None:
+        proc.kill()
+
   async def test_a_sweep_deletes_only_what_the_registry_lets_go(self):
     store = Store(root=tempfile.mkdtemp())
     old = time.time() - SWEEP_GRACE_S - 60
