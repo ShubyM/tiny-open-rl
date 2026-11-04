@@ -55,6 +55,11 @@ def reap(proc: subprocess.Popen) -> None:
       os.killpg(proc.pid, signal.SIGKILL)
 
 
+# a trainer that sees the node's GPUs parks and resumes on its new one, saving a cold start
+def moves_itself(w: scheduler.Worker, gpus: int) -> bool:
+  return w.kind.role == "trainer" and w.kind.lora and len(w.gpus) == 1 and gpus > 1
+
+
 class NodeDaemon:
   def __init__(
     self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None, store: Store | None = None
@@ -86,6 +91,9 @@ class NodeDaemon:
       self.after = events[-1].id
     mine = {n: p for n, p in self.state.workers.items() if p.node == self.id and scheduler.members(self.state, n)}
     for worker, (gpus, proc) in list(self.procs.items()):
+      if worker in mine and proc.poll() is None and moves_itself(mine[worker], self.gpus) and len(gpus) == 1:
+        self.procs[worker] = (list(mine[worker].gpus), proc)
+        continue
       if proc.poll() is not None or worker not in mine or list(mine[worker].gpus) != gpus:
         proc.terminate()
         self.stopping[worker] = self.procs.pop(worker)[1]
@@ -150,6 +158,8 @@ class NodeDaemon:
       ",".join(f"{socket.gethostname()}:{g}" for g in gpus),
     )
     env["TINYRL_LORA"], env["TINYRL_BASE"] = str(int(k.lora)), k.base
+    if moves_itself(p, self.gpus):
+      env["CUDA_VISIBLE_DEVICES"], env["TINYRL_NODE"] = ",".join(map(str, range(self.gpus))), self.id
     mod = f"tinyrl.workers.{k.role}"
     if mod == "tinyrl.workers.trainer":
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")

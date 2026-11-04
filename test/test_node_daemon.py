@@ -95,6 +95,33 @@ class TestNodeDaemon(RedisTest):
     finally:
       scheduling.cancel()
 
+  async def test_a_single_gpu_trainer_moved_on_its_node_keeps_its_process(self):
+    await self.bus.create_run(Run("ra", "a", "base", 4))
+    daemon = NodeDaemon(self.bus, gpus=2, node="n", gpu_mib=0)
+    await daemon.announce_node()
+    await self.bus.append_event("placed", worker="a", node="n", gpus=[0], rule="test")
+    with patch("subprocess.Popen", side_effect=lambda *a, **kw: MagicMock(**{"poll.return_value": None})):
+      await daemon.tick()
+      proc = daemon.procs["a"][1]
+      self.assertEqual(daemon.procs["a"][0], [0])
+
+      await self.bus.append_event("placed", worker="a", node="n", gpus=[1], rule="test")
+      await daemon.tick()
+      proc.terminate.assert_not_called()
+      self.assertEqual(daemon.procs["a"][0], [1])
+
+      await self.bus.append_event("unplaced", worker="a")
+      await daemon.tick()
+      proc.terminate.assert_called_once()
+
+      await self.bus.create_run(Run("rb", "b", "base", 4))
+      await self.bus.append_event("placed", worker="b", node="n", gpus=[0], rule="test")
+      await daemon.tick()
+      proc2 = daemon.procs["b"][1]
+      await self.bus.append_event("placed", worker="b", node="m", gpus=[0], rule="test")
+      await daemon.tick()
+      proc2.terminate.assert_called_once()
+
   async def test_a_stopped_process_keeps_its_turn_until_it_exits(self):
     await self.bus.create_run(Run("ra", "a", "base", 4))
     daemon, proc = NodeDaemon(self.bus, gpus=1, node="n", gpu_mib=0), MagicMock(**{"poll.return_value": None})

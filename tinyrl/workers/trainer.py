@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import concurrent.futures
 import contextlib
 import enum
 import json
@@ -233,6 +234,10 @@ class Trainer:
   async def hold_gpu_for_batch(self, queued: int):
     """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back after the batch if the scheduler revoked it."""
     if await self.turn.wait_for_turn(queued):
+      if self.turn.gpu is not None:
+        import torch
+
+        await asyncio.to_thread(torch.cuda.set_device, self.turn.gpu)
       await asyncio.to_thread(self.model.resume_on_gpu)
     try:
       yield
@@ -284,6 +289,13 @@ class Trainer:
 
 
 async def main(worker: str) -> None:
+  import torch
+
+  if os.environ.get("TINYRL_NODE") and torch.cuda.is_available():
+    gpu = int(GPU.rsplit(":", 1)[1])
+    torch.cuda.set_device(gpu)
+    pool = concurrent.futures.ThreadPoolExecutor(1, initializer=torch.cuda.set_device, initargs=(gpu,))
+    asyncio.get_running_loop().set_default_executor(pool)
   trainer = Trainer(Bus(), worker)
   asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, trainer.stop)
   await trainer.serve()
