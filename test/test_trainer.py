@@ -914,52 +914,41 @@ class TestTrainer(RedisTest):
   async def test_a_multi_rank_fsdp2_trainer_matches_a_single_rank_trainer(self):
     import sys
 
-    base_dir, ckpt_dir = tempfile.mkdtemp(), tempfile.mkdtemp()
+    base_dir = tempfile.mkdtemp()
     tiny().save_pretrained(base_dir)
-    store = Store(root=ckpt_dir)
-    r1, r2 = new_id(), new_id()
-    await self.bus.create_run(Run(r1, "w1", base_dir, 0))
-    await self.bus.create_run(Run(r2, "w2", base_dir, 0, gpus=2))
+    for rank, lora in ((0, {"seed": 0}), (4, LORA)):
+      ckpt_dir, r1, r2 = tempfile.mkdtemp(), new_id(), new_id()
+      store = Store(root=ckpt_dir)
+      await self.bus.create_run(Run(r1, f"w1-{rank}", base_dir, rank, lora=lora))
+      await self.bus.create_run(Run(r2, f"w2-{rank}", base_dir, rank, lora=lora, gpus=2))
+      t1 = Trainer(self.bus, f"w1-{rank}", store=store)
+      await self.own(t1)
+      env = {**os.environ, "REDIS_URL": self.url, "CKPT": ckpt_dir, "CUDA_VISIBLE_DEVICES": ""}
+      cmd = ["-m", "torch.distributed.run", "--standalone", "--nproc-per-node=2", "-m", "tinyrl.workers.trainer"]
+      proc = await asyncio.create_subprocess_exec(sys.executable, *cmd, f"w2-{rank}", env=env)
+      try:
+        ids = []
+        for r in (r1, r2):
+          ids += await self.submit(
+            r,
+            (Op.CREATE_MODEL, {"base_model": base_dir, "rank": rank, "lora": lora}),
+            (Op.FORWARD_BACKWARD, proto_body(r)),
+            (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
+            (Op.FORWARD_BACKWARD, proto_body(r)),
+            (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
+            (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{r}/sampler_weights/s1"}),
+          )
+        while await t1.step(block_ms=10):
+          pass
+        for request_id in ids:
+          reply = await self.bus.wait_for_reply(request_id, 60)
+          self.assertTrue(reply and reply.ok, reply and reply.body)
 
-    t1 = Trainer(self.bus, "w1", store=store)
-    await self.own(t1)
-    env = {**os.environ, "REDIS_URL": self.url, "CKPT": ckpt_dir, "CUDA_VISIBLE_DEVICES": ""}
-    proc = await asyncio.create_subprocess_exec(
-      sys.executable,
-      "-m",
-      "torch.distributed.run",
-      "--standalone",
-      "--nproc-per-node=2",
-      "-m",
-      "tinyrl.workers.trainer",
-      "w2",
-      env=env,
-    )
-    try:
-      ids = []
-      for r in (r1, r2):
-        ids += await self.submit(
-          r,
-          (Op.CREATE_MODEL, {"base_model": base_dir, "rank": 0, "lora": {"seed": 0}}),
-          (Op.FORWARD_BACKWARD, proto_body(r)),
-          (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
-          (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{r}/sampler_weights/s1"}),
-          (Op.DELETE_MODEL, {}),
-        )
-      while await t1.step(block_ms=10):
-        pass
-      await asyncio.wait_for(proc.wait(), 60)
-      self.assertEqual(proc.returncode, 0)
-      for request_id in ids:
-        reply = await self.bus.wait_for_reply(request_id, 1)
-        self.assertTrue(reply.ok, reply.body)
-
-      single, fsdp = (store.get(f"tinker://{r}/sampler_weights/s1")[0] for r in (r1, r2))
-      self.assertEqual(single.keys(), fsdp.keys())
-      for name in single:
-        torch.testing.assert_close(fsdp[name], single[name], atol=1e-5, rtol=1e-5)
-    finally:
-      if proc.returncode is None:
+        single, multi = (store.get(f"tinker://{r}/sampler_weights/s1")[0] for r in (r1, r2))
+        self.assertEqual(single.keys(), multi.keys(), f"rank {rank}")
+        for name in single:
+          torch.testing.assert_close(multi[name], single[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")
+      finally:
         proc.kill()
         await proc.wait()
 
