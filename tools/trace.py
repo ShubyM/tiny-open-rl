@@ -75,9 +75,13 @@ def system_view(events: list, t0: float) -> list:
       case "batch_done":
         start = e.t - b.get("seconds", 0.0)
         span(w, "batch", start, e.t, {"queued": b.get("queued")})
-        for op, ms in b.get("ops", []):  # logs from before spans: commands in the order they ran, back to back
-          span(w, op, start, start + ms / 1000)
-          start += ms / 1000
+        ops = b.get("ops", [])  # logs from before spans: a trainer's commands, in the order they ran, back to back
+        if (
+          sum(ms for _, ms in ops) <= b.get("seconds", 0.0) * 1000 * 1.01
+        ):  # a sampler's ran at once, so they don't fit and aren't drawn
+          for op, ms in ops:
+            span(w, op, start, start + ms / 1000)
+            start += ms / 1000
       case "placed" | "unplaced" | "revoked" | "idle":
         out.append(
           {
