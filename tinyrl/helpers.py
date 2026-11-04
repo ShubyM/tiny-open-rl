@@ -1,14 +1,8 @@
 import functools
 import os
-from typing import Any, TypeVar, overload
-
-T = TypeVar("T")
+from typing import Any
 
 
-@overload
-def getenv(key: str) -> int: ...
-@overload
-def getenv(key: str, default: T) -> T: ...
 @functools.cache
 def getenv(key: str, default: Any = 0):
   """Read an environment variable, converted to the type of its default."""

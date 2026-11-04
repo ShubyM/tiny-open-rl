@@ -12,7 +12,6 @@ import contextlib
 import enum
 import json
 import os
-import signal
 import socket
 import sys
 import time
@@ -274,6 +273,13 @@ class Trainer:
 
 
 async def main(worker: str) -> None:
+  if "LOCAL_RANK" in os.environ:
+    import ctypes
+    import signal
+
+    with contextlib.suppress(Exception):
+      ctypes.CDLL(None).prctl(1, signal.SIGKILL)
+
   if torch.cuda.is_available() and ("LOCAL_RANK" in os.environ or "TINYRL_NODE" in os.environ):
     gpu = int(os.environ.get("LOCAL_RANK") or GPU.rsplit(":", 1)[1])
     torch.cuda.set_device(gpu)
