@@ -17,6 +17,9 @@ import socket
 import sys
 import time
 
+import torch
+import torch.distributed as dist
+
 from tinyrl.api import wire
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Op, Reply
 from tinyrl.control.turns import IDLE_MS, GpuTurn
@@ -52,30 +55,39 @@ def enqueue_cmds(queue: collections.deque[Cmd], cmds: list[Cmd], lora: bool) -> 
   if not lora:
     queue.extend(cmds)
     return
-  blocked = {x.run for x in queue}
-  front, back = [], []
+  blocked, front, back = {x.run for x in queue}, [], []
   for c in cmds:
-    if c.op == Op.SAVE_WEIGHTS_FOR_SAMPLER and c.run not in blocked:
-      front.append(c)
-    else:
+    (front if c.op == Op.SAVE_WEIGHTS_FOR_SAMPLER and c.run not in blocked else back).append(c)
+    if c.op != Op.SAVE_WEIGHTS_FOR_SAMPLER:
       blocked.add(c.run)
-      back.append(c)
   queue.extendleft(reversed(front))
   queue.extend(back)
 
 
+def serve_follower(model: Model) -> None:
+  while True:
+    dist.broadcast_object_list(msg := [None], src=0)
+    if msg[0][0] == "stop":
+      return
+    with contextlib.suppress(Exception):
+      getattr(model, msg[0][0])(*msg[0][1])
+
+
 class Trainer:
   def __init__(self, bus: Bus, worker: str, model: Model | None = None, owner: str = "", store: Store | None = None):
-    self.bus = bus
-    self.registry = Registry(bus)
-    self.worker = worker
+    self.bus, self.registry, self.worker = bus, Registry(bus), worker
     self.model = model if model is not None else Model()
     self.store = store if store is not None else Store()
     self.owner = owner or f"{socket.gethostname()}-{os.getpid()}-{os.urandom(3).hex()}"
     self.stopping: Stop | None = None
     self.turn = GpuTurn(bus, worker, bool(GPU))
     self.queue: collections.deque[Cmd] = collections.deque()
-    self.revoked_turn = False
+    self.revoked_turn, self.world_size = False, int(os.environ.get("WORLD_SIZE", 1))
+
+  def call_model(self, method: str, *args):
+    if self.world_size > 1:
+      dist.broadcast_object_list([(method, args)], src=0)
+    return None if method == "stop" else getattr(self.model, method)(*args)
 
   async def serve(self) -> None:
     await self.wait_for_lease()
@@ -91,11 +103,13 @@ class Trainer:
     finally:
       renewing.cancel()
       await self.release_gpu_and_worker()
+      if self.world_size > 1:
+        await asyncio.to_thread(self.call_model, "stop")
 
   async def release_gpu_and_worker(self) -> None:
     """Hand the GPU back with nothing of ours left on it, then the worker to its next trainer."""
     if self.turn.held and self.turn.shared:
-      await asyncio.to_thread(self.model.park_on_host)
+      await asyncio.to_thread(self.call_model, "park_on_host")
     await self.turn.give_turn_back()
     await self.bus.release_lease(self.worker, self.owner)
 
@@ -127,30 +141,28 @@ class Trainer:
 
   async def park_every_run(self) -> None:
     for run in list(self.model.params):
-      uri, (tensors, meta) = f"tinker://{run}/parked/{time.time_ns()}", self.model.training_state(run)
+      uri = f"tinker://{run}/parked/{time.time_ns()}"
+      tensors, meta = await asyncio.to_thread(self.call_model, "training_state", run)
       await asyncio.to_thread(self.store.put, uri, tensors, meta)
-      await self.registry.register_checkpoint(
-        uri, sum(map(nbytes, tensors.values())), owned=True, version=self.store.versions.get(uri)
-      )
+      ver = self.store.versions.get(uri)
+      await self.registry.register_checkpoint(uri, sum(map(nbytes, tensors.values())), owned=True, version=ver)
       await self.bus.set_parked_checkpoint(run, uri, self.worker, self.owner)
 
   async def restore_missing_run(self, cmd: Cmd) -> None:
     """Bring back a run this trainer doesn't hold: from the state its last trainer saved when it stopped, or empty, for load_weights to fill. A run whose trainer died without saving it can't go on from where it was."""
     run, uri = await self.bus.get_run(cmd.run), await self.bus.parked_checkpoint(cmd.run)
     if not uri and cmd.op not in (Op.LOAD_WEIGHTS, Op.DELETE_MODEL):
-      raise KeyError(
-        f"model {cmd.run} lost its unsaved steps when its trainer stopped. load_state to go on from a checkpoint"
-      )
-    await asyncio.to_thread(self.model.create_run, cmd.run, run["base"], run["rank"], run.get("lora", {}))
+      raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
+    await asyncio.to_thread(self.call_model, "create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
     try:
       if uri:
         version = (await self.registry.get_checkpoint(uri) or {}).get("version")
         tensors, meta = await asyncio.to_thread(self.store.get, uri, version)
-        await asyncio.to_thread(self.model.restore_run, cmd.run, tensors, meta, True)
+        await asyncio.to_thread(self.call_model, "restore_run", cmd.run, tensors, meta, True)
         if await self.bus.set_parked_checkpoint(cmd.run, None, self.worker, self.owner):
           await self.registry.unregister_checkpoints(uri)  # the node daemons' sweeps delete it
     except Exception:
-      await asyncio.to_thread(self.model.delete_run, cmd.run)
+      await asyncio.to_thread(self.call_model, "delete_run", cmd.run)
       raise
 
   async def answer_command(self, cmd: Cmd) -> Reply:
@@ -167,11 +179,9 @@ class Trainer:
     # off the event loop, so redis stays responsive
     reply, size = await asyncio.to_thread(self.run_command, cmd, version)
     if reply.ok and cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):  # registered before the reply lands
-      args = json.loads(cmd.body)
-      saved = self.store.versions.get(args["uri"])
-      await self.registry.register_checkpoint(
-        args["uri"], size, args.get("ttl_seconds"), args.get("owned", False), saved
-      )
+      a = json.loads(cmd.body)
+      ver = self.store.versions.get(a["uri"])
+      await self.registry.register_checkpoint(a["uri"], size, a.get("ttl_seconds"), a.get("owned", False), ver)
     return reply
 
   async def fail_stranded_commands(self, min_idle_ms: int) -> None:
@@ -225,8 +235,7 @@ class Trainer:
           if self.stopping is None and not self.revoked_turn:
             if cmd.op == Op.OPTIM_STEP:
               await asyncio.sleep(0.015)
-            more = await self.bus.take_commands(self.worker, self.owner, count, 0)
-            enqueue_cmds(self.queue, more, True)
+            enqueue_cmds(self.queue, await self.bus.take_commands(self.worker, self.owner, count, 0), True)
       await self.turn.report_batch_done(queued=len(self.queue), seconds=time.time() - batch_start, ops=ops)
     return processed
 
@@ -235,10 +244,8 @@ class Trainer:
     """Hold the GPU for one batch. Waits for this trainer's turn and brings its tensors back, then gives the turn back after the batch if the scheduler revoked it."""
     if await self.turn.wait_for_turn(queued):
       if self.turn.gpu is not None:
-        import torch
-
         await asyncio.to_thread(torch.cuda.set_device, self.turn.gpu)
-      await asyncio.to_thread(self.model.resume_on_gpu)
+      await asyncio.to_thread(self.call_model, "resume_on_gpu")
     try:
       yield
     finally:
@@ -248,39 +255,38 @@ class Trainer:
     revoked = self.revoked_turn or await self.turn.was_revoked()
     self.revoked_turn = False
     if revoked:
-      await asyncio.to_thread(self.model.park_on_host)
+      await asyncio.to_thread(self.call_model, "park_on_host")
       await self.turn.give_turn_back()
 
   def run_command(self, cmd: Cmd, version: str | None = None) -> tuple[Reply, int]:
     """Run one command on the model, loading `version` of a checkpoint. Returns the reply, which a failure becomes instead of an exception, and the bytes a save wrote."""
-    model, size = self.model, 0
+    size = 0
     try:
       if cmd.op == Op.FORWARD_BACKWARD:
         req = wire.parse(cmd.body)
         data, loss_fn, config = wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req)
-        logprobs, metrics = model.forward_backward(cmd.run, data, loss_fn, config, req.forward_only)
+        logprobs, metrics = self.call_model("forward_backward", cmd.run, data, loss_fn, config, req.forward_only)
         return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), 0
 
       args = json.loads(cmd.body)
       match cmd.op:
         case Op.CREATE_MODEL:
-          model.create_run(cmd.run, args["base_model"], args["rank"], args["lora"])
+          self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
         case Op.OPTIM_STEP:
-          return ok({"type": cmd.op, "metrics": model.optim_step(cmd.run, args["adam_params"])}), 0
+          return ok({"type": cmd.op, "metrics": self.call_model("optim_step", cmd.run, args["adam_params"])}), 0
         case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
-          tensors, meta = model.training_state(cmd.run) if cmd.op == Op.SAVE_WEIGHTS else model.sampler_weights(cmd.run)
+          fn = "training_state" if cmd.op == Op.SAVE_WEIGHTS else "sampler_weights"
+          tensors, meta = self.call_model(fn, cmd.run)
           self.store.put(args["uri"], tensors, meta)
           size = sum(map(nbytes, tensors.values()))
         case Op.LOAD_WEIGHTS:
-          model.restore_run(cmd.run, *self.store.get(args["uri"], version), args["optimizer"])
+          self.call_model("restore_run", cmd.run, *self.store.get(args["uri"], version), args["optimizer"])
         case Op.DELETE_MODEL:
-          model.delete_run(cmd.run)
+          self.call_model("delete_run", cmd.run)
         case _:
           raise ValueError(f"unknown op {cmd.op}")
 
-      reply = {"type": cmd.op, "model_id": cmd.run}
-      if "uri" in args:
-        reply["path"] = args["uri"]
+      reply = {"type": cmd.op, "model_id": cmd.run, **({"path": args["uri"]} if "uri" in args else {})}
       if "sampling_session_id" in args:
         reply["sampling_session_id"] = args["sampling_session_id"]
       return ok(reply), size
@@ -289,16 +295,24 @@ class Trainer:
 
 
 async def main(worker: str) -> None:
-  import torch
-
-  if os.environ.get("TINYRL_NODE") and torch.cuda.is_available():
-    gpu = int(GPU.rsplit(":", 1)[1])
+  if torch.cuda.is_available() and ("LOCAL_RANK" in os.environ or "TINYRL_NODE" in os.environ):
+    gpu = int(os.environ.get("LOCAL_RANK") or GPU.rsplit(":", 1)[1])
     torch.cuda.set_device(gpu)
     pool = concurrent.futures.ThreadPoolExecutor(1, initializer=torch.cuda.set_device, initargs=(gpu,))
     asyncio.get_running_loop().set_default_executor(pool)
-  trainer = Trainer(Bus(), worker)
-  asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, trainer.stop)
-  await trainer.serve()
+  if int(os.environ.get("WORLD_SIZE", 1)) > 1:
+    dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
+    dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", device_id=dev)
+  try:
+    if dist.is_initialized() and dist.get_rank() > 0:
+      serve_follower(Model())
+      return
+    trainer = Trainer(Bus(), worker)
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, trainer.stop)
+    await trainer.serve()
+  finally:
+    if dist.is_initialized():
+      dist.destroy_process_group()
 
 
 if __name__ == "__main__":

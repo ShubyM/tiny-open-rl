@@ -901,6 +901,58 @@ class TestTrainer(RedisTest):
     processed3 = await t.step(count=10, block_ms=10)
     self.assertEqual(processed3, 0)
 
+  async def test_a_multi_rank_fsdp2_trainer_matches_a_single_rank_trainer(self):
+    import sys
+
+    base_dir, ckpt_dir = tempfile.mkdtemp(), tempfile.mkdtemp()
+    tiny().save_pretrained(base_dir)
+    store = Store(root=ckpt_dir)
+    r1, r2 = new_id(), new_id()
+    await self.bus.create_run(Run(r1, "w1", base_dir, 0))
+    await self.bus.create_run(Run(r2, "w2", base_dir, 0, gpus=2))
+
+    t1 = Trainer(self.bus, "w1", store=store)
+    await self.own(t1)
+    env = {**os.environ, "REDIS_URL": self.url, "CKPT": ckpt_dir, "CUDA_VISIBLE_DEVICES": ""}
+    proc = await asyncio.create_subprocess_exec(
+      sys.executable,
+      "-m",
+      "torch.distributed.run",
+      "--standalone",
+      "--nproc-per-node=2",
+      "-m",
+      "tinyrl.workers.trainer",
+      "w2",
+      env=env,
+    )
+    try:
+      for r in (r1, r2):
+        await self.submit(
+          r,
+          (Op.CREATE_MODEL, {"base_model": base_dir, "rank": 0, "lora": {"seed": 0}}),
+          (Op.FORWARD_BACKWARD, proto_body(r)),
+          (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
+          (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{r}/sampler_weights/s1"}),
+          (Op.DELETE_MODEL, {}),
+        )
+      while await t1.step(block_ms=10):
+        pass
+      await asyncio.wait_for(proc.wait(), 60)
+      self.assertEqual(proc.returncode, 0)
+
+      for name in ("embed_tokens.weight", "layers.0.self_attn.q_proj.weight", "lm_head.weight"):
+        w_single = store.get(f"tinker://{r1}/sampler_weights/s1")[0][
+          f"model.{name}" if name != "lm_head.weight" else name
+        ]
+        w_fsdp = store.get(f"tinker://{r2}/sampler_weights/s1")[0][
+          f"model.{name}" if name != "lm_head.weight" else name
+        ]
+        torch.testing.assert_close(w_fsdp, w_single, atol=1e-5, rtol=1e-5)
+    finally:
+      if proc.returncode is None:
+        proc.kill()
+        await proc.wait()
+
 
 class TestCheckpointNames(unittest.TestCase):
   def test_a_multimodal_checkpoint_trains_under_its_own_parameter_names(self):

@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir "peft>=0.15" "redis>=7.1" fsspec gcsfs
 # Prebuilt for the image's CUDA 13.0 and torch 2.13 on the Astral GPU index, so nothing compiles here
 RUN pip install --no-cache-dir --no-deps causal-conv1d==1.7.0+cu.13.0.torch.2.13 flash-linear-attention fla-core \
   --extra-index-url https://wheels.astral.sh/simple/cu130/
-RUN pip install --no-cache-dir --no-deps liger-kernel
+RUN pip install --no-cache-dir --no-deps liger-kernel nemo-automodel==0.7.0
 
 WORKDIR /app
 COPY pyproject.toml README.md ./
