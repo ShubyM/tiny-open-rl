@@ -62,7 +62,7 @@ def serve_follower(model: Model) -> None:
     dist.broadcast_object_list(msg := [None], src=0)
     if msg[0][0] == "stop":
       return
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(ValueError, KeyError):  # rejected the same way on every rank, before any collective
       getattr(model, msg[0][0])(*msg[0][1])
 
 
@@ -80,7 +80,13 @@ class Trainer:
   def call_model(self, method: str, *args):
     if self.world_size > 1:
       dist.broadcast_object_list([(method, args)], src=0)
-    return None if method == "stop" else getattr(self.model, method)(*args)
+    try:
+      return None if method == "stop" else getattr(self.model, method)(*args)
+    except Exception as e:
+      # the other ranks may be waiting in a collective this rank left, so torchrun restarts them all
+      if self.world_size > 1 and not isinstance(e, (ValueError, KeyError)):
+        os._exit(1)
+      raise
 
   async def serve(self) -> None:
     await self.wait_for_lease()
@@ -96,8 +102,9 @@ class Trainer:
         await self.park_every_run()
     finally:
       renewing.cancel()
-      await self.release_gpu_and_worker()
-      if self.world_size > 1:
+      try:
+        await self.release_gpu_and_worker()
+      finally:
         await asyncio.to_thread(self.call_model, "stop")
 
   async def release_gpu_and_worker(self) -> None:

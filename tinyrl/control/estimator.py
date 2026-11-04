@@ -50,8 +50,7 @@ def estimate(
 
 @functools.lru_cache
 def gpus(repo: str, mode: str) -> int:
-  if "/" not in repo or "://" in repo or os.path.exists(repo):
-    return 1
   with contextlib.suppress(Exception):
-    return estimate(repo, mode)[1] or 1
+    if "/" in repo and "://" not in repo and not os.path.exists(repo):
+      return estimate(repo, mode)[1] or 1
   return 1
