@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import math
 import os
 from collections.abc import Callable
@@ -17,6 +19,12 @@ from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from tinyrl.api import wire
 from tinyrl.helpers import getenv
 from tinyrl.storage import models
+
+LigerFusedLinearCrossEntropyLoss = apply_liger = None
+with contextlib.suppress(ImportError):
+  logging.getLogger("liger_kernel").setLevel(logging.ERROR)
+  from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+  from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance as apply_liger
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
@@ -109,7 +117,8 @@ def batches(lengths: list[int], budget: int) -> list[list[int]]:
 
 def pad(rows: list[np.ndarray], lengths: list[int], dtype, device: torch.device) -> torch.Tensor:
   """Right-pad rows with zeros into one [rows, max(lengths)] tensor, keeping the first lengths[i] values of row i."""
-  out = np.zeros((len(rows), max(lengths)), dtype)
+  width = -(-max(lengths) // 128) * 128 if device.type == "cuda" else max(lengths)
+  out = np.zeros((len(rows), width), dtype)
   for i, (row, n) in enumerate(zip(rows, lengths)):
     out[i, :n] = row[:n]
   return torch.from_numpy(out).to(device)
@@ -139,6 +148,12 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
   hidden = out.hidden_states[-1].flatten(0, 1)
   head = lm.get_output_embeddings()
   softcap = getattr(lm.config.get_text_config(), "final_logit_softcapping", None)  # gemma caps its logits
+
+  if lm.device.type == "cuda" and type(head) is torch.nn.Linear and LigerFusedLinearCrossEntropyLoss:
+    w, b = head.weight.to(hidden.dtype), head.bias.to(hidden.dtype) if head.bias is not None else None
+    return -LigerFusedLinearCrossEntropyLoss(reduction="none", softcap=softcap)(w, hidden, targets.flatten(), b).view(
+      targets.shape
+    )
 
   def chunk_logprobs(h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     logits = head(h)
@@ -207,6 +222,8 @@ class Model:
           if child != "language_model":
             setattr(inner, child, None)
       self.dtype = self.lm.dtype
+      if self.lm.device.type == "cuda" and apply_liger:
+        apply_liger(model=self.lm, cross_entropy=False, fused_linear_cross_entropy=False)
       if not self.lora:
         self.lm.float()  # a full fine-tune updates fp32 master weights. Its forward pass runs in bf16, under autocast
       if should_checkpoint_layers(self.lm, self.lora):
@@ -232,7 +249,8 @@ class Model:
       lora_dropout=config.get("lora_dropout", 0.05),
       target_modules=lora_targets(self.lm, config),
     )
-    self.lm.add_adapter(adapter, adapter_name=run)
+    with torch.device(self.lm.device):
+      self.lm.add_adapter(adapter, adapter_name=run)
     infix = f".{run}."
     self.params[run] = {name.replace(infix, "."): p for name, p in self.lm.named_parameters() if infix in name}
     for p in self.params[run].values():
