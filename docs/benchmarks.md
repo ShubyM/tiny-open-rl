@@ -11,7 +11,8 @@ All runs execute the 23-job benchmark (`3 steps` per job across `13` Qwen3-0.6B 
 | E23 (Liger kernels + 128-token CUDA pad + GPU adapter init) | `hc-liger1` | 5 | `149.3, 152.2, 150.5, 153.1, 160.0` | `152.2` | `153.0` | `149.3` |
 | E24 (E23 + parallel host slab pin + size-balanced shards + drop `self.lm`) | `hc-stack2` | 2 | `185.3, 142.5` | `163.9` | `163.9` | `142.5` |
 | E25a (E24 + in-place move on all single-GPU trainers, reverted) | `hc-stack3` | 2 | `177.5, 179.3` | `178.4` | `178.4` | `177.5` |
-| E25b (E24 + in-place move restricted to `w.kind.lora`) | `hc-stack4` | 3 | `150.0, 140.7, 150.6` | `150.0` | `147.1` | `140.7` |
+| E25b (E24 + in-place move restricted to `w.kind.lora`, with `MADV_HUGEPAGE`) | `hc-stack4` | 3 | `150.0, 140.7, 150.6` | `150.0` | `147.1` | `140.7` |
+| E25c (E25b without `MADV_HUGEPAGE` in `pinned_bytes`) | `hc-stack5` | 2 | `136.9, 133.3` | `135.1` | `135.1` | `133.3` |
 
 ## Per-group completion times (`report.md`)
 
@@ -77,6 +78,26 @@ Each table shows `first step done (median s) | last step done (median / max s) |
 | `gemma-lora` | 6 | 73 | 102 / 103 | 14 |
 | `qwen-lora` | 13 | 106 | 148 / 151 | 20 |
 
+### E25c `hc-stack5` run 1 (`btn-063244`, makespan `136.9 s`, Jain `0.950`)
+
+| Group | Jobs | First step done (s) | Last step done (med / max s) | Step time (med s) |
+|---|---|---|---|---|
+| `gemma-fft-x` | 1 | 89 | 115 / 115 | 13 |
+| `gemma-fft-ts` | 1 | 85 | 125 / 125 | 20 |
+| `qwen-fft-ts` | 2 | 49 | 81 / 104 | 8 |
+| `gemma-lora` | 6 | 82 | 123 / 125 | 16 |
+| `qwen-lora` | 13 | 79 | 128 / 137 | 26 |
+
+### E25c `hc-stack5` run 2 (`btn-063547`, makespan `133.3 s`, Jain `0.904`)
+
+| Group | Jobs | First step done (s) | Last step done (med / max s) | Step time (med s) |
+|---|---|---|---|---|
+| `gemma-fft-x` | 1 | 85 | 115 / 115 | 15 |
+| `gemma-fft-ts` | 1 | 86 | 120 / 120 | 17 |
+| `qwen-fft-ts` | 2 | 39 | 53 / 54 | 7 |
+| `gemma-lora` | 6 | 70 | 96 / 102 | 13 |
+| `qwen-lora` | 13 | 77 | 127 / 133 | 21 |
+
 ## Where the 140.7 s goes in `btn-052156` (and why `btn-052516` took 150.6 s)
 
 ### Client view summed over 3 steps (`btn-052156` vs `btn-052516`, medians in seconds)
@@ -113,7 +134,33 @@ In `btn-052516`, at `t = 46.07 s`, both Gemma-4-E2B full-FT trainers (`w121659` 
 2. During that same window (`t = 48.26 s` to `t = 74.33 s`), `w121667` (`trai-qwen-fftx1` on GPU 2) stalled `14.79 s` in `save_weights` (`7.2 GiB`) and `11.25 s` in `park_on_host` waiting on host pinning and `cudaHostRegister`.
 3. `w121677` (`trai-qwen-lorax13`), which had moved in place onto GPU 2 in `0.55 s` at `t = 30.22 s`, requested GPU 2 at `t = 53.54 s` and waited `20.8 s` until `w121667` finished parking at `t = 74.33 s`, pushing `qwen-lora` completion from `138.5 s` (`btn-052156`) to `150.6 s` (`btn-052516`).
 
-Removing `m.madvise(mmap.MADV_HUGEPAGE)` in `pinned_bytes` pins `2 x 36 GiB` concurrently on GPUs 6 and 7 in `4.23 s` to `4.30 s` with `0` `compact_stall` events.
+Removing `m.madvise(mmap.MADV_HUGEPAGE)` in `pinned_bytes` pins `2 x 36 GiB` concurrently on GPUs 6 and 7 in `4.23 s` to `4.30 s` with `0` `compact_stall` events. In `E25c` (`hc-stack5`, `btn-063244` and `btn-063547`), step 1 `optim_step` dropped to `5.14 s` and `5.25 s` in run 1 and `7.37 s` and `7.43 s` in run 2, `gemma-fft-x` finished at `115.0 s` and `114.7 s`, `gemma-fft-ts` finished at `125.1 s` and `120.2 s`, `qwen-lora` `train` dropped to `21.9 s` and `20.1 s`, and overall 23-job makespan dropped to `136.9 s` and `133.3 s` (`135.1 s` mean and median).
+
+### Per-worker GPU accounting (`btn-063547`, `133.3 s`)
+
+| Worker | Role and group | Moves | `move_s` | `wait_s` | `hold_s` | `busy_s` |
+|---|---|---|---|---|---|---|
+| `w122898` | `trai-gemma-fft-xx1` | 0 | 0.0 | 0.0 | 101.3 | 71.2 |
+| `w122894` | `trai-gemma-fftx1` | 0 | 0.0 | 0.0 | 107.0 | 72.5 |
+| `w122918` | `trai-qwen-lorax13` | 1 | 22.9 | 0.0 | 91.9 | 61.7 |
+| `w122906` | `trai-gemma-lorax6` | 1 | 3.4 | 1.0 | 67.5 | 52.1 |
+| `w122901` | `trai-qwen-fftx1` | 0 | 0.0 | 0.7 | 32.9 | 12.4 |
+| `w122910` | `trai-qwen-fftx1` | 0 | 0.0 | 0.0 | 34.7 | 12.6 |
+| `w122986` | `samp-qwen-lorax52` | 0 | 0.0 | 0.0 | 104.9 | 95.0 |
+| `w123064` | `samp-gemma-lorax24` | 0 | 0.0 | 0.0 | 65.9 | 50.5 |
+| `w123045` | `samp-gemma-fft-xx4` | 0 | 0.0 | 1.1 | 79.7 | 18.2 |
+| `w123042` | `samp-gemma-fftx4` | 0 | 0.0 | 0.0 | 86.1 | 23.0 |
+| `w122976` | `samp-qwen-fftx8` | 0 | 0.0 | 0.0 | 28.4 | 19.8 |
+
+### Client view summed over 3 steps (`btn-063244` `136.9 s` and `btn-063547` `133.3 s`, medians in seconds)
+
+| Group | `btn-063244` save | `btn-063244` train | `btn-063244` sample | `btn-063244` end | `btn-063547` save | `btn-063547` train | `btn-063547` sample | `btn-063547` end |
+|---|---|---|---|---|---|---|---|---|
+| `gemma-fft-ts` | 16.9 | 24.7 | 20.8 | 125.1 | 9.2 | 28.3 | 20.3 | 120.2 |
+| `gemma-fft-x` | 7.8 | 23.8 | 16.8 | 115.0 | 8.3 | 28.0 | 16.5 | 114.7 |
+| `gemma-lora` | 1.4 | 38.7 | 33.1 | 124.9 | 0.7 | 21.6 | 31.7 | 102.5 |
+| `qwen-fft-ts` | 4.0 | 45.4 | 17.3 | 103.8 | 1.2 | 8.5 | 15.0 | 53.6 |
+| `qwen-lora` | 1.6 | 21.9 | 67.4 | 136.9 | 1.5 | 20.1 | 71.2 | 133.3 |
 
 ## Full hillclimb decision log (`decision.tsv`)
 
@@ -149,3 +196,4 @@ Removing `m.madvise(mmap.MADV_HUGEPAGE)` in `pinned_bytes` pins `2 x 36 GiB` con
 | E24 | Stack Commit 2 on E23 (`hc-stack2`, `n=2`) | Commit 1 + Commit 2 | `152.2 s` | `142.5 s` (`btn-050351`) | `-9.7 s` | kept | `gemma-fft-x` busy `98.8 s -> 65.7 s`, finish `149.3 s -> 116.4 s` |
 | E25a | Stack Commit 3 on all single-GPU trainers (`hc-stack3`) | `moves_itself` on all `len(gpus) == 1` trainers | `142.5 s` | `177.5 s` (`btn-050938`) | `+35.0 s` | reverted | `CUDA_VISIBLE_DEVICES=0..7` on full-FT stalled `36 GiB` `cudaHostRegister` (`51.4 s`) |
 | E25b | Restrict `moves_itself` to `w.kind.lora` (`hc-stack4`, `n=3`) | `w.kind.lora` in `moves_itself` | `157.1 s` mean (`main1`) | `147.1 s` mean (`140.7 s` best) | `-10.0 s` mean | kept | `qwen-lora` 2 moves in `0.9 s`, `gemma-lora` finish `103.6 s`, `23/23` OK |
+| E25c | Remove `MADV_HUGEPAGE` in `pinned_bytes` (`hc-stack5`, `n=2`) | Drop `m.madvise(mmap.MADV_HUGEPAGE)` | `147.1 s` (`hc-stack4`) | `135.1 s` (`136.9, 133.3 s`) | `-12.0 s` (`-22.0 s` vs `main1`) | kept | Step 1 `optim_step` `5.1-7.4 s`, `gemma-fft` finish `115-125 s`, `23/23` OK |
