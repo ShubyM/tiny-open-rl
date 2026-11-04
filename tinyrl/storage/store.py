@@ -39,7 +39,8 @@ CKPT = getenv("CKPT", "/tmp/tinyrl")
 CKPT_CACHE = getenv("CKPT_CACHE", "/tmp/tinyrl-cache")
 SHARD_BYTES = getenv("SHARD_BYTES", 256 * 1024 * 1024)  # a full checkpoint this big is written as parallel shards
 MAX_SHARDS = 16
-MAX_PIN_BYTES = getenv("MAX_PIN_BYTES", 24 * 1024**3)  # the most pinned host memory a save holds
+# a save copies GPU tensors off in pieces this big, through two pinned buffers per file
+STREAM_CHUNK = 256 * 1024 * 1024
 UPLOAD_WAIT_S = getenv("UPLOAD_WAIT_S", 900.0)  # how long a node waits for a version another node is uploading
 # trim_cache() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
 CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)
@@ -181,8 +182,8 @@ class Store:
     if not self.remote:
       self.base = os.path.realpath(self.base)
     self.cache = CKPT_CACHE if cache is None else cache
-    self.pinned: torch.Tensor | None = None  # reused by every save, since pinning host memory is slow
-    self.lock = threading.RLock()  # a save's tensors can be views of self.pinned until it is written
+    self.buffers: dict[int, list[torch.Tensor]] = {}  # shard -> pinned buffers its writer keeps, since pinning is slow
+    self.lock = threading.RLock()  # one save at a time, since saves share self.buffers
     self.uploading = threading.Lock()
     self.versions: dict[str, str] = {}  # uri -> the version this process last saved
     self.chains: dict[str, str] = {}  # run -> the last link of its chain this process saved
@@ -192,43 +193,53 @@ class Store:
 
   # ***** put *****
 
-  def copy_to_host(self, tensors: dict[str, torch.Tensor], is_cuda=lambda t: t.is_cuda) -> dict[str, torch.Tensor]:
-    """The tensors on the CPU. GPU tensors go through one pinned buffer, so the copy runs at DMA speed. When they all fit, they are views of it, else each streams through it in pieces into its own host tensor."""
+  def write_safetensors(self, i: int, path: str, tensors: dict[str, torch.Tensor], meta: dict) -> None:
+    """safetensors.torch.save_file, but GPU tensors stream through two pinned buffers, so each piece is written while the next copies off the GPU, and the save never holds a host copy of itself."""
     import torch
 
-    with self.lock:
-      gpu = {k for k, v in tensors.items() if is_cuda(v)}
-      out = {k: v.detach().cpu().contiguous() for k, v in tensors.items() if k not in gpu}
-      total = sum(aligned(nbytes(tensors[k])) for k in gpu)
-      if not total:
-        return out
-      size = min(total, MAX_PIN_BYTES)
-      if self.pinned is None or self.pinned.numel() < size:
-        self.pinned = None  # free the old buffer before pinning a bigger one
-        self.pinned = pinned_bytes(size)
-      sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
-      at = 0
-      for k in gpu:
-        src, v = as_bytes(tensors[k]), tensors[k]
-        if total <= MAX_PIN_BYTES:
-          self.pinned[at : at + len(src)].copy_(src, non_blocking=True)
-          out[k] = self.pinned[at : at + len(src)].view(v.dtype).view(v.shape)
-          at += aligned(len(src))
+    def dtype(d: torch.dtype) -> str:
+      kind = "BF" if d == torch.bfloat16 else "F" if d.is_floating_point else "U" if d == torch.uint8 else "I"
+      return "BOOL" if d == torch.bool else f"{kind}{d.itemsize * 8}"
+
+    head, at = {"__metadata__": meta}, 0
+    for k, v in tensors.items():
+      head[k] = {"dtype": dtype(v.dtype), "shape": list(v.shape), "data_offsets": [at, at + nbytes(v)]}
+      at += nbytes(v)
+    h = json.dumps(head).encode()
+    h += b" " * (-len(h) % 8)
+    gpu = next((v.device for v in tensors.values() if v.is_cuda), None)
+    if gpu is not None and i not in self.buffers:
+      self.buffers[i] = [pinned_bytes(STREAM_CHUNK) for _ in range(2)]
+    bufs, pending, j = self.buffers.get(i), [], 0
+    with open(path, "wb") as f, torch.cuda.device(-1 if gpu is None else gpu):
+      f.write(len(h).to_bytes(8, "little") + h)
+      stream = torch.cuda.Stream() if gpu is not None else None
+
+      def flush(keep: int) -> None:
+        while len(pending) > keep:
+          ev, n, buf = pending.pop(0)
+          ev.synchronize()
+          f.write(buf[:n].numpy())
+
+      for v in tensors.values():
+        src = as_bytes(v)
+        if not v.is_cuda:
+          flush(0)
+          f.write(src.numpy())
           continue
-        dst = torch.empty(len(src), dtype=torch.uint8)
-        for i in range(0, len(src), size):
-          piece = src[i : i + size]
-          self.pinned[: len(piece)].copy_(piece, non_blocking=True)
-          sync()
-          dst[i : i + len(piece)].copy_(self.pinned[: len(piece)])
-        out[k] = dst.view(v.dtype).view(v.shape)
-      sync()
-      return {k: out[k] for k in tensors}
+        stream.wait_stream(torch.cuda.current_stream())
+        src.record_stream(stream)
+        for piece in chunks(len(src), STREAM_CHUNK):
+          flush(1)  # write out the buffer this piece is about to reuse
+          buf, j = bufs[j % 2], j + 1
+          with torch.cuda.stream(stream):
+            buf[: piece.stop - piece.start].copy_(src[piece], non_blocking=True)
+            pending.append((torch.cuda.Event(), piece.stop - piece.start, buf))
+            pending[-1][0].record(stream)
+      flush(0)
 
   def write_checkpoint_files(self, folder: str, tensors: dict[str, torch.Tensor], info: dict) -> list[str]:
     """Write a checkpoint into folder, and return its file names, with the weights last."""
-    import safetensors.torch
-
     lora, cfg, total = info.get("lora"), info.get("config"), sum(map(nbytes, tensors.values()))
     n = max(1, min(MAX_SHARDS, len(tensors))) if not lora and total >= SHARD_BYTES else 1
     stem = ("adapter_model" if lora else "model") if cfg else "state"
@@ -249,7 +260,9 @@ class Store:
       with open(f"{folder}/{name}", "w") as f:
         json.dump(obj, f)
     meta = {"meta": json.dumps(info)}
-    parallel(lambda name, shard: safetensors.torch.save_file(shard, f"{folder}/{name}", metadata=meta), weights, shards)
+    parallel(
+      lambda i, name, shard: self.write_safetensors(i, f"{folder}/{name}", shard, meta), range(n), weights, shards
+    )
     return [*files, *weights]
 
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
@@ -263,7 +276,7 @@ class Store:
         version = self.chains[run] = f"{k}.{int(n) + 1}" if k and int(n) + 1 < KEYFRAME_EVERY else f"{version}.0"
       try:
         with self.lock:
-          names = self.write_checkpoint_files(folder, self.copy_to_host(tensors), dict(meta or {}))
+          names = self.write_checkpoint_files(folder, tensors, dict(meta or {}))
         os.rename(folder, f"{self.cache}/{version}")
       finally:
         shutil.rmtree(folder, ignore_errors=True)
@@ -280,7 +293,7 @@ class Store:
     link, prev = f"{folder}.link", f"{parent}/.{base}.prev"
     try:
       with self.lock:
-        self.write_checkpoint_files(folder, self.copy_to_host(tensors), dict(meta or {}))
+        self.write_checkpoint_files(folder, tensors, dict(meta or {}))
         cur = os.readlink(dest) if os.path.islink(dest) else None
         stale = os.readlink(prev) if os.path.islink(prev) else None
         os.symlink(os.path.basename(folder), link)
