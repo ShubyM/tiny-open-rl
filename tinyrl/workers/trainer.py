@@ -9,6 +9,7 @@ import asyncio
 import collections
 import concurrent.futures
 import contextlib
+import ctypes
 import enum
 import json
 import os
@@ -274,6 +275,10 @@ class Trainer:
 
 
 async def main(worker: str) -> None:
+  if "LOCAL_RANK" in os.environ:  # torchrun starts each rank in its own session, so a SIGKILL of its group misses them
+    with contextlib.suppress(Exception):
+      ctypes.CDLL(None).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG: die with torchrun
+
   if torch.cuda.is_available() and ("LOCAL_RANK" in os.environ or "TINYRL_NODE" in os.environ):
     gpu = int(os.environ.get("LOCAL_RANK") or GPU.rsplit(":", 1)[1])
     torch.cuda.set_device(gpu)

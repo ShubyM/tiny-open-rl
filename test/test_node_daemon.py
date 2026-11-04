@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import pathlib
@@ -249,6 +250,53 @@ class TestNodeDaemon(RedisTest):
       proc.poll.return_value = 0
       await daemon.tick()
     self.assertEqual([e.kind for e in await self.bus.read_events()][-2:], ["exited", "node_up"])
+
+  async def test_reap_kills_process_tree(self):
+    env = os.environ.copy()
+    env.update({"LOCAL_RANK": "0", "WORLD_SIZE": "1", "REDIS_URL": self.url})
+    script = """
+import subprocess, sys
+proc = subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", "dummy_worker"], start_new_session=True, stdout=sys.stdout)
+print(proc.pid, flush=True)
+proc.wait()
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+      f.write(script)
+    try:
+      parent = subprocess.Popen([sys.executable, f.name], env=env, stdout=subprocess.PIPE, start_new_session=True)
+      child_pid = int(parent.stdout.readline().decode().strip())
+      for _ in range(100):
+        if await self.bus.r.keys("tinyrl:owner:dummy_worker"):
+          break
+        await asyncio.sleep(0.1)
+
+      reap(parent)
+
+      await asyncio.sleep(0.5)
+      with self.assertRaises(OSError, msg="kernel killed child"):
+        os.kill(child_pid, 0)
+    finally:
+      os.unlink(f.name)
+      if parent.poll() is None:
+        reap(parent)
+      with contextlib.suppress(OSError):
+        os.kill(child_pid, 9)
+
+  async def test_a_single_gpu_trainer_process_serves_and_stops_on_sigterm(self):
+    env = {**os.environ, "REDIS_URL": self.url, "CUDA_VISIBLE_DEVICES": ""}
+    env.pop("LOCAL_RANK", None)
+    proc = subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", "solo"], env=env)
+    try:
+      for _ in range(200):
+        if await self.bus.lease_owner("solo") or proc.poll() is not None:
+          break
+        await asyncio.sleep(0.1)
+      self.assertIsNotNone(await self.bus.lease_owner("solo"), "the trainer took its worker's lease")
+      proc.terminate()
+      self.assertEqual(proc.wait(30), 0)
+    finally:
+      if proc.poll() is None:
+        proc.kill()
 
   async def test_a_sweep_deletes_only_what_the_registry_lets_go(self):
     store = Store(root=tempfile.mkdtemp())
