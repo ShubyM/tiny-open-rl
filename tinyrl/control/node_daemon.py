@@ -153,7 +153,7 @@ class NodeDaemon:
       ",".join(map(str, gpus)),
       ",".join(f"{socket.gethostname()}:{g}" for g in gpus),
     )
-    env["TINYRL_LORA"], env["TINYRL_BASE"] = str(int(k.lora)), k.base
+    env["TINYRL_LORA"], env["TINYRL_BASE"], env["TINYRL_WORKER"] = str(int(k.lora)), k.base, worker
     mod = f"tinyrl.workers.{k.role}"
     if mod == "tinyrl.workers.trainer":
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")

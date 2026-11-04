@@ -91,7 +91,10 @@ class VLLM:
       extra += ["--kv-cache-memory-bytes", KV_BYTES]
     flags += extra
     if spans.PROFILE:  # its engine records ops and kernels from boot to close, into the folder trainers write theirs to
-      config = {"profiler": "torch", "torch_profiler_dir": spans.PROFILE, "torch_profiler_with_stack": False}
+      # named for its worker, like trainers' traces
+      folder = f"{spans.PROFILE}/sampler-{os.environ.get('TINYRL_WORKER')}"
+      # kernels only: CPU ops would be most of a 2.8 GB trace
+      config = {"profiler": "torch", "torch_profiler_dir": folder, "torch_profiler_activities": ["CUDA"]}
       flags += ["--profiler-config", json.dumps(config)]
 
     def serve(*listen: str) -> list[str]:
