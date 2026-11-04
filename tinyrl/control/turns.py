@@ -26,6 +26,9 @@ class GpuTurn:
   async def wait_for_turn(self, queued: int) -> bool:
     """Wait for a grant. True if this call took the turn, so the worker brings its tensors back to the GPU."""
     if self.held:
+      if self.idle:
+        self.idle = False
+        await self.bus.append_event(Ev.WANTS_GPU, worker=self.worker, queued=queued)
       return False
     while True:
       asked = await self.bus.append_event(Ev.WANTS_GPU, worker=self.worker, queued=queued)

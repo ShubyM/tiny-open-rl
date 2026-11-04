@@ -224,11 +224,12 @@ class TestSampler(RedisTest):
         active -= 1
         return await super().sample(job, name)
 
+    store.local_folder = MagicMock(wraps=store.local_folder)
     sampler = Sampler(self.bus, "sampler:base", engine=BatchEngine, store=store)
     await self.own(sampler)
     ids = [await self.bus.submit_command("samp-1", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(8)]
     self.assertEqual(await sampler.step(block_ms=0), 8)
-    self.assertEqual((starts, loads, peak), (1, 1, 8))
+    self.assertEqual((starts, loads, peak, store.local_folder.call_count), (1, 1, 8, 1))
     self.assertTrue(all([(await self.bus.wait_for_reply(i, 1)).ok for i in ids]))
 
   async def test_vllm_retries_a_dropped_keepalive_socket(self):

@@ -13,6 +13,8 @@ All runs execute the 23-job benchmark (`3 steps` per job across `13` Qwen3-0.6B 
 | E25a (E24 + in-place move on all single-GPU trainers, reverted) | `hc-stack3` | 2 | `177.5, 179.3` | `178.4` | `178.4` | `177.5` |
 | E25b (E24 + in-place move restricted to `w.kind.lora`, with `MADV_HUGEPAGE`) | `hc-stack4` | 3 | `150.0, 140.7, 150.6` | `150.0` | `147.1` | `140.7` |
 | E25c (E25b without `MADV_HUGEPAGE` in `pinned_bytes`) | `hc-stack5` | 2 | `136.9, 133.3` | `135.1` | `135.1` | `133.3` |
+| E26 (E25c + staged checkpoint reuse + 3-run LoRA sampler waves) | `hc-samp1` | 2 | `147.5, 132.6` | `140.1` | `140.1` | `132.6` |
+| E27 (E26 + clear stale `GpuTurn.idle` on holder resume) | `hc-samp2` | 2 | `145.1, 127.4` | `136.2` | `136.2` | `127.4` |
 
 ## Per-group completion times (`report.md`)
 
@@ -97,6 +99,26 @@ Each table shows `first step done (median s) | last step done (median / max s) |
 | `qwen-fft-ts` | 2 | 39 | 53 / 54 | 7 |
 | `gemma-lora` | 6 | 70 | 96 / 102 | 13 |
 | `qwen-lora` | 13 | 77 | 127 / 133 | 21 |
+
+### E27 `hc-samp2` run 1 (`btn-074442`, makespan `145.1 s`, Jain `0.971`)
+
+| Group | Jobs | First step done (s) | Last step done (med / max s) | Step time (med s) |
+|---|---|---|---|---|
+| `gemma-fft-x` | 1 | 112 | 145 / 145 | 17 |
+| `gemma-fft-ts` | 1 | 114 | 144 / 144 | 15 |
+| `qwen-fft-ts` | 2 | 49 | 113 / 133 | 35 |
+| `gemma-lora` | 6 | 84 | 117 / 128 | 15 |
+| `qwen-lora` | 13 | 63 | 101 / 136 | 19 |
+
+### E27 `hc-samp2` run 2 (`btn-074814`, makespan `127.4 s`, Jain `0.989`)
+
+| Group | Jobs | First step done (s) | Last step done (med / max s) | Step time (med s) |
+|---|---|---|---|---|
+| `gemma-fft-x` | 1 | 89 | 121 / 121 | 16 |
+| `gemma-fft-ts` | 1 | 87 | 127 / 127 | 20 |
+| `qwen-fft-ts` | 2 | 44 | 104 / 119 | 36 |
+| `gemma-lora` | 6 | 72 | 106 / 110 | 16 |
+| `qwen-lora` | 13 | 60 | 102 / 120 | 20 |
 
 ## Where the 140.7 s goes in `btn-052156` (and why `btn-052516` took 150.6 s)
 
@@ -197,3 +219,5 @@ Removing `m.madvise(mmap.MADV_HUGEPAGE)` in `pinned_bytes` pins `2 x 36 GiB` con
 | E25a | Stack Commit 3 on all single-GPU trainers (`hc-stack3`) | `moves_itself` on all `len(gpus) == 1` trainers | `142.5 s` | `177.5 s` (`btn-050938`) | `+35.0 s` | reverted | `CUDA_VISIBLE_DEVICES=0..7` on full-FT stalled `36 GiB` `cudaHostRegister` (`51.4 s`) |
 | E25b | Restrict `moves_itself` to `w.kind.lora` (`hc-stack4`, `n=3`) | `w.kind.lora` in `moves_itself` | `157.1 s` mean (`main1`) | `147.1 s` mean (`140.7 s` best) | `-10.0 s` mean | kept | `qwen-lora` 2 moves in `0.9 s`, `gemma-lora` finish `103.6 s`, `23/23` OK |
 | E25c | Remove `MADV_HUGEPAGE` in `pinned_bytes` (`hc-stack5`, `n=2`) | Drop `m.madvise(mmap.MADV_HUGEPAGE)` | `147.1 s` (`hc-stack4`) | `135.1 s` (`136.9, 133.3 s`) | `-12.0 s` (`-22.0 s` vs `main1`) | kept | Step 1 `optim_step` `5.1-7.4 s`, `gemma-fft` finish `115-125 s`, `23/23` OK |
+| E26 | Reuse staged checkpoints + 3-run LoRA sampler waves (`hc-samp1`, `n=2`) | `stage_new` cache + 3-run waves in `sampler.py` | `135.1 s` (`hc-stack5`) | `147.5, 132.6 s` | `-17..-30 s` `qwen-lora` med | kept | `qwen-lora` med `98/110 s`, max `116/121 s`, Jain `0.981` |
+| E27 | Clear stale `GpuTurn.idle` on holder resume (`hc-samp2`, `n=2`) | Clear `self.idle` and emit `WANTS_GPU` in `turns.py` | `135.1 s` (`hc-stack5`) | `145.1, 127.4 s` | `-7.7 s` best (`-29.7 s` vs `main1`) | kept | `127.4 s` (`btn-074814`), `qwen-lora` med `102 s`, `gemma-lora` med `106 s`, Jain `0.989`, `23/23` OK |
