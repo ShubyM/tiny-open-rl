@@ -926,8 +926,9 @@ class TestTrainer(RedisTest):
       env=env,
     )
     try:
+      ids = []
       for r in (r1, r2):
-        await self.submit(
+        ids += await self.submit(
           r,
           (Op.CREATE_MODEL, {"base_model": base_dir, "rank": 0, "lora": {"seed": 0}}),
           (Op.FORWARD_BACKWARD, proto_body(r)),
@@ -939,15 +940,14 @@ class TestTrainer(RedisTest):
         pass
       await asyncio.wait_for(proc.wait(), 60)
       self.assertEqual(proc.returncode, 0)
+      for request_id in ids:
+        reply = await self.bus.wait_for_reply(request_id, 1)
+        self.assertTrue(reply.ok, reply.body)
 
-      for name in ("embed_tokens.weight", "layers.0.self_attn.q_proj.weight", "lm_head.weight"):
-        w_single = store.get(f"tinker://{r1}/sampler_weights/s1")[0][
-          f"model.{name}" if name != "lm_head.weight" else name
-        ]
-        w_fsdp = store.get(f"tinker://{r2}/sampler_weights/s1")[0][
-          f"model.{name}" if name != "lm_head.weight" else name
-        ]
-        torch.testing.assert_close(w_fsdp, w_single, atol=1e-5, rtol=1e-5)
+      single, fsdp = (store.get(f"tinker://{r}/sampler_weights/s1")[0] for r in (r1, r2))
+      self.assertEqual(single.keys(), fsdp.keys())
+      for name in single:
+        torch.testing.assert_close(fsdp[name], single[name], atol=1e-5, rtol=1e-5)
     finally:
       if proc.returncode is None:
         proc.kill()
