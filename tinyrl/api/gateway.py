@@ -5,6 +5,7 @@ Every training call becomes a command on its run's stream, and retrieve_future w
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import time
@@ -18,6 +19,7 @@ from pydantic import BaseModel
 
 from tinyrl.api import wire
 from tinyrl.bus import Bus, Op, Role, Run, key
+from tinyrl.control import estimator
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
@@ -140,11 +142,9 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       base, lora, uri, train_run = base_model, True, None, None
 
     exclusive = bool(train.get("exclusive")) if train_run else False
+    gpus = await asyncio.to_thread(estimator.gpus, base, "vllm")
     sid = f"samp-{uuid.uuid4().hex[:12]}"
-    run = Run(
-      sid, "", base, int(lora), session_id, model_path=uri, exclusive=exclusive, role=Role.SAMPLER, train_run=train_run
-    )
-    await bus.create_run(run)
+    await bus.create_run(Run(sid, "", base, int(lora), session_id, uri, {}, exclusive, Role.SAMPLER, train_run, gpus))
     return sid
 
   # ***** service *****
@@ -202,11 +202,11 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     else:
       run = str(uuid.uuid4())
 
+    base = req.base_model
+    gpus = int(metadata.get("openrl.gpus") or (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")))
     if not await bus.get_run(run):
-      await bus.create_run(Run(run, "", req.base_model, rank, req.session_id, lora=lora, exclusive=exclusive))
-    return await submit(
-      run, Op.CREATE_MODEL, {"base_model": req.base_model, "rank": rank, "lora": lora}, req.model_seq_id
-    )
+      await bus.create_run(Run(run, "", base, rank, req.session_id, None, lora, exclusive, gpus=gpus))
+    return await submit(run, Op.CREATE_MODEL, {"base_model": base, "rank": rank, "lora": lora}, req.model_seq_id)
 
   @api.post("/api/v1/get_info")
   async def get_info(req: ModelRequest):

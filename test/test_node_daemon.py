@@ -175,6 +175,21 @@ class TestNodeDaemon(RedisTest):
     with patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"}):
       daemon.start_worker_process("lora:base:1", scheduler.Worker(gpus=(0,)))
       self.assertEqual(popen.call_args[1]["env"]["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
+    daemon.start_worker_process("fft:2gpu", scheduler.Worker(scheduler.Kind(gpus=2), gpus=(2, 3)))
+    self.assertEqual(
+      popen.call_args[0][0],
+      [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=2",
+        "-m",
+        "tinyrl.workers.trainer",
+        "fft:2gpu",
+      ],
+    )
+    self.assertEqual(popen.call_args[1]["env"]["CUDA_VISIBLE_DEVICES"], "2,3")
 
   async def test_started_is_in_the_log_before_the_process_spawns(self):
     await self.bus.create_run(Run("r1", "worker", "base", 4))

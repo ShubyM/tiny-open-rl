@@ -3,6 +3,9 @@
 Activations are left to the dynamic token_budget in model.py. No static reserve is added here.
 """
 
+import contextlib
+import functools
+import os
 import re
 
 import torch
@@ -25,12 +28,11 @@ def estimate(
 ) -> tuple[int, int | None]:
   meta = get_safetensors_metadata(repo, revision=revision).parameter_count
   base = sum(c * (1 if k == "BOOL" else int(re.search(r"\d+", k).group()) // 8) for k, c in meta.items())
-  cfg = AutoConfig.from_pretrained(repo, revision=revision)
+  cfg = AutoConfig.from_pretrained(repo, revision=revision).get_text_config()
   if mode == "vllm":
     dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
-    run_bytes = (
-      cfg.num_hidden_layers * 2 * max_model_len * getattr(cfg, "num_key_value_heads", cfg.num_attention_heads) * dim * 2
-    )
+    heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+    run_bytes = cfg.num_hidden_layers * 2 * max_model_len * heads * dim * 2
   elif mode == "full":
     base, run_bytes = 0, sum(meta.values()) * 16
   else:
@@ -44,3 +46,12 @@ def estimate(
 
   tot = base + run_bytes + OVERHEAD
   return tot, next((n for n in (1, 2, 4, 8) if (tot - OVERHEAD) / n + OVERHEAD <= budget), None)
+
+
+@functools.lru_cache
+def gpus(repo: str, mode: str) -> int:
+  if "/" not in repo or "://" in repo or os.path.exists(repo):
+    return 1
+  with contextlib.suppress(Exception):
+    return estimate(repo, mode)[1] or 1
+  return 1

@@ -36,7 +36,7 @@ def settings(k: Kind, gpus: int, gpu_bytes: int) -> dict[str, str]:
     return env
   if gpus >= 2:  # samplers have GPUs of their own, so they start their engine before the first command
     env["TINYRL_WARM_SAMPLER"] = "1"
-  if gpu_bytes >= 64 * 2**30 and not k.lora and not k.exclusive:
+  if gpu_bytes >= 64 * 2**30 and not k.lora and not k.exclusive and k.gpus == 1:
     env.update(TINYRL_GPU_MEM="0.42", TINYRL_KV_BYTES=str(16 * 1024**3))
   elif gpu_bytes >= 64 * 2**30:
     env["TINYRL_KV_BYTES"] = str(24 * 1024**3)
@@ -81,6 +81,7 @@ class Kind:
   lora: bool = False
   exclusive: bool = False
   train_run: str | None = None  # an exclusive run's sampling sessions name it, so they share only with each other
+  gpus: int = 1
 
 
 @dataclass
@@ -161,13 +162,9 @@ def fold(state: State, e: Event) -> State:
   w = s.workers.get(b.get("worker", ""))
   match e.kind:
     case Ev.RUN_CREATED:
-      exclusive = b.get("exclusive", False)
+      ex, tr = b.get("exclusive", False), b.get("train_run")
       k = Kind(
-        Role(b.get("role", Role.TRAINER)),
-        b.get("base", ""),
-        b.get("rank", 0) > 0,
-        exclusive,
-        exclusive and b.get("train_run") or None,
+        Role(b.get("role", "trainer")), b.get("base", ""), b.get("rank", 0) > 0, ex, ex and tr or None, b.get("gpus", 1)
       )
       s.runs[b["run"]] = Run(k, train_run=b.get("train_run"))
       if b.get("worker"):  # created in a worker already, as tests do
@@ -248,8 +245,9 @@ def unplace(s: State, now: float) -> tuple[Ev, dict] | None:
 
 def place_next(s: State, now: float) -> tuple[Ev, dict] | None:
   """Place one worker that has runs and no GPU, exclusive ones first."""
-  unplaced = [name for name, w in s.workers.items() if w.node is None and members(s, name)]
-  if unplaced and s.nodes:
+  cap = max((g for g, _ in s.nodes.values()), default=0)
+  unplaced = [name for name, w in s.workers.items() if w.node is None and members(s, name) and w.kind.gpus <= cap]
+  if unplaced:
     return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
 
 
@@ -270,25 +268,21 @@ def revoke(s: State, now: float) -> tuple[Ev, dict] | None:
 
 
 def place(s: State, name: str) -> dict:
-  """Where a worker goes: the node with the fewest workers per GPU, and the GPU choose picks there. When trainers have to move out of the way first, the decision is the move of one of them, and the worker goes once its GPU is clear."""
-  load = {n: sum(w.node == n for w in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items()}
-  me, trainers = s.workers[name], [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
+  """Where a worker goes: the node with the fewest workers per GPU, and the GPUs choose picks there. When trainers have to move out of the way first, the decision is the move of one of them, and the worker goes once its GPUs are clear."""
+  me = s.workers[name]
+  load = {
+    n: sum(w.node == n for w in s.workers.values()) / gpus for n, (gpus, _) in s.nodes.items() if gpus >= me.kind.gpus
+  }
+  trainers = [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
   near = near if me.kind.role == Role.SAMPLER and not me.kind.lora else set()  # a LoRA adapter is small to fetch
   node = min(sorted(load), key=lambda n: (n not in near, load[n]))
-  gpu, why, aside = choose(s, node, name)
+  gpus, why, aside = choose(s, node, name)
   if aside:
-    to, to_why, _ = choose(s, node, aside[0], avoid=gpu)
-    return {
-      "worker": aside[0],
-      "node": node,
-      "gpus": [to],
-      "for": name,
-      "rule": "place.moved_aside",
-      "gpu_rule": to_why,
-    }
+    to, to_why, _ = choose(s, node, aside[0], avoid=tuple(gpus))
+    return {"worker": aside[0], "node": node, "gpus": to, "for": name, "rule": "place.moved_aside", "gpu_rule": to_why}
   rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
-  return {"worker": name, "node": node, "gpus": [gpu], "rule": rule, "gpu_rule": why}
+  return {"worker": name, "node": node, "gpus": gpus, "rule": rule, "gpu_rule": why}
 
 
 def spread(s: State, now: float) -> tuple[Ev, dict] | None:
@@ -313,39 +307,38 @@ def takes_turns(w: Worker) -> bool:
   return w.kind.role == Role.TRAINER and not w.kind.exclusive
 
 
-def choose(s: State, node: str, name: str, avoid: int = -1) -> tuple[int, str, list[str]]:
-  """The GPU on a node a worker goes to, why, and the trainers it moves out of the way. An exclusive worker is alone, and others stay off its GPU. A worker takes an empty GPU, or one its memory budget fits on next to the workers there, and a worker with a budget fills such a GPU before it takes an empty one. With neither, a worker that takes turns takes them with the least busy trainers. One that doesn't takes those trainers' GPU, and they move elsewhere."""
+def choose(s: State, node: str, name: str, avoid: tuple[int, ...] = ()) -> tuple[list[int], str, list[str]]:
+  """The GPUs on a node a worker goes to, why, and the trainers it moves out of the way. An exclusive worker is alone, and others stay off its GPU. A worker takes an empty GPU, or one its memory budget fits on next to the workers there, and a worker with a budget fills such a GPU before it takes an empty one. With neither, a worker that takes turns takes them with the least busy trainers. One that doesn't takes those trainers' GPU, and they move elsewhere."""
   gpus, gpu_bytes = s.nodes[node]
-  me, memory = s.workers[name], budget(s, s.workers[name].kind, node)
+  me, width, memory = s.workers[name], s.workers[name].kind.gpus, budget(s, s.workers[name].kind, node)
   there = {
     g: [(n, w) for n, w in s.workers.items() if n != name and w.node == node and g in w.gpus] for g in range(gpus)
   }
 
   def fits_on(g: int) -> bool:
     others = [w for _, w in there[g]]
-    if not others:
-      return True
-    return (
-      not me.kind.exclusive
-      and not any(w.kind.exclusive for w in others)
-      and fit([budget(s, w.kind, node) for w in others] + [memory], gpu_bytes)
-    )
+    ok = not me.kind.exclusive and not any(w.kind.exclusive for w in others)
+    return not others or (ok and fit([budget(s, w.kind, node) for w in others] + [memory], gpu_bytes))
 
   def trainers_only(g: int) -> bool:
-    return bool(there[g]) and all(takes_turns(w) for _, w in there[g])
+    return bool(there[g]) and all(takes_turns(w) and w.kind.gpus <= gpus - width for _, w in there[g])
 
-  options = [g for g in range(gpus) if g != avoid]
-  if fitting := [g for g in options if fits_on(g)]:
-    g = min(fitting, key=lambda g: (bool(there[g]) != bool(memory), g))
-    return g, "fits_next_to_others" if there[g] else "empty_gpu", []
+  def clear(g: int) -> bool:
+    return fits_on(g) or trainers_only(g)
+
+  options = [g for g in range(gpus) if g not in avoid]
+  if len(fitting := [g for g in options if fits_on(g)]) >= width:
+    chosen = sorted(fitting, key=lambda g: (bool(there[g]) != bool(memory), g))[:width]
+    return chosen, "fits_next_to_others" if any(there[g] for g in chosen) else "empty_gpu", []
   busy = {g: sum(w.busy for _, w in there[g]) for g in options}
-  if takes_turns(me) or len(options) == 1:  # with one GPU there is nowhere to move to
-    g = min(options, key=lambda g: (not trainers_only(g), busy[g], g))
-    return g, "takes_turns", []
+  if takes_turns(me) or len(options) <= width:  # with no spare GPUs there is nowhere to move to
+    return sorted(options, key=lambda g: (not clear(g), busy[g], g))[:width], "takes_turns", []
   # as few moves as it can, LoRA trainers first, since a full fine-tune saves its weights and AdamW state far slower
   lora = {g: all(w.kind.lora for _, w in there[g]) for g in options}
-  g = min(options, key=lambda g: (not trainers_only(g), len(there[g]), not lora[g], busy[g], g))
-  return (g, "moves_trainers_aside", sorted(n for n, _ in there[g])) if trainers_only(g) else (g, "takes_turns", [])
+  moves = {g: 0 if fits_on(g) else sum(w.kind.gpus for _, w in there[g]) for g in options}
+  chosen = sorted(options, key=lambda g: (not clear(g), moves[g], not lora[g], busy[g], g))[:width]
+  aside = sorted({n for g in chosen if not fits_on(g) for n, _ in there[g]})
+  return (chosen, "moves_trainers_aside", aside) if all(map(clear, chosen)) else (chosen, "takes_turns", [])
 
 
 # ***** the loop *****
