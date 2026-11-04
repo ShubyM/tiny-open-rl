@@ -231,11 +231,10 @@ class TestModel(unittest.TestCase):
     tensors, meta = model.training_state(run_id)
     self.assertTrue(any("grad" in name for name in tensors.keys()))
 
-    model.restore_run(run_id, tensors, meta, True)
+    model.restore_run(run_id, tensors, meta, True, gradients=True)
     self.assertTrue(any(p.grad is not None for p in model.params[run_id].values()))
 
-    meta["internal_handoff"] = False
-    model.restore_run(run_id, tensors, meta, True)
+    model.restore_run(run_id, tensors, meta, True, gradients=False)
     self.assertFalse(any(p.grad is not None for p in model.params[run_id].values()))
 
   def test_a4_mixed_state(self):
@@ -708,8 +707,7 @@ class TestTrainer(RedisTest):
     await asyncio.sleep(0.2)
     self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (t.owner, None))
 
-    t.model.params["r"] = {}  # but not once another trainer has served the worker and parked its run
-    await self.bus.r.set("tinyrl:parked:r", "tinker://r/parked/1")
+    await self.bus.r.set("tinyrl:last_owner:p", "another")
     await self.bus.r.delete("tinyrl:owner:p")
     await asyncio.sleep(0.2)
     self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (None, Stop.EXIT))
@@ -964,6 +962,24 @@ class TestTrainer(RedisTest):
       if proc.returncode is None:
         proc.kill()
         await proc.wait()
+
+  async def test_a_user_load_clears_the_gradients_its_checkpoint_was_saved_with(self):
+    run_id = new_id()
+    uri = f"tinker://{run_id}/weights/mid-step"
+    await self.bus.create_run(Run(run_id, "p", "tiny", 0))
+    t = Trainer(self.bus, "p", Model(tiny), store=Store(root=tempfile.mkdtemp()))
+    await self.own(t)
+    await self.submit(run_id, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}))
+    await t.step(block_ms=10)
+    for p in t.model.params[run_id].values():
+      p.grad = torch.ones_like(p.data)
+    [save, load] = await self.submit(
+      run_id, (Op.SAVE_WEIGHTS, {"uri": uri}), (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": False})
+    )
+    while await t.step(block_ms=10):
+      pass
+    self.assertTrue(all([(await self.bus.wait_for_reply(r, 1)).ok for r in (save, load)]))
+    self.assertTrue(all(p.grad is None for p in t.model.params[run_id].values()))
 
 
 class TestCheckpointNames(unittest.TestCase):

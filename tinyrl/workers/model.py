@@ -354,7 +354,7 @@ class Model:
       if optim and p in optim.state:
         for k in ("exp_avg", "exp_avg_sq", "step"):
           tensors[f"{name}.{k}"] = full_tensor(optim.state[p][k].detach())
-    return tensors, {"optimizer": True, "internal_handoff": True}
+    return tensors, {"optimizer": True}
 
   def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
@@ -368,7 +368,9 @@ class Model:
     untouched = not self.lora and run not in self.dirty
     return tensors, {"base": self.base, "lora": self.lora, "optimizer": False, "untouched": untouched, "config": cfg}
 
-  def restore_run(self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool) -> None:
+  def restore_run(
+    self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool, gradients: bool = False
+  ) -> None:
     self.activate_run(run)
     if optimizer and not meta.get("optimizer"):
       raise ValueError("checkpoint has no optimizer state")
@@ -385,7 +387,7 @@ class Model:
         raise ValueError(f"bad: {n}")
     for name, p in self.params[run].items():
       p.data.copy_(like_param(weights[name], p))
-      has_grad = meta.get("internal_handoff") and f"{name}.grad" in tensors
+      has_grad = gradients and f"{name}.grad" in tensors
       p.grad = like_param(tensors[f"{name}.grad"], p) if has_grad else None
 
     self.needs_recovery.discard(run)

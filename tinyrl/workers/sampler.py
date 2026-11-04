@@ -31,12 +31,6 @@ STRANDED_MS = 5000
 GPU = getenv("GPU", "")  # the GPUs this sampler takes turns on, set by the node daemon. Unset, it never takes turns
 
 
-def fail(error: Exception) -> Reply:
-  category = "user" if isinstance(error, (ValueError, KeyError)) else "server"
-  body = {"error": f"{type(error).__name__}: {error}", "category": category}
-  return Reply(False, wire.JSON, json.dumps(body).encode())
-
-
 ENGINE = getenv("ENGINE", "tinyrl.workers.vllm:VLLM")
 WARM = getenv("TINYRL_WARM_SAMPLER", 0)  # start the engine before the first command, from the scheduler's placement
 MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
@@ -140,12 +134,12 @@ class Sampler:
     await self.wait_for_lease()
     renewing = asyncio.create_task(self.keep_renewing_lease())
     try:
-      await self.fail_stranded_commands(0)
+      await self.bus.fail_stranded_commands(self.worker, self.owner, 0)
       if WARM:
         await self.warm_engine()
       while not self.done:
         await self.step()
-        await self.fail_stranded_commands(STRANDED_MS)
+        await self.bus.fail_stranded_commands(self.worker, self.owner, STRANDED_MS)
     finally:
       renewing.cancel()
       if self.running:
@@ -161,7 +155,7 @@ class Sampler:
     while not self.done:
       await asyncio.sleep(LEASE_MS / 4000)
       if not await self.bus.renew_lease(self.worker, self.owner) and not await self.bus.take_lease(
-        self.worker, self.owner
+        self.worker, self.owner, recover=True
       ):
         # another sampler took the worker. A lease that expired untaken, as in a Redis restart, is taken again
         self.done = True
@@ -174,12 +168,6 @@ class Sampler:
         async with self.loading:
           if self.running is None:
             self.running = Running(await self.engine_type.start(run["base"], self.lora))
-
-  async def fail_stranded_commands(self, min_idle_ms: int) -> None:
-    for cmd in await self.bus.reclaim_stranded_commands(self.worker, self.owner, min_idle_ms):
-      await self.bus.write_reply(
-        cmd, fail(RuntimeError("its sampler died, or lost the worker")), self.worker, self.owner
-      )
 
   async def step(self, count: int = 128, block_ms: int = 1000) -> int:
     if self.done:
@@ -259,7 +247,7 @@ class Sampler:
         name = await self.load_checkpoint(self.running, uri, (staged or {}).get(uri))
       return Reply(True, wire.PROTO, encode(job, await self.running.engine.sample(job, name)))
     except Exception as e:
-      return fail(e)
+      return Reply.error(e)
 
   async def load_checkpoint(
     self, running: Running, uri: str | None, staged: tuple[str, str] | None = None
