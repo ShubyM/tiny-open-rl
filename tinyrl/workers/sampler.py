@@ -191,26 +191,27 @@ class Sampler:
       await self.yield_gpu()
       return 0
 
-    runs = {}
-    for cmd in cmds:
-      if cmd.run not in runs:
-        runs[cmd.run] = await self.bus.get_run(cmd.run)
+    runs, staged = {}, {}
 
-    async def stage(run):
-      if run and run.get("model_path"):
-        uri = run["model_path"]
-        saved = (await self.registry.get_checkpoint(uri) or {}).get("version")
-        try:
-          await asyncio.to_thread(self.store.local_folder, uri, saved)
-        except Exception:
-          pass  # run_sample will raise and reply with the real error
+    async def stage_new():
+      for cmd in cmds:
+        if cmd.run not in runs:
+          runs[cmd.run] = await self.bus.get_run(cmd.run)
 
-    await asyncio.gather(*(stage(r) for r in runs.values()))
+      async def stage(run):
+        if run and (uri := run.get("model_path")) and uri not in staged:
+          saved = (await self.registry.get_checkpoint(uri) or {}).get("version")
+          with contextlib.suppress(Exception):
+            staged[uri] = await asyncio.to_thread(self.store.local_folder, uri, saved)
+
+      await asyncio.gather(*(stage(r) for r in runs.values()))
+
+    await stage_new()
 
     async def one(cmd) -> list:
       start = time.time()
       first = await self.bus.reply_to_repeated_command(cmd)
-      reply = first or await self.run_sample(cmd.run, json.loads(cmd.body))
+      reply = first or await self.run_sample(cmd.run, json.loads(cmd.body), runs.get(cmd.run), staged)
       ms = (time.time() - start) * 1000
       if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, repeat=first is not None, started=start):
         self.done = True
@@ -229,12 +230,11 @@ class Sampler:
       if block_ms:
         await asyncio.sleep(0.02)
         cmds += await self.bus.take_commands(self.worker, self.owner, count, 0)
-      if self.lora:
-        batches = [cmds]
-      else:
-        by_run: dict[str, list] = {}
-        [by_run.setdefault(c.run, []).append(c) for c in cmds]
-        batches = list(by_run.values())
+        await stage_new()
+      by_run: dict[str, list] = {}
+      [by_run.setdefault(c.run, []).append(c) for c in cmds]
+      grouped, n = list(by_run.values()), 3 if self.lora else 1
+      batches = [[c for r in grouped[i : i + n] for c in r] for i in range(0, len(grouped), n)]
       ops = []
       for batch in batches:
         if not self.done:
@@ -245,25 +245,35 @@ class Sampler:
       )
     return len(cmds)
 
-  async def run_sample(self, session: str, job: dict) -> Reply:
+  async def run_sample(
+    self, session: str, job: dict, run: dict | None = None, staged: dict[str, tuple[str, str]] | None = None
+  ) -> Reply:
     try:
-      run = await self.bus.get_run(session)
+      run = run or await self.bus.get_run(session)
       if run is None:
         raise ValueError(f"no sampling session {session}")
+      uri = run["model_path"]
       async with self.loading:
         if self.running is None:
           self.running = Running(await self.engine_type.start(run["base"], self.lora))
-        name = await self.load_checkpoint(self.running, run["model_path"])
+        name = await self.load_checkpoint(self.running, uri, (staged or {}).get(uri))
       return Reply(True, wire.PROTO, encode(job, await self.running.engine.sample(job, name)))
     except Exception as e:
       return fail(e)
 
-  async def load_checkpoint(self, running: Running, uri: str | None) -> str | None:
+  async def load_checkpoint(
+    self, running: Running, uri: str | None, staged: tuple[str, str] | None = None
+  ) -> str | None:
     """The engine's name for a checkpoint, which the engine loads unless it already holds it."""
     if not uri:
       return None
-    saved = (await self.registry.get_checkpoint(uri) or {}).get("version")  # another node's may still be uploading
-    path, version = await asyncio.to_thread(self.store.local_folder, uri, saved)  # a checkpoint name can be saved again
+    if staged:
+      path, version = staged
+    else:
+      saved = (await self.registry.get_checkpoint(uri) or {}).get("version")  # another node's may still be uploading
+      path, version = await asyncio.to_thread(
+        self.store.local_folder, uri, saved
+      )  # a checkpoint name can be saved again
     if (uri, version) not in running.names:
       name = f"c{len(running.names)}"
       await running.engine.load_checkpoint(name, path)

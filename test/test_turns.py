@@ -99,3 +99,16 @@ class TestScheduler(RedisTest):
       self.assertTrue(await asyncio.wait_for(second, 5))
     finally:
       task.cancel()
+
+  async def test_a_holder_that_resumes_work_after_idle_is_not_revoked_as_idle(self):
+    task = await self.start("a", "b")
+    a = GpuTurn(self.bus, "a", shared=True)
+    try:
+      self.assertTrue(await asyncio.wait_for(a.wait_for_turn(1), 5))
+      await a.report_idle()
+      self.assertFalse(await a.wait_for_turn(1))
+      await self.bus.append_event("wants_gpu", worker="b", queued=1)
+      await asyncio.sleep(0.3)
+      self.assertFalse(await a.was_revoked())
+    finally:
+      task.cancel()

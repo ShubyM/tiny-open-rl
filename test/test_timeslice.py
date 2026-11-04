@@ -102,6 +102,26 @@ class TestTakingTurns(RedisTest):
       await t.serve()
       self.assertEqual(await asyncio.wait_for(b.step(block_ms=10), 5), 1)
 
+  @patch("tinyrl.control.turns.NODE", "n")
+  async def test_a_trainer_moved_on_its_node_revokes_itself_and_asks_on_its_new_gpu(self):
+    await self.run_scheduler({"a": [0], "b": [0], "c": [1]})
+    turn, turn2 = GpuTurn(self.bus, "a", shared=True), GpuTurn(self.bus, "b", shared=True)
+    await turn.wait_for_turn(1)
+
+    waiting = asyncio.create_task(turn2.wait_for_turn(1))
+    while not any(e.kind == "wants_gpu" and e.body["worker"] == "b" for e in await self.bus.read_events()):
+      await asyncio.sleep(0.01)
+    await self.bus.append_event("placed", worker="b", node="n", gpus=[1], rule="test")
+    self.assertTrue(await asyncio.wait_for(waiting, 5))
+    self.assertEqual(turn2.gpu, 1)
+
+    await self.bus.append_event("placed", worker="a", node="n", gpus=[1], rule="test")
+    self.assertTrue(await turn.was_revoked())
+    await turn.give_turn_back()
+    self.assertEqual(turn.gpu, 1)
+    self.assertFalse(turn.moved)
+    await turn2.give_turn_back()
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestParking(unittest.TestCase):

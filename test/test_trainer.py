@@ -54,6 +54,34 @@ def same(a, b) -> bool:
 
 
 class TestForwardPass(unittest.TestCase):
+  def test_pad_rounds_width_on_cuda(self):
+    from tinyrl.workers.model import pad
+
+    rows, lengths = [np.ones(5), np.ones(130)], [5, 130]
+    self.assertEqual(pad(rows, lengths, np.float32, torch.device("cpu")).shape, (2, 130))
+    with patch("torch.Tensor.to", lambda t, _: t):
+      out = pad(rows, lengths, np.float32, torch.device("cuda"))
+      self.assertEqual(out.shape, (2, 256))
+      self.assertEqual(out[1, 129].item(), 1.0)
+      self.assertEqual(out[1, 130].item(), 0.0)
+
+  def test_liger_kernel_fallback(self):
+    lm = tiny()
+    ids, mask, targets = (
+      torch.zeros((1, 5), dtype=torch.long),
+      torch.ones((1, 5), dtype=torch.long),
+      torch.zeros((1, 5), dtype=torch.long),
+    )
+    expected = target_logprobs(lm, ids, mask, targets)
+    with (
+      patch.object(
+        type(lm), "device", new_callable=unittest.mock.PropertyMock, return_value=SimpleNamespace(type="cuda")
+      ),
+      patch("tinyrl.workers.model.LigerFusedLinearCrossEntropyLoss", None),
+    ):
+      actual = target_logprobs(lm, ids, mask, targets)
+    self.assertTrue(torch.allclose(actual, expected))
+
   def test_batches(self):
     self.assertEqual(batches([5, 5, 5], 100), [[0, 1, 2]])
     self.assertEqual(batches([5, 5, 5], 10), [[0, 1], [2]])
@@ -185,6 +213,14 @@ class CudaMock(torch.Tensor):
 
 
 class TestModel(unittest.TestCase):
+  def test_full_ft_delete_run_drops_model_lm(self):
+    m = Model(tiny)
+    m.create_run("test-full-ft", "tiny", 0, {})
+    m.activate_run("test-full-ft")
+    self.assertIsNotNone(m.lm)
+    m.delete_run("test-full-ft")
+    self.assertIsNone(m.lm)
+
   def test_a1_and_a2_gradients(self):
     model, run_id = Model(tiny), new_id()
     model.create_run(run_id, "tiny", 0, {})

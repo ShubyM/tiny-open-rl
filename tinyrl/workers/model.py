@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import math
 import os
 from collections.abc import Callable
@@ -17,6 +19,13 @@ from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from tinyrl.api import wire
 from tinyrl.helpers import getenv
 from tinyrl.storage import models
+from tinyrl.storage.store import aligned, nbytes, pinned_bytes
+
+LigerFusedLinearCrossEntropyLoss = apply_liger = None
+with contextlib.suppress(ImportError):
+  logging.getLogger("liger_kernel").setLevel(logging.ERROR)
+  from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+  from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance as apply_liger
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
@@ -109,7 +118,8 @@ def batches(lengths: list[int], budget: int) -> list[list[int]]:
 
 def pad(rows: list[np.ndarray], lengths: list[int], dtype, device: torch.device) -> torch.Tensor:
   """Right-pad rows with zeros into one [rows, max(lengths)] tensor, keeping the first lengths[i] values of row i."""
-  out = np.zeros((len(rows), max(lengths)), dtype)
+  width = -(-max(lengths) // 128) * 128 if device.type == "cuda" else max(lengths)
+  out = np.zeros((len(rows), width), dtype)
   for i, (row, n) in enumerate(zip(rows, lengths)):
     out[i, :n] = row[:n]
   return torch.from_numpy(out).to(device)
@@ -140,6 +150,12 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
   head = lm.get_output_embeddings()
   softcap = getattr(lm.config.get_text_config(), "final_logit_softcapping", None)  # gemma caps its logits
 
+  if lm.device.type == "cuda" and type(head) is torch.nn.Linear and LigerFusedLinearCrossEntropyLoss:
+    w, b = head.weight.to(hidden.dtype), head.bias.to(hidden.dtype) if head.bias is not None else None
+    return -LigerFusedLinearCrossEntropyLoss(reduction="none", softcap=softcap)(w, hidden, targets.flatten(), b).view(
+      targets.shape
+    )
+
   def chunk_logprobs(h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     logits = head(h)
     if softcap:
@@ -161,7 +177,8 @@ def load(name: str) -> PreTrainedModel:
   cls = getattr(transformers, arch, AutoModelForCausalLM)
   # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create_run
   if torch.cuda.is_available():
-    return cls.from_pretrained(name, dtype=torch.bfloat16, device_map="auto")
+    device_map = {"": torch.cuda.current_device()} if os.environ.get("TINYRL_NODE") else "auto"
+    return cls.from_pretrained(name, dtype=torch.bfloat16, device_map=device_map)
   return cls.from_pretrained(name, dtype=torch.float32)
 
 
@@ -207,6 +224,8 @@ class Model:
           if child != "language_model":
             setattr(inner, child, None)
       self.dtype = self.lm.dtype
+      if self.lm.device.type == "cuda" and apply_liger:
+        apply_liger(model=self.lm, cross_entropy=False, fused_linear_cross_entropy=False)
       if not self.lora:
         self.lm.float()  # a full fine-tune updates fp32 master weights. Its forward pass runs in bf16, under autocast
       if should_checkpoint_layers(self.lm, self.lora):
@@ -232,7 +251,8 @@ class Model:
       lora_dropout=config.get("lora_dropout", 0.05),
       target_modules=lora_targets(self.lm, config),
     )
-    self.lm.add_adapter(adapter, adapter_name=run)
+    with torch.device(self.lm.device):
+      self.lm.add_adapter(adapter, adapter_name=run)
     infix = f".{run}."
     self.params[run] = {name.replace(infix, "."): p for name, p in self.lm.named_parameters() if infix in name}
     for p in self.params[run].values():
@@ -410,12 +430,21 @@ class Model:
       yield from self.adam_moments()
 
   def move_tensors(self, tensors, device: str) -> None:
+    tensors = list(tensors)
+    if device == "cpu":
+      need = [
+        t
+        for t in tensors
+        if t.is_cuda and ((b := self.pinned.get(id(t))) is None or b.shape != t.shape or b.dtype != t.dtype)
+      ]
+      if need:
+        slab, at = pinned_bytes(sum(aligned(nbytes(t)) for t in need)), 0
+        for t in need:
+          self.pinned[id(t)] = slab[at : at + nbytes(t)].view(t.dtype).view(t.shape)
+          at += aligned(nbytes(t))
     for t in tensors:
       if device == "cpu" and t.is_cuda:
-        buf = self.pinned.get(id(t))
-        if buf is None or buf.shape != t.shape or buf.dtype != t.dtype:
-          buf = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-          self.pinned[id(t)] = buf
+        buf = self.pinned[id(t)]
         buf.copy_(t, non_blocking=True)
         t.data = buf
       elif device == "cuda" and (t.is_pinned() or id(t) in self.pinned):
@@ -445,6 +474,10 @@ class Model:
     self.needs_recovery.discard(run)
     if self.lora:
       lm.delete_adapter(run)
+    else:
+      self.lm = None
+      if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     del self.params[run]
     self.pinned.clear()
     self.optimizers.pop(run, None)
