@@ -11,7 +11,10 @@ from unittest.mock import patch
 
 import torch
 
+import tempfile
 import tinyrl.storage.store
+tinyrl.storage.store.SHM = tempfile.mkdtemp()
+
 from tinyrl.storage.store import Store
 
 
@@ -235,7 +238,8 @@ class TestStore(unittest.TestCase):
       saver.put(uri, {"w": torch.ones(4)})  # saved here, so it returns: the upload fails behind it
       saver.upload_pending_saves()
     v = saver.versions[uri]
-    self.assertEqual(sorted(os.listdir(saver.cache)), sorted([v, f"{v}.upload", "latest"]))  # no temp folders
+    self.assertEqual(sorted(os.listdir(saver.cache)), sorted([f"{v}.upload", "latest"]))
+    self.assertEqual(sorted(e for e in os.listdir(tinyrl.storage.store.SHM) if e != "free"), [v])
 
     saver.put(uri, {"w": torch.ones(4)})
     saver.upload_pending_saves()  # the one that failed, then this one
@@ -334,10 +338,11 @@ class TestStore(unittest.TestCase):
       store.upload_pending_saves()
       time.sleep(0.01)
     store.put("tinker://r/weights/uploading", {"w": torch.ones(1024)})
-    with unittest.mock.patch("tinyrl.storage.store.CACHE_BYTES", 1):
+    with unittest.mock.patch("tinyrl.storage.store.CACHE_BYTES", 1), unittest.mock.patch("tinyrl.storage.store.SHM_BYTES", 1):
       store.trim_cache()
     v = store.versions["tinker://r/weights/uploading"]
-    self.assertEqual(sorted(n for n in os.listdir(store.cache) if n != "latest"), [v, f"{v}.upload"])
+    self.assertEqual(sorted(n for n in os.listdir(store.cache) if n != "latest"), [f"{v}.upload"])
+    self.assertEqual(sorted(n for n in os.listdir(tinyrl.storage.store.SHM) if n != "free"), [v])
     self.assertTrue(torch.equal(store.get("tinker://r/weights/v0")[0]["w"], torch.ones(1024)))  # from the bucket again
 
   def test_full_sampler_weights_upload_as_xors_another_node_rebuilds_exactly(self):
@@ -362,8 +367,9 @@ class TestStore(unittest.TestCase):
     folder = loader.local_folder(uris[1], versions[1])[0]  # link 0 whole, then link 1's XOR
     saver.fs.rm(f"{links}/{versions[0]}", recursive=True)
     folder = loader.local_folder(uris[2], versions[2])[0]  # from link 1 here, so link 0 is never read again
-    for name in os.listdir(f"{saver.cache}/{versions[2]}"):
-      with open(f"{saver.cache}/{versions[2]}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
+    saver_folder = f"{tinyrl.storage.store.SHM}/{versions[2]}" if os.path.exists(f"{tinyrl.storage.store.SHM}/{versions[2]}") else f"{saver.cache}/{versions[2]}"
+    for name in os.listdir(saver_folder):
+      with open(f"{saver_folder}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
         self.assertEqual(a.read(), b.read())
     self.assertTrue(torch.equal(loader.get(uris[2])[0]["w"], w))
 
@@ -404,13 +410,15 @@ class TestStore(unittest.TestCase):
     versions = [saver.versions[u] for u in uris]
     self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/0/_latest"))["from"], "base")
     self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/1/_latest"))["from"], "base")
-    whole = sum(os.path.getsize(f) for f in glob.glob(f"{saver.cache}/{versions[0]}/*.safetensors"))
+    saver_folder0 = f"{tinyrl.storage.store.SHM}/{versions[0]}" if os.path.exists(f"{tinyrl.storage.store.SHM}/{versions[0]}") else f"{saver.cache}/{versions[0]}"
+    whole = sum(os.path.getsize(f) for f in glob.glob(f"{saver_folder0}/*.safetensors"))
     self.assertLess(saver.fs.du(f"{saver.base}/r/_versions/{versions[0]}"), whole / 4)
 
     for uri, version in zip(uris, versions):  # each on a node that has nothing cached
       folder = Store(root, cache=tempfile.mkdtemp()).local_folder(uri, version)[0]
-      for name in os.listdir(f"{saver.cache}/{version}"):
-        with open(f"{saver.cache}/{version}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
+      saver_folder_v = f"{tinyrl.storage.store.SHM}/{version}" if os.path.exists(f"{tinyrl.storage.store.SHM}/{version}") else f"{saver.cache}/{version}"
+      for name in os.listdir(saver_folder_v):
+        with open(f"{saver_folder_v}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
           self.assertEqual(a.read(), b.read())
       self.assertEqual(glob.glob(f"{os.path.dirname(folder)}/*.base"), [])
 

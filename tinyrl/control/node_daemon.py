@@ -20,7 +20,7 @@ from tinyrl.bus import Bus, Ev
 from tinyrl.control import scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
-from tinyrl.storage.store import Store
+from tinyrl.storage.store import SHM, Store
 
 GPUS = getenv("GPUS", 1)
 # how long a stopping node daemon waits for its processes, so trainers save their runs
@@ -149,8 +149,16 @@ class NodeDaemon:
           if await self.registry.get_checkpoint(uri) is None:
             version = e.name.removesuffix(".upload")
             await asyncio.to_thread(shutil.rmtree, f"{self.store.cache}/{version}", ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, f"{SHM}/{version}", ignore_errors=True)
             with contextlib.suppress(OSError):
               await asyncio.to_thread(os.unlink, e.path)
+    if os.path.isdir(SHM):
+      for e in list(os.scandir(SHM)):
+        if e.is_dir() and e.name != "free" and e.stat().st_mtime < time.time() - SWEEP_GRACE_S:
+          if not os.path.exists(f"{self.store.cache}/{e.name}.upload") and not os.path.exists(
+            f"{self.store.cache}/{e.name}.uploaded"
+          ):
+            await asyncio.to_thread(shutil.rmtree, e.path, ignore_errors=True)
 
   def start_worker_process(self, worker: str, p: scheduler.Worker) -> tuple[list[int], subprocess.Popen]:
     """Start a worker's process on its GPUs, with the settings for its kind. This node's environment wins."""

@@ -39,7 +39,8 @@ CKPT = getenv("CKPT", "/tmp/tinyrl")
 CKPT_CACHE = getenv("CKPT_CACHE", "/tmp/tinyrl-cache")
 SHARD_BYTES = getenv("SHARD_BYTES", 256 * 1024 * 1024)  # a full checkpoint this big is written as parallel shards
 MAX_SHARDS = 16
-MAX_PIN_BYTES = getenv("MAX_PIN_BYTES", 24 * 1024**3)  # the most pinned host memory a save holds
+SHM = getenv("SHM", "/dev/shm/tinyrl")
+SHM_BYTES = getenv("SHM_BYTES", 0)
 UPLOAD_WAIT_S = getenv("UPLOAD_WAIT_S", 900.0)  # how long a node waits for a version another node is uploading
 # trim_cache() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
 CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)
@@ -122,7 +123,8 @@ def sparse(old: np.ndarray, new: np.ndarray) -> tuple[bytes, int]:
   """The bytes of new that differ from old, as the gaps between them then their XOR with old, zlib compressed, and new's CRC. Few bytes differ, so this is small, and quicker to compress than the whole XOR."""
   x = np.bitwise_xor(old, new)
   at = np.flatnonzero(x)
-  return zlib.compress(np.diff(at, prepend=-1).astype(np.uint32).tobytes() + x[at].tobytes(), 1), zlib.crc32(new)
+  compressed = zlib.compress(np.diff(at, prepend=-1).astype(np.uint32).tobytes() + x[at].tobytes(), 1)
+  return compressed, zlib.crc32(new)
 
 
 def unsparse(data: np.ndarray, z: np.ndarray) -> int:
@@ -186,6 +188,8 @@ class Store:
     self.uploading = threading.Lock()
     self.versions: dict[str, str] = {}  # uri -> the version this process last saved
     self.chains: dict[str, str] = {}  # run -> the last link of its chain this process saved
+    self.shm_buffers = []
+    self.shm_buffers_lock = threading.Lock()
 
   def path(self, uri: str) -> str:
     return f"{self.base}/{uri.removeprefix('tinker://')}"
@@ -193,7 +197,7 @@ class Store:
   # ***** put *****
 
   def copy_to_host(self, tensors: dict[str, torch.Tensor], is_cuda=lambda t: t.is_cuda) -> dict[str, torch.Tensor]:
-    """The tensors on the CPU. GPU tensors go through one pinned buffer, so the copy runs at DMA speed. When they all fit, they are views of it, else each streams through it in pieces into its own host tensor."""
+    """The tensors on the CPU. GPU tensors go through one pinned buffer, so the copy runs at DMA speed."""
     import torch
 
     with self.lock:
@@ -202,32 +206,26 @@ class Store:
       total = sum(aligned(nbytes(tensors[k])) for k in gpu)
       if not total:
         return out
-      size = min(total, MAX_PIN_BYTES)
-      if self.pinned is None or self.pinned.numel() < size:
-        self.pinned = None  # free the old buffer before pinning a bigger one
-        self.pinned = pinned_bytes(size)
-      sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
+      if self.pinned is None or self.pinned.numel() < total:
+        self.pinned = None
+        self.pinned = pinned_bytes(total)
       at = 0
       for k in gpu:
         src, v = as_bytes(tensors[k]), tensors[k]
-        if total <= MAX_PIN_BYTES:
-          self.pinned[at : at + len(src)].copy_(src, non_blocking=True)
-          out[k] = self.pinned[at : at + len(src)].view(v.dtype).view(v.shape)
-          at += aligned(len(src))
-          continue
-        dst = torch.empty(len(src), dtype=torch.uint8)
-        for i in range(0, len(src), size):
-          piece = src[i : i + size]
-          self.pinned[: len(piece)].copy_(piece, non_blocking=True)
-          sync()
-          dst[i : i + len(piece)].copy_(self.pinned[: len(piece)])
-        out[k] = dst.view(v.dtype).view(v.shape)
-      sync()
+        self.pinned[at : at + len(src)].copy_(src, non_blocking=True)
+        out[k] = self.pinned[at : at + len(src)].view(v.dtype).view(v.shape)
+        at += aligned(len(src))
+      if torch.cuda.is_available():
+        torch.cuda.synchronize()
       return {k: out[k] for k in tensors}
 
-  def write_checkpoint_files(self, folder: str, tensors: dict[str, torch.Tensor], info: dict) -> list[str]:
+  def write_checkpoint_files(
+    self, folder: str, tensors: dict[str, torch.Tensor], info: dict, use_shm: bool = False
+  ) -> list[str]:
     """Write a checkpoint into folder, and return its file names, with the weights last."""
     import safetensors.torch
+    import ctypes
+    import mmap
 
     lora, cfg, total = info.get("lora"), info.get("config"), sum(map(nbytes, tensors.values()))
     n = max(1, min(MAX_SHARDS, len(tensors))) if not lora and total >= SHARD_BYTES else 1
@@ -248,30 +246,236 @@ class Store:
     for name, obj in files.items():
       with open(f"{folder}/{name}", "w") as f:
         json.dump(obj, f)
-    meta = {"meta": json.dumps(info)}
-    parallel(lambda name, shard: safetensors.torch.save_file(shard, f"{folder}/{name}", metadata=meta), weights, shards)
+    meta_json = {"meta": json.dumps(info)}
+
+    cpu_tensors = self.copy_to_host(tensors) if not use_shm else None
+
+    def write_shard(name: str, shard: dict[str, torch.Tensor]) -> None:
+      path = f"{folder}/{name}"
+      if not use_shm:
+        safetensors.torch.save_file({k: cpu_tensors[k] for k in shard}, path, metadata=meta_json)
+        return
+
+      gpu_ts = {k: v for k, v in shard.items() if getattr(v, "is_cuda", False)}
+      fake = {k: (torch.empty(0, dtype=v.dtype) if k in gpu_ts else v) for k, v in shard.items()}
+      safetensors.torch.save_file(fake, path, metadata=meta_json)
+
+      head = raw(path)[0]
+      header_dict = layout(head)
+      size = 8 + len(head) + sum(nbytes(v) for v in shard.values())
+
+      pool_dir = f"{SHM}/free"
+      os.makedirs(pool_dir, exist_ok=True)
+      claimed = False
+      with contextlib.suppress(OSError):
+        for e in os.scandir(pool_dir):
+          try:
+            os.rename(e.path, f"{path}.tmp")
+            os.replace(f"{path}.tmp", path)
+            claimed = True
+            break
+          except OSError:
+            pass
+
+      fd = os.open(path, os.O_RDWR)
+      os.ftruncate(fd, size)
+      mm = mmap.mmap(fd, size, mmap.MAP_SHARED)
+      os.close(fd)
+      dst = torch.frombuffer(mm, dtype=torch.uint8)
+
+      if not claimed:
+        ctypes.memset(dst.data_ptr(), 0, size)
+
+      dst[:8] = torch.tensor(list(len(head).to_bytes(8, "little")), dtype=torch.uint8)
+      dst[8 : 8 + len(head)] = torch.frombuffer(bytearray(head), dtype=torch.uint8)
+      base = 8 + len(head)
+
+      if gpu_ts:
+        torch.cuda.set_device(next(iter(gpu_ts.values())).device)
+        with self.shm_buffers_lock:
+          bufs = self.shm_buffers.pop() if self.shm_buffers else [pinned_bytes(256 * 1024**2) for _ in range(2)]
+        try:
+          chunk, evs, stream = bufs[0].numel(), [torch.cuda.Event() for _ in range(2)], torch.cuda.Stream()
+          pending, j = [], 0
+          for k, v in gpu_ts.items():
+            s, _ = header_dict[k]["data_offsets"]
+            pat = base + s
+            src = as_bytes(v)
+            for offset in range(0, len(src), chunk):
+              piece, b = src[offset : offset + chunk], j % 2
+              if len(pending) == 2:
+                ev, pb, p_at, p_n = pending.pop(0)
+                ev.synchronize()
+                dst[p_at : p_at + p_n].copy_(pb[:p_n])
+              with torch.cuda.stream(stream):
+                bufs[b][: len(piece)].copy_(piece, non_blocking=True)
+                evs[b].record(stream)
+              pending.append((evs[b], bufs[b], pat, len(piece)))
+              pat += len(piece)
+              j += 1
+          for ev, pb, p_at, p_n in pending:
+            ev.synchronize()
+            dst[p_at : p_at + p_n].copy_(pb[:p_n])
+        finally:
+          with self.shm_buffers_lock:
+            self.shm_buffers.append(bufs)
+
+      for k, v in shard.items():
+        if k not in gpu_ts:
+          s, _ = header_dict[k]["data_offsets"]
+          dst[base + s : base + s + nbytes(v)].copy_(as_bytes(v))
+
+      with open(path, "r+b") as f:
+        os.fsync(f.fileno())
+      mm.close()
+
+    parallel(write_shard, weights, shards)
+    return [*files, *weights]
+
+    import torch
+
+    lora, cfg, total = info.get("lora"), info.get("config"), sum(map(nbytes, tensors.values()))
+    n = max(1, min(MAX_SHARDS, len(tensors))) if not lora and total >= SHARD_BYTES else 1
+    stem = ("adapter_model" if lora else "model") if cfg else "state"
+    shards, sizes = [{} for _ in range(n)], [0] * n
+    for k, v in sorted(tensors.items(), key=lambda kv: nbytes(kv[1]), reverse=True):
+      i = sizes.index(min(sizes))
+      shards[i][k], sizes[i] = v, sizes[i] + nbytes(v)
+    shards = [s for s in shards if s] or [{}]
+    n = len(shards)
+    weights = [f"{stem}.safetensors"] if n == 1 else [f"{stem}-{i + 1:05d}-of-{n:05d}.safetensors" for i in range(n)]
+    files = {}
+    if cfg:
+      files["adapter_config.json" if lora else "config.json"] = cfg
+    if cfg and n > 1:
+      weight_map = {k: w for w, shard in zip(weights, shards) for k in shard}
+      files["model.safetensors.index.json"] = {"metadata": {"total_size": total}, "weight_map": weight_map}
+    for name, obj in files.items():
+      with open(f"{folder}/{name}", "w") as f:
+        json.dump(obj, f)
+
+    def write_shard(name: str, shard: dict[str, torch.Tensor]) -> None:
+      DT = {
+        torch.float32: "F32",
+        torch.float64: "F64",
+        torch.float16: "F16",
+        torch.bfloat16: "BF16",
+        torch.int64: "I64",
+        torch.int32: "I32",
+        torch.int16: "I16",
+        torch.int8: "I8",
+        torch.uint8: "U8",
+        torch.bool: "BOOL",
+      }
+      header_dict, off = {}, 0
+      for k, v in shard.items():
+        dt = DT.get(v.dtype, str(v.dtype).split(".")[-1].upper())
+        header_dict[k] = {"dtype": dt, "shape": list(v.shape), "data_offsets": [off, off + nbytes(v)]}
+        off += nbytes(v)
+      header_dict["__metadata__"] = {"meta": json.dumps(info)}
+      h = json.dumps(header_dict).encode()
+      h += b" " * (-len(h) % 8)
+      size = 8 + len(h) + off
+
+      pool_dir = f"{SHM}/free"
+      os.makedirs(pool_dir, exist_ok=True)
+      claimed = False
+      with contextlib.suppress(OSError):
+        for e in os.scandir(pool_dir):
+          try:
+            os.rename(e.path, f"{folder}/{name}")
+            claimed = True
+            break
+          except OSError:
+            pass
+
+      path = f"{folder}/{name}"
+      fd = os.open(path, os.O_RDWR | os.O_CREAT)
+      os.ftruncate(fd, size)
+      mm = mmap.mmap(fd, size, mmap.MAP_SHARED)
+      os.close(fd)
+
+      dst = torch.frombuffer(mm, dtype=torch.uint8)
+      if not claimed:
+        ctypes.memset(dst.data_ptr(), 0, size)
+
+      dst[:8] = torch.tensor(list(len(h).to_bytes(8, "little")), dtype=torch.uint8)
+      dst[8 : 8 + len(h)] = torch.frombuffer(bytearray(h), dtype=torch.uint8)
+      base = 8 + len(h)
+
+      gpu_tensors = {k: v for k, v in shard.items() if getattr(v, "is_cuda", False)}
+      cpu_tensors = {k: v for k, v in shard.items() if not getattr(v, "is_cuda", False)}
+
+      if gpu_tensors:
+        torch.cuda.set_device(next(iter(gpu_tensors.values())).device)
+        with self.shm_buffers_lock:
+          bufs = self.shm_buffers.pop() if self.shm_buffers else [pinned_bytes(256 * 1024**2) for _ in range(2)]
+        try:
+          chunk, evs, stream = bufs[0].numel(), [torch.cuda.Event() for _ in range(2)], torch.cuda.Stream()
+          pending, j = [], 0
+          for k, v in gpu_tensors.items():
+            s, _ = header_dict[k]["data_offsets"]
+            pat = base + s
+            src = as_bytes(v)
+            for offset in range(0, len(src), chunk):
+              piece, b = src[offset : offset + chunk], j % 2
+              if len(pending) == 2:
+                ev, pb, p_at, p_n = pending.pop(0)
+                ev.synchronize()
+                dst[p_at : p_at + p_n].copy_(pb[:p_n])
+              with torch.cuda.stream(stream):
+                bufs[b][: len(piece)].copy_(piece, non_blocking=True)
+                evs[b].record(stream)
+              pending.append((evs[b], bufs[b], pat, len(piece)))
+              pat += len(piece)
+              j += 1
+          for ev, pb, p_at, p_n in pending:
+            ev.synchronize()
+            dst[p_at : p_at + p_n].copy_(pb[:p_n])
+        finally:
+          with self.shm_buffers_lock:
+            self.shm_buffers.append(bufs)
+
+      for k, v in cpu_tensors.items():
+        s, _ = header_dict[k]["data_offsets"]
+        dst[base + s : base + s + nbytes(v)].copy_(as_bytes(v))
+
+      with open(path, "r+b") as f:
+        os.fsync(f.fileno())
+      mm.close()
+
+    parallel(write_shard, weights, shards)
     return [*files, *weights]
 
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
     dest = self.path(uri)
     if self.remote:
       os.makedirs(self.cache, exist_ok=True)
-      folder, version = tempfile.mkdtemp(dir=self.cache), uuid.uuid4().hex[:16]
+      version = uuid.uuid4().hex[:16]
       if (meta or {}).get("config") and not (meta or {}).get("lora"):  # a full fine-tune's sampler weights
         run = uri.removeprefix("tinker://").split("/")[0]
         k, _, n = self.chains.get(run, "").rpartition(".")
         version = self.chains[run] = f"{k}.{int(n) + 1}" if k and int(n) + 1 < KEYFRAME_EVERY else f"{version}.0"
+
+      total_bytes = sum(nbytes(t) for t in tensors.values())
+      limit = SHM_BYTES or (shutil.disk_usage(SHM).total // 2 if os.path.exists(SHM) else 10 * 1024**3)
+      use_shm = bool(limit and total_bytes < limit)
+      folder = f"{SHM}/{version}" if use_shm else tempfile.mkdtemp(dir=self.cache)
+      os.makedirs(folder, exist_ok=True)
+
       try:
         with self.lock:
-          names = self.write_checkpoint_files(folder, self.copy_to_host(tensors), dict(meta or {}))
-        os.rename(folder, f"{self.cache}/{version}")
-      finally:
+          names = self.write_checkpoint_files(folder, tensors, dict(meta or {}), use_shm=use_shm)
+        if not use_shm:
+          os.rename(folder, f"{self.cache}/{version}")
+      except Exception:
         shutil.rmtree(folder, ignore_errors=True)
+        raise
+
       self.record_latest_version(uri, version)
       self.versions[uri] = version
       with open(f"{self.cache}/{version}.upload.tmp", "w") as f:
-        json.dump({"uri": uri, "names": names}, f)
-      # upload_pending_saves() takes it from here
+        json.dump({"uri": uri, "names": names, "shm": use_shm}, f)
       os.replace(f"{self.cache}/{version}.upload.tmp", f"{self.cache}/{version}.upload")
       return dest
     parent, base = os.path.dirname(dest), os.path.basename(dest)
@@ -318,17 +522,20 @@ class Store:
     with open(pointer) as f:
       return f.read()
 
-  def upload_version(self, dest: str, version: str, names: list[str]) -> None:
-    folder, rel = f"{self.cache}/{version}", dest[len(self.base) + 1 :]
+  def upload_version(self, dest: str, version: str, names: list[str], is_shm: bool = False) -> None:
+    folder, rel = f"{SHM}/{version}" if is_shm else f"{self.cache}/{version}", dest[len(self.base) + 1 :]
     info, files = {"version": version, "dir": f"{rel}/{version}", "files": names}, [f"{folder}/{n}" for n in names]
     k, _, n = version.rpartition(".")
     if k:  # a link of the run's chain
-      info["dir"], parent = f"{rel.split('/')[0]}/_versions/{version}", f"{self.cache}/{k}.{int(n) - 1}"
+      info["dir"], parent = (
+        f"{rel.split('/')[0]}/_versions/{version}",
+        f"{SHM}/{k}.{int(n) - 1}" if os.path.isdir(f"{SHM}/{k}.{int(n) - 1}") else f"{self.cache}/{k}.{int(n) - 1}",
+      )
       first = ""  # the newest link before it that went up whole, if the one before it went up
-      if os.path.exists(f"{parent}.uploaded") and self.fs.exists(
+      if os.path.exists(f"{self.cache}/{k}.{int(n) - 1}.uploaded") and self.fs.exists(
         f"{self.base}/{rel.split('/')[0]}/_versions/{k}.{int(n) - 1}"
       ):
-        with open(f"{parent}.uploaded") as f:
+        with open(f"{self.cache}/{k}.{int(n) - 1}.uploaded") as f:
           first = f.read()
       xor = int(n) and first and self.write_changed_bytes(parent, folder, names, f"{folder}.xor")
       heads = {name: raw(f"{folder}/{name}")[0] for name in names if name.endswith(".safetensors")}
@@ -351,7 +558,7 @@ class Store:
       for e in self.fs.ls(dest, detail=False):
         if os.path.basename(e) not in keep:
           self.fs.rm(e, recursive=True)
-    with open(f"{folder}.uploaded", "w") as f:  # beside the folder, so engines that list it never see it
+    with open(f"{self.cache}/{version}.uploaded", "w") as f:
       f.write(info.get("from", ""))
 
   def write_changed_bytes(self, parent: str, folder: str, names: list[str], out: str) -> list[str] | None:
@@ -359,7 +566,7 @@ class Store:
     import safetensors.numpy
 
     shards = [n for n in names if n.endswith(".safetensors")]
-    if not all(os.path.exists(f"{parent}/{n}") for n in shards):  # trimmed from this node's cache
+    if not all(os.path.exists(f"{parent}/{n}") for n in shards):
       return None
     files = [(raw(f"{parent}/{n}"), raw(f"{folder}/{n}")) for n in shards]
     if any(layout(was) != layout(head) or len(old) != len(new) for (was, old), (head, new) in files):
@@ -378,8 +585,8 @@ class Store:
     return [f"{n}.xor" for n in shards]
 
   def upload_pending_saves(self) -> None:
-    """Upload this node's saves in the order they were made. A failed upload skips the rest for that URI or chain, so _latest never goes backward, and the next flush tries again."""
-    with self.uploading:  # the node daemon's last call at shutdown waits for the one running behind
+    """Upload this node's saves in the order they were made."""
+    with self.uploading:
       found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
       failed = set()
       for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
@@ -389,9 +596,11 @@ class Store:
           job = json.load(f)
         if (k and k in failed) or job["uri"] in failed:
           continue
-        if os.path.isdir(f"{self.cache}/{version}"):
+        is_shm = job.get("shm", False)
+        folder = f"{SHM}/{version}" if is_shm else f"{self.cache}/{version}"
+        if os.path.isdir(folder):
           try:
-            self.upload_version(self.path(job["uri"]), version, job["names"])
+            self.upload_version(self.path(job["uri"]), version, job["names"], is_shm=is_shm)
           except Exception as exc:
             if k:
               failed.add(k)
@@ -416,9 +625,13 @@ class Store:
       return dest, hashlib.blake2b(repr((real, stats)).encode(), digest_size=8).hexdigest()
     # without a version: the one this node saved last, else the bucket's
     want = version or self.latest_version_here(uri)
-    if want and os.path.isdir(f"{self.cache}/{want}"):
-      os.utime(f"{self.cache}/{want}")  # so trim_cache() takes the ones nobody read for longest
-      return f"{self.cache}/{want}", want
+    if want:
+      shm_folder = f"{SHM}/{want}"
+      if os.path.isdir(shm_folder):
+        return shm_folder, want
+      if os.path.isdir(f"{self.cache}/{want}"):
+        os.utime(f"{self.cache}/{want}")  # so trim_cache() takes the ones nobody read for longest
+        return f"{self.cache}/{want}", want
     deadline = time.time() + UPLOAD_WAIT_S
     while True:
       info = json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
@@ -452,7 +665,7 @@ class Store:
         except OSError:
           if not os.path.isdir(folder):
             raise
-        open(f"{folder}.uploaded", "w").close()  # the bucket has it, so trim_cache() may drop it here
+        open(f"{self.cache}/{version}.uploaded", "w").close()  # the bucket has it, so trim_cache() may drop it here
       finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return folder
@@ -466,7 +679,11 @@ class Store:
 
     k, _, n = version.rpartition(".")
     chain = [f"{k}.{i}" for i in range(0 if whole == "base" else int(whole.rpartition(".")[2]), int(n) + 1)]
-    cached = [i for i in range(len(chain) - 1) if os.path.isdir(f"{self.cache}/{chain[i]}")]
+    cached = [
+      i
+      for i in range(len(chain) - 1)
+      if os.path.isdir(f"{self.cache}/{chain[i]}") or os.path.isdir(f"{SHM}/{chain[i]}")
+    ]
     from_base = whole == "base" and not cached  # a chain whose link 0 went up as its changes from the base model
     have = -1 if from_base else (cached or [0])[-1]
     shards, after = [n for n in names if n.endswith(".safetensors")], chain[have + 1 :]
@@ -481,7 +698,11 @@ class Store:
       if not lay_out_base(heads, start := f"{folder}.base"):
         raise ValueError(f"{version} is built on its base model, which isn't on this node")
     else:
-      start = self.cached_folder(chain[have], lambda tmp: self.download_files(f"{links}/{chain[have]}", names, tmp))
+      start = (
+        f"{SHM}/{chain[have]}"
+        if os.path.isdir(f"{SHM}/{chain[have]}")
+        else self.cached_folder(chain[have], lambda tmp: self.download_files(f"{links}/{chain[have]}", names, tmp))
+      )
     data = dict(zip(shards, parallel(lambda name: np.array(raw(f"{start}/{name}")[1]), shards)))
     shutil.rmtree(f"{folder}.base", ignore_errors=True)
     for link in after:
@@ -568,16 +789,35 @@ class Store:
           self.fs.rm(links, recursive=True)
 
   def trim_cache(self) -> None:
-    """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the bucket has: a version still uploading stays."""
-    if not os.path.isdir(self.cache):
-      return
-    limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2
-    found = [e for e in os.scandir(self.cache) if e.is_dir() and os.path.exists(f"{e.path}.uploaded")]
-    size = {e.path: sum(f.stat().st_size for f in os.scandir(e.path)) for e in found}
-    total = sum(size.values())
-    for e in sorted(found, key=lambda e: e.stat().st_mtime):
-      if total <= limit:
-        break
-      shutil.rmtree(e.path, ignore_errors=True)
-      os.unlink(f"{e.path}.uploaded")
-      total -= size[e.path]
+    """Delete the versions in CKPT_CACHE and SHM nobody read for longest."""
+    if os.path.isdir(self.cache):
+      limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2
+      found = [e for e in os.scandir(self.cache) if e.is_dir() and os.path.exists(f"{e.path}.uploaded")]
+      size = {e.path: sum(f.stat().st_size for f in os.scandir(e.path)) for e in found}
+      total = sum(size.values())
+      for e in sorted(found, key=lambda e: e.stat().st_mtime):
+        if total <= limit:
+          break
+        shutil.rmtree(e.path, ignore_errors=True)
+        os.unlink(f"{e.path}.uploaded")
+        total -= size[e.path]
+    if os.path.isdir(SHM):
+      limit = SHM_BYTES or shutil.disk_usage(SHM).total // 2
+      uploaded = []
+      for e in os.scandir(SHM):
+        if e.is_dir() and e.name != "free" and os.path.exists(f"{self.cache}/{e.name}.uploaded"):
+          uploaded.append(e)
+      size = {e.path: sum(f.stat().st_size for f in os.scandir(e.path)) for e in uploaded}
+      total = sum(size.values())
+      pool_dir = f"{SHM}/free"
+      os.makedirs(pool_dir, exist_ok=True)
+      for e in sorted(uploaded, key=lambda e: e.stat().st_mtime):
+        if total <= limit:
+          break
+        for f in os.scandir(e.path):
+          with contextlib.suppress(OSError):
+            os.rename(f.path, f"{pool_dir}/{uuid.uuid4().hex}")
+        shutil.rmtree(e.path, ignore_errors=True)
+        with contextlib.suppress(OSError):
+          os.unlink(f"{self.cache}/{e.name}.uploaded")
+        total -= size[e.path]
