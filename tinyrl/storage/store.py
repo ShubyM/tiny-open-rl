@@ -543,18 +543,20 @@ class Store:
         shutil.rmtree(p, ignore_errors=True)
 
   def list_checkpoints(self) -> list[str]:
-    """Every checkpoint in the store."""
+    """Every checkpoint in the store, including one whose upload never wrote its _latest."""
     if self.remote:
       return [
-        f"tinker://{p[len(self.base) + 1 : -len('/_latest')]}" for p in self.fs.glob(f"{self.base}/*/*/*/_latest")
+        f"tinker://{p[len(self.base) + 1 :]}" for p in self.fs.glob(f"{self.base}/*/*/*") if "/_versions/" not in p
       ]
     found = glob.glob(f"{glob.escape(self.base)}/*/*/*")  # glob skips the dot folders a save writes into
     return [f"tinker://{os.path.relpath(p, self.base)}" for p in found]
 
   def saved_at(self, uri: str) -> float:
     """When a checkpoint was last saved."""
-    if self.remote:
-      return self.fs.modified(f"{self.path(uri)}/_latest").timestamp()
+    if self.remote and self.fs.exists(latest := f"{self.path(uri)}/_latest"):
+      return self.fs.modified(latest).timestamp()
+    if self.remote:  # an upload that never finished: when its newest file landed
+      return max((self.fs.modified(f).timestamp() for f in self.fs.find(self.path(uri))), default=0.0)
     return os.lstat(self.path(uri)).st_mtime
 
   def delete_unused_chain_links(self, live: set[str], since: float, before: float) -> None:
