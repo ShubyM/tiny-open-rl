@@ -246,6 +246,32 @@ class TestNodeDaemon(RedisTest):
       await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
     self.assertEqual(sorted(p.rsplit("/", 1)[1] for p in store.fs.glob(f"{store.base}/r/_versions/*")), v[:2])
 
+  async def test_a_sweep_moves_on_past_a_checkpoint_it_cannot_delete(self):
+    store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
+    for name in ("a", "b"):
+      store.put(f"tinker://r/weights/{name}", {"w": torch.ones(2)})
+    store.upload_pending_saves()
+    await self.bus.r.set("tinyrl:ckpt_since", 0)
+    delete = store.delete
+    store.delete = lambda uri: (_ for _ in ()).throw(OSError("503")) if uri.endswith("/a") else delete(uri)
+    with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
+      await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
+    self.assertEqual(store.list_checkpoints(), ["tinker://r/weights/a"])
+
+  async def test_a_sweep_deletes_a_save_whose_upload_never_finished(self):
+    store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
+    store.put("tinker://r/weights/w", {"w": torch.ones(2)})
+    pipe = store.fs.pipe_file
+    with patch.object(
+      store.fs, "pipe_file", lambda p, d: (_ for _ in ()).throw(OSError("429")) if p.endswith("_latest") else pipe(p, d)
+    ):
+      store.upload_pending_saves()  # its files went up, but not the _latest that names them
+    self.assertTrue(store.fs.find(store.path("tinker://r/weights/w")))
+    await self.bus.r.set("tinyrl:ckpt_since", 0)
+    with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
+      await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
+    self.assertFalse(store.fs.exists(store.path("tinker://r/weights/w")))
+
 
 if __name__ == "__main__":
   unittest.main()
