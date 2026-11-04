@@ -96,6 +96,19 @@ class TestStore(unittest.TestCase):
     self.assertIn("config.json", sampler_files)
     self.assertIn("model.safetensors.index.json", sampler_files)
     self.assertTrue(any("model-00001-of-" in f for f in sampler_files))
+    want_huge = {
+      "t1": torch.ones(512, dtype=torch.uint8),
+      "t2": torch.ones(512, dtype=torch.uint8),
+      "t3": torch.ones(8, dtype=torch.uint8),
+      "t4": torch.ones(8, dtype=torch.uint8),
+    }
+    huge_folder = store.put(uri + "-huge", want_huge, {"lora": False, "config": {"test": True}})
+    st_file = next(f for f in sorted(os.listdir(huge_folder)) if f.endswith(".safetensors"))
+    import safetensors
+
+    with safetensors.safe_open(f"{huge_folder}/{st_file}", framework="pt", device="cpu") as f:
+      keys = f.keys()
+      self.assertNotEqual("t1" in keys, "t2" in keys)
 
   def test_stage_below_and_above_max_pin_bytes(self):
     old_max = tinyrl.storage.store.MAX_PIN_BYTES
@@ -486,6 +499,33 @@ class TestStore(unittest.TestCase):
     remote_dir = f"{store.base}/r/weights/d4_count"
     versions = [e for e in store.fs.ls(remote_dir, detail=False) if os.path.basename(e) != "_latest"]
     self.assertEqual(len(versions), 2)
+
+  def test_pinned_bytes_and_storage_lifetime(self):
+    import gc
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from tinyrl.storage.store import pinned_bytes
+
+    self.assertEqual(pinned_bytes(0).numel(), 0)
+    events = []
+    fake_cudart = SimpleNamespace(
+      cudaHostRegister=lambda ptr, sz, flags: (events.append(("reg", sz)), 0)[1],
+      cudaHostUnregister=lambda ptr: events.append(("unreg", ptr)),
+    )
+    with patch("torch.cuda.is_available", return_value=True), patch("torch.cuda.cudart", return_value=fake_cudart):
+      slab = pinned_bytes(10000)
+      self.assertEqual(slab.numel(), 10000)
+      self.assertEqual(slab.sum().item(), 0)
+      view = slab[8:40].view(torch.float32)
+      view.fill_(3.0)
+      del slab
+      gc.collect()
+      self.assertEqual([e[0] for e in events], ["reg"])
+      self.assertEqual(view.sum().item(), 24.0)
+      del view
+      gc.collect()
+      self.assertEqual([e[0] for e in events], ["reg", "unreg"])
 
 
 if __name__ == "__main__":

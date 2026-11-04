@@ -19,6 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from tinyrl.api import wire
 from tinyrl.helpers import getenv
 from tinyrl.storage import models
+from tinyrl.storage.store import aligned, nbytes, pinned_bytes
 
 LigerFusedLinearCrossEntropyLoss = apply_liger = None
 with contextlib.suppress(ImportError):
@@ -428,12 +429,21 @@ class Model:
       yield from self.adam_moments()
 
   def move_tensors(self, tensors, device: str) -> None:
+    tensors = list(tensors)
+    if device == "cpu":
+      need = [
+        t
+        for t in tensors
+        if t.is_cuda and ((b := self.pinned.get(id(t))) is None or b.shape != t.shape or b.dtype != t.dtype)
+      ]
+      if need:
+        slab, at = pinned_bytes(sum(aligned(nbytes(t)) for t in need)), 0
+        for t in need:
+          self.pinned[id(t)] = slab[at : at + nbytes(t)].view(t.dtype).view(t.shape)
+          at += aligned(nbytes(t))
     for t in tensors:
       if device == "cpu" and t.is_cuda:
-        buf = self.pinned.get(id(t))
-        if buf is None or buf.shape != t.shape or buf.dtype != t.dtype:
-          buf = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-          self.pinned[id(t)] = buf
+        buf = self.pinned[id(t)]
         buf.copy_(t, non_blocking=True)
         t.data = buf
       elif device == "cuda" and (t.is_pinned() or id(t) in self.pinned):
@@ -463,6 +473,10 @@ class Model:
     self.needs_recovery.discard(run)
     if self.lora:
       lm.delete_adapter(run)
+    else:
+      self.lm = None
+      if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     del self.params[run]
     self.pinned.clear()
     self.optimizers.pop(run, None)

@@ -10,9 +10,12 @@ A full fine-tune's sampler weights change in few bf16 values a step, so its save
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import ctypes
 import glob
 import hashlib
 import json
+import mmap
 import os
 import shutil
 import sys
@@ -20,6 +23,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 import zlib
 from typing import TYPE_CHECKING
 
@@ -35,12 +39,34 @@ CKPT = getenv("CKPT", "/tmp/tinyrl")
 CKPT_CACHE = getenv("CKPT_CACHE", "/tmp/tinyrl-cache")
 SHARD_BYTES = getenv("SHARD_BYTES", 256 * 1024 * 1024)  # a full checkpoint this big is written as parallel shards
 MAX_SHARDS = 16
-MAX_PIN_BYTES = getenv("MAX_PIN_BYTES", 10 * 1024 * 1024 * 1024)  # the most pinned host memory a save holds
+MAX_PIN_BYTES = getenv("MAX_PIN_BYTES", 24 * 1024**3)  # the most pinned host memory a save holds
 UPLOAD_WAIT_S = getenv("UPLOAD_WAIT_S", 900.0)  # how long a node waits for a version another node is uploading
 # trim_cache() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
 CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)
 KEYFRAME_EVERY = getenv("KEYFRAME_EVERY", 8)  # the most links in a chain of full sampler weights
 XOR_CHUNK = 16 * 1024 * 1024
+
+
+def pinned_bytes(size: int) -> torch.Tensor:
+  import torch
+
+  cudart = None
+  if size > 0 and sys.platform == "linux" and torch.cuda.is_available():
+    with contextlib.suppress(AssertionError, RuntimeError):
+      cudart = torch.cuda.cudart()
+  if cudart is None:
+    return torch.empty(size, dtype=torch.uint8, pin_memory=torch.cuda.is_available())
+  alloc = (size + 4095) & ~4095
+  m = mmap.mmap(-1, alloc, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+  buf = torch.frombuffer(m, dtype=torch.uint8, count=size)
+  ptr = buf.data_ptr()
+  step = (alloc // min(32, max(1, os.cpu_count() or 1), max(1, alloc >> 22)) + 4095) & ~4095
+  parallel(lambda a: ctypes.memset(ptr + a, 0, min(step, alloc - a)), list(range(0, alloc, step)))
+  if cudart.cudaHostRegister(ptr, alloc, 0) != 0:
+    m.close()
+    return torch.empty(size, dtype=torch.uint8, pin_memory=True)
+  weakref.finalize(buf.untyped_storage(), lambda mm, p: (cudart.cudaHostUnregister(p), mm.close()), m, ptr)
+  return buf
 
 
 def nbytes(t: torch.Tensor) -> int:
@@ -179,7 +205,7 @@ class Store:
       size = min(total, MAX_PIN_BYTES)
       if self.pinned is None or self.pinned.numel() < size:
         self.pinned = None  # free the old buffer before pinning a bigger one
-        self.pinned = torch.empty(size, dtype=torch.uint8, pin_memory=torch.cuda.is_available())
+        self.pinned = pinned_bytes(size)
       sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
       at = 0
       for k in gpu:
@@ -206,8 +232,13 @@ class Store:
     lora, cfg, total = info.get("lora"), info.get("config"), sum(map(nbytes, tensors.values()))
     n = max(1, min(MAX_SHARDS, len(tensors))) if not lora and total >= SHARD_BYTES else 1
     stem = ("adapter_model" if lora else "model") if cfg else "state"
+    shards, sizes = [{} for _ in range(n)], [0] * n
+    for k, v in sorted(tensors.items(), key=lambda kv: nbytes(kv[1]), reverse=True):
+      i = sizes.index(min(sizes))
+      shards[i][k], sizes[i] = v, sizes[i] + nbytes(v)
+    shards = [s for s in shards if s] or [{}]
+    n = len(shards)
     weights = [f"{stem}.safetensors"] if n == 1 else [f"{stem}-{i + 1:05d}-of-{n:05d}.safetensors" for i in range(n)]
-    shards = [dict(list(tensors.items())[i::n]) for i in range(n)]
     files = {}
     if cfg:
       files["adapter_config.json" if lora else "config.json"] = cfg

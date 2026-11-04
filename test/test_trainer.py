@@ -213,6 +213,14 @@ class CudaMock(torch.Tensor):
 
 
 class TestModel(unittest.TestCase):
+  def test_full_ft_delete_run_drops_model_lm(self):
+    m = Model(tiny)
+    m.create_run("test-full-ft", "tiny", 0, {})
+    m.activate_run("test-full-ft")
+    self.assertIsNotNone(m.lm)
+    m.delete_run("test-full-ft")
+    self.assertIsNone(m.lm)
+
   def test_a1_and_a2_gradients(self):
     model, run_id = Model(tiny), new_id()
     model.create_run(run_id, "tiny", 0, {})
