@@ -439,7 +439,8 @@ class TestAPI(RedisTest):
     self.assertEqual(data["state"]["workers"][worker]["node"], "node-1")
     sampler = data["state"]["workers"][await self.worker(samp_id)]
     self.assertEqual(
-      sampler["kind"], {"role": "sampler", "base": "tiny", "lora": True, "exclusive": True, "train_run": excl_id}
+      sampler["kind"],
+      {"role": "sampler", "base": "tiny", "lora": True, "exclusive": True, "train_run": excl_id, "gpus": 1},
     )
     self.assertIn("node-1", data["nodes"])
 

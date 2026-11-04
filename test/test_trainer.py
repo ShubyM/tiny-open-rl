@@ -901,6 +901,70 @@ class TestTrainer(RedisTest):
     processed3 = await t.step(count=10, block_ms=10)
     self.assertEqual(processed3, 0)
 
+  async def test_a_multi_rank_trainer_exits_on_a_server_error_but_answers_a_user_error(self):
+    t = Trainer(self.bus, "p", Model(tiny))
+    t.world_size = 2
+    with patch("torch.distributed.broadcast_object_list"), patch("os._exit", side_effect=SystemExit(1)) as exit_:
+      with self.assertRaises(KeyError):
+        t.call_model("optim_step", new_id(), {})
+      exit_.assert_not_called()
+      with patch.object(t.model, "optim_step", side_effect=RuntimeError("CUDA out of memory")):
+        with self.assertRaises(SystemExit):
+          t.call_model("optim_step", new_id(), {})
+      exit_.assert_called_once_with(1)
+
+  async def test_a_multi_rank_fsdp2_trainer_matches_a_single_rank_trainer(self):
+    import sys
+
+    base_dir, ckpt_dir = tempfile.mkdtemp(), tempfile.mkdtemp()
+    tiny().save_pretrained(base_dir)
+    store = Store(root=ckpt_dir)
+    r1, r2 = new_id(), new_id()
+    await self.bus.create_run(Run(r1, "w1", base_dir, 0))
+    await self.bus.create_run(Run(r2, "w2", base_dir, 0, gpus=2))
+
+    t1 = Trainer(self.bus, "w1", store=store)
+    await self.own(t1)
+    env = {**os.environ, "REDIS_URL": self.url, "CKPT": ckpt_dir, "CUDA_VISIBLE_DEVICES": ""}
+    proc = await asyncio.create_subprocess_exec(
+      sys.executable,
+      "-m",
+      "torch.distributed.run",
+      "--standalone",
+      "--nproc-per-node=2",
+      "-m",
+      "tinyrl.workers.trainer",
+      "w2",
+      env=env,
+    )
+    try:
+      ids = []
+      for r in (r1, r2):
+        ids += await self.submit(
+          r,
+          (Op.CREATE_MODEL, {"base_model": base_dir, "rank": 0, "lora": {"seed": 0}}),
+          (Op.FORWARD_BACKWARD, proto_body(r)),
+          (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
+          (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{r}/sampler_weights/s1"}),
+          (Op.DELETE_MODEL, {}),
+        )
+      while await t1.step(block_ms=10):
+        pass
+      await asyncio.wait_for(proc.wait(), 60)
+      self.assertEqual(proc.returncode, 0)
+      for request_id in ids:
+        reply = await self.bus.wait_for_reply(request_id, 1)
+        self.assertTrue(reply.ok, reply.body)
+
+      single, fsdp = (store.get(f"tinker://{r}/sampler_weights/s1")[0] for r in (r1, r2))
+      self.assertEqual(single.keys(), fsdp.keys())
+      for name in single:
+        torch.testing.assert_close(fsdp[name], single[name], atol=1e-5, rtol=1e-5)
+    finally:
+      if proc.returncode is None:
+        proc.kill()
+        await proc.wait()
+
 
 class TestCheckpointNames(unittest.TestCase):
   def test_a_multimodal_checkpoint_trains_under_its_own_parameter_names(self):

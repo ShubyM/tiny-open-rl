@@ -164,9 +164,12 @@ class NodeDaemon:
     if moves_itself(p, self.gpus):
       env["CUDA_VISIBLE_DEVICES"], env["TINYRL_NODE"] = ",".join(map(str, range(self.gpus))), self.id
     mod = f"tinyrl.workers.{k.role}"
+    cmd = [sys.executable, "-m", mod, worker]
     if mod == "tinyrl.workers.trainer":
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    return gpus, subprocess.Popen([sys.executable, "-m", mod, worker], env=env, start_new_session=True)
+      if len(gpus) > 1:
+        cmd[:1] = [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc-per-node={len(gpus)}"]
+    return gpus, subprocess.Popen(cmd, env=env, start_new_session=True)
 
   async def serve(self) -> None:
     await self.announce_node()

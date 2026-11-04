@@ -408,6 +408,20 @@ class TestWorkersAndGpus(unittest.TestCase):
     log("run_created", run="b", worker="b")
     self.assertEqual([log.s.workers[n].gpus for n in ("x", "a", "b")], [(0,), (1,), (1,)])
 
+  def test_a_multi_gpu_worker_takes_that_many_gpus_on_a_node_that_has_them(self):
+    log = Log(self)
+    log.node(1, node="a")
+    log.node(4, node="b")
+    log("run_created", run="t", worker="t")
+    self.assertEqual(log.s.workers["t"].node, "a")
+    log("run_created", run="w2", worker="w2", gpus=2)
+    self.assertEqual((log.s.workers["w2"].node, log.s.workers["w2"].gpus), ("b", (0, 1)))
+    log("run_created", run="t2", worker="t2")
+    self.assertEqual((log.s.workers["t2"].node, log.s.workers["t2"].gpus), ("b", (2,)))
+    decided = log("sampler_warmed", worker="sampler:s2", gpus=2)
+    self.assertEqual([(k, w) for k, w, _ in decided], [("placed", "t2"), ("placed", "sampler:s2")])
+    self.assertEqual((log.s.workers["sampler:s2"].gpus, log.s.workers["t2"].gpus), ((2, 3), (0,)))
+
   def test_the_benchmark_s_arrivals_move_lora_trainers_and_leave_samplers_alone(self):
     log = Log(self)
     log.node(8, memory=81559 * MIB)

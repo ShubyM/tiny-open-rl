@@ -88,6 +88,7 @@ class Run:
   exclusive: bool = False
   role: Role = Role.TRAINER
   train_run: str | None = None  # the training run a sampling session samples
+  gpus: int = 1
 
 
 @dataclass(frozen=True)
@@ -218,7 +219,7 @@ class Bus:
       p.sadd(key("sess", run.session, "runs"), run.id)
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
     body = {"run": run.id, "role": run.role, "base": run.base, "rank": run.rank, "exclusive": run.exclusive}
-    body |= {"train_run": run.train_run} | ({"worker": run.worker} if run.worker else {})
+    body |= {"train_run": run.train_run, "gpus": run.gpus} | ({"worker": run.worker} if run.worker else {})
     p.xadd(key("events"), {"kind": Ev.RUN_CREATED, "body": json.dumps(body)})
     await p.execute()
 
