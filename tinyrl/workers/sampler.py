@@ -155,7 +155,7 @@ class Sampler:
     while not self.done:
       await asyncio.sleep(LEASE_MS / 4000)
       if not await self.bus.renew_lease(self.worker, self.owner) and not await self.bus.take_lease(
-        self.worker, self.owner
+        self.worker, self.owner, recover=True
       ):
         # another sampler took the worker. A lease that expired untaken, as in a Redis restart, is taken again
         self.done = True

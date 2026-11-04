@@ -113,21 +113,14 @@ class Trainer:
       await asyncio.sleep(LEASE_MS / 4000)
 
   async def keep_renewing_lease(self) -> None:
-    """Renew the worker's lease until another trainer has it."""
+    """Renew the worker's lease until another trainer has it. A lease that ran out with nobody serving the worker since, as while Redis restarts, is taken again."""
     while True:  # until serve() cancels it, so the lease holds while a stopping trainer saves its runs
       await asyncio.sleep(LEASE_MS / 4000)
-      if not await self.bus.renew_lease(self.worker, self.owner) and not await self.retake_lost_lease():
+      if not await self.bus.renew_lease(self.worker, self.owner) and not await self.bus.take_lease(
+        self.worker, self.owner, recover=True
+      ):
         self.stopping = Stop.EXIT
         return
-
-  async def retake_lost_lease(self) -> bool:
-    """Take the worker's lease again if it ran out with nobody taking it, as it does while Redis restarts. Not if another trainer has parked one of this trainer's runs since, which it only does after serving the worker."""
-    if not await self.bus.take_lease(self.worker, self.owner):
-      return False
-    if any([await self.bus.parked_checkpoint(run) for run in self.model.params]):
-      await self.bus.release_lease(self.worker, self.owner)
-      return False
-    return True
 
   def stop(self) -> None:
     """Finish the batch in hand, save every run for the worker's next trainer, and exit. SIGTERM calls it."""
@@ -142,10 +135,10 @@ class Trainer:
       await self.registry.register_checkpoint(uri, sum(map(nbytes, tensors.values())), owned=True, version=ver)
       await self.bus.set_parked_checkpoint(run, uri, self.worker, self.owner)
 
-  async def load_run(self, run_id: str, uri: str, optimizer: bool) -> None:
+  async def load_run(self, run_id: str, uri: str, optimizer: bool, gradients: bool) -> None:
     version = (await self.registry.get_checkpoint(uri) or {}).get("version")
     tensors, meta = await asyncio.to_thread(self.store.get, uri, version)
-    await asyncio.to_thread(self.call_model, "restore_run", run_id, tensors, meta, optimizer)
+    await asyncio.to_thread(self.call_model, "restore_run", run_id, tensors, meta, optimizer, gradients)
 
   async def answer_command(self, cmd: Cmd) -> Reply:
     try:
@@ -158,7 +151,7 @@ class Trainer:
         await asyncio.to_thread(self.call_model, "create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
         if parked:
           try:
-            await self.load_run(cmd.run, parked, optimizer=True)
+            await self.load_run(cmd.run, parked, optimizer=True, gradients=True)
           except Exception:
             await asyncio.to_thread(self.call_model, "delete_run", cmd.run)
             raise
@@ -189,7 +182,7 @@ class Trainer:
             args["uri"], size, args.get("ttl_seconds"), args.get("owned", False), ver
           )
         case Op.LOAD_WEIGHTS:
-          await self.load_run(cmd.run, args["uri"], optimizer=args["optimizer"])
+          await self.load_run(cmd.run, args["uri"], optimizer=args["optimizer"], gradients=False)
         case Op.DELETE_MODEL:
           if cmd.run in self.model.params:
             await asyncio.to_thread(self.call_model, "delete_run", cmd.run)

@@ -165,6 +165,43 @@ class TestBus(RedisTest):
     run = await self.bus.get_run(run_id)
     self.assertEqual((run["steps"], run["failed"]), (0, 1))
 
+  async def test_an_owner_can_recover_a_lease_that_expired_untaken(self):
+    await self.bus.r.pexpire(key("owner", "p"), 0)
+    self.assertFalse(await self.bus.renew_lease("p", "w0"))
+    self.assertTrue(await self.bus.take_lease("p", "w0", recover=True))
+    self.assertEqual(await self.bus.lease_owner("p"), "w0")
+    self.assertEqual(await self.bus.r.pttl(key("last_owner", "p")), -1)
+
+  async def test_concurrent_lease_takes_have_one_winner_and_matching_history(self):
+    await self.bus.release_lease("p", "w0")
+    owners = ["first", "second"]
+    taken = await asyncio.gather(*(self.bus.take_lease("p", owner) for owner in owners))
+    self.assertEqual(sum(taken), 1)
+    winner = owners[taken.index(True)]
+    self.assertEqual(await self.bus.lease_owner("p"), winner)
+    self.assertEqual(await self.bus.r.get(key("last_owner", "p")), winner.encode())
+
+  async def test_recovery_rejects_an_owner_that_acquires_and_releases_before_its_commit(self):
+    await self.bus.r.pexpire(key("owner", "p"), 0)
+    from tinyrl.bus import Bus, connect
+
+    rival = Bus(connect(self.url))
+    self.addAsyncCleanup(rival.r.aclose)
+    pipeline = self.bus.r.pipeline(transaction=True)
+    execute, intervened = pipeline.execute, False
+
+    async def execute_after_takeover():
+      nonlocal intervened
+      if not intervened:
+        intervened = True
+        self.assertTrue(await rival.take_lease("p", "next"))
+        await rival.release_lease("p", "next")
+      return await execute()
+
+    with patch.object(pipeline, "execute", side_effect=execute_after_takeover):
+      with patch.object(self.bus.r, "pipeline", return_value=pipeline):
+        self.assertFalse(await self.bus.take_lease("p", "w0", recover=True))
+
   async def test_only_the_workers_owner_can_answer_for_it(self):
     run_id = await self.new_run()
     request_id = await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"")

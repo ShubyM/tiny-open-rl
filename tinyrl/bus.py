@@ -408,9 +408,24 @@ class Bus:
 
   # ***** worker leases *****
 
-  async def take_lease(self, worker: str, owner: str) -> bool:
-    """Take the worker's lease if no trainer holds it."""
-    return bool(await self.r.set(key("owner", worker), owner, nx=True, px=LEASE_MS))
+  async def take_lease(self, worker: str, owner: str, recover: bool = False) -> bool:
+    """Take an empty lease; resume existing state only if no other owner served the worker since."""
+    k, last = key("owner", worker), key("last_owner", worker)
+    while True:
+      try:
+        async with self.r.pipeline(transaction=True) as p:
+          await p.watch(k, last)
+          current, previous = await p.mget(k, last)
+          if current is not None or (recover and previous not in (None, owner.encode())):
+            await p.unwatch()
+            return False
+          p.multi()
+          p.set(k, owner, px=LEASE_MS)
+          p.set(last, owner)
+          await p.execute()
+          return True
+      except redis.WatchError:
+        continue
 
   async def renew_lease(self, worker: str, owner: str) -> bool:
     """Hold the worker's lease for another LEASE_MS. False if `owner` doesn't hold it anymore."""
