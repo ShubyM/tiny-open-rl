@@ -901,6 +901,18 @@ class TestTrainer(RedisTest):
     processed3 = await t.step(count=10, block_ms=10)
     self.assertEqual(processed3, 0)
 
+  async def test_a_multi_rank_trainer_exits_on_a_server_error_but_answers_a_user_error(self):
+    t = Trainer(self.bus, "p", Model(tiny))
+    t.world_size = 2
+    with patch("torch.distributed.broadcast_object_list"), patch("os._exit", side_effect=SystemExit(1)) as exit_:
+      with self.assertRaises(KeyError):
+        t.call_model("optim_step", new_id(), {})
+      exit_.assert_not_called()
+      with patch.object(t.model, "optim_step", side_effect=RuntimeError("CUDA out of memory")):
+        with self.assertRaises(SystemExit):
+          t.call_model("optim_step", new_id(), {})
+      exit_.assert_called_once_with(1)
+
   async def test_a_multi_rank_fsdp2_trainer_matches_a_single_rank_trainer(self):
     import sys
 
