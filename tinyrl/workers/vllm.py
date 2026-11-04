@@ -163,6 +163,7 @@ class VLLM:
       await engine.close()
       raise
 
+  @spans.timed
   async def ready(self) -> VLLM:
     while self.server.poll() is None:
       with contextlib.suppress(httpx.HTTPError):
@@ -187,6 +188,12 @@ class VLLM:
     await self.http.aclose()
 
   async def post(self, path: str, **kwargs) -> httpx.Response:
+    with spans.span(
+      f"vllm {path} {kwargs.get('params', {}).get('tags', '')}".strip()
+    ):  # every control call: wake, reload, adapters, sleep
+      return await self.post_once(path, **kwargs)
+
+  async def post_once(self, path: str, **kwargs) -> httpx.Response:
     for attempt in range(3):
       try:
         res = await self.http.post(path, **kwargs)

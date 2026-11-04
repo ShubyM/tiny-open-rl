@@ -12,6 +12,7 @@ import glob
 import gzip
 import json
 import os
+import re
 import sys
 
 from tinyrl.bus import Bus, connect
@@ -128,22 +129,42 @@ def union(intervals: list) -> float:
   return total
 
 
+GPU_EVENT = re.compile(
+  rb'"cat": "(kernel|gpu_memcpy|gpu_memset)",\s*"name": "((?:[^"\\]|\\.)*)",\s*"pid": [^,]*,\s*"tid": [^,]*,\s*"ts": ([\d.]+),\s*"dur": ([\d.]+)'
+)
+BASE_TIME = re.compile(rb'"baseTimeNanoseconds": (\d+)')
+
+
+def gpu_events(path: str) -> tuple[float, list, list]:
+  """A torch trace's base time (ns) and its kernels and copies as (ts, dur, name), scanned from the stream: a vLLM trace is GBs of JSON, too big to load."""
+  base, kernels, copies, buf, chunk = 0, [], [], b"", 64 << 20
+  with gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb") as f:
+    while True:
+      got = f.read(chunk)
+      buf += got
+      done = 0
+      for m in GPU_EVENT.finditer(buf):
+        if got and m.end() > len(buf) - 4096:  # it may continue in the next chunk
+          break
+        (kernels if m[1] == b"kernel" else copies).append((float(m[3]), float(m[4]), m[2].decode()))
+        done = m.end()
+      base = base or int((BASE_TIME.search(buf) or [0, 0])[1])
+      if not got:
+        break
+      buf = buf[max(done, len(buf) - 8192) :] if done else buf[-8192:]
+  return base, kernels, copies
+
+
 def summarize(path: str, t0: float, commands: list, raw: bool, bin_s: float) -> tuple[list, list, list]:
   """One trace's GPU-busy counter bins, what the GPU did during each of commands, and (raw) all its events, on the log's clock."""
   try:
-    with (gzip.open if path.endswith(".gz") else open)(path, "rb") as f:
-      trace = loads(f.read())
+    base, kernels, copies = gpu_events(path)
   except (EOFError, OSError, ValueError) as e:  # cut off: its process was killed while writing it
     print(f"skipping {path}: {e}", file=sys.stderr)
     return [], [], []
-  shift = trace.get("baseTimeNanoseconds", 0) / 1e3 - t0 * 1e6  # an event's wall clock is base + ts
-  events = trace.get("traceEvents", [])
-  kernels = sorted(
-    (e["ts"] + shift, e["ts"] + shift + e.get("dur", 0), e["name"]) for e in events if e.get("cat") == "kernel"
-  )
-  copies = [
-    (e["ts"] + shift, e.get("dur", 0), e["name"]) for e in events if e.get("cat") in ("gpu_memcpy", "gpu_memset")
-  ]
+  shift = base / 1e3 - t0 * 1e6  # an event's wall clock is base + ts
+  kernels = sorted((ts + shift, ts + shift + dur, name) for ts, dur, name in kernels)
+  copies = [(ts + shift, dur, name) for ts, dur, name in copies]
   counter, notes, width = [], [], bin_s * 1e6
   if kernels:
     bins = collections.defaultdict(list)
@@ -171,6 +192,8 @@ def summarize(path: str, t0: float, commands: list, raw: bool, bin_s: float) -> 
       )
   rest = []
   if raw:
+    with gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb") as f:
+      events = loads(f.read()).get("traceEvents", [])
     for e in events:
       if "ts" in e:
         e["ts"] = float(e["ts"]) + shift

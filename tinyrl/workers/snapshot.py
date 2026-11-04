@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 
+from tinyrl import spans
 from tinyrl.helpers import getenv
 
 # where to keep snapshots, like /dev/shm/tinyrl-snapshots; empty turns them off
@@ -81,6 +82,7 @@ def cuda_pids(pid: int) -> list[int]:
   ]
 
 
+@spans.timed
 def save(pid: int, folder: str, name: str) -> None:
   """Save the asleep server whose root process is `pid`, and whose socket and log are `name`.sock and `name`.log, to `folder`. This ends the server."""
   pids = cuda_pids(pid)
@@ -111,6 +113,7 @@ def save(pid: int, folder: str, name: str) -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+@spans.timed
 def restore(folder: str) -> tuple[subprocess.Popen, str]:
   """Restore a snapshot onto this process's GPU. Returns the namespaces' root process, which ends them all when it ends, and the server's socket."""
   ns = subprocess.Popen([*UNSHARE, sys.executable, "-m", __name__, folder, gpu()], stdout=subprocess.PIPE, text=True)
