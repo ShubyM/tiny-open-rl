@@ -17,7 +17,7 @@ import traceback
 
 import httpx
 
-from tinyrl.control.process import launch, reap, target_pid
+from tinyrl.control.process import launch, reap
 from tinyrl.storage import models
 from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
@@ -117,16 +117,16 @@ class VLLM:
     saving = (
       env | snapshot.ENV | {"PYTHONPATH": os.pathsep.join([snapshot.site(), *filter(None, [env.get("PYTHONPATH")])])}
     )
-    # its own stdin and log: a snapshot can't hold files from outside it
+    # its own stdin and log: a snapshot can't hold files from outside it. Not launch(): CRIU saves a parent-death
+    # signal with the process, so a copy restored with `criu restore -d` would be killed as soon as criu exits
     with open(f"{name}.log", "ab") as log:
-      server = launch(
-        serve("--uds", f"{name}.sock"), env=saving, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT
-      )
+      out = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": subprocess.STDOUT}
+      server = subprocess.Popen(serve("--uds", f"{name}.sock"), env=saving, start_new_session=True, **out)
     engine = await cls("http://vllm", base, lora, server, unix_client(f"{name}.sock")).ready()
     try:
       await engine.post("/sleep", params={"level": 2})
       await engine.http.aclose()  # a connection into the server would reach outside the snapshot
-      await asyncio.to_thread(snapshot.save, await asyncio.to_thread(target_pid, server), folder, name, visible)
+      await asyncio.to_thread(snapshot.save, server.pid, folder, name, visible)
       await asyncio.to_thread(server.wait)
       return await cls.restore(folder, base, lora, env)
     except Exception:
