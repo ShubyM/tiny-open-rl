@@ -347,15 +347,13 @@ class Bus:
 
   async def fail_stranded_commands(self, runs: list[str], worker: str, owner: str, min_idle_ms: int = 0) -> None:
     """Fail the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by the node only when it has nothing in flight; claims are failed, never replayed."""
+    p = self.r.pipeline(transaction=False)
     for run_id in runs:
-      stream = key("q", run_id)
-      try:
-        _, entries, _ = await self.r.xautoclaim(stream, GROUP, owner, min_idle_time=min_idle_ms, count=10000)
-      except redis.ResponseError as e:
-        if "NOGROUP" not in str(e):
-          raise
-        continue  # a run deleted after it was listed has nothing left to claim
-      for entry_id, fields in entries:
+      p.xautoclaim(key("q", run_id), GROUP, owner, min_idle_time=min_idle_ms, count=10000)
+    for run_id, got in zip(runs, await p.execute(raise_on_error=False)):
+      if isinstance(got, Exception) and "NOGROUP" not in str(got):
+        raise got
+      for entry_id, fields in [] if isinstance(got, Exception) else got[1]:
         cmd = parse_cmd(run_id, entry_id, fields)
         reply = Reply.error(RuntimeError(f"its worker died, or lost the worker, during {cmd.op}"))
         await self.write_reply(cmd, reply, worker, owner)

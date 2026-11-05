@@ -23,7 +23,7 @@ from tinyrl.storage.store import Store
 from tinyrl.workers.sampler import Sampler
 
 GPUS, DRAIN_S, TICK = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK", 0.25)
-IDLE_MS, STRANDED_MS, SAVE_WAIT_S = getenv("IDLE_MS", 150), 5000, 0.015
+IDLE_MS, SAVE_WAIT_S = getenv("IDLE_MS", 150), 0.015
 SWEEP_S, SWEEP_GRACE_S = getenv("SWEEP_S", 60.0), 600
 
 
@@ -81,9 +81,9 @@ class Lease:
     if not await self.bus.set_parked_checkpoint(run, uri, self.worker, self.owner):
       raise self.lose()
 
-  async def fail_stranded(self, runs: list[str], min_idle_ms: int) -> None:
+  async def fail_stranded(self, runs: list[str]) -> None:
     if not self.lost:
-      await self.bus.fail_stranded_commands(runs, self.worker, self.owner, min_idle_ms)
+      await self.bus.fail_stranded_commands(runs, self.worker, self.owner)
 
   async def release(self) -> None:
     self.lost = True
@@ -305,7 +305,7 @@ class NodeDaemon:
           print(f"{lw.name} did not close, trying again: {e!r}", file=sys.stderr, flush=True)
           await asyncio.sleep(TICK)
       self.note(Ev.EXITED, worker=lw.name)  # only the completed reap releases the actual GPUs
-      await lw.lease.fail_stranded(scheduler.members(self.state, lw.name), 0)
+      await lw.lease.fail_stranded(scheduler.members(self.state, lw.name))
       await lw.lease.release()
 
     closing = asyncio.ensure_future(retire())
@@ -316,15 +316,12 @@ class NodeDaemon:
 
   async def serve_worker(self, lw: LocalWorker) -> None:
     try:
-      await lw.lease.fail_stranded(scheduler.members(self.state, lw.name), 0)
-      swept = time.monotonic()
+      await lw.lease.fail_stranded(scheduler.members(self.state, lw.name))
       if lw.engine.warm:
         await self.acquire(lw)
       while self.wanted(lw.name) and not lw.lease.lost:
         await self.step(lw)
-        if time.monotonic() - swept >= STRANDED_MS / 2000:
-          swept = time.monotonic()
-          await lw.lease.fail_stranded(scheduler.members(self.state, lw.name), STRANDED_MS)
+        await lw.lease.fail_stranded(scheduler.members(self.state, lw.name))
       w = self.state.workers.get(lw.name)
       if w and scheduler.parks_in_place(w):
         await self.acquire(lw, leaving=True)  # FSDP checkpoint gathers need its CUDA/NCCL group, resumed on it

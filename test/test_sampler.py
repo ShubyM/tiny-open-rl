@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import httpx
 import safetensors.torch
@@ -127,7 +127,6 @@ class TestSampler(RedisTest):
     self.assertLessEqual([r.ok for r in replies].count(False), 1, "the error outlived the step that hit it")
     self.assertTrue(replies[-1].ok)
 
-  @patch("tinyrl.control.node_daemon.STRANDED_MS", 300)
   async def test_a_stale_claim_is_failed_while_the_sampler_stays_busy(self):
     await self.bus.create_run(Run("s1", "sampler:base", "base", 1, role=Role.SAMPLER))
     node = self.node(engine=Slow)
@@ -136,8 +135,8 @@ class TestSampler(RedisTest):
       await asyncio.sleep(0.1)
       stranded = await self.sample("s1")
       self.assertIn(stranded, [c.request_id for c in await self.bus.take_commands(["s1"], "dead", 1000)])
-      reply = await self.bus.wait_for_reply(stranded, 2)
-    self.assertIsNotNone(reply, "a dead owner's claim is never failed while the worker has work")
+      reply = await self.bus.wait_for_reply(stranded, 1)
+    self.assertIsNotNone(reply, "a dead owner's claim was not failed by the step after it while the worker had work")
     self.assertFalse(reply.ok)
 
   async def test_an_idle_session_s_slow_staging_does_not_delay_a_busy_one(self):
