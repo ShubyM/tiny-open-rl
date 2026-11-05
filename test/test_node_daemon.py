@@ -24,6 +24,15 @@ from tinyrl.workers.trainer import Trainer
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
+class DeadChildNode(TestNode):
+  """Its trainer child dies while loading, before it answers anything."""
+
+  def engine(self, w, lease):
+    engine = super().engine(w, lease)
+    engine.process.kill()
+    return engine
+
+
 class TestNodeDaemon(RedisTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
@@ -117,6 +126,46 @@ class TestNodeDaemon(RedisTest):
     serving.cancel()
     await asyncio.wait_for(asyncio.gather(serving, return_exceptions=True), 10)
     self.assertIsNone(await self.bus.lease_owner("worker"))
+
+  async def test_a_child_that_dies_before_answering_fails_the_queued_command(self):
+    run, folder = new_id(), tempfile.TemporaryDirectory()
+    self.addCleanup(folder.cleanup)
+    node = DeadChildNode(self.bus, store=Store(root=folder.name))
+    self.nodes.append(node)
+    await self.bus.create_run(Run(run, "worker", "tiny", 4, lora=LORA))
+    serving = self.background(node.serve())
+    self.background(scheduler.run(self.bus))
+    body = json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
+    request = await self.bus.submit_command(run, Op.CREATE_MODEL, body)
+    reply = await self.bus.wait_for_reply(request, 5)
+    self.assertIsNotNone(reply, "no reply within 5 s from a worker whose child keeps dying")
+    self.assertFalse(reply.ok)
+    self.assertIn("its worker died", json.loads(reply.body)["error"])
+    serving.cancel()
+    await asyncio.wait_for(asyncio.gather(serving, return_exceptions=True), 10)
+
+  async def test_a_gracefully_stopped_worker_leaves_queued_commands_for_the_next_owner(self):
+    node = self.node()
+    lw = await self.served(node, "run", "worker", [0])
+    entered, finish = asyncio.Event(), asyncio.Event()
+    close = lw.engine.process.close
+
+    async def slow_close():
+      entered.set()
+      await finish.wait()
+      await close()
+
+    try:
+      with patch.object(lw.engine.process, "close", side_effect=slow_close):
+        node.note(Ev.UNPLACED, worker="worker")
+        await asyncio.wait_for(entered.wait(), 5)
+        request = await self.bus.submit_command("run", Op.OPTIM_STEP, b'{"adam_params":{}}')
+        finish.set()
+        await asyncio.wait_for(lw.task, 5)
+      self.assertIsNone(await self.bus.wait_for_reply(request, 0))
+      self.assertEqual(await self.bus.queued_and_in_flight("run"), {"live": True, "queued": 1, "in_flight": []})
+    finally:
+      finish.set()
 
   @patch("tinyrl.bus.NODE_MS", 600)
   @patch("tinyrl.bus.LEASE_MS", 400)

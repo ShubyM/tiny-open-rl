@@ -81,8 +81,10 @@ class Lease:
     if not await self.bus.set_parked_checkpoint(run, uri, self.worker, self.owner):
       raise self.lose()
 
-  async def fail_stranded(self, runs: list[str]) -> None:
+  async def fail_stranded(self, runs: list[str], died: bool = False) -> None:
     if not self.lost:
+      if died:  # a worker that died before claiming anything still answers each run's waiting client
+        await self.bus.take_commands(runs, self.owner, 1)
       await self.bus.fail_stranded_commands(runs, self.worker, self.owner)
 
   async def release(self) -> None:
@@ -296,6 +298,8 @@ class NodeDaemon:
     await self.release(lw)
 
   async def close(self, lw: LocalWorker) -> None:
+    died = lw.engine.proc is not None and lw.engine.proc.poll() is not None  # exited on its own, before the reap
+
     async def retire():
       while True:
         try:
@@ -305,7 +309,7 @@ class NodeDaemon:
           print(f"{lw.name} did not close, trying again: {e!r}", file=sys.stderr, flush=True)
           await asyncio.sleep(TICK)
       self.note(Ev.EXITED, worker=lw.name)  # only the completed reap releases the actual GPUs
-      await lw.lease.fail_stranded(scheduler.members(self.state, lw.name))
+      await lw.lease.fail_stranded(scheduler.members(self.state, lw.name), died)
       await lw.lease.release()
 
     closing = asyncio.ensure_future(retire())
