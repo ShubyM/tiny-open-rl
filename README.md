@@ -25,7 +25,7 @@ pip install -e .
 redis-server &                                          # Redis 8.4 or newer
 python -m tinyrl.api.gateway &                          # the Tinker HTTP API, on :8000
 python -m tinyrl.control.scheduler &                    # assigns runs to workers and workers to nodes
-python -m tinyrl.control.node_daemon                    # prepares work, reserves GPUs and dispatches model operations
+python -m tinyrl.control.node_daemon                    # runs worker lifetimes and coordinates their GPUs
 ```
 
 A **worker** is a group of runs sharing one trainer model or sampling engine. The gateway records what a run needs, and
@@ -38,11 +38,15 @@ Run one node daemon per GPU machine (`GPUS`, default 1) and one cluster schedule
 nodes with the fewest workers per GPU, keeps full fine-tune samplers near their trainers, and moves work off dead nodes.
 Each node owns its workers' Redis leases and command streams, chooses their GPUs, and runs the local fairness policy.
 
-The node has one dispatcher. Each worker has a read task that claims commands and prepares sampler checkpoints off
-the event loop. Only prepared commands enter its ready queue. The dispatcher updates local reservations directly,
-then starts independent wake, execution, park and close operations. Operation completions wake the dispatcher;
-regular ticks maintain leases and node heartbeats. Work on separate GPUs and checkpoint preparation can progress
-concurrently, and a download does not keep a worker with no ready commands from yielding its GPU.
+Each worker runs in one coroutine. Its executor, lease token, ready queue and checkpoint preparation task belong to
+that lifetime. Sampling commands become ready after their checkpoint files are prepared off the event loop;
+preparation can overlap startup and execution. The worker then wakes its model, executes ready work and parks or
+closes it as needed, with cleanup in `finally`.
+
+The node keeps GPU placements, waiting order and reservations. A worker waiting for its GPUs sleeps on a node change
+event and checks admission when it wakes. Workers on independent GPUs run concurrently. Node heartbeats and each
+worker's lease renewal continue during model operations, and a download does not keep an otherwise idle worker from
+yielding its GPU.
 
 A trainer is a synchronous model process. The node sends request bytes over a private Unix socket and receives reply
 bytes and checkpoint metadata. Model tensors, optimizer state and checkpoint I/O stay in the trainer. Multi-GPU
@@ -118,7 +122,7 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 * **One wire format.** `forward_backward` stays protobuf from the SDK to the trainer, which reads the tensors straight out of the bytes.
   Older SDKs' JSON is turned into the same protobuf at the gateway, and JSON clients get the output decoded back to JSON.
 * **Cluster assignments in one log.** The gateway, scheduler and nodes use `tinyrl:events` for run membership and node placement.
-  The node keeps ready queues and GPU reservations directly in memory and updates them as operations complete.
+  Worker coroutines keep their ready queues locally and update the node's GPU reservations directly.
   Model processes do not read the log.
 * **One trainer.** A base model, with a PEFT adapter per run or the whole model for a single run, behind `create_run`, `forward_backward`,
   `optim_step`, `training_state`, `sampler_weights`, `restore_run` and `delete_run`. Logprobs are computed `CHUNK` tokens at a time under checkpointing, so the
@@ -135,7 +139,7 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 
 Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains the streams. Then read [gateway.py](tinyrl/api/gateway.py)
 to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/scheduler.py) for placement and GPU admission,
-and [node_daemon.py](tinyrl/control/node_daemon.py) for command preparation and dispatch,
+and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU handoff,
 [store.py](tinyrl/storage/store.py) to see how checkpoints are stored, and [trainer.py](tinyrl/workers/trainer.py) and
 [model.py](tinyrl/workers/model.py) to see how a command runs on the model.
 
@@ -145,7 +149,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for command preparation and 
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy arrays |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | cluster assignment, local GPU placement and admission rules |
-| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | leases, command preparation, concurrent dispatch, GPU reservations, recovery, uploads and checkpoint sweeps |
+| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | worker lifetimes, leases, command preparation, GPU reservations, recovery, uploads and checkpoint sweeps |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | private model IPC and parent-owned process groups |
 | [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | model memory and GPU-width estimates |
 | [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | synchronous model commands and checkpoint metadata |
@@ -187,7 +191,7 @@ A run's wait includes waiting on its own earlier calls, since a run's calls run 
 
 `GET /api/v1/scheduling` combines cluster assignments with the latest live-node heartbeat: actual GPUs, waiting workers,
 reservations, accumulated busy time, and the owned process PID (or `null` before a sampling engine starts). These local
-snapshots are diagnostic; the node's dispatcher owns the reservations. Per-command timing is available with `DEBUG=1`.
+snapshots are diagnostic; the node's live GPU state governs admission. Per-command timing is available with `DEBUG=1`.
 The Redis event log contains cluster assignments.
 
 ## Throughput simulator

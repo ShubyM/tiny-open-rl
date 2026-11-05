@@ -1,11 +1,11 @@
 # tinyrl on Kubernetes
 
 **Current implementation.** The cluster scheduler groups runs and places workers on nodes. Each node daemon owns
-worker leases, command preparation, GPU reservations and process lifetime. One dispatcher handles operation completions
-and launches independent work on the node's GPUs. Trainers are synchronous model processes; sampling controllers run
-in the node and drive isolated engines. Only cluster assignments use the event log; local queues and reservations are
-updated directly. Portable checkpoints, multi-node placement, single-node FSDP, host parking, background uploads and
-node-loss recovery are built.
+worker leases, command preparation, GPU reservations and process lifetime. Each worker runs in one coroutine with its
+executor and ready queue local to that lifetime. GPU admission uses the node's actual reservations and waiting order;
+state changes wake waiting coroutines directly. Trainers are synchronous model processes; sampling controllers run
+in the node and drive isolated engines. Only cluster assignments use the event log. Portable checkpoints, multi-node
+placement, single-node FSDP, host parking, background uploads and node-loss recovery are built.
 See the [README](../README.md) and [node_daemon.py](../tinyrl/control/node_daemon.py) for the running system.
 
 **Roadmap below.** Live run migration between healthy nodes, adaptive worker sharding, `/dev/shm` + peer Store tiers,
@@ -71,7 +71,7 @@ The table starts with current execution ownership and marks the proposed extensi
 |---|---|---|---|
 | gateway | Deployment | [gateway.py](../tinyrl/api/gateway.py) | records run requirements, translates Tinker calls into commands and uses logical `tinker://` URIs. Proposed: `queue_state: "paused_capacity"` while capacity is unavailable. |
 | scheduler | Deployment, 1 replica | [scheduler.py](../tinyrl/control/scheduler.py) | assigns runs to workers and workers to live nodes through the cluster log. Proposed: utilization-driven migration, consolidation and creation/deletion of burst node daemon pods. |
-| node daemon | one DaemonSet pod per GPU node, holding all its GPUs | [node_daemon.py](../tinyrl/control/node_daemon.py) | owns leases, prepares commands, dispatches concurrent model operations and retains GPU reservations through park/cleanup acknowledgment. Proposed: burst pods, `/dev/shm` peer serving and Spot notification handling. |
+| node daemon | one DaemonSet pod per GPU node, holding all its GPUs | [node_daemon.py](../tinyrl/control/node_daemon.py) | runs one coroutine per worker; each owns its lease, executor, ready queue and cleanup. GPU reservations remain held through park/cleanup acknowledgment. Proposed: burst pods, `/dev/shm` peer serving and Spot notification handling. |
 | trainer | a synchronous process or torchrun rank group in a node daemon pod | [trainer.py](../tinyrl/workers/trainer.py) | executes model and checkpoint operations over private local IPC; the node consumes queues and publishes fenced results. Proposed: live run migration through the additional Store tiers. |
 | sampler | a controller in the node plus isolated engine processes | [sampler.py](../tinyrl/workers/sampler.py) | executes prepared sampling waves and drives the engine's load, sample, sleep and wake calls; the node prepares checkpoint files before commands become ready. Proposed: direct weight streaming from the peer Store tier. |
 | store | library in model processes and node daemons | [store.py](../tinyrl/storage/store.py) | safetensors, local caches and background bucket uploads. Proposed: `put`, `get`, `drop` across `/dev/shm`, peer network and durable storage. |
@@ -368,12 +368,14 @@ above `TARGET_UTIL` for a while, before work queues.
 
 **Current local policy.** Workers with known memory budgets may hold a GPU together when they fit. Otherwise the node
 uses the order workers become ready and a 30-second quantum, starting after cold engine startup completes. The node
-updates its own ready queues and reservations directly; the cluster scheduler handles run and node assignment.
+coordinates GPU reservations directly; each worker coroutine owns its execution state, and the cluster scheduler
+handles run and node assignment.
 
-1. A worker's read task claims commands and prepares sampler checkpoints off the event loop. Commands join the ready
-   queue only when preparation completes. Reads and preparation can continue during engine startup or execution.
-2. The dispatcher reserves all of a worker's GPUs before waking it. It launches operations for independent workers
-   concurrently and wakes on completion; regular ticks maintain node heartbeats and worker leases.
+1. A worker coroutine owns its model handle, command queue and preparation task. Sampling commands join the ready
+   queue only after their checkpoint files are prepared off the event loop, which can overlap startup or execution.
+2. The worker reserves all its GPUs before waking the model. If admission is blocked, it waits on the node's change
+   event and checks again when notified. Independent workers continue on their own GPUs; node heartbeats and worker
+   lease renewal continue while model operations run.
 3. An idle holder yields to a waiter, and a busy holder yields at a command or sampling-wave boundary after its quantum.
    A wave has up to three sessions for a LoRA engine or one session for a full fine-tune engine.
 4. The node orders a trainer to park its tensors on pinned host memory, or an engine to sleep. The reservation remains

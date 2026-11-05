@@ -538,7 +538,7 @@ class TestTrainer(RedisTest):
     ]
 
   def model(self, worker):
-    return self.node.running[worker].model.trainer.model
+    return self.node.processes[worker].trainer.model
 
   async def until(self, predicate):
     async with asyncio.timeout(10):
@@ -574,19 +574,18 @@ class TestTrainer(RedisTest):
     ids = await self.submit(
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.DELETE_MODEL, {})
     )
-    running = await self.node.add("p")
-    original = running.model.call
+    await self.node.add("p")
+    child = self.node.processes["p"]
+    original = child.call
 
     async def call(method, *args):
       if method == "execute":
-        running.stop = "drain"  # graceful shutdown arrives while the first command executes
+        self.node.draining = True  # graceful shutdown arrives while the first command executes
       return await original(method, *args)
 
-    running.model.call = call
-    self.assertEqual(await self.node.step("p", block_ms=10), 2)
+    child.call = call
     await self.finish_worker("p")
-    self.assertTrue(running.model.closed)
-    self.assertEqual(running.stop, "close")
+    self.assertTrue(child.closed)
     self.assertTrue(all([(await self.bus.wait_for_reply(request_id, 1)).ok for request_id in ids]))
 
   async def test_a_new_node_owner_fails_what_a_dead_one_left_in_flight(self):
@@ -594,8 +593,9 @@ class TestTrainer(RedisTest):
     await self.bus.create_run(Run(run, "p", "tiny", 4))
     [request_id] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}}))
     await self.bus.take_commands([run], "dead", block_ms=10)
-    running = await self.node.add("p", owner="new")
-    running.stop = "drain"  # startup reconciliation still runs even if the node immediately drains
+    await self.node.add("p")
+    self.node.draining = True  # startup reconciliation still runs even if the node immediately drains
+    self.node.notify()
     await self.finish_worker("p")
     reply = await self.bus.wait_for_reply(request_id, 1)
     self.assertFalse(reply.ok)
@@ -606,10 +606,10 @@ class TestTrainer(RedisTest):
     run = new_id()
     await self.bus.create_run(Run(run, run, "tiny", 0))
     await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
-    running = await self.node.add(run)
-    self.assertEqual(await self.node.step(run), 2)
+    await self.node.add(run)
+    child = self.node.processes[run]
     await self.finish_worker(run)
-    self.assertTrue(running.model.closed)
+    self.assertTrue(child.closed)
     self.assertIsNone(await self.bus.lease_owner(run))
 
   async def test_a_run_moves_between_node_owned_models_through_the_store(self):
@@ -659,7 +659,8 @@ class TestTrainer(RedisTest):
           )
         await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
         await self.node.drain(r)
-      self.node.running[f"p-{rank}"].stop = "drain"
+      self.node.state.workers[f"p-{rank}"].node = None
+      self.node.notify()
       await self.finish_worker(f"p-{rank}")
       parked = await self.bus.parked_checkpoint(run)
       self.assertIsNotNone(parked)
@@ -680,11 +681,10 @@ class TestTrainer(RedisTest):
       await self.bus.create_run(Run(run, worker, "tiny", 4, lora=LORA, gpus=2))
       await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
       await self.node.drain(run)
-      if worker == "wide":
-        await self.node.park("wide")
-    wide, holder = self.node.running["wide"], self.node.running["holder"]
+
+    wide = self.node.running["wide"]
     entered, finish = asyncio.Event(), asyncio.Event()
-    holder_call = holder.model.call
+    holder_call = self.node.processes["holder"].call
 
     async def blocked(method, *args):
       if method == "execute":
@@ -692,14 +692,13 @@ class TestTrainer(RedisTest):
         await finish.wait()
       return await holder_call(method, *args)
 
-    holder.model.call = blocked
+    self.node.processes["holder"].call = blocked
     await self.submit(holder_run, (Op.OPTIM_STEP, {"adam_params": {}}))
-    working = asyncio.create_task(self.node.step("holder"))
-    self.renewal_tasks.append(working)
+
     await asyncio.wait_for(entered.wait(), 5)
 
     waking, checkpoint = asyncio.Event(), asyncio.Event()
-    wide_call = wide.model.call
+    wide_call = self.node.processes["wide"].call
 
     async def checkpoint_wake(method, *args):
       if method == "resume":
@@ -707,8 +706,9 @@ class TestTrainer(RedisTest):
         await checkpoint.wait()
       return await wide_call(method, *args)
 
-    wide.model.call = checkpoint_wake
-    wide.stop = "drain"
+    self.node.processes["wide"].call = checkpoint_wake
+    self.node.state.workers["wide"].node = None
+    self.node.notify()
     await self.until(lambda: wide.ticket > 0)
     ticket = wide.ticket
     await self.bus.create_run(Run(later_run, "later", "tiny", 4, lora=LORA))
@@ -730,25 +730,25 @@ class TestTrainer(RedisTest):
     self.assertIsNone(later.since)
     checkpoint.set()
     await self.finish_worker("wide")
-    await working
     self.assertIsNotNone(await self.bus.parked_checkpoint(wide_run))
-    await self.node.step("later")
-    self.assertTrue((await self.bus.wait_for_reply(later_reply, 0)).ok)
+    self.assertTrue((await self.bus.wait_for_reply(later_reply, 5)).ok)
 
+  @patch("tinyrl.control.node_daemon.LEASE_MS", 100)
   async def test_the_node_recovers_an_uncontested_lease_but_rejects_an_intervening_owner(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4))
-    running = await self.node.add("p")
+    await self.node.add("p")
+    owner = await self.bus.lease_owner("p")
     await self.bus.r.delete("tinyrl:owner:p")
-    running.renewed = 0
-    await self.node.renew()
-    self.assertEqual(await self.bus.lease_owner("p"), running.owner)
-    self.assertEqual(running.stop, "")
+    async with asyncio.timeout(5):
+      while await self.bus.lease_owner("p") != owner:
+        await asyncio.sleep(0.01)
+    self.assertFalse(self.node.tasks["p"].done())
     await self.bus.r.set("tinyrl:last_owner:p", "another")
     await self.bus.r.delete("tinyrl:owner:p")
-    running.renewed = 0
-    await self.node.renew()
-    self.assertEqual(running.stop, "abort")
+    child = self.node.processes["p"]
+    await self.finish_worker("p")
+    self.assertTrue(child.closed)
     self.assertIsNone(await self.bus.lease_owner("p"))
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
@@ -758,7 +758,8 @@ class TestTrainer(RedisTest):
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
     )
     await self.node.drain(run)
-    await self.node.close_worker("p")  # a lost process has no park checkpoint
+    self.node.tasks["p"].cancel()  # a lost process has no park checkpoint
+    await self.finish_worker("p")
     ids = await self.submit(
       run,
       (Op.OPTIM_STEP, {"adam_params": {}}),
@@ -805,7 +806,6 @@ class TestTrainer(RedisTest):
       return first, await watch("save", request_id)
 
     save = asyncio.create_task(first_save())
-    self.assertEqual(await self.node.step("p", block_ms=10), 7)
     first, reply = await save
     await asyncio.gather(*opt_tasks.values())
     self.assertTrue(reply.ok)
@@ -817,7 +817,6 @@ class TestTrainer(RedisTest):
       (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.1}}),
       (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{causal}/sampler_weights/s1"}),
     )
-    self.assertEqual(await self.node.step("p", block_ms=10), 3)
     self.assertTrue(all([(await self.bus.wait_for_reply(request, 1)).ok for request in pipelined]))
     self.assertEqual((await self.bus.get_run(causal))["steps"], 2)
 
@@ -832,9 +831,9 @@ class TestTrainer(RedisTest):
       *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(15)],
     )
     running = await self.node.add("p")
-    original = running.model.call
+    original = self.node.processes["p"].call
     calls = 0
-    entered, finish = asyncio.Event(), asyncio.Event()
+    entered, finish, other_entered, other_finish = (asyncio.Event() for _ in range(4))
 
     async def call(method, *args):
       nonlocal calls
@@ -845,31 +844,40 @@ class TestTrainer(RedisTest):
           await finish.wait()
       return await original(method, *args)
 
-    running.model.call = call
-    working = asyncio.create_task(self.node.step("p"))
-    self.renewal_tasks.append(working)
-    await asyncio.wait_for(entered.wait(), 5)
-    other_run = new_id()
-    await self.bus.create_run(Run(other_run, "other", "tiny", 4, lora=LORA))
-    await self.submit(other_run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-    other = await self.node.add("other")
-    async with asyncio.timeout(5):
-      while not other.ticket:
-        await asyncio.sleep(0.001)
-    running.since = time.time() - self.node.state.quantum - 1
-    self.assertFalse(working.done())
-    self.assertIsNone(await self.bus.wait_for_reply(ids[0], 0))
-    finish.set()
-    self.assertEqual(await working, 1)
-    self.assertEqual(len(running.queue), 15)
-    self.assertIsNone(running.since)
-    self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
-    self.assertIsNone(await self.bus.wait_for_reply(ids[1], 0))
-    running.stop = "drain"
-    self.assertEqual(await self.node.step("p"), 15)
-    await self.finish_worker("p")
-    self.assertEqual(calls, 16)
-    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)).ok for request in ids]))
+    self.node.processes["p"].call = call
+    try:
+      await asyncio.wait_for(entered.wait(), 5)
+      other_run = new_id()
+      await self.bus.create_run(Run(other_run, "other", "tiny", 4, lora=LORA))
+      other = await self.node.add("other")
+      other_call = self.node.processes["other"].call
+
+      async def blocked_other(method, *args):
+        if method == "execute":
+          other_entered.set()
+          await other_finish.wait()
+        return await other_call(method, *args)
+
+      self.node.processes["other"].call = blocked_other
+      await self.submit(other_run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+      await self.until(lambda: other.ticket > 0)
+      running.since = time.time() - self.node.state.quantum - 1
+      self.assertIsNone(await self.bus.wait_for_reply(ids[0], 0))
+      finish.set()
+      await asyncio.wait_for(other_entered.wait(), 5)
+      self.assertIsNone(running.since)
+      self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
+      self.assertIsNone(await self.bus.wait_for_reply(ids[1], 0))
+      self.assertEqual(calls, 1)
+      self.node.state.workers["p"].node = None
+      self.node.notify()
+      other_finish.set()
+      await self.finish_worker("p")
+      self.assertEqual(calls, 16)
+      self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)).ok for request in ids]))
+    finally:
+      finish.set()
+      other_finish.set()
 
   async def test_shutdown_does_not_fetch_another_batch(self):
     run = new_id()
@@ -879,18 +887,16 @@ class TestTrainer(RedisTest):
       (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
       *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(17)],
     )
-    running = await self.node.add("p")
-    original = running.model.call
+    await self.node.add("p")
+    original = self.node.processes["p"].call
 
     async def call(method, *args):
       if method == "execute":
-        running.stop = "drain"
+        self.node.draining = True
       return await original(method, *args)
 
-    running.model.call = call
-    self.assertEqual(await self.node.step("p", block_ms=10), 16)
+    self.node.processes["p"].call = call
     await self.finish_worker("p")
-    self.assertEqual(list(running.queue), [])
     self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
     self.assertTrue((await self.bus.wait_for_reply(ids[15], 0)).ok)
     self.assertIsNone(await self.bus.wait_for_reply(ids[16], 0))

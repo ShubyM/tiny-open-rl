@@ -50,13 +50,11 @@ class TestEvents(RedisTest):
       request = await self.bus.submit_command(
         "r", Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": {}}).encode()
       )
-      self.assertEqual(await node.step("p", block_ms=10), 1)
       self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
-      self.assertEqual(await node.step("p", block_ms=10), 0)
       worker = node.running["p"]
       self.assertEqual(worker.gpus, (0,))
       self.assertIsNotNone(worker.since)
-      self.assertFalse(worker.queue)
+      self.assertEqual(await self.bus.queued_and_in_flight("r"), {"live": True, "queued": 0, "in_flight": []})
       self.assertGreater(worker.busy, 0)
       local = {"started", "exited", "wants_gpu", "granted", "revoked", "released", "batch_done", "idle"}
       self.assertFalse([e for e in await self.bus.read_events() if e.kind in local])

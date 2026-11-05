@@ -51,17 +51,7 @@ class TestNodeDaemon(RedisTest):
       task.cancel()
     await asyncio.gather(*self.tasks, return_exceptions=True)
     for node in self.nodes:
-      tasks = []
-      for running in node.running.values():
-        running.cancel()
-        for task in (running.reader, running.task):
-          if task:
-            task.cancel()
-            tasks.append(task)
-      await asyncio.gather(*tasks, return_exceptions=True)
-      for worker in list(node.running):
-        await node.close_worker(worker)
-      node.running.clear()
+      await node.close(graceful=False)
       for task in (node.uploading, node.sweeping):
         if task:
           task.cancel()
@@ -108,11 +98,11 @@ class TestNodeDaemon(RedisTest):
     await self.until(lambda: bool(node.running), node)
     self.assertEqual(set(node.running), {"worker"})
     await self.create(run)
-    first = node.running["worker"].model
+    first = node.processes["worker"]
     await node.tick()
-    self.assertIs(node.running["worker"].model, first)
+    self.assertIs(node.processes["worker"], first)
     first.kill()
-    await self.until(lambda: "worker" in node.running and node.running["worker"].model is not first, node)
+    await self.until(lambda: "worker" in node.running and node.processes["worker"] is not first, node)
     self.assertTrue(first.closed)
     await self.create(run)
 
@@ -128,7 +118,7 @@ class TestNodeDaemon(RedisTest):
     self.background(scheduler.run(self.bus))
     await self.until(lambda: len(a.running) == len(b.running) == 1, a, b)
     await self.until(lambda: set(b.running) == {"worker-r1", "worker-r2"}, b)
-    child = b.running["worker-r1"].model
+    child = b.processes["worker-r1"]
     await self.bus.delete_run("r1", "worker-r1")
     await self.until(lambda: set(b.running) == {"worker-r2"}, b)
     self.assertTrue(child.closed)
@@ -136,13 +126,13 @@ class TestNodeDaemon(RedisTest):
   async def test_a_lora_move_parks_and_resumes_the_same_model_process(self):
     node = self.node(gpus=2)
     run, running = await self.prepared(node)
-    first = running.model
+    first = node.processes["worker"]
     weights = first.trainer.model.params[run]
     node.state.workers["worker"].gpus = (1,)
     with patch.object(first, "call", wraps=first.call) as calls:
       request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
       await self.reply(request, node)
-    self.assertIs(node.running["worker"].model, first)
+    self.assertIs(node.processes["worker"], first)
     self.assertIs(first.trainer.model.params[run], weights)
     self.assertEqual(running.gpus, (1,))
     self.assertIsNotNone(running.since)
@@ -155,7 +145,8 @@ class TestNodeDaemon(RedisTest):
       await self.bus.create_run(Run(run, worker, "tiny", 4, lora=LORA))
       await node.add(worker, gpus=[gpu])
     entered, finish = asyncio.Event(), asyncio.Event()
-    original = a.model.call
+    child = node.processes["a"]
+    original = child.call
 
     async def slow_park(method, *args):
       if method == "park":
@@ -164,7 +155,7 @@ class TestNodeDaemon(RedisTest):
       return await original(method, *args)
 
     try:
-      with patch.object(a.model, "call", side_effect=slow_park):
+      with patch.object(child, "call", side_effect=slow_park):
         waiting = await self.bus.submit_command(
           "rb", Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
         )
@@ -192,7 +183,9 @@ class TestNodeDaemon(RedisTest):
       await self.bus.create_run(Run(run, worker, "tiny", 4, lora=LORA))
       await node.add(worker, gpus=[gpu])
     entered, finish = asyncio.Event(), asyncio.Event()
-    original = a.model.close
+    child = node.processes["a"]
+    owner = await self.bus.lease_owner("a")
+    original = child.close
 
     async def slow_close():
       entered.set()
@@ -200,7 +193,7 @@ class TestNodeDaemon(RedisTest):
       await original()
 
     try:
-      with patch.object(a.model, "close", side_effect=slow_close):
+      with patch.object(child, "close", side_effect=slow_close):
         await self.bus.append_event(Ev.UNPLACED, worker="a")
         await self.until(entered.is_set, node)
         waiting = await self.bus.submit_command(
@@ -212,11 +205,11 @@ class TestNodeDaemon(RedisTest):
         await self.reply(other, node)
         self.assertIsNotNone(a.since)
         self.assertIsNone(node.running["b"].since)
-        self.assertEqual(await self.bus.lease_owner("a"), a.owner)
+        self.assertEqual(await self.bus.lease_owner("a"), owner)
         self.assertIsNone(await self.bus.wait_for_reply(waiting, 0))
         finish.set()
         await self.reply(waiting, node)
-        self.assertTrue(a.model.closed)
+        self.assertTrue(child.closed)
         self.assertIsNone(await self.bus.lease_owner("a"))
     finally:
       finish.set()
@@ -225,7 +218,9 @@ class TestNodeDaemon(RedisTest):
     node = self.node()
     _, running = await self.prepared(node)
     entered, finish = asyncio.Event(), asyncio.Event()
-    close = running.model.close
+    child = node.processes["worker"]
+    owner = await self.bus.lease_owner("worker")
+    close = child.close
 
     async def slow_close():
       entered.set()
@@ -233,18 +228,19 @@ class TestNodeDaemon(RedisTest):
       await close()
 
     try:
-      with patch.object(running.model, "close", side_effect=slow_close):
-        closing = self.background(node.close_worker("worker"))
-        await asyncio.wait_for(entered.wait(), 5)
+      with patch.object(child, "close", side_effect=slow_close):
+        closing = node.tasks["worker"]
+        await self.bus.append_event(Ev.UNPLACED, worker="worker")
+        await self.until(entered.is_set, node)
         closing.cancel()
         await asyncio.sleep(0.02)
         self.assertFalse(closing.done())
-        self.assertFalse(running.model.closed)
-        self.assertEqual(await self.bus.lease_owner("worker"), running.owner)
+        self.assertFalse(child.closed)
+        self.assertEqual(await self.bus.lease_owner("worker"), owner)
         self.assertIsNotNone(running.since)
         finish.set()
-        await closing
-      self.assertTrue(running.model.closed)
+        await asyncio.gather(closing, return_exceptions=True)
+      self.assertTrue(child.closed)
       self.assertIsNone(running.since)
       self.assertIsNone(await self.bus.lease_owner("worker"))
     finally:
@@ -254,7 +250,9 @@ class TestNodeDaemon(RedisTest):
     node = self.node()
     _, running = await self.prepared(node)
     entered, finish, attempts = asyncio.Event(), asyncio.Event(), []
-    close = running.model.close
+    child = node.processes["worker"]
+    owner = await self.bus.lease_owner("worker")
+    close = child.close
 
     async def retry_close():
       attempts.append(True)
@@ -265,16 +263,50 @@ class TestNodeDaemon(RedisTest):
       await close()
 
     try:
-      with patch.object(running.model, "close", side_effect=retry_close):
+      with patch.object(child, "close", side_effect=retry_close):
         await self.bus.append_event(Ev.UNPLACED, worker="worker")
         await self.until(entered.is_set, node)
         self.assertEqual(len(attempts), 2)
-        self.assertFalse(running.model.closed)
+        self.assertFalse(child.closed)
         self.assertIsNotNone(running.since)
-        self.assertEqual(await self.bus.lease_owner("worker"), running.owner)
+        self.assertEqual(await self.bus.lease_owner("worker"), owner)
         finish.set()
         await self.until(lambda: "worker" not in node.running, node)
-      self.assertTrue(running.model.closed)
+      self.assertTrue(child.closed)
+      self.assertIsNone(await self.bus.lease_owner("worker"))
+    finally:
+      finish.set()
+
+  async def test_a_cancelled_child_close_retries_without_blocking_the_node(self):
+    node = self.node()
+    _, running = await self.prepared(node)
+    child = node.processes["worker"]
+    owner = await self.bus.lease_owner("worker")
+    entered, finish, attempts = asyncio.Event(), asyncio.Event(), []
+    close = child.close
+
+    async def retry_close():
+      attempts.append(True)
+      if len(attempts) == 1:
+        raise asyncio.CancelledError
+      entered.set()
+      await finish.wait()
+      await close()
+
+    try:
+      with patch.object(child, "close", side_effect=retry_close):
+        await self.bus.append_event(Ev.UNPLACED, worker="worker")
+        await self.until(entered.is_set, node)
+        heartbeat = (await self.bus.live_nodes(details=True))[node.id]["until"]
+        await node.tick()
+        self.assertGreater((await self.bus.live_nodes(details=True))[node.id]["until"], heartbeat)
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(child.closed)
+        self.assertIsNotNone(running.since)
+        self.assertEqual(await self.bus.lease_owner("worker"), owner)
+        finish.set()
+        await self.until(lambda: "worker" not in node.running, node)
+      self.assertTrue(child.closed)
       self.assertIsNone(await self.bus.lease_owner("worker"))
     finally:
       finish.set()
@@ -287,15 +319,18 @@ class TestNodeDaemon(RedisTest):
     first_scheduler = self.background(scheduler.run(self.bus))
     await self.until(lambda: "worker" in node.running, node)
     await self.create(run)
-    first = node.running["worker"]
+    first = node.tasks["worker"]
+    child = node.processes["worker"]
+    owner = await self.bus.lease_owner("worker")
     first_scheduler.cancel()
     await asyncio.gather(first_scheduler, return_exceptions=True)
     self.background(scheduler.run(self.bus))
     for _ in range(5):
       await node.tick()
       await asyncio.sleep(0.03)
-    self.assertIs(node.running["worker"], first)
-    self.assertEqual(await self.bus.lease_owner("worker"), first.owner)
+    self.assertIs(node.tasks["worker"], first)
+    self.assertIs(node.processes["worker"], child)
+    self.assertEqual(await self.bus.lease_owner("worker"), owner)
     request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
     await self.reply(request, node)
     local = {"started", "wants_gpu", "granted", "revoked", "batch_done", "idle", "released", "exited"}
@@ -317,22 +352,28 @@ class TestNodeDaemon(RedisTest):
       patch(
         "tinyrl.control.node_daemon.Process", side_effect=lambda *_: InlineProcess(Trainer(Model(tiny), node.store))
       ) as process,
+      patch.object(node, "open_sampler", wraps=node.open_sampler) as sampler,
     ):
-      sample = await node.open_worker("sample")
-      self.assertEqual(sample.sampler.env["CUDA_VISIBLE_DEVICES"], "6")
-      self.assertEqual(sample.sampler.env["TINYRL_GPU_MEM"], "0.42")
-      self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", sample.sampler.env)
-      await node.open_worker("lora")
+      node.start("sample")
+      await self.until(lambda: sampler.called)
+      env = sampler.call_args.args[1]
+      self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "6")
+      self.assertEqual(env["TINYRL_GPU_MEM"], "0.42")
+      self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", env)
+      node.start("lora")
+      await self.until(lambda: process.call_count == 1)
       cmd, env = process.call_args.args
       self.assertEqual(cmd, [sys.executable, "-m", "tinyrl.workers.trainer"])
       self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
       self.assertEqual(env["PYTORCH_CUDA_ALLOC_CONF"], "expandable_segments:True")
       with patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"}):
-        await node.open_worker("fft")
+        node.start("fft")
+        await self.until(lambda: process.call_count == 2)
       self.assertEqual(process.call_args.args[1]["CUDA_VISIBLE_DEVICES"], "6")
       self.assertEqual(process.call_args.args[1]["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
       self.assertNotIn("TINYRL_NODE", process.call_args.args[1])
-      await node.open_worker("multi")
+      node.start("multi")
+      await self.until(lambda: process.call_count == 3)
       cmd, env = process.call_args.args
       self.assertEqual(
         cmd,
@@ -354,7 +395,7 @@ class TestNodeDaemon(RedisTest):
     node.state.workers["worker"] = scheduler.Worker(scheduler.Kind(base="tiny"), node=node.id, gpus=(0,))
     self.assertTrue(await self.bus.take_lease("worker", "another-node"))
     with patch("tinyrl.control.node_daemon.Process") as process:
-      self.assertIsNone(await node.open_worker("worker"))
+      self.assertIsNone(await node.start("worker"))
     process.assert_not_called()
     self.assertNotIn("worker", node.running)
 
@@ -374,9 +415,9 @@ class TestNodeDaemon(RedisTest):
         patch.object(self.bus, "fail_stranded_commands", side_effect=delayed),
         patch("tinyrl.control.node_daemon.Process") as process,
       ):
-        starting = self.background(node.open_worker("worker", owner="old-owner"))
+        starting = node.start("worker")
         await asyncio.wait_for(entered.wait(), 5)
-        self.assertEqual(await self.bus.lease_owner("worker"), "old-owner")
+        self.assertIsNotNone(await self.bus.lease_owner("worker"))
         self.assertNotIn("worker", node.running)
         process.assert_not_called()
         await self.bus.r.pexpire("tinyrl:owner:worker", 0)
@@ -389,13 +430,44 @@ class TestNodeDaemon(RedisTest):
     finally:
       finish.set()
 
+  async def test_cancelled_startup_never_leaves_a_child_or_lease(self):
+    for stage in ("before_start", "after_lease"):
+      with self.subTest(stage=stage):
+        node = self.node(node=stage)
+        await self.bus.create_run(Run(stage, stage, "tiny", 4, lora=LORA))
+        await node.sync()
+        node.state.workers[stage].node = node.id
+        node.state.workers[stage].gpus = (0,)
+        entered = asyncio.Event()
+        cleanup = self.bus.fail_stranded_commands
+
+        async def held_cleanup(*args, entered=entered, cleanup=cleanup):
+          if not entered.is_set():
+            entered.set()
+            await asyncio.Event().wait()
+          return await cleanup(*args)
+
+        with patch.object(self.bus, "fail_stranded_commands", side_effect=held_cleanup):
+          starting = node.start(stage)
+          if stage == "after_lease":
+            await asyncio.wait_for(entered.wait(), 5)
+            self.assertIsNotNone(await self.bus.lease_owner(stage))
+          starting.cancel()
+          [result] = await asyncio.gather(starting, return_exceptions=True)
+        self.assertIsInstance(result, asyncio.CancelledError)
+        node.dispatch()
+        self.assertNotIn(stage, node.tasks)
+        self.assertNotIn(stage, node.running)
+        self.assertNotIn(stage, node.processes)
+        self.assertIsNone(await self.bus.lease_owner(stage))
+
   async def test_a_lost_node_reannounces_only_after_its_model_has_closed(self):
     await self.bus.create_run(Run("run", "worker", "tiny", 4))
     node = self.node()
     await node.announce_node()
     self.background(scheduler.run(self.bus))
     await self.until(lambda: "worker" in node.running, node)
-    child = node.running["worker"].model
+    child = node.processes["worker"]
     close, entered, finish = child.close, asyncio.Event(), asyncio.Event()
 
     async def slow_close():
@@ -443,20 +515,29 @@ class TestNodeDaemon(RedisTest):
       run = new_id()
       await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
       node = self.node(gpus=2, real=True)
-      await node.announce_node()
-      self.background(scheduler.run(self.bus))
-      await self.until(lambda: "worker" in node.running, node)
-      await self.create(run, base)
-      first = node.running["worker"].model.proc
-      node.state.workers["worker"].gpus = (1,)
-      request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
-      await self.reply(request, node)
-      self.assertIs(node.running["worker"].model.proc, first)
-      self.assertEqual(node.running["worker"].gpus, (1,))
-      first.kill()
-      await asyncio.to_thread(first.wait)
-      await self.until(lambda: "worker" in node.running and node.running["worker"].model.proc is not first, node)
-      await self.create(run, base)
+      launched, factory = [], node.open_trainer
+
+      def capture(worker, env):
+        launched.append(process := factory(worker, env))
+        return process
+
+      with patch.object(node, "open_trainer", side_effect=capture):
+        await node.announce_node()
+        self.background(scheduler.run(self.bus))
+        await self.until(lambda: "worker" in node.running, node)
+        await self.create(run, base)
+        first = launched[-1].proc
+        self.assertEqual(node.running["worker"].pid, first.pid)
+        node.state.workers["worker"].gpus = (1,)
+        request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+        await self.reply(request, node)
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(node.running["worker"].gpus, (1,))
+        first.kill()
+        await asyncio.to_thread(first.wait)
+        await self.until(lambda: len(launched) == 2, node)
+        self.assertNotEqual(node.running["worker"].pid, first.pid)
+        await self.create(run, base)
 
   async def test_a_sweep_deletes_only_what_the_registry_lets_go(self):
     store = Store(root=tempfile.mkdtemp())

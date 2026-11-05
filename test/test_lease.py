@@ -55,7 +55,7 @@ class TestLease(RedisTest):
     run = new_id()
     await self.bus.create_run(Run(run, "worker", "tiny", 4, lora=LORA))
     first = self.node("first")
-    await first.add("worker", owner="old-owner")
+    await first.add("worker")
     await self.bus.submit_command(
       run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
     )
@@ -65,58 +65,81 @@ class TestLease(RedisTest):
   async def takeover(self):
     await self.bus.r.delete(key("owner", "worker"))  # its lease expired while the node was paused
     second = self.node("second")
-    await second.add("worker", owner="new-owner")
+    await second.add("worker")
     return second
 
   async def test_a_stale_parent_checks_ownership_before_dispatching_to_its_child(self):
     first, run = await self.prepared()
-    request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
-    reader = first.running["worker"].reader
-    claimed = await reader if reader else []
-    first.running["worker"].reader = None
-    [(cmd, _, _)] = claimed or await first.read("worker")
-    await self.takeover()
-    await self.bus.fail_stranded_commands([run], "worker", "new-owner")
-    expected = await self.bus.wait_for_reply(request, 0)
-    self.assertFalse(expected.ok)
-    with patch.object(first.running["worker"].model, "call", wraps=first.running["worker"].model.call) as call:
-      with self.assertRaisesRegex(RuntimeError, "lost worker"):
-        await first.answer_command("worker", cmd)
-    call.assert_not_called()
-    self.assertEqual(first.running["worker"].stop, "abort")
-    self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
-    self.assertFalse(await self.bus.write_reply(cmd, Reply(True, "application/json", b"{}"), "worker", "old-owner"))
-    await first.close_worker("worker")
-    self.assertEqual(await self.bus.lease_owner("worker"), "new-owner")
+    owner, child = await self.bus.lease_owner("worker"), first.processes["worker"]
+    entered, finish, get_run = asyncio.Event(), asyncio.Event(), self.bus.get_run
 
+    async def delayed(name):
+      result = await get_run(name)
+      if name == run and not entered.is_set():
+        entered.set()
+        await finish.wait()
+      return result
+
+    try:
+      with (
+        patch.object(self.bus, "get_run", side_effect=delayed),
+        patch.object(child, "call", wraps=child.call) as call,
+      ):
+        request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+        await asyncio.wait_for(entered.wait(), 5)
+        await self.takeover()
+        new_owner = await self.bus.lease_owner("worker")
+        expected = await self.bus.wait_for_reply(request, 0)
+        self.assertFalse(expected.ok)
+        finish.set()
+        [result] = await asyncio.gather(first.tasks["worker"], return_exceptions=True)
+        self.assertIsInstance(result, BaseException)
+      call.assert_not_called()
+      self.assertTrue(child.closed)
+      self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
+      cmd = Cmd(run, request.split("/", 1)[1], Op.OPTIM_STEP, b'{"adam_params":{}}')
+      self.assertFalse(await self.bus.write_reply(cmd, Reply(True, "application/json", b"{}"), "worker", owner))
+      self.assertEqual(await self.bus.lease_owner("worker"), new_owner)
+    finally:
+      finish.set()
+
+  @patch("tinyrl.control.node_daemon.LEASE_MS", 800)
   async def test_a_renewal_racing_with_close_cannot_reacquire_the_released_lease(self):
     first, _ = await self.prepared()
-    running = first.running["worker"]
-    running.renewed = 0
-    entered, finish = asyncio.Event(), asyncio.Event()
+    child = first.processes["worker"]
+    entered, finish, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
     renew = self.bus.renew_lease
 
     async def delayed(*args):
       entered.set()
-      await finish.wait()
-      return await renew(*args)
+      try:
+        await finish.wait()
+        return await renew(*args)
+      except asyncio.CancelledError:
+        cancelled.set()
+        raise
 
-    with patch.object(self.bus, "renew_lease", side_effect=delayed):
-      renewing = asyncio.create_task(first.renew())
-      self.tasks.append(renewing)
-      await entered.wait()
-      await first.close_worker("worker")
+    try:
+      with (
+        patch.object(self.bus, "renew_lease", side_effect=delayed),
+        patch.object(self.bus, "take_lease", wraps=self.bus.take_lease) as acquire,
+      ):
+        await asyncio.wait_for(entered.wait(), 5)
+        await first.close(graceful=False)
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(child.closed)
+        self.assertIsNone(await self.bus.lease_owner("worker"))
+        finish.set()
+        await asyncio.sleep(0)
+        acquire.assert_not_called()
       self.assertIsNone(await self.bus.lease_owner("worker"))
+    finally:
       finish.set()
-      await renewing
-    self.assertIsNone(await self.bus.lease_owner("worker"))
-    self.assertTrue(running.model.closed)
 
   async def test_a_completed_stale_result_cannot_replace_the_takeover_failure(self):
     first, run = await self.prepared()
-    request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
     entered, finish = asyncio.Event(), asyncio.Event()
-    child = first.running["worker"].model
+    child = first.processes["worker"]
     execute = child.call
 
     async def held_reply(method, *args):
@@ -128,19 +151,17 @@ class TestLease(RedisTest):
 
     try:
       with patch.object(child, "call", side_effect=held_reply):
-        work = asyncio.create_task(first.step("worker", block_ms=1))
-        self.tasks.append(work)
+        request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
         await asyncio.wait_for(entered.wait(), 5)
         second = await self.takeover()
-        await self.bus.fail_stranded_commands([run], "worker", "new-owner")
         expected = await self.bus.wait_for_reply(request, 0)
         self.assertFalse(expected.ok)
         finish.set()
-        [result] = await asyncio.gather(work, return_exceptions=True)
+        [result] = await asyncio.gather(first.tasks["worker"], return_exceptions=True)
         self.assertIsInstance(result, BaseException)
       self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
       self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
-      self.assertNotIn(run, second.running["worker"].model.trainer.model.params)
+      self.assertNotIn(run, second.processes["worker"].trainer.model.params)
       self.assertEqual((await self.bus.get_run(run))["steps"], 0)
     finally:
       finish.set()
@@ -148,9 +169,9 @@ class TestLease(RedisTest):
   async def test_a_stale_checkpoint_result_is_not_registered(self):
     first, run = await self.prepared()
     uri = f"tinker://{run}/weights/stale"
-    request = await self.bus.submit_command(run, Op.SAVE_WEIGHTS, json.dumps({"uri": uri}).encode())
     entered, finish = asyncio.Event(), asyncio.Event()
-    child, execute = first.running["worker"].model, first.running["worker"].model.call
+    child = first.processes["worker"]
+    execute = child.call
 
     async def held_save(method, *args):
       result = await execute(method, *args)
@@ -161,13 +182,11 @@ class TestLease(RedisTest):
 
     try:
       with patch.object(child, "call", side_effect=held_save):
-        saving = asyncio.create_task(first.step("worker", block_ms=1))
-        self.tasks.append(saving)
+        request = await self.bus.submit_command(run, Op.SAVE_WEIGHTS, json.dumps({"uri": uri}).encode())
         await asyncio.wait_for(entered.wait(), 5)
         await self.takeover()
-        await self.bus.fail_stranded_commands([run], "worker", "new-owner")
         finish.set()
-        [result] = await asyncio.gather(saving, return_exceptions=True)
+        [result] = await asyncio.gather(first.tasks["worker"], return_exceptions=True)
         self.assertIsInstance(result, BaseException)
       self.assertIsNone(await self.registry.get_checkpoint(uri))
       self.assertFalse((await self.bus.wait_for_reply(request, 0)).ok)
@@ -176,14 +195,35 @@ class TestLease(RedisTest):
 
   async def test_an_intervening_owner_prevents_recovery_even_after_it_released_the_lease(self):
     first, run = await self.prepared()
-    second = await self.takeover()
-    await second.close_worker("worker")
-    self.assertIsNone(await self.bus.lease_owner("worker"))
-    with patch.object(first.running["worker"].model, "call") as call:
-      with self.assertRaisesRegex(RuntimeError, "lost worker"):
-        await first.answer_command("worker", Cmd(run, "0-1", Op.OPTIM_STEP, b'{"adam_params":{}}'))
-    call.assert_not_called()
-    self.assertEqual(first.running["worker"].stop, "abort")
+    child = first.processes["worker"]
+    entered, finish, get_run = asyncio.Event(), asyncio.Event(), self.bus.get_run
+
+    async def delayed(name):
+      result = await get_run(name)
+      if name == run and not entered.is_set():
+        entered.set()
+        await finish.wait()
+      return result
+
+    try:
+      with (
+        patch.object(self.bus, "get_run", side_effect=delayed),
+        patch.object(child, "call", wraps=child.call) as call,
+      ):
+        request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+        await asyncio.wait_for(entered.wait(), 5)
+        second = await self.takeover()
+        await second.close(graceful=False)
+        self.assertIsNone(await self.bus.lease_owner("worker"))
+        finish.set()
+        [result] = await asyncio.gather(first.tasks["worker"], return_exceptions=True)
+        self.assertIsInstance(result, BaseException)
+      call.assert_not_called()
+      self.assertTrue(child.closed)
+      self.assertIsNone(await self.bus.lease_owner("worker"))
+      self.assertFalse((await self.bus.wait_for_reply(request, 0)).ok)
+    finally:
+      finish.set()
 
   def daemon(self):
     env = {

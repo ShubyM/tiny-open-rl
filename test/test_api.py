@@ -104,10 +104,30 @@ class TestAPI(RedisTest):
 
   async def test_a_call_counts_its_time_in_the_queue_and_running(self):
     run_id = await self.create_model()
+    other = await self.create_model()
+    worker = await self.node.worker_for(run_id)
+    self.assertEqual(await self.node.worker_for(other), worker)
+    child = self.node.processes[worker]
+    execute, entered, finish = child.call, asyncio.Event(), asyncio.Event()
+
+    async def held(method, *args):
+      if method == "execute" and args[0].run == other:
+        entered.set()
+        await finish.wait()
+      return await execute(method, *args)
+
     before = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
-    submitted = await self.post("forward_backward", content=proto_body(run_id), headers=PROTO)
-    await asyncio.sleep(0.3)
-    await self.result(submitted)
+    try:
+      with patch.object(child, "call", side_effect=held):
+        blocking = await self.post("forward_backward", content=proto_body(other), headers=PROTO)
+        await asyncio.wait_for(entered.wait(), 5)
+        submitted = await self.post("forward_backward", content=proto_body(run_id), headers=PROTO)
+        await asyncio.sleep(0.3)  # this run waits while the other run is executing on its worker
+        finish.set()
+        await self.result(submitted)
+        await self.result(blocking)
+    finally:
+      finish.set()
     after = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
     self.assertEqual(after["cmds"] - before["cmds"], 1)
     self.assertGreaterEqual(after["wait_ms"] - before["wait_ms"], 300)

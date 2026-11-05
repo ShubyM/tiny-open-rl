@@ -78,6 +78,11 @@ class Worker:
   kind: Kind = Kind()
   node: str | None = None  # None until it is placed
   gpus: tuple[int, ...] = ()  # desired GPUs, chosen by the node; a running process may still be on its old ones
+  # The node's local copy records actual GPUs and reservations; cluster assignments leave these fields empty.
+  ticket: int = 0
+  since: float | None = None
+  busy: float = 0.0
+  pid: int | None = None
 
 
 @dataclass

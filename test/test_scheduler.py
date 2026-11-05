@@ -2,7 +2,6 @@ import copy
 import dataclasses
 import random
 import unittest
-from types import SimpleNamespace
 
 from tinyrl.bus import Ev, Event, Role
 from tinyrl.control.scheduler import (
@@ -61,7 +60,7 @@ class Local:
     self.s.runs[name] = Run(kind, name)
     if at is None:
       self.place()
-    self.running[name] = SimpleNamespace(kind=kind, gpus=self.s.workers[name].gpus, ticket=0, since=None, busy=busy)
+    self.running[name] = Worker(kind, "n", self.s.workers[name].gpus, busy=busy)
     return self.running[name]
 
   def place(self):
