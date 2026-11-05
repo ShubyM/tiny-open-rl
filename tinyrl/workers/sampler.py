@@ -72,7 +72,7 @@ class Sampler:
 
   @property
   def proc(self):
-    return getattr(self.running, "server", None)
+    return self.running.server if self.running else None
 
   @property
   def started(self) -> bool:

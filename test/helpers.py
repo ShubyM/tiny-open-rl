@@ -89,6 +89,8 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 class FakeEngine:
   """A sampling engine that needs no GPU: each sample counts up from the last prompt token, every logprob is -1, and `calls` records what the sampler asked of it."""
 
+  server = None
+
   def __init__(self):
     self.calls = []
     self.loaded: set[str] = set()
