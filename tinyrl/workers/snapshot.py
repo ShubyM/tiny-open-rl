@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import glob
 import hashlib
@@ -13,15 +14,13 @@ import subprocess
 import sys
 import time
 
-from tinyrl.helpers import getenv
+from tinyrl.control.process import launch, reap, target_pid
 
-# where to keep snapshots, like /dev/shm/tinyrl-snapshots; empty turns them off
-SNAPSHOTS = getenv("TINYRL_SNAPSHOTS", "")
 RUN = "/run/tinyrl-vllm"  # each server's socket and log, private to every restored copy
 # CRIU can't save an io_uring, and uvloop's bundled libuv opens one for every loop: run vLLM's server on asyncio instead
 SITECUSTOMIZE = "import asyncio, uvloop\nuvloop.run, uvloop.new_event_loop, uvloop.install = asyncio.run, asyncio.new_event_loop, lambda: None\n"
 ENV = {"VLLM_HOST_IP": "127.0.0.1", "GLOO_SOCKET_IFNAME": "lo"}  # a restored copy has only loopback
-# --shell-job: the server stays in its sampler's process group, which the node daemon kills to stop the sampler
+# --shell-job: permit a server's process group to be restored into its namespaces
 CRIU = ["--shell-job", "--file-locks", "--link-remap", "--tcp-established", "-W", "/tmp", "-v1"]
 # a restored copy's own pids, network and mounts, all ended by a kill of unshare
 UNSHARE = ["unshare", "--kill-child", "--pid", "--net", "--mount", "--mount-proc", "--propagation", "private"]
@@ -49,16 +48,15 @@ def gpus() -> list[str]:
   return out.stdout.split()
 
 
-def gpu() -> str:
-  """This process's GPU, from CUDA_VISIBLE_DEVICES as an index or a UUID."""
-  visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+def gpu(visible: str) -> str:
+  """The engine's GPU, passed from its CUDA_VISIBLE_DEVICES as an index or a UUID."""
   return visible if visible.startswith("GPU-") else gpus()[int(visible)]
 
 
-def key(args: list[str]) -> str:
+def key(args: list[str], visible: str) -> str:
   """What a snapshot depends on: the server's command line, vLLM's version, the driver and the GPU model."""
   smi = subprocess.run(
-    ["nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader", "-i", "0"],
+    ["nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader", "-i", visible],
     capture_output=True,
     text=True,
   )
@@ -81,18 +79,18 @@ def cuda_pids(pid: int) -> list[int]:
   ]
 
 
-def save(pid: int, folder: str, name: str) -> None:
+def save(pid: int, folder: str, name: str, visible: str) -> None:
   """Save the asleep server whose root process is `pid`, and whose socket and log are `name`.sock and `name`.log, to `folder`. This ends the server."""
   pids = cuda_pids(pid)
   for p in pids:
     run("cuda-checkpoint", "--action", "lock", "--pid", str(p), "--timeout", "10000")
   for p in pids:
     run("cuda-checkpoint", "--action", "checkpoint", "--pid", str(p))
-  tmp = f"{folder}.{os.getpid()}"
+  tmp = f"{folder}.{pid}"
   try:
     os.makedirs(f"{tmp}/keep")
-    log = f"/tmp/criu-dump-{os.getpid()}.log"
-    # one dump at a time on a node, so the link_remap files that appear in /dev/shm are this dump's
+    log = f"/tmp/criu-dump-{pid}.log"
+    # One dump at a time, through publication: remap files and concurrent saves of the same configuration cannot collide.
     with open(f"{os.path.dirname(folder)}/.lock", "w") as lock:
       fcntl.flock(lock, fcntl.LOCK_EX)
       before = set(glob.glob("/dev/shm/link_remap.*"))
@@ -100,27 +98,35 @@ def save(pid: int, folder: str, name: str) -> None:
       # files the image refers to that a restore consumes or checks: vLLM's unlinked semaphores, which CRIU links back as link_remap.N (moved, since the next dump reuses those names), and the server's log
       for f in set(glob.glob("/dev/shm/link_remap.*")) - before:
         shutil.move(f, f"{tmp}/keep/")
-    shutil.copy2(f"{name}.log", f"{tmp}/keep/")
-    for f in glob.glob(f"{tmp}/pages-*.img"):
-      run("fallocate", "--dig-holes", f)  # about a third of the image is zero pages
-    with open(f"{tmp}/meta.json", "w") as f:
-      json.dump({"pids": pids, "gpu": gpu(), "sock": f"{os.path.basename(name)}.sock"}, f)
-    if not os.path.isdir(folder):  # another sampler on this node may have saved the same configuration first
-      os.rename(tmp, folder)
+      shutil.copy2(f"{name}.log", f"{tmp}/keep/")
+      for f in glob.glob(f"{tmp}/pages-*.img"):
+        run("fallocate", "--dig-holes", f)  # about a third of the image is zero pages
+      with open(f"{tmp}/meta.json", "w") as f:
+        json.dump({"pids": pids, "gpu": gpu(visible), "sock": f"{os.path.basename(name)}.sock"}, f)
+      if not os.path.isdir(folder):  # another sampler on this node may have saved the same configuration first
+        os.rename(tmp, folder)
   finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def restore(folder: str) -> tuple[subprocess.Popen, str]:
-  """Restore a snapshot onto this process's GPU. Returns the namespaces' root process, which ends them all when it ends, and the server's socket."""
-  ns = subprocess.Popen([*UNSHARE, sys.executable, "-m", __name__, folder, gpu()], stdout=subprocess.PIPE, text=True)
-  if ns.stdout.readline().strip() != "restored":
-    ns.kill()
-    raise RuntimeError(f"could not restore the snapshot in {folder}")
-  with open(f"/proc/{ns.pid}/task/{ns.pid}/children") as f:
-    init = int(f.read().split()[0])
-  with open(f"{folder}/meta.json") as f:
-    return ns, f"/proc/{init}/root{RUN}/{json.load(f)['sock']}"
+async def restore(folder: str, visible: str, env: dict[str, str]) -> tuple[subprocess.Popen, str]:
+  """Restore onto the engine's GPU. The node owns the namespace process even while waiting for it to start."""
+  target = await asyncio.to_thread(gpu, visible)
+  ns = launch([*UNSHARE, sys.executable, "-m", __name__, folder, target], env=env, stdout=subprocess.PIPE, text=True)
+  try:
+    if (await asyncio.to_thread(ns.stdout.readline)).strip() != "restored":
+      raise RuntimeError(f"could not restore the snapshot in {folder}")
+    root = await asyncio.to_thread(target_pid, ns)
+    with open(f"/proc/{root}/task/{root}/children") as f:
+      init = int(f.read().split()[0])
+    with open(f"{folder}/meta.json") as f:
+      return ns, f"/proc/{init}/root{RUN}/{json.load(f)['sock']}"
+  except BaseException:
+    reap(ns)
+    await asyncio.to_thread(ns.wait)
+    raise
+  finally:
+    ns.stdout.close()
 
 
 def restore_here(folder: str, target: str) -> None:

@@ -465,7 +465,7 @@ class TestStore(unittest.TestCase):
     from tinyrl.control.node_daemon import NodeDaemon
 
     store = Store(root=f"memory://test-{uuid.uuid4()}", cache=tempfile.mkdtemp())
-    bus = unittest.mock.AsyncMock(spec=Bus)
+    bus = unittest.mock.AsyncMock(spec=Bus, r=unittest.mock.AsyncMock())
     daemon = NodeDaemon(bus=bus, store=store)
     daemon.registry = unittest.mock.AsyncMock()
     daemon.registry.first_registered_at.return_value = 0.0

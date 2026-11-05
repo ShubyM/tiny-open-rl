@@ -1,14 +1,15 @@
 # tinyrl on Kubernetes
 
-**Status.** Portable `safetensors` checkpoints (`store.py`), one owner per worker, per-run telemetry (`GET /metrics`), a
-single-node process supervisor (`node_daemon.py`), load-based LoRA worker sharding, cooperative GPU time-slicing to
-pinned host memory, and samplers (`sampler.py`) are built. Multi-node placement, live run migration, `/dev/shm` + peer `Store` tiers, and
-Spot drain do not exist yet. Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
+**Current implementation.** The cluster scheduler groups runs and places workers on nodes. Each node daemon owns
+worker leases, queue consumption, local GPU turns and process lifetime. Trainers are synchronous model processes;
+sampling controllers run in the node and drive isolated engines. Local turns do not pass through Redis. Portable
+checkpoints, multi-node placement, single-node FSDP, host parking, background uploads and node-loss recovery are built.
+See the [README](../README.md) and [node_daemon.py](../tinyrl/control/node_daemon.py) for the running system.
 
-Today [`node_daemon.py`](../tinyrl/control/node_daemon.py) runs on one machine and starts a trainer for every worker that has runs,
-while [`gateway.py`](../tinyrl/api/gateway.py) picks each LoRA run's worker once at creation time. Nothing places workers across
-multiple GPU nodes, sizes them up front, moves runs off hot or dying Spot nodes, or scales burst nodes with load. This is
-the design for the piece that does, on GKE.
+**Roadmap below.** Live run migration between healthy nodes, adaptive worker sharding, `/dev/shm` + peer Store tiers,
+Spot notification handling and autoscaling remain proposals. The topology, key layouts and implementation sketches
+below describe that broader design; they are not a specification of the current Redis schema or process ownership.
+Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
 
 ## The idea
 
@@ -361,24 +362,24 @@ above `TARGET_UTIL` for a while, before work queues.
 
 ## Taking turns on a node daemon's GPUs
 
-**When everything fits, nothing parks.** Processes whose memory fits together hold a GPU at once and CUDA interleaves
-their kernels. When they don't fit, they take turns, decided by one scheduler process, `python -m tinyrl.control.scheduler`.
-Node daemons and workers append facts to one log, `tinyrl:events`. The scheduler folds the log into its state with
-`scheduler.fold` and appends what `scheduler.decide` says, `granted` or `revoked`, to the same log, where workers read them.
-A process on several GPUs is granted all of them at once, so two processes never deadlock:
+**Current local policy.** Workers with known memory budgets may hold a GPU together when they fit. Otherwise the node
+uses first-request order and a 30-second quantum, excluding engine startup. `scheduler.local_decide` supplies the pure
+rules and the node applies them immediately; the cluster scheduler handles only run and node assignment.
 
-1. A process with queued work and no turn appends `wants_gpu` and waits for `granted`, asking again every 2.5 s.
-2. With someone waiting, an idle holder is revoked at once and a busy one after a 30 s quantum. Engine boot doesn't
-   count toward the quantum. A revoked holder parks and emits `released`.
-3. Parking is in the application, not the driver. A trainer calls `store.put(..., durable=False)` and
-   `torch.cuda.empty_cache()`. A sampler puts its engine to sleep.
+1. The node requests every GPU of a worker together, so a multi-GPU trainer never holds a partial grant.
+2. An idle holder yields to a waiter, and a busy holder yields at a command or sampling-wave boundary after its quantum.
+3. The node orders a trainer to park its tensors on pinned host memory, or an engine to sleep. It releases the grant
+   only after that operation acknowledges. On shutdown it waits for the process group to be reaped.
+
+A local LoRA move retains the model process. Its next grant is valid only after its old allocation has parked and the
+node acknowledges its new GPUs. Current local placement and held turns appear in node heartbeats and the scheduling
+endpoint; Redis retains cluster assignments rather than a history of local grants.
 
 Measured on an H100: parking 16 GB takes 0.60 s, resuming takes 0.64 s, and 725–781 MiB stay on the GPU (529 MiB of
 CUDA context, about 210 MiB of cuBLAS, and allocator slack). vLLM's level 1 sleep leaves 808 MiB on an L4. That leftover
 caps how many processes one GPU can host, at about 0.8 GB each.
 
-Waiters are granted in the order they first asked. Every grant and revoke names the rule in `scheduler.RULES` that made
-it, and replaying the log rebuilds every decision.
+The remaining idle-run and storage-tier behaviors below are roadmap proposals, rather than the current turn protocol.
 
 **LoRA workers park like any other, and so do their runs.** An active LoRA worker stays resident while it has queued work; an
 idle 8B LoRA base parks 16.4 GB of bf16 to `/dev/shm` in 0.62 s. A run inside a busy worker that sits idle for 30 minutes
@@ -415,32 +416,22 @@ Activations are left to the dynamic [`token_budget`](../tinyrl/workers/trainer.p
 
 ## One owner per worker
 
-Two trainers serving one worker would split its runs' commands between two copies of the model, and a paused trainer
-waking up late must neither answer a client nor overwrite a checkpoint or `parked` pointer. Three pieces in `bus.py`
-and `trainer.py` plus immutable `Store` `ref`s enforce that:
+The node takes each worker's Redis lease before opening its executor, renews all local leases in one loop, and checks
+ownership before dispatch. Training updates with an uncertain outcome are failed rather than replayed. The model
+process has no Redis client, lease timer or global event cursor.
 
-1. **The lease.** A trainer serves a worker only after `SET tinyrl:owner:<worker> <worker> NX PX 10000` succeeds. It renews
-   every 2.5 s with `SET ... IFEQ <worker>` from the event loop while commands run in a thread. If a renewal fails, the
-   trainer stops before reading or running another command.
-2. **The fenced finish and handoff.** `Bus.write_reply` writes the reply, acknowledges the command, updates counters, and (for
-   `save_weights*`) publishes `ref` into `tinyrl:ckpt:<run>` in one WATCH/MULTI/EXEC transaction on the lease key.
-   Releasing a run (`parked = ref`) goes through the same lease check.
+`Bus.write_reply` commits replies, acknowledgments and counters in a WATCH/MULTI/EXEC transaction on the owner key;
+parked checkpoint pointers use the same ownership fence. A lease can be recovered after expiry only if no intervening
+owner served the worker. When ownership is lost, the node kills and reaps the old group and discards its result.
 
-   ```python
-   async with self.r.pipeline(transaction=True) as p:
-     await p.watch(lease_key)
-     if await p.get(lease_key) == worker.encode():
-       p.multi()
-       # write reply, ack, update counters
-       await p.execute()
-   ```
+Before a new executor starts, and between batches with nothing in flight, the node uses `XAUTOCLAIM` to fail abandoned
+commands. This also reconciles a stream read whose Redis claim succeeded but whose response was lost. SDK retries
+reuse the original queued request and future through ingress deduplication.
 
-3. **The stranded sweep.** Between batches, when the owner has nothing in flight itself, it `XAUTOCLAIM`s anything in its
-   worker pending for 5 seconds and fails it cleanly.
-
-`test/test_lease.py` verifies takeover under `SIGSTOP` against a real `redis-server` and two trainer subprocesses, and
-`test/test_trainer.py` verifies that restoring a run with its optimizer produces identical losses and bitwise-equal weights
-over subsequent steps.
+`test/test_lease.py` covers stale-parent dispatch, stale results, intervening owners, real paused-node takeover and
+SIGTERM checkpoint publication. `test/test_trainer.py` and `test/test_trainer_child.py` verify exact restore of weights,
+optimizer state and pending gradients. The proposed immutable-ref transactions and storage tiers elsewhere in this
+document are additional work, not guarantees of the current registry implementation.
 
 ## When things fail
 

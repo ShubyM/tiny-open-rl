@@ -2,7 +2,18 @@ import random
 import unittest
 
 from tinyrl.bus import Event
-from tinyrl.control.scheduler import QUANTUM, RULES, Kind, State, budget, decide, fold, holders, settings, uses
+from tinyrl.control.scheduler import (
+  QUANTUM,
+  Kind,
+  State,
+  budget,
+  decide,
+  fold,
+  holders,
+  local_decide,
+  settings,
+  uses,
+)
 
 GIB = 1024**3
 
@@ -55,8 +66,13 @@ class Log:
     self.t = self.t if at is None else at
     decided = decide(self.s, self.t)
     for kind, body in decided:
-      self.test.assertIn(body["rule"], RULES)
       self.append(kind, body)
+    for node in sorted(self.s.nodes):
+      local = local_decide(self.s, node, self.t)
+      for kind, body in local:
+        self.append(kind, body)
+      decided.extend((kind, body) for kind, body in local if body["rule"] != "place.local")
+      self.test.assertEqual(local_decide(self.s, node, self.t), [])
     self.test.assertEqual(decide(self.s, self.t), [])
     return [(kind, body["worker"], body["rule"]) for kind, body in decided]
 
@@ -241,7 +257,9 @@ class TestTurns(unittest.TestCase):
     log = self.one_gpu("a", "b")
     log("wants_gpu", worker="a")
     log("wants_gpu", worker="b")
-    self.assertEqual(log("run_deleted", run="a-run", worker="a"), [("unplaced", "a", EMPTIED)])
+    self.assertEqual(
+      log("run_deleted", run="a-run", worker="a"), [("unplaced", "a", EMPTIED), ("revoked", "a", "turn.moved")]
+    )
     self.assertEqual(log("exited", worker="a"), [("granted", "b", GRANTED)])
     self.assertNotIn("a", log.s.workers)
 
@@ -360,7 +378,7 @@ class TestWorkersAndGpus(unittest.TestCase):
       log("run_created", run=worker, worker=worker)
       log("batch_done", worker=worker, seconds=busy)
     decided = log("sampler_warmed", worker="sampler:b")
-    self.assertEqual([(k, p) for k, p, _ in decided], [("placed", "light"), ("placed", "sampler:b")])
+    self.assertEqual([(k, p) for k, p, _ in decided], [("placed", "sampler:b"), ("placed", "light")])
     self.assertEqual(log.s.workers["light"].gpus, log.s.workers["busy"].gpus)
     self.assertNotEqual(log.s.workers["sampler:b"].gpus, log.s.workers["busy"].gpus)
 
@@ -419,7 +437,7 @@ class TestWorkersAndGpus(unittest.TestCase):
     log("run_created", run="t2", worker="t2")
     self.assertEqual((log.s.workers["t2"].node, log.s.workers["t2"].gpus), ("b", (2,)))
     decided = log("sampler_warmed", worker="sampler:s2", gpus=2)
-    self.assertEqual([(k, w) for k, w, _ in decided], [("placed", "t2"), ("placed", "sampler:s2")])
+    self.assertEqual([(k, w) for k, w, _ in decided], [("placed", "sampler:s2"), ("placed", "t2")])
     self.assertEqual((log.s.workers["sampler:s2"].gpus, log.s.workers["t2"].gpus), ((2, 3), (0,)))
 
   def test_the_benchmark_s_arrivals_move_lora_trainers_and_leave_samplers_alone(self):
@@ -483,7 +501,9 @@ class TestWorkersAndGpus(unittest.TestCase):
         before = len(log.entries)
         log("run_created" if not name.startswith("sampler:") else "sampler_warmed", run=name, worker=name)
         log("batch_done", worker=name, seconds=rnd.random() * 10)
-        [mine] = [e for e in log.entries[before:] if e.kind == "placed" and e.body["worker"] == name]
+        [mine] = [
+          e for e in log.entries[before:] if e.kind == "placed" and e.body["worker"] == name and "gpus" in e.body
+        ]
         if name.startswith("sampler:") and movable:
           self.assertIn(mine.body["gpu_rule"], ("empty_gpu", "fits_next_to_others"), name)
 

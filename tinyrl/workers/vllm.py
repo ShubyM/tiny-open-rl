@@ -17,14 +17,11 @@ import traceback
 
 import httpx
 
-from tinyrl.helpers import getenv
+from tinyrl.control.process import launch, reap, target_pid
 from tinyrl.storage import models
 from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
 
-VLLM_ARGS = getenv("VLLM_ARGS", "")  # more `vllm serve` flags, like --gpu-memory-utilization 0.4
-GPU_MEM = getenv("TINYRL_GPU_MEM", "")  # the share of GPU memory vLLM may use, from the scheduler's placement
-KV_BYTES = getenv("TINYRL_KV_BYTES", "")  # bytes for vLLM's KV cache, from the scheduler's placement
 CUDAGRAPH_CONFIG = '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128,256]}'
 KERNEL_CONFIG = '{"enable_flashinfer_autotune":false}'
 
@@ -63,30 +60,34 @@ class VLLM:
     self.clean: bool = True
 
   @classmethod
-  async def start(cls, base: str, lora: bool) -> VLLM:
+  async def start(cls, base: str, lora: bool, env: dict[str, str] | None = None) -> VLLM:
+    options = dict(os.environ if env is None else env)
     path = await asyncio.to_thread(models.local, base)  # served under the reference's name, which requests use
     flags = ["--enable-sleep-mode", "--language-model-only"]
     flags += ["--enable-lora", "--max-lora-rank", "64", "--max-loras", "16", "--max-cpu-loras", "64"] if lora else []
-    if (tp := len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))) > 1:
+    visible = options.get("CUDA_VISIBLE_DEVICES", "0")
+    if (tp := len(visible.split(","))) > 1:
       flags += ["--tensor-parallel-size", str(tp)]
     env = {
       "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",  # its FlashAttention 4 kernels compile at each start unless cached
       "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": os.path.expanduser("~/.cache/flash-attention-cute"),
-      **{k: v for k, v in os.environ.items() if k not in {"TINYRL_GPU_MEM", "TINYRL_KV_BYTES", "TINYRL_WARM_SAMPLER"}},
+      **{k: v for k, v in options.items() if k not in {"TINYRL_GPU_MEM", "TINYRL_KV_BYTES", "TINYRL_WARM_SAMPLER"}},
       "VLLM_SERVER_DEV_MODE": "1",
       "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
     }
-    extra = shlex.split(VLLM_ARGS)
+    extra = shlex.split(options.get("VLLM_ARGS", ""))
     if not any(
       a == "--compilation-config" or a.startswith("--compilation-config=") or a.startswith("-O") for a in extra
     ):
       extra += ["--compilation-config", CUDAGRAPH_CONFIG]
     if not any(a == "--kernel-config" or a.startswith("--kernel-config=") for a in extra):
       extra += ["--kernel-config", KERNEL_CONFIG]
-    if GPU_MEM:
-      extra += ["--gpu-memory-utilization", GPU_MEM]
-    if KV_BYTES and not any(a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra):
-      extra += ["--kv-cache-memory-bytes", KV_BYTES]
+    if memory := options.get("TINYRL_GPU_MEM"):
+      extra += ["--gpu-memory-utilization", memory]
+    if (kv := options.get("TINYRL_KV_BYTES")) and not any(
+      a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra
+    ):
+      extra += ["--kv-cache-memory-bytes", kv]
     flags += extra
 
     def serve(*listen: str) -> list[str]:
@@ -96,17 +97,17 @@ class VLLM:
       with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-      server = subprocess.Popen(serve("--host", "127.0.0.1", "--port", str(port)), env=env)
+      server = launch(serve("--host", "127.0.0.1", "--port", str(port)), env=env)
       return await cls(f"http://127.0.0.1:{port}", base, lora, server).ready()
 
     # a multi-GPU server's NCCL communicators must be suspended before a snapshot, which isn't done yet
-    if not snapshot.SNAPSHOTS or tp > 1:
+    if not (snapshots := options.get("TINYRL_SNAPSHOTS")) or tp > 1:
       return await boot()
 
-    folder = os.path.join(snapshot.SNAPSHOTS, await asyncio.to_thread(snapshot.key, serve()))
+    folder = os.path.join(snapshots, await asyncio.to_thread(snapshot.key, serve(), visible))
     if os.path.isdir(folder):
       try:
-        return await cls.restore(folder, base, lora)
+        return await cls.restore(folder, base, lora, env)
       except Exception:
         print(f"the snapshot in {folder} did not restore, so vLLM boots", file=sys.stderr, flush=True)
         traceback.print_exc()
@@ -118,26 +119,28 @@ class VLLM:
     )
     # its own stdin and log: a snapshot can't hold files from outside it
     with open(f"{name}.log", "ab") as log:
-      server = subprocess.Popen(
+      server = launch(
         serve("--uds", f"{name}.sock"), env=saving, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT
       )
     engine = await cls("http://vllm", base, lora, server, unix_client(f"{name}.sock")).ready()
     try:
       await engine.post("/sleep", params={"level": 2})
       await engine.http.aclose()  # a connection into the server would reach outside the snapshot
-      await asyncio.to_thread(snapshot.save, server.pid, folder, name)
+      await asyncio.to_thread(snapshot.save, await asyncio.to_thread(target_pid, server), folder, name, visible)
       await asyncio.to_thread(server.wait)
-      return await cls.restore(folder, base, lora)
+      return await cls.restore(folder, base, lora, env)
     except Exception:
       print(f"vLLM could not be saved to {folder} and restored, so it boots again", file=sys.stderr, flush=True)
       traceback.print_exc()
       await engine.close()
       return await boot()
+    finally:
+      await engine.close()
 
   @classmethod
-  async def restore(cls, folder: str, base: str, lora: bool) -> VLLM:
+  async def restore(cls, folder: str, base: str, lora: bool, env: dict[str, str]) -> VLLM:
     """Restore a snapshot of vLLM asleep at level 2, then wake it with its weights read again from the model files."""
-    namespaces, sock = await asyncio.to_thread(snapshot.restore, folder)
+    namespaces, sock = await snapshot.restore(folder, env.get("CUDA_VISIBLE_DEVICES", "0"), env)
     engine = cls("http://vllm", base, lora, namespaces, unix_client(sock))
     try:
       await engine.ready()
@@ -146,29 +149,30 @@ class VLLM:
       await engine.post("/wake_up", params={"tags": "kv_cache"})
       await engine.post("/reset_prefix_cache")
       return engine
-    except Exception:
+    except BaseException:
       await engine.close()
       raise
 
   async def ready(self) -> VLLM:
-    while self.server.poll() is None:
-      with contextlib.suppress(httpx.HTTPError):
-        if (await self.http.get("/health")).is_success:
-          return self
-      await asyncio.sleep(0.2)
-    raise RuntimeError(f"vllm serve exited with {self.server.returncode}")
+    try:
+      while self.server.poll() is None:
+        with contextlib.suppress(httpx.HTTPError):
+          if (await self.http.get("/health", timeout=1)).is_success:
+            return self
+        await asyncio.sleep(0.2)
+      raise RuntimeError(f"vllm serve exited with {self.server.returncode}")
+    except BaseException:
+      await self.close()
+      raise
 
   async def close(self) -> None:
-    if self.server:
-      if self.server.args[0] == "unshare":
-        self.server.kill()  # a restored server's namespaces end with their root, which blocks SIGTERM
-      else:
-        self.server.terminate()
-      try:
-        await asyncio.to_thread(self.server.wait, 30)
-      except subprocess.TimeoutExpired:
-        self.server.kill()
-    await self.http.aclose()
+    try:
+      if self.server:
+        reap(self.server)
+        await asyncio.to_thread(self.server.wait)
+        self.server = None
+    finally:
+      await self.http.aclose()
 
   async def post(self, path: str, **kwargs) -> httpx.Response:
     for attempt in range(3):

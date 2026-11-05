@@ -67,11 +67,6 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     self.registry = Registry(self.bus)
     await self.bus.r.flushall()
 
-  async def own(self, trainer):
-    """Renew the lease as Trainer.serve does."""
-    await trainer.wait_for_lease()
-    self.renewal_tasks.append(asyncio.create_task(trainer.keep_renewing_lease()))
-
   async def worker(self, run: str) -> str:
     """The run's worker, once every new run is assigned the way the scheduler assigns it."""
     from tinyrl.control import scheduler
@@ -84,26 +79,10 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
         await self.bus.assign_run_to_worker(body["run"], body["worker"])
     return (await self.bus.get_run(run))["worker"]
 
-  async def running(self, placed: dict[str, list[int]]) -> None:
-    """Node n is up with these workers placed on these GPUs and their processes started, each kept by a held run."""
-    gpus = 1 + max(i for worker_gpus in placed.values() for i in worker_gpus)
-    await self.bus.node_heartbeat("n", gpus)
-    await self.bus.append_event("node_up", node="n", gpus=gpus, memory=0)
-    for worker, worker_gpus in placed.items():
-      await self.bus.append_event("run_created", run=f"{worker}-held", worker=worker)
-      await self.bus.append_event("placed", worker=worker, node="n", gpus=worker_gpus, rule="test")
-      await self.bus.append_event("started", worker=worker, node="n")
-
-  async def run_scheduler(self, placed: dict[str, list[int]], quantum: float = 30.0) -> None:
-    """Run the scheduler over these running workers, so workers that share a GPU get turns."""
-    from tinyrl.control import scheduler
-
-    await self.running(placed)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus, quantum)))
-
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
       task.cancel()
+    await asyncio.gather(*self.renewal_tasks, return_exceptions=True)
     await self.bus.r.aclose()
 
 
@@ -112,15 +91,21 @@ class FakeEngine:
 
   def __init__(self):
     self.calls = []
+    self.loaded: set[str] = set()
+    self.lora = True
 
   @classmethod
-  async def start(cls, base: str, lora: bool) -> "FakeEngine":
+  async def start(cls, base: str, lora: bool, env: dict[str, str] | None = None) -> "FakeEngine":
     engine = cls()
+    engine.lora = lora
     engine.calls.append(("start", base, lora))
     return engine
 
   async def load_checkpoint(self, name: str, path: str) -> None:
+    if name in self.loaded:
+      return
     self.calls.append(("load", name, path))
+    self.loaded = self.loaded | {name} if self.lora else {name}
 
   async def sleep(self) -> None:
     self.calls.append(("sleep",))

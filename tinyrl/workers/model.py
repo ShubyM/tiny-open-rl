@@ -184,8 +184,7 @@ def load(name: str) -> PreTrainedModel:
   cls = getattr(transformers, arch, AutoModelForCausalLM)
   # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create_run
   if torch.cuda.is_available() and not dist.is_initialized():
-    device_map = {"": torch.cuda.current_device()} if os.environ.get("TINYRL_NODE") else "auto"
-    return cls.from_pretrained(name, dtype=torch.bfloat16, device_map=device_map)
+    return cls.from_pretrained(name, dtype=torch.bfloat16, device_map={"": torch.cuda.current_device()})
   return cls.from_pretrained(name, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
 
 

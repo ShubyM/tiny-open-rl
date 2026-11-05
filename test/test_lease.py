@@ -6,88 +6,279 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from test.execution import TestNode
 from test.helpers import RedisTest, new_id, tiny
-from tinyrl.bus import GROUP, Op, Reply, Run, key
+from test.test_process import require_unix
+from tinyrl.bus import GROUP, Cmd, Ev, Op, Reply, Run, key
+from tinyrl.control import scheduler
+from tinyrl.storage.store import Store
 
 LEASE_MS = 2000
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
 class TestLease(RedisTest):
-  """Two trainer processes and one worker. The lease decides which one serves it, even after the first comes back from a pause long enough for the second to take over."""
+  async def asyncSetUp(self):
+    await super().asyncSetUp()
+    self.nodes, self.tasks, self.processes = [], [], []
+    self.folder = tempfile.TemporaryDirectory()
+    self.addCleanup(self.folder.cleanup)
+    self.store = Store(root=self.folder.name)
 
-  def trainer(self, worker: str) -> subprocess.Popen:
-    env = {**os.environ, "REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS)}
-    return subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", worker], env=env)
+  async def asyncTearDown(self):
+    for proc in self.processes:
+      if proc.poll() is None:
+        proc.send_signal(signal.SIGCONT)
+        proc.terminate()
+    for proc in self.processes:
+      try:
+        await asyncio.to_thread(proc.wait, 30)
+      except subprocess.TimeoutExpired:
+        proc.kill()
+        await asyncio.to_thread(proc.wait)
+    for task in self.tasks:
+      task.cancel()
+    await asyncio.gather(*self.tasks, return_exceptions=True)
+    for node in self.nodes:
+      await node.aclose()
+    await super().asyncTearDown()
+
+  def node(self, name):
+    node = TestNode(self.bus, store=self.store, gpus=1, node=name)
+    self.nodes.append(node)
+    return node
+
+  async def prepared(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "worker", "tiny", 4, lora=LORA))
+    first = self.node("first")
+    await first.add("worker", owner="old-owner")
+    await self.bus.submit_command(
+      run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
+    )
+    await first.drain(run)
+    return first, run
+
+  async def takeover(self):
+    await self.bus.r.delete(key("owner", "worker"))  # its lease expired while the node was paused
+    second = self.node("second")
+    await second.add("worker", owner="new-owner")
+    return second
+
+  async def test_a_stale_parent_checks_ownership_before_dispatching_to_its_child(self):
+    first, run = await self.prepared()
+    request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    [cmd] = await self.bus.take_commands([run], "old-owner", block_ms=1)
+    await self.takeover()
+    await self.bus.fail_stranded_commands([run], "worker", "new-owner")
+    expected = await self.bus.wait_for_reply(request, 0)
+    self.assertFalse(expected.ok)
+    with patch.object(first.running["worker"].model, "call", wraps=first.running["worker"].model.call) as call:
+      with self.assertRaisesRegex(RuntimeError, "lost worker"):
+        await first.answer_command("worker", cmd)
+    call.assert_not_called()
+    self.assertTrue(first.running["worker"].lost)
+    self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
+    self.assertFalse(await self.bus.write_reply(cmd, Reply(True, "application/json", b"{}"), "worker", "old-owner"))
+    await first.close_worker("worker")
+    self.assertEqual(await self.bus.lease_owner("worker"), "new-owner")
+
+  async def test_a_renewal_racing_with_close_cannot_reacquire_the_released_lease(self):
+    first, _ = await self.prepared()
+    running = first.running["worker"]
+    running.renewed = 0
+    entered, finish = asyncio.Event(), asyncio.Event()
+    renew = self.bus.renew_lease
+
+    async def delayed(*args):
+      entered.set()
+      await finish.wait()
+      return await renew(*args)
+
+    with patch.object(self.bus, "renew_lease", side_effect=delayed):
+      renewing = asyncio.create_task(first.renew())
+      self.tasks.append(renewing)
+      await entered.wait()
+      await first.close_worker("worker")
+      self.assertIsNone(await self.bus.lease_owner("worker"))
+      finish.set()
+      await renewing
+    self.assertIsNone(await self.bus.lease_owner("worker"))
+    self.assertTrue(running.closed)
+
+  async def test_a_completed_stale_result_cannot_replace_the_takeover_failure(self):
+    first, run = await self.prepared()
+    request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    entered, finish = asyncio.Event(), asyncio.Event()
+    child = first.running["worker"].model
+    execute = child.call
+
+    async def held_reply(method, *args):
+      result = await execute(method, *args)
+      if method == "execute":
+        entered.set()
+        await finish.wait()
+      return result
+
+    try:
+      with patch.object(child, "call", side_effect=held_reply):
+        work = asyncio.create_task(first.step("worker", block_ms=1))
+        self.tasks.append(work)
+        await asyncio.wait_for(entered.wait(), 5)
+        second = await self.takeover()
+        await self.bus.fail_stranded_commands([run], "worker", "new-owner")
+        expected = await self.bus.wait_for_reply(request, 0)
+        self.assertFalse(expected.ok)
+        finish.set()
+        with self.assertRaisesRegex(RuntimeError, "lost worker"):
+          await work
+      self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
+      self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
+      self.assertNotIn(run, second.running["worker"].model.trainer.model.params)
+      self.assertEqual((await self.bus.get_run(run))["steps"], 0)
+    finally:
+      finish.set()
+
+  async def test_a_stale_checkpoint_result_is_not_registered(self):
+    first, run = await self.prepared()
+    uri = f"tinker://{run}/weights/stale"
+    request = await self.bus.submit_command(run, Op.SAVE_WEIGHTS, json.dumps({"uri": uri}).encode())
+    entered, finish = asyncio.Event(), asyncio.Event()
+    child, execute = first.running["worker"].model, first.running["worker"].model.call
+
+    async def held_save(method, *args):
+      result = await execute(method, *args)
+      if method == "execute":
+        entered.set()
+        await finish.wait()
+      return result
+
+    try:
+      with patch.object(child, "call", side_effect=held_save):
+        saving = asyncio.create_task(first.step("worker", block_ms=1))
+        self.tasks.append(saving)
+        await asyncio.wait_for(entered.wait(), 5)
+        await self.takeover()
+        await self.bus.fail_stranded_commands([run], "worker", "new-owner")
+        finish.set()
+        with self.assertRaisesRegex(RuntimeError, "lost worker"):
+          await saving
+      self.assertIsNone(await self.registry.get_checkpoint(uri))
+      self.assertFalse((await self.bus.wait_for_reply(request, 0)).ok)
+    finally:
+      finish.set()
+
+  async def test_an_intervening_owner_prevents_recovery_even_after_it_released_the_lease(self):
+    first, run = await self.prepared()
+    second = await self.takeover()
+    await second.close_worker("worker")
+    self.assertIsNone(await self.bus.lease_owner("worker"))
+    with patch.object(first.running["worker"].model, "call") as call:
+      with self.assertRaisesRegex(RuntimeError, "lost worker"):
+        await first.answer_command("worker", Cmd(run, "0-1", Op.OPTIM_STEP, b'{"adam_params":{}}'))
+    call.assert_not_called()
+    self.assertTrue(first.running["worker"].lost)
+
+  def daemon(self):
+    env = {
+      **os.environ,
+      "REDIS_URL": self.url,
+      "LEASE_MS": str(LEASE_MS),
+      "GPUS": "1",
+      "GPU_MEMORY_MIB": "0",
+      "TICK": "0.05",
+      "CKPT": self.folder.name,
+    }
+    proc = subprocess.Popen([sys.executable, "-m", "tinyrl.control.node_daemon"], env=env)
+    self.processes.append(proc)
+    return proc
+
+  async def until(self, predicate, timeout=60):
+    async def wait():
+      while not await predicate():
+        await asyncio.sleep(0.02)
+
+    await asyncio.wait_for(wait(), timeout)
 
   async def call(self, run: str, op: Op, body: dict) -> Reply:
-    request_id = await self.bus.submit_command(run, op, json.dumps(body).encode())
-    return await self.bus.wait_for_reply(request_id, 60)
+    request = await self.bus.submit_command(run, op, json.dumps(body).encode())
+    reply = await self.bus.wait_for_reply(request, 60)
+    self.assertIsNotNone(reply)
+    return reply
 
-  async def test_a_paused_trainer_cannot_answer_once_another_owns_its_worker(self):
-    base = f"{tempfile.mkdtemp()}/tiny"
+  async def test_a_paused_daemon_cannot_answer_after_another_node_takes_its_worker(self):
+    require_unix()
+    base = f"{self.folder.name}/base"
     tiny().save_pretrained(base)
-    worker, run = f"lora:{base}", new_id()
-    await self.bus.create_run(Run(run, worker, base, 4))
+    run = new_id()
+    await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
+    first = self.daemon()
+    scheduling = asyncio.create_task(scheduler.run(self.bus))
+    self.tasks.append(scheduling)
+    self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
+    old_owner = await self.bus.lease_owner("worker")
+    [first_node] = await self.bus.live_nodes()
+    second = self.daemon()
 
-    first = self.trainer(worker)
-    second = None
-    try:
-      self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
+    async def both_up():
+      return len(await self.bus.live_nodes()) == 2
 
-      second = self.trainer(worker)  # it starts while the first owns the worker, so it waits
-      await asyncio.sleep(3 * LEASE_MS / 1000)
-      self.assertTrue((await self.call(run, Op.OPTIM_STEP, {"adam_params": {}})).ok)
-      consumers = await self.bus.r.xinfo_consumers(key("q", run), GROUP)
-      self.assertEqual(len(consumers), 1)  # the second never read from the worker
+    await self.until(both_up)
+    await asyncio.sleep(1.5 * LEASE_MS / 1000)
+    self.assertEqual(await self.bus.lease_owner("worker"), old_owner)
+    self.assertEqual(len(await self.bus.r.xinfo_consumers(key("q", run), GROUP)), 1)
 
-      # pause the first while it's blocked reading the worker, so Redis hands it the next command, and past its lease
-      while not any(c["cmd"] == "xreadgroup" and "b" in c["flags"] for c in await self.bus.r.client_list()):
-        await asyncio.sleep(0.01)
-      first.send_signal(signal.SIGSTOP)
-      request_id = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params": {}}')
-      await asyncio.sleep(0.2)
-      [stranded] = (await self.bus.queued_and_in_flight(run))["in_flight"]
-      self.assertEqual(stranded["request_id"], request_id)
+    async def blocked():
+      return any(c["cmd"] == "xreadgroup" and "b" in c["flags"] for c in await self.bus.r.client_list())
 
-      reply = await self.bus.wait_for_reply(request_id, 30)  # the second takes the worker over and fails the command
-      self.assertFalse(reply.ok)
-      self.assertIn("lost the worker", json.loads(reply.body)["error"])
+    await self.until(blocked)
+    first.send_signal(signal.SIGSTOP)
+    request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
 
-      first.send_signal(signal.SIGCONT)
-      await asyncio.to_thread(first.wait, 30)  # it finds its lease gone, and exits
-      self.assertEqual(await self.bus.wait_for_reply(request_id, 0), reply)  # and nothing it did reached the client
-      self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
+    async def pending():
+      return bool((await self.bus.queued_and_in_flight(run))["in_flight"])
 
-      other = new_id()
-      await self.bus.create_run(Run(other, worker, base, 4))
-      self.assertTrue((await self.call(other, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
-      self.assertIsNone(second.poll())  # the second serves the worker from now on
-    finally:
-      for proc in (first, second):
-        if proc is not None and proc.poll() is None:
-          proc.send_signal(signal.SIGCONT)
-          proc.terminate()
-          proc.wait()
+    await self.until(pending)
+    await self.bus.append_event(Ev.NODE_LOST, node=first_node)  # what the heartbeat timeout decides
+    expected = await self.bus.wait_for_reply(request, 30)
+    self.assertFalse(expected.ok)
+    self.assertIn("lost the worker", json.loads(expected.body)["error"])
+    new_owner = await self.bus.lease_owner("worker")
+    self.assertNotEqual(new_owner, old_owner)
+    first.send_signal(signal.SIGCONT)
 
-  async def test_sigterm_saves_the_runs_before_the_trainer_exits(self):
-    base, ckpt = f"{tempfile.mkdtemp()}/tiny", tempfile.mkdtemp()
+    async def first_reaped():
+      nodes = await self.bus.live_nodes(details=True)
+      return first_node in nodes and not nodes[first_node]["workers"]
+
+    await self.until(first_reaped)
+    self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
+    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
+    other = new_id()
+    await self.bus.create_run(Run(other, "worker", base, 4, lora=LORA))
+    self.assertTrue((await self.call(other, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
+    self.assertIsNone(second.poll())
+
+  async def test_sigterm_parks_runs_before_the_node_releases_ownership(self):
+    require_unix()
+    base = f"{self.folder.name}/base"
     tiny().save_pretrained(base)
-    worker, run = f"lora:{base}", new_id()
-    await self.bus.create_run(Run(run, worker, base, 4, lora=LORA))
-    env = {**os.environ, "REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS), "CKPT": ckpt}
-    proc = subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", worker], env=env)
-    try:
-      self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
-      proc.terminate()
-      self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
-      uri = await self.bus.parked_checkpoint(run)
-      self.assertTrue(os.path.exists(f"{ckpt}/{uri.removeprefix('tinker://')}/state.safetensors"))
-      self.assertIsNone(await self.bus.lease_owner(worker))  # released, so the next trainer starts at once
-    finally:
-      if proc.poll() is None:
-        proc.kill()
+    run = new_id()
+    await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
+    proc = self.daemon()
+    self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
+    proc.terminate()
+    self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
+    uri = await self.bus.parked_checkpoint(run)
+    self.assertIsNotNone(uri)
+    tensors, meta = self.store.get(uri)
+    self.assertTrue(tensors)
+    self.assertTrue(meta["optimizer"])
+    self.assertIsNotNone(await self.registry.get_checkpoint(uri))
+    self.assertIsNone(await self.bus.lease_owner("worker"))
 
 
 if __name__ == "__main__":

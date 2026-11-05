@@ -2,12 +2,12 @@
 
 Needs kubectl pointed at a cluster running k8s/ on at least two GPU nodes, and the tinker SDK. It port-forwards the gateway, trains two LoRA runs through the SDK, then injects one failure at a time and checks what the user sees:
 
-  trainer_killed   a trainer process dies: the node daemon starts another, calls fail cleanly, load_state recovers
+  trainer_killed   a trainer's supervisor dies: the node daemon starts another, calls fail cleanly, load_state recovers
   gateway_deleted  every gateway pod is deleted: the SDK's retries land and no call runs twice
   redis_restarted  Redis is down past the worker lease: runs survive on its append-only file and training goes on
   node_drained     a node is drained, as on a Spot notice: its trainer saves the run, which goes on on another node
   node_died        a node is reset with no notice: its workers move, calls fail cleanly, load_state recovers
-  no_leaks         afterwards, one trainer process per placed worker and no lease without a worker
+  no_leaks         afterwards, one owned process group per trainer or live engine, and no stray processes or leases
 
 python k8s/e2e.py prints one line per check and writes the report to e2e.json.
 """
@@ -20,9 +20,10 @@ import subprocess
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING
 
-import tinker
-from tinker import types
+if TYPE_CHECKING:
+  import tinker
 
 NS = os.getenv("NAMESPACE", "tinyrl")
 MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-0.5B")
@@ -68,9 +69,61 @@ def serving(worker: str) -> str | None:
   return placements().get(worker)
 
 
-def trainers(pod: str) -> list[str]:
-  ps = kubectl("exec", pod, "--", "ps", "-eo", "args", check=False)
-  return [line for line in ps.splitlines() if "tinyrl.workers.trainer" in line or "tinyrl.workers.sampler" in line]
+def live_workers() -> dict[tuple[str, str], dict]:
+  """Physical (pod, worker) -> live state, including its owned supervisor PID. Placement may already name another node."""
+  records = redis("HGETALL", "tinyrl:nodes").splitlines()
+  workers = {}
+  for node, raw in zip(records[::2], records[1::2]):
+    info = json.loads(raw)
+    if info["until"] <= time.time():
+      continue
+    for worker, state in info.get("workers", {}).items():
+      key = node.rsplit("-", 1)[0], worker
+      assert key not in workers, f"two live node daemons report {key}"
+      workers[key] = state
+  return workers
+
+
+def processes(pod: str) -> dict[int, tuple[int, int, str]]:
+  ps = kubectl("exec", pod, "--", "ps", "-ww", "-eo", "pid=,ppid=,pgid=,args=")
+  return {
+    int(pid): (int(parent), int(group), args)
+    for pid, parent, group, args in (s.split(None, 3) for s in ps.splitlines())
+  }
+
+
+def trainer_process(worker: str) -> tuple[str, int]:
+  pod = serving(worker)
+  state = live_workers()[(pod, worker)]
+  pid = state["pid"]
+  assert state["kind"]["role"] == "trainer" and isinstance(pid, int) and pid > 1, state
+  args = processes(pod)[pid][2]
+  assert "-m tinyrl.control.process " in args and "-m tinyrl.workers.trainer " in args, args
+  return pod, pid
+
+
+def check_processes(placed: dict, workers: dict, procs: dict, owners: list[str]) -> None:
+  assert set(workers) == {(pod, worker) for worker, pod in placed.items()}, (placed, workers)
+  for pod, ps in procs.items():
+    local = {worker: state for (at, worker), state in workers.items() if at == pod}
+    missing = [worker for worker, s in local.items() if s["kind"]["role"] == "trainer" and s["pid"] is None]
+    assert not missing, (pod, "trainers without a process", missing)
+    expected = [s["pid"] for s in local.values() if s["pid"] is not None]
+    supervisors = {pid for pid, (_, _, args) in ps.items() if "-m tinyrl.control.process " in args}
+    assert len(expected) == len(set(expected)) and set(expected) == supervisors, (pod, expected, supervisors)
+    owned, groups = set(expected), {ps[pid][1] for pid in expected}
+    while children := {pid for pid, (parent, _, _) in ps.items() if parent in owned} - owned:
+      owned.update(children)
+    # torchrun ranks may have separate process groups; restored vLLM copies have their own PID namespace.
+    names = ("tinyrl.workers.trainer", "tinyrl.workers.snapshot", "vllm serve", "VLLM::")
+    extra = {
+      pid: args
+      for pid, (_, group, args) in ps.items()
+      if any(name in args for name in names) and pid not in owned and group not in groups
+    }
+    assert not extra, (pod, "unowned model processes", extra)
+  assert not (missing_pods := {pod for pod, _ in workers} - procs.keys()), missing_pods
+  assert not (leaked := set(owners) - placed.keys()), ("leases without a worker", leaked)
 
 
 def wait(what: str, ok, timeout: float) -> float:
@@ -87,6 +140,8 @@ def wait(what: str, ok, timeout: float) -> float:
 
 class Run:
   def __init__(self, client: tinker.ServiceClient, tok, name: str):
+    from tinker import types
+
     self.name = name
     self.tc = client.create_lora_training_client(MODEL, rank=8, seed=0, user_metadata={"openrl.exclusive": "true"})
     self.run_id = self.tc.model_id
@@ -103,6 +158,8 @@ class Run:
     return w if w else self.run_id
 
   def step(self) -> float:
+    from tinker import types
+
     fb = self.tc.forward_backward([self.datum], "cross_entropy")
     self.tc.optim_step(types.AdamParams(learning_rate=1e-4)).result()
     self.steps += 1
@@ -120,6 +177,9 @@ class Run:
 
 
 def main() -> None:
+  import tinker
+  from tinker import types
+
   port_forward()
   wait(
     "gateway", lambda: subprocess.run(["curl", "-sf", f"http://127.0.0.1:{PORT}/api/v1/healthz"]).returncode == 0, 120
@@ -154,9 +214,9 @@ def main() -> None:
   checkpoint = run.tc.save_state("e2e").result().path
 
   def trainer_killed():
-    pod = serving(run.worker)
-    kubectl("exec", pod, "--", "pkill", "-9", "-f", f"tinyrl.workers.trainer {run.worker}")
-    restart = wait("a new trainer", lambda: any(run.worker in t for t in trainers(pod)), 15)
+    pod, pid = trainer_process(run.worker)
+    kubectl("exec", pod, "--", "kill", "-9", str(pid))
+    restart = wait("a new trainer supervisor", lambda: trainer_process(run.worker) != (pod, pid), 15)
     error = run.fails_cleanly()
     assert "lost its unsaved steps" in error, error
     run.tc.load_state_with_optimizer(checkpoint).result()
@@ -214,16 +274,12 @@ def main() -> None:
   def no_leaks():
     time.sleep(10)
     placed = placements()
-    procs = {pod: trainers(pod) for pod in daemons()}
-    extra = {
-      pod: [p for p in ps if not any(worker in p for worker, at in placed.items() if at == pod)]
-      for pod, ps in procs.items()
-    }
-    missing = [worker for worker, pod in placed.items() if sum(worker in p for p in procs.get(pod, [])) != 1]
+    workers = live_workers()
+    procs = {pod: processes(pod) for pod in daemons()}
     owners = [k.removeprefix("tinyrl:owner:") for k in redis("KEYS", "tinyrl:owner:*").split()]
-    leaked = [o for o in owners if o not in placed and o != "scheduler" and not o.startswith("gpu:")]
-    assert not any(extra.values()) and not missing and not leaked, (extra, missing, leaked)
-    return f"{len(placed)} workers, each with one process, and no stray processes or leases"
+    check_processes(placed, workers, procs, owners)
+    engines = sum(s["pid"] is not None for s in workers.values())
+    return f"{len(placed)} workers, {engines} owned process groups, and no stray processes or leases"
 
   for name, fn in [
     ("trainer_killed", trainer_killed),

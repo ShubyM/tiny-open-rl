@@ -151,10 +151,12 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.get("/api/v1/scheduling")
   async def scheduling():
-    return {
-      "nodes": await bus.live_nodes(),
-      "state": json.loads(await bus.r.get(key("state")) or "{}"),  # the scheduler's: placements and turns
-    }
+    nodes, state = await bus.live_nodes(details=True), json.loads(await bus.r.get(key("state")) or "{}")
+    for node, info in nodes.items():
+      for worker, local in info.get("workers", {}).items():
+        if state.get("workers", {}).get(worker, {}).get("node") == node:
+          state["workers"][worker] = local
+    return {"nodes": {n: v["gpus"] for n, v in nodes.items()}, "state": state}
 
   @api.get("/api/v1/healthz")
   async def healthz():
