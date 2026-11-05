@@ -1,9 +1,10 @@
 import asyncio
 import json
+import os
 import tempfile
 import threading
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import httpx
 import safetensors.torch
@@ -41,9 +42,12 @@ def tokens(chunks: list[int]) -> dict:
 class TestSampler(RedisTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
-    self.nodes = []
+    self.nodes, self.tasks = [], []
 
   async def asyncTearDown(self):
+    for task in self.tasks:
+      task.cancel()
+    await asyncio.gather(*self.tasks, return_exceptions=True)
     for node in self.nodes:
       await node.aclose()
     await super().asyncTearDown()
@@ -52,6 +56,19 @@ class TestSampler(RedisTest):
     node = TestNode(self.bus, store=store, **kwargs)
     self.nodes.append(node)
     return node
+
+  def pump(self, node):
+    async def run():
+      while True:
+        await node.tick()
+        await asyncio.sleep(0.01)
+
+    self.tasks.append(asyncio.create_task(run()))
+
+  async def until(self, done):
+    async with asyncio.timeout(5):
+      while not done():
+        await asyncio.sleep(0.01)
 
   def test_encode_masks_the_prompt_before_last_n_and_pads_top_k(self):
     out = Out(
@@ -183,22 +200,42 @@ class TestSampler(RedisTest):
     trainer = await node.add("t1", gpus=trainer_gpus)
     trainer.model.trainer.model.create_run("t1", "base", 0, {})
     sampler = await node.add("sampler:base", gpus=sampler_gpus)
-    trainer.task = asyncio.create_task(node.serve_worker("t1"))
-    sampler.task = asyncio.create_task(node.serve_worker("sampler:base"))
-    try:
-      for run, op, body in [
-        ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
-        ("samp-1", Op.SAMPLE, JOB),
-        ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
-      ]:
-        reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, json.dumps(body).encode()), 5)
-        self.assertTrue(reply.ok, reply.body)
-      engine = sampler.sampler.running
-      self.assertIn(("sleep",), engine.calls)
-    finally:
-      trainer.stopping = sampler.stopping = True
-      await asyncio.gather(trainer.task, sampler.task)
-    self.assertEqual(engine.calls[-1], ("close",))
+    self.pump(node)
+    for run, op, body in [
+      ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
+      ("samp-1", Op.SAMPLE, JOB),
+      ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
+    ]:
+      reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, json.dumps(body).encode()), 5)
+      self.assertIsNotNone(reply)
+      self.assertTrue(reply.ok, reply.body)
+    self.assertIn(("sleep",), sampler.sampler.running.calls)
+
+  async def test_compatible_fft_samplers_share_a_gpu_without_parking_the_idle_holder(self):
+    for run in ("a", "b"):
+      await self.bus.create_run(Run(run, run, f"base-{run}", 0, role=Role.SAMPLER))
+    node = self.node(gpus=1, gpu_mib=80 * 1024)
+    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "0"}):
+      first, second = await node.add("a", gpus=[0]), await node.add("b", gpus=[0])
+    for worker in (first, second):
+      self.assertEqual(worker.sampler.env["TINYRL_GPU_MEM"], "0.42")
+
+    request = await self.bus.submit_command("a", Op.SAMPLE, json.dumps(JOB).encode())
+    self.assertEqual(await node.step("a", block_ms=0), 1)
+    self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
+    reserved = first.since
+    self.assertIsNotNone(reserved)
+    self.assertFalse(first.queue)
+    self.assertIsNone(first.task)
+
+    request = await self.bus.submit_command("b", Op.SAMPLE, json.dumps(JOB).encode())
+    self.assertEqual(await node.step("b", block_ms=0), 1)
+    self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
+    self.assertEqual(first.since, reserved)
+    self.assertIsNotNone(second.since)
+    self.assertEqual((first.gpus, second.gpus), ((0,), (0,)))
+    self.assertNotIn(("sleep",), first.sampler.running.calls)
+    self.assertNotIn(("sleep",), second.sampler.running.calls)
 
   async def test_a_sampler_batches_queued_commands_concurrently_and_loads_once(self):
     store = Store(tempfile.mkdtemp())
@@ -238,6 +275,88 @@ class TestSampler(RedisTest):
     self.assertEqual(await node.step("sampler:base", block_ms=0), 8)
     self.assertEqual((starts, loads, peak, store.local_folder.call_count), (1, 1, 8, 1))
     self.assertTrue(all([(await self.bus.wait_for_reply(i, 1)).ok for i in ids]))
+
+  async def test_a_lora_sampler_runs_three_sessions_at_once_before_starting_the_next_wave(self):
+    store = Store(tempfile.mkdtemp())
+    for i in range(4):
+      uri = f"tinker://r{i}/sampler_weights/s0"
+      store.put(uri, {}, {"base": "base", "lora": True, "config": {}})
+      await self.bus.create_run(Run(f"s{i}", "sampler", "base", 4, role=Role.SAMPLER, model_path=uri))
+    active, peak = {}, 0
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    class WaveEngine(FakeEngine):
+      async def sample(self, job, name):
+        nonlocal peak
+        active[name] = active.get(name, 0) + 1
+        peak = max(peak, len(active))
+        if sum(active.values()) == 6:
+          entered.set()
+        try:
+          await finish.wait()
+          return await super().sample(job, name)
+        finally:
+          active[name] -= 1
+          if not active[name]:
+            del active[name]
+
+    node = self.node(store, engine=WaveEngine)
+    running = await node.add("sampler")
+    requests = [
+      await self.bus.submit_command(f"s{i}", Op.SAMPLE, json.dumps(JOB).encode()) for i in range(4) for _ in range(2)
+    ]
+    handling = asyncio.create_task(node.drain("s0"))
+    self.tasks.append(handling)
+    try:
+      await asyncio.wait_for(entered.wait(), 5)
+      self.assertEqual(sorted(active.values()), [2, 2, 2])
+      self.assertEqual(len([c for c in running.sampler.running.calls if c[0] == "load"]), 3)
+    finally:
+      finish.set()
+    await asyncio.wait_for(handling, 5)
+    self.assertEqual(peak, 3)
+    self.assertEqual(len([c for c in running.sampler.running.calls if c[0] == "load"]), 4)
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 1)).ok for request in requests]))
+
+  async def test_empty_prefetch_reads_never_fail_a_sample_that_is_still_running(self):
+    await self.bus.create_run(Run("s", "sampler", "base", 4, role=Role.SAMPLER))
+    sampling, finish, prefetched = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    take, empty_reads = self.bus.take_commands, 0
+
+    async def read(*args, **kwargs):
+      nonlocal empty_reads
+      commands = await take(*args, **kwargs)
+      if not commands and sampling.is_set():
+        empty_reads += 1
+        if empty_reads >= 2:
+          prefetched.set()
+      return commands
+
+    class SlowSample(FakeEngine):
+      async def sample(self, job, name):
+        sampling.set()
+        await finish.wait()
+        return await super().sample(job, name)
+
+    node = self.node(gpus=1, engine=SlowSample)
+    await node.add("sampler")
+    with (
+      patch("tinyrl.control.node_daemon.STRANDED_MS", 0),
+      patch("tinyrl.control.node_daemon.IDLE_MS", 5),
+      patch.object(self.bus, "take_commands", side_effect=read),
+    ):
+      self.pump(node)
+      request = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
+      try:
+        await asyncio.wait_for(prefetched.wait(), 5)
+        self.assertIsNone(await self.bus.wait_for_reply(request, 0))
+        run = await self.bus.get_run("s")
+        self.assertEqual((run["cmds"], run["failed"]), (0, 0))
+      finally:
+        finish.set()
+      self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
+      run = await self.bus.get_run("s")
+      self.assertEqual((run["cmds"], run["failed"]), (1, 0))
 
   async def test_vllm_retries_a_dropped_keepalive_socket(self):
     import httpx
@@ -328,7 +447,7 @@ class TestSampler(RedisTest):
         return await super().start(base, lora, env)
 
     node = self.node(store, engine=SlowStartEngine)
-    await node.add("sampler:base")
+    running = await node.add("sampler:base")
 
     await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())
 
@@ -336,12 +455,17 @@ class TestSampler(RedisTest):
       await booting.wait()
       await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())
       await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.until(lambda: len(running.queue) == 3)
       queued.set()
 
     pushing = asyncio.create_task(push_more())
+    self.tasks.append(pushing)
 
-    handled = await node.step("sampler:base", block_ms=200)
-    await pushing
+    try:
+      handled = await asyncio.wait_for(node.step("sampler:base", block_ms=200), 5)
+      await pushing
+    finally:
+      queued.set()
     self.assertEqual(handled, 3)
 
   async def test_sampler_step_groups_non_exclusive_fft_interleaved(self):
@@ -354,11 +478,33 @@ class TestSampler(RedisTest):
     await self.bus.create_run(
       Run("s2", "sampler:fft:base", "base", 0, role=Role.SAMPLER, model_path="tinker://r2/sampler_weights/s0")
     )
-    node = self.node(store)
+    active = 0
+    case = self
+
+    class UnmixedEngine(FakeEngine):
+      async def load_checkpoint(self, name, path):
+        if name not in self.loaded:
+          case.assertEqual(active, 0, "FFT weights changed while the previous session was still sampling")
+        await super().load_checkpoint(name, path)
+
+      async def sample(self, job, name):
+        nonlocal active
+        expected = set(self.loaded)
+        active += 1
+        try:
+          await asyncio.sleep(0.01)
+          case.assertEqual(self.loaded, expected)
+          return await super().sample(job, name)
+        finally:
+          active -= 1
+
+    node = self.node(store, engine=UnmixedEngine)
     running = await node.add("sampler:fft:base")
+    requests = []
     for run in ("s1", "s2", "s1", "s2"):
-      await self.bus.submit_command(run, Op.SAMPLE, json.dumps(JOB).encode())
-    self.assertEqual(await node.step("sampler:fft:base", block_ms=10), 4)
+      requests.append(await self.bus.submit_command(run, Op.SAMPLE, json.dumps(JOB).encode()))
+    await node.drain("s1")
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 1)).ok for request in requests]))
     engine = running.sampler.running
     loads = [c for c in engine.calls if c[0] == "load"]
     self.assertEqual(len(loads), 2)
@@ -373,17 +519,41 @@ class TestSampler(RedisTest):
     await self.bus.create_run(Run("s", "sampler:base", "base", 1, role=Role.SAMPLER))
     node = self.node(gpus=2)
     running = await node.add("sampler:base")
-    running.task = asyncio.create_task(node.serve_worker("sampler:base"))
+    self.pump(node)
+    await self.until(lambda: running.sampler.running is not None)
+    self.assertEqual(running.sampler.running.calls[0], ("start", "base", True))
+
+  async def test_cold_boot_longer_than_a_quantum_still_gets_a_turn_to_sample(self):
+    for run in ("a", "b"):
+      await self.bus.create_run(Run(run, run, "base", 4, role=Role.SAMPLER))
+    booting, finish_boot = asyncio.Event(), asyncio.Event()
+
+    class SlowBoot(FakeEngine):
+      @classmethod
+      async def start(cls, base, lora, env=None):
+        booting.set()
+        await finish_boot.wait()
+        return await super().start(base, lora, env)
+
+    node = self.node(gpus=1)
+    node.state.quantum = 0.1
+    first, waiter = await node.add("a", gpus=[0]), await node.add("b", gpus=[0])
+    first.sampler.engine_type = SlowBoot
+    self.pump(node)
+    request = await self.bus.submit_command("a", Op.SAMPLE, json.dumps(JOB).encode())
     try:
-      for _ in range(50):
-        if running.sampler.running is not None:
-          break
-        await asyncio.sleep(0.02)
-      self.assertIsNotNone(running.sampler.running)
-      self.assertEqual(running.sampler.running.calls[0], ("start", "base", True))
+      await asyncio.wait_for(booting.wait(), 5)
+      other = await self.bus.submit_command("b", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.until(lambda: bool(waiter.ticket))
+      await asyncio.sleep(0.2)
+      self.assertIsNone(waiter.sampler.running)
     finally:
-      running.stopping = True
-      await running.task
+      finish_boot.set()
+    self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
+    calls = first.sampler.running.calls
+    sampled = next(i for i, call in enumerate(calls) if call[0] == "sample")
+    self.assertNotIn(("sleep",), calls[:sampled])
+    self.assertTrue((await self.bus.wait_for_reply(other, 5)).ok)
 
   async def test_failed_warm_start_replies_with_error_and_the_sampler_keeps_going(self):
     class Broken(FakeEngine):
@@ -394,19 +564,53 @@ class TestSampler(RedisTest):
     await self.bus.create_run(Run("s", "sampler:base", "base", 1, role=Role.SAMPLER))
     node = self.node(gpus=2, engine=Broken)
     running = await node.add("sampler:base")
-    running.task = asyncio.create_task(node.serve_worker("sampler:base"))
+    self.pump(node)
+    command = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
+    reply = await self.bus.wait_for_reply(command, 5)
+    self.assertIsNotNone(reply)
+    self.assertFalse(reply.ok)
+    self.assertIn("no GPU memory", json.loads(reply.body)["error"])
+    self.assertEqual(running.stop, "")
+    running.sampler.engine_type = FakeEngine
+    command = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
+    self.assertTrue((await self.bus.wait_for_reply(command, 5)).ok)
+
+  async def test_a_failed_wake_keeps_its_gpu_until_the_engine_has_closed(self):
+    for run in ("a", "b"):
+      await self.bus.create_run(Run(run, run, "base", 4, role=Role.SAMPLER))
+    closing, finish_close = asyncio.Event(), asyncio.Event()
+
+    class BrokenWake(FakeEngine):
+      async def wake(self):
+        raise RuntimeError("wake failed after allocating GPU memory")
+
+      async def close(self):
+        closing.set()
+        await finish_close.wait()
+        await super().close()
+
+    node = self.node(gpus=1)
+    first, other = await node.add("a", gpus=[0]), await node.add("b", gpus=[0])
+    first.sampler.engine_type = BrokenWake
+    self.pump(node)
+
+    async def submit(run):
+      return await self.bus.submit_command(run, Op.SAMPLE, json.dumps(JOB).encode())
+
     try:
-      command = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
-      reply = await self.bus.wait_for_reply(command, 2)
-      self.assertFalse(reply.ok)
-      self.assertIn("no GPU memory", json.loads(reply.body)["error"])
-      self.assertFalse(running.task.done())
-      running.sampler.engine_type = FakeEngine
-      command = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
-      self.assertTrue((await self.bus.wait_for_reply(command, 2)).ok)
+      self.assertTrue((await self.bus.wait_for_reply(await submit("a"), 5)).ok)
+      self.assertTrue((await self.bus.wait_for_reply(await submit("b"), 5)).ok)
+      self.assertIn(("sleep",), first.sampler.running.calls)
+      failed = await submit("a")
+      await asyncio.wait_for(closing.wait(), 5)
+      waiting = await submit("b")
+      await self.until(lambda: bool(other.ticket))
+      self.assertIsNotNone(first.since)
+      self.assertIsNone(await self.bus.wait_for_reply(waiting, 0))
     finally:
-      running.stopping = True
-      await running.task
+      finish_close.set()
+    self.assertFalse((await self.bus.wait_for_reply(failed, 5)).ok)
+    self.assertTrue((await self.bus.wait_for_reply(waiting, 5)).ok)
 
   def test_sampler_imports_are_clean(self):
     import subprocess
@@ -424,7 +628,7 @@ class TestSampler(RedisTest):
     )
     self.assertEqual(out.returncode, 0, out.stderr)
 
-  async def test_a_sampler_stages_checkpoints_before_asking_for_its_turn(self):
+  async def test_a_sampler_stages_checkpoints_before_it_is_ready_for_a_turn(self):
     store = Store(tempfile.mkdtemp())
     uri = "tinker://r1/sampler_weights/s0"
     store.put(uri, {}, {"base": "base", "lora": True, "config": {}})
@@ -444,15 +648,16 @@ class TestSampler(RedisTest):
     node = self.node(store, gpus=1)
     running = await node.add("sampler:base")
     command = await self.bus.submit_command("samp-1", Op.SAMPLE, json.dumps(JOB).encode())
-    running.task = asyncio.create_task(node.step("sampler:base", block_ms=0))
+    handling = asyncio.create_task(node.step("sampler:base", block_ms=0))
+    self.tasks.append(handling)
     try:
       await asyncio.wait_for(blocking.wait(), timeout=2)
-      worker = node.state.workers["sampler:base"]
-      self.assertEqual(worker.asked, 0)
-      self.assertIsNone(worker.since)
+      self.assertEqual(running.ticket, 0)
+      self.assertIsNone(running.since)
+      self.assertIsNone(running.sampler.running)
     finally:
       blocked.set()
-    self.assertEqual(await asyncio.wait_for(running.task, 2), 1)
+    self.assertEqual(await asyncio.wait_for(handling, 2), 1)
     self.assertTrue((await self.bus.wait_for_reply(command, 1)).ok)
 
   async def test_a_run_whose_checkpoint_fails_to_stage_gets_an_error_and_the_sampler_keeps_serving(self):
@@ -474,6 +679,62 @@ class TestSampler(RedisTest):
     cmd_id = await self.bus.submit_command("base", Op.SAMPLE, json.dumps(JOB).encode())
     self.assertEqual(await node.step("sampler:base", block_ms=0), 1)
     self.assertTrue((await self.bus.wait_for_reply(cmd_id, 1)).ok)
+
+  async def test_a_new_checkpoint_can_stage_while_both_gpus_and_heartbeats_keep_progressing(self):
+    store = Store(tempfile.mkdtemp())
+    uri = "tinker://r1/sampler_weights/new"
+    store.put(uri, {}, {"base": "base", "lora": True, "config": {}})
+    for run, worker, path in (("first", "a", None), ("later", "a", uri), ("waiter", "b", None), ("other", "c", None)):
+      await self.bus.create_run(Run(run, worker, "base", 4, role=Role.SAMPLER, model_path=path))
+    sampling, finish_sample, staging = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    finish_stage = threading.Event()
+    loop, loop_thread = asyncio.get_running_loop(), threading.get_ident()
+    local = store.local_folder
+
+    def slow_checkpoint(uri, version):
+      self.assertNotEqual(threading.get_ident(), loop_thread)
+      loop.call_soon_threadsafe(staging.set)
+      if not finish_stage.wait(10):
+        raise TimeoutError("test never released checkpoint staging")
+      return local(uri, version)
+
+    class ControlledEngine(FakeEngine):
+      async def sample(self, job, name):
+        if job["prompt"] == [11]:
+          sampling.set()
+          await finish_sample.wait()
+        return await super().sample(job, name)
+
+    store.local_folder = MagicMock(side_effect=slow_checkpoint)
+    node = self.node(store, gpus=2, engine=ControlledEngine)
+    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "0"}):
+      workers = [await node.add(worker, gpus=gpus) for worker, gpus in (("a", [0]), ("b", [0]), ("c", [1]))]
+    self.pump(node)
+    first = await self.bus.submit_command("first", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
+    try:
+      await asyncio.wait_for(sampling.wait(), 5)
+      later = await self.bus.submit_command("later", Op.SAMPLE, json.dumps(JOB).encode())
+      await asyncio.wait_for(staging.wait(), 5)
+      heartbeat = (await self.bus.live_nodes(details=True))[node.id]["until"]
+      other = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
+      reply = await self.bus.wait_for_reply(other, 5)
+      self.assertIsNotNone(reply, "GPU1 was blocked by GPU0's work or checkpoint staging")
+      self.assertTrue(reply.ok, reply.body)
+      self.assertFalse(finish_stage.is_set())
+      self.assertGreater((await self.bus.live_nodes(details=True))[node.id]["until"], heartbeat)
+      waiter = await self.bus.submit_command("waiter", Op.SAMPLE, json.dumps(JOB).encode())
+      finish_sample.set()
+      self.assertTrue((await self.bus.wait_for_reply(first, 5)).ok)
+      reply = await self.bus.wait_for_reply(waiter, 5)
+      self.assertIsNotNone(reply, "GPU0 stayed reserved until an unrelated checkpoint finished staging")
+      self.assertTrue(reply.ok, reply.body)
+      self.assertIn(("sleep",), workers[0].sampler.running.calls)
+      self.assertIsNone(await self.bus.wait_for_reply(later, 0))
+    finally:
+      finish_sample.set()
+      finish_stage.set()
+    self.assertTrue((await self.bus.wait_for_reply(later, 5)).ok)
+    self.assertEqual(store.local_folder.call_count, 1)
 
 
 if __name__ == "__main__":

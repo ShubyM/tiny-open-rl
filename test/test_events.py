@@ -42,7 +42,7 @@ class TestEvents(RedisTest):
     self.assertEqual(sorted(scheduler.members(state, runs["a"])), ["a", "b"])
     self.assertEqual(scheduler.members(state, runs["f"]), ["f"])
 
-  async def test_gpu_turns_and_batches_stay_in_the_node_that_executes_them(self):
+  async def test_gpu_reservations_and_accounting_stay_with_the_node_that_executes_them(self):
     node = TestNode(self.bus, store=Store(tempfile.mkdtemp()), gpus=1)
     try:
       await self.bus.create_run(Run("r", "p", "tiny", 4))
@@ -53,11 +53,12 @@ class TestEvents(RedisTest):
       self.assertEqual(await node.step("p", block_ms=10), 1)
       self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertEqual(await node.step("p", block_ms=10), 0)
-      worker = node.state.workers["p"]
-      self.assertEqual(worker.on, ((node.id, 0),))
-      self.assertTrue(worker.idle)
+      worker = node.running["p"]
+      self.assertEqual(worker.gpus, (0,))
+      self.assertIsNotNone(worker.since)
+      self.assertFalse(worker.queue)
       self.assertGreater(worker.busy, 0)
-      local = {Ev.STARTED, Ev.EXITED, Ev.WANTS_GPU, Ev.GRANTED, Ev.REVOKED, Ev.RELEASED, Ev.BATCH_DONE, Ev.IDLE}
+      local = {"started", "exited", "wants_gpu", "granted", "revoked", "released", "batch_done", "idle"}
       self.assertFalse([e for e in await self.bus.read_events() if e.kind in local])
     finally:
       await node.aclose()

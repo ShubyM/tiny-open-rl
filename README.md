@@ -25,7 +25,7 @@ pip install -e .
 redis-server &                                          # Redis 8.4 or newer
 python -m tinyrl.api.gateway &                          # the Tinker HTTP API, on :8000
 python -m tinyrl.control.scheduler &                    # assigns runs to workers and workers to nodes
-python -m tinyrl.control.node_daemon                    # owns local queues, GPU turns and model processes
+python -m tinyrl.control.node_daemon                    # prepares work, reserves GPUs and dispatches model operations
 ```
 
 A **worker** is a group of runs sharing one trainer model or sampling engine. The gateway records what a run needs, and
@@ -38,27 +38,36 @@ Run one node daemon per GPU machine (`GPUS`, default 1) and one cluster schedule
 nodes with the fewest workers per GPU, keeps full fine-tune samplers near their trainers, and moves work off dead nodes.
 Each node owns its workers' Redis leases and command streams, chooses their GPUs, and runs the local fairness policy.
 
+The node has one dispatcher. Each worker has a read task that claims commands and prepares sampler checkpoints off
+the event loop. Only prepared commands enter its ready queue. The dispatcher updates local reservations directly,
+then starts independent wake, execution, park and close operations. Operation completions wake the dispatcher;
+regular ticks maintain leases and node heartbeats. Work on separate GPUs and checkpoint preparation can progress
+concurrently, and a download does not keep a worker with no ready commands from yielding its GPU.
+
 A trainer is a synchronous model process. The node sends request bytes over a private Unix socket and receives reply
 bytes and checkpoint metadata. Model tensors, optimizer state and checkpoint I/O stay in the trainer. Multi-GPU
 trainers use torchrun and FSDP; the whole rank group parks, resumes and exits together. A single-GPU LoRA trainer can
 move between a node's GPUs without restarting its model.
 
-Sampling controllers run in the node's event loop and drive isolated vLLM engine processes. On multi-GPU nodes they
-warm the engine at placement; on one GPU they start it on the first request. `ENGINE=module:Class` can select another
-engine implementing async `start(base, lora, env)`, `load_checkpoint(name, path)`, `sample(job, name)`, `sleep()`, `wake()`
-and `close()`. Settings are per engine; loading an already loaded checkpoint name must be idempotent, and `close()`
-must wait for its processes to exit. Checkpoint names include both the URI and its version.
+Sampling controllers run in the node's event loop and drive isolated vLLM engine processes. On multi-GPU nodes the
+node queues a warm startup at placement; on one GPU it starts the engine for the first request. `ENGINE=module:Class`
+can select another engine implementing async `start(base, lora, env)`, `load_checkpoint(name, path)`, `sample(job, name)`,
+`sleep()`, `wake()` and `close()`. Settings are per engine; loading an already loaded checkpoint name must be idempotent,
+and `close()` must wait for its processes to exit. Checkpoint names include both the URI and its version.
 
-The node grants every GPU of a worker together, in first-request order. Workers with known memory budgets can share
-when they fit; others take turns. An idle holder yields to a waiter, and a busy holder yields after `QUANTUM` (30 s),
-excluding engine startup. Training yields between commands, sampling between waves of sessions. The node waits for
-parking to finish before releasing a GPU, or for the entire process group to exit when closing a worker. A trainer's
+The node reserves every GPU of a worker together, honoring readiness order on each GPU. Workers with known memory
+budgets can share when they fit; others take turns. An idle holder yields to a waiter, and a busy holder yields
+after `QUANTUM` (30 s), starting after cold engine startup completes. Training yields between commands; sampling yields
+between waves of up to three sessions for a LoRA engine or one session for a full fine-tune engine. The reservation
+starts before wake and remains held until parking acknowledges or the entire process group has exited. A trainer's
 parking copies weights, gradients and Adam state to pinned host memory, then restores them on its next turn.
 
 Stop the node daemon with SIGTERM to drain work and save its training state before the processes are reaped. `DRAIN_S`
-(default 20 s) bounds this drain. A crash or an expired drain fails uncertain commands instead of replaying training
-updates; a run with no parked checkpoint must explicitly load a saved state before continuing. When upgrading from
-the former standalone worker services, drain the nodes and restart the scheduler and node daemons together.
+(default 20 s) is the grace period for already claimed work and checkpointing. After it expires the node aborts
+unfinished work, then still waits for process cleanup and flushes pending uploads; it is not a bound on total shutdown
+time. A crash or an expired drain fails uncertain commands instead of replaying training updates; a run with no parked
+checkpoint must explicitly load a saved state before continuing. When upgrading from the former standalone worker
+services, drain the nodes and restart the scheduler and node daemons together.
 
 ### Checkpoints
 
@@ -99,8 +108,8 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
   and `XPENDING` says what's in flight, under which owner, and for how long. `GET /api/v1/runs/<id>` just asks.
 * **A dead trainer fails fast.** Its commands stay in the pending list. The node claims abandoned work with `XAUTOCLAIM`
   and fails it before replacement execution starts, so clients receive a definite failure instead of an uncertain replay.
-* **A stopping trainer saves its runs.** On node SIGTERM, the node drains the already claimed commands and asks each trainer to save weights,
-  pending gradients and Adam state. The replacement trainer restores that state before its next command.
+* **A stopping trainer saves its runs.** On node SIGTERM, the node uses the drain grace period to finish already claimed commands and save weights,
+  pending gradients and Adam state. The replacement trainer restores the published checkpoint before its next command.
 * **Retries are free.** `XREAD` from id `0` blocks until the reply is written and never consumes it, so
   `retrieve_future` can be retried, or waited on by many clients, and every one of them gets the same answer.
   A call the SDK retries with the same `seq_id` runs once, and every attempt gets the first attempt's answer.
@@ -109,7 +118,8 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 * **One wire format.** `forward_backward` stays protobuf from the SDK to the trainer, which reads the tensors straight out of the bytes.
   Older SDKs' JSON is turned into the same protobuf at the gateway, and JSON clients get the output decoded back to JSON.
 * **Cluster assignments in one log.** The gateway, scheduler and nodes use `tinyrl:events` for run membership and node placement.
-  GPU requests, grants, revocations and parking acknowledgments stay in the node; a model process never reads this log.
+  The node keeps ready queues and GPU reservations directly in memory and updates them as operations complete.
+  Model processes do not read the log.
 * **One trainer.** A base model, with a PEFT adapter per run or the whole model for a single run, behind `create_run`, `forward_backward`,
   `optim_step`, `training_state`, `sampler_weights`, `restore_run` and `delete_run`. Logprobs are computed `CHUNK` tokens at a time under checkpointing, so the
   `[tokens, vocab]` logits never exist all at once. The optimizer updates fp32 master weights and keeps fp32 AdamW state, while the
@@ -124,8 +134,8 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 ## Reading the code
 
 Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains the streams. Then read [gateway.py](tinyrl/api/gateway.py)
-to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/scheduler.py) for placement and fairness rules,
-and [node_daemon.py](tinyrl/control/node_daemon.py) for their execution,
+to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/scheduler.py) for placement and GPU admission,
+and [node_daemon.py](tinyrl/control/node_daemon.py) for command preparation and dispatch,
 [store.py](tinyrl/storage/store.py) to see how checkpoints are stored, and [trainer.py](tinyrl/workers/trainer.py) and
 [model.py](tinyrl/workers/model.py) to see how a command runs on the model.
 
@@ -134,8 +144,8 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for their execution,
 | [tinyrl/bus.py](tinyrl/bus.py) | runs, sessions, command streams, fenced replies and leases |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy arrays |
-| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | cluster assignment and pure local placement/fairness rules |
-| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | leases, dispatch, local GPU turns, recovery, uploads and checkpoint sweeps |
+| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | cluster assignment, local GPU placement and admission rules |
+| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | leases, command preparation, concurrent dispatch, GPU reservations, recovery, uploads and checkpoint sweeps |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | private model IPC and parent-owned process groups |
 | [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | model memory and GPU-width estimates |
 | [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | synchronous model commands and checkpoint metadata |
@@ -153,7 +163,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for their execution,
 
 Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `KEYFRAME_EVERY`, `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`,
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM`, `IDLE_MS`, `DRAIN_S`,
 `ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted), `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 
 ## Telemetry
@@ -175,10 +185,10 @@ counters:
 
 A run's wait includes waiting on its own earlier calls, since a run's calls run in order.
 
-`GET /api/v1/scheduling` combines cluster assignments with the latest live-node heartbeat: actual GPUs, waiting and held
-turns, accumulated busy time, and the owned supervisor PID (or `null` before a sampling engine starts). These local
-snapshots are diagnostic; they do not grant work. Per-command timing is available with `DEBUG=1`. The Redis event log
-contains cluster assignments, not a replay of local GPU turns.
+`GET /api/v1/scheduling` combines cluster assignments with the latest live-node heartbeat: actual GPUs, waiting workers,
+reservations, accumulated busy time, and the owned process PID (or `null` before a sampling engine starts). These local
+snapshots are diagnostic; the node's dispatcher owns the reservations. Per-command timing is available with `DEBUG=1`.
+The Redis event log contains cluster assignments.
 
 ## Throughput simulator
 

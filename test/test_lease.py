@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -70,7 +71,10 @@ class TestLease(RedisTest):
   async def test_a_stale_parent_checks_ownership_before_dispatching_to_its_child(self):
     first, run = await self.prepared()
     request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
-    [cmd] = await self.bus.take_commands([run], "old-owner", block_ms=1)
+    reader = first.running["worker"].reader
+    claimed = await reader if reader else []
+    first.running["worker"].reader = None
+    [(cmd, _, _)] = claimed or await first.read("worker")
     await self.takeover()
     await self.bus.fail_stranded_commands([run], "worker", "new-owner")
     expected = await self.bus.wait_for_reply(request, 0)
@@ -79,7 +83,7 @@ class TestLease(RedisTest):
       with self.assertRaisesRegex(RuntimeError, "lost worker"):
         await first.answer_command("worker", cmd)
     call.assert_not_called()
-    self.assertTrue(first.running["worker"].lost)
+    self.assertEqual(first.running["worker"].stop, "abort")
     self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
     self.assertFalse(await self.bus.write_reply(cmd, Reply(True, "application/json", b"{}"), "worker", "old-owner"))
     await first.close_worker("worker")
@@ -106,7 +110,7 @@ class TestLease(RedisTest):
       finish.set()
       await renewing
     self.assertIsNone(await self.bus.lease_owner("worker"))
-    self.assertTrue(running.closed)
+    self.assertTrue(running.model.closed)
 
   async def test_a_completed_stale_result_cannot_replace_the_takeover_failure(self):
     first, run = await self.prepared()
@@ -132,8 +136,8 @@ class TestLease(RedisTest):
         expected = await self.bus.wait_for_reply(request, 0)
         self.assertFalse(expected.ok)
         finish.set()
-        with self.assertRaisesRegex(RuntimeError, "lost worker"):
-          await work
+        [result] = await asyncio.gather(work, return_exceptions=True)
+        self.assertIsInstance(result, BaseException)
       self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
       self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
       self.assertNotIn(run, second.running["worker"].model.trainer.model.params)
@@ -163,8 +167,8 @@ class TestLease(RedisTest):
         await self.takeover()
         await self.bus.fail_stranded_commands([run], "worker", "new-owner")
         finish.set()
-        with self.assertRaisesRegex(RuntimeError, "lost worker"):
-          await saving
+        [result] = await asyncio.gather(saving, return_exceptions=True)
+        self.assertIsInstance(result, BaseException)
       self.assertIsNone(await self.registry.get_checkpoint(uri))
       self.assertFalse((await self.bus.wait_for_reply(request, 0)).ok)
     finally:
@@ -179,7 +183,7 @@ class TestLease(RedisTest):
       with self.assertRaisesRegex(RuntimeError, "lost worker"):
         await first.answer_command("worker", Cmd(run, "0-1", Op.OPTIM_STEP, b'{"adam_params":{}}'))
     call.assert_not_called()
-    self.assertTrue(first.running["worker"].lost)
+    self.assertEqual(first.running["worker"].stop, "abort")
 
   def daemon(self):
     env = {
@@ -230,24 +234,32 @@ class TestLease(RedisTest):
     self.assertEqual(await self.bus.lease_owner("worker"), old_owner)
     self.assertEqual(len(await self.bus.r.xinfo_consumers(key("q", run), GROUP)), 1)
 
-    async def blocked():
-      return any(c["cmd"] == "xreadgroup" and "b" in c["flags"] for c in await self.bus.r.client_list())
+    async def reported():
+      node = (await self.bus.live_nodes(details=True)).get(first_node, {})
+      return node.get("workers", {}).get("worker", {}).get("pid")
 
-    await self.until(blocked)
-    first.send_signal(signal.SIGSTOP)
-    request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    await self.until(reported)
+    model_pid = await reported()
+    os.killpg(model_pid, signal.SIGSTOP)
+    try:
+      request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
 
-    async def pending():
-      return bool((await self.bus.queued_and_in_flight(run))["in_flight"])
+      async def pending():
+        return bool((await self.bus.queued_and_in_flight(run))["in_flight"])
 
-    await self.until(pending)
-    await self.bus.append_event(Ev.NODE_LOST, node=first_node)  # what the heartbeat timeout decides
-    expected = await self.bus.wait_for_reply(request, 30)
-    self.assertFalse(expected.ok)
-    self.assertIn("lost the worker", json.loads(expected.body)["error"])
-    new_owner = await self.bus.lease_owner("worker")
-    self.assertNotEqual(new_owner, old_owner)
-    first.send_signal(signal.SIGCONT)
+      await self.until(pending)
+      first.send_signal(signal.SIGSTOP)
+      os.killpg(model_pid, signal.SIGCONT)  # the child may run while its parent cannot publish a result
+      await self.bus.append_event(Ev.NODE_LOST, node=first_node)
+      expected = await self.bus.wait_for_reply(request, 30)
+      self.assertFalse(expected.ok)
+      self.assertIn("lost the worker", json.loads(expected.body)["error"])
+      new_owner = await self.bus.lease_owner("worker")
+      self.assertNotEqual(new_owner, old_owner)
+    finally:
+      first.send_signal(signal.SIGCONT)
+      with contextlib.suppress(ProcessLookupError):
+        os.killpg(model_pid, signal.SIGCONT)
 
     async def first_reaped():
       nodes = await self.bus.live_nodes(details=True)

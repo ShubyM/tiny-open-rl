@@ -52,7 +52,7 @@ class Op(StrEnum):
 
 
 class Ev(StrEnum):
-  """Cluster facts and local execution facts, folded by the scheduler or node respectively. Only cluster facts go to Redis."""
+  """Cluster assignments and membership, replayed from Redis."""
 
   RUN_CREATED = "run_created"
   ASSIGNED = "assigned"
@@ -61,14 +61,6 @@ class Ev(StrEnum):
   NODE_LOST = "node_lost"
   PLACED = "placed"
   UNPLACED = "unplaced"
-  STARTED = "started"
-  EXITED = "exited"
-  WANTS_GPU = "wants_gpu"
-  BATCH_DONE = "batch_done"
-  IDLE = "idle"
-  RELEASED = "released"
-  GRANTED = "granted"
-  REVOKED = "revoked"
 
 
 class Role(StrEnum):

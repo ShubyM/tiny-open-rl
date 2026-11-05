@@ -77,12 +77,11 @@ class Sampler:
       self.running = await self.engine_type.start(self.base, self.lora, self.env)
       return time.monotonic() - start
 
-  async def execute(self, cmd: Cmd, run: dict | None, staged: dict[str, tuple[str, str] | Exception]) -> Reply:
+  async def execute(self, cmd: Cmd, run: dict | None, checkpoint: tuple[str, str] | Exception | None) -> Reply:
     try:
       if run is None:
         raise ValueError(f"no sampling session {cmd.run}")
       job, uri, name = json.loads(cmd.body), run.get("model_path"), None
-      checkpoint = staged[uri] if uri else None
       if isinstance(checkpoint, Exception):
         raise checkpoint
       await self.start()

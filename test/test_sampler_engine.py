@@ -73,7 +73,7 @@ class TestSamplerDriver(unittest.IsolatedAsyncioTestCase):
     env = {"CUDA_VISIBLE_DEVICES": "2"}
     sampler = Sampler("base", True, env, engine=RecordingEngine)
     env["CUDA_VISIBLE_DEVICES"] = "5"
-    replies = await asyncio.gather(*(sampler.execute(self.cmd(n=n), {}, {}) for n in range(8)))
+    replies = await asyncio.gather(*(sampler.execute(self.cmd(n=n), {}, None) for n in range(8)))
     engine = sampler.running
     self.assertTrue(all(r.ok for r in replies))
     self.assertEqual(wire.sample_json(replies[0].body)["sequences"][0]["tokens"], [3])
@@ -90,7 +90,7 @@ class TestSamplerDriver(unittest.IsolatedAsyncioTestCase):
     sampler = Sampler("base", False, {}, engine=RecordingEngine)
     a, b = "tinker://r/sampler_weights/a", "tinker://r/sampler_weights/b"
     for uri, version in [(a, "1"), (a, "1"), (b, "1"), (a, "1"), (a, "2")]:
-      self.assertTrue((await sampler.execute(self.cmd(), {"model_path": uri}, {uri: ("/weights", version)})).ok)
+      self.assertTrue((await sampler.execute(self.cmd(), {"model_path": uri}, ("/weights", version))).ok)
     engine = sampler.running
     names = [c[1] for c in engine.calls if c[0] == "load"]
     self.assertEqual(len(names), 4)
@@ -100,18 +100,18 @@ class TestSamplerDriver(unittest.IsolatedAsyncioTestCase):
 
     # Recreating a controller doesn't assign a new name to the same immutable checkpoint.
     other = Sampler("base", True, {}, engine=RecordingEngine)
-    await other.execute(self.cmd(), {"model_path": a}, {a: ("/another-node-cache", "1")})
+    await other.execute(self.cmd(), {"model_path": a}, ("/another-node-cache", "1"))
     self.assertEqual(other.running.calls[1][1], names[0])
     await other.close()
 
   async def test_failed_staging_replies_without_starting_engine_and_next_command_works(self):
     sampler = Sampler("base", True, {}, engine=RecordingEngine)
     uri = "tinker://r/sampler_weights/a"
-    reply = await sampler.execute(self.cmd(), {"model_path": uri}, {uri: RuntimeError("bucket error")})
+    reply = await sampler.execute(self.cmd(), {"model_path": uri}, RuntimeError("bucket error"))
     self.assertFalse(reply.ok)
     self.assertIn("bucket error", json.loads(reply.body)["error"])
     self.assertIsNone(sampler.running)
-    self.assertTrue((await sampler.execute(self.cmd(), {}, {})).ok)
+    self.assertTrue((await sampler.execute(self.cmd(), {}, None)).ok)
     await sampler.close()
 
 
