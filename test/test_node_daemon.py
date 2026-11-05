@@ -104,6 +104,20 @@ class TestNodeDaemon(RedisTest):
     self.assertTrue(first.closed)
     await self.create(run)
 
+  async def test_serve_starts_a_worker_as_soon_as_it_is_placed(self):
+    node, run = self.node(), new_id()
+    with patch("tinyrl.control.node_daemon.TICK", 5.0):
+      serving = self.background(node.serve())
+      self.background(scheduler.run(self.bus))
+      await self.until(lambda: node.id in node.state.nodes)
+      start = time.monotonic()
+      await self.bus.create_run(Run(run, "worker", "tiny", 4, lora=LORA))
+      await self.create(run)
+      self.assertLess(time.monotonic() - start, 2.0, "the node slept out TICK before it saw the placement")
+    serving.cancel()
+    await asyncio.wait_for(asyncio.gather(serving, return_exceptions=True), 10)
+    self.assertIsNone(await self.bus.lease_owner("worker"))
+
   @patch("tinyrl.bus.NODE_MS", 600)
   @patch("tinyrl.bus.LEASE_MS", 400)
   @patch("tinyrl.control.node_daemon.LEASE_MS", 400)

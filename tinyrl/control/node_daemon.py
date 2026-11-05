@@ -329,7 +329,7 @@ class NodeDaemon:
     finally:
       await self.close(lw)
 
-  async def tick(self) -> None:
+  async def tick(self, block_ms: int = 0) -> None:
     workers = {
       n: dataclasses.asdict(self.state.workers[n]) | {"pid": lw.engine.proc.pid if lw.engine.proc else None}
       for n, lw in self.local.items()
@@ -340,10 +340,10 @@ class NodeDaemon:
       for lw in self.local.values():
         lw.cancel(lost=True)
       self.state, self.after, self.seen = scheduler.State(), "0-0", 0
-    while events := await self.bus.read_events(self.after):
+    while events := await self.bus.read_events(self.after, block_ms=block_ms):
       for e in events:
         scheduler.fold(self.state, e)
-      self.after, self.seen = events[-1].id, self.seen + len(events)
+      self.after, self.seen, block_ms = events[-1].id, self.seen + len(events), 0
     await self.renew()
     self.schedule()
     for worker, lw in list(self.local.items()):
@@ -404,8 +404,7 @@ class NodeDaemon:
     await self.announce_node()
     try:
       while True:
-        await self.tick()
-        await asyncio.sleep(TICK)
+        await self.tick(int(TICK * 1000))
     finally:
       self.stopping = True
       deadline = time.monotonic() + DRAIN_S
