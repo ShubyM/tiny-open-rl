@@ -39,14 +39,16 @@ nodes with the fewest workers per GPU, keeps full fine-tune samplers near their 
 Each node owns its workers' Redis leases and command streams, chooses their GPUs, and runs the local fairness policy.
 
 Each worker runs in one coroutine. Its executor, lease token, ready queue and checkpoint preparation task belong to
-that lifetime. Sampling commands become ready after their checkpoint files are prepared off the event loop;
-preparation can overlap startup and execution. The worker then wakes its model, executes ready work and parks or
-closes it as needed, with cleanup in `finally`.
+that lifetime. Sampling commands become ready after their session metadata and checkpoint files are available.
+Checkpoint I/O runs off the event loop, and preparation can overlap startup and execution. Missing sessions and failed
+checkpoint downloads receive fenced error replies before entering the GPU queue. The worker wakes its model, executes ready
+work and parks when another worker needs its GPUs. On shutdown it stops claiming commands, finishes the work already
+claimed, saves its training state and closes, with process cleanup in `finally`.
 
-The node keeps GPU placements, waiting order and reservations. A worker waiting for its GPUs sleeps on a node change
-event and checks admission when it wakes. Workers on independent GPUs run concurrently. Node heartbeats and each
-worker's lease renewal continue during model operations, and a download does not keep an otherwise idle worker from
-yielding its GPU.
+The node keeps GPU placements, waiting order and reservations. Preparation completion and scheduling changes wake
+workers through the same node change event. A worker waiting for its GPUs checks admission when it wakes. Workers on
+independent GPUs run concurrently. Node heartbeats and each worker's lease renewal continue during model operations,
+and a download does not keep an otherwise idle worker from yielding its GPU.
 
 A trainer is a synchronous model process. The node sends request bytes over a private Unix socket and receives reply
 bytes and checkpoint metadata. Model tensors, optimizer state and checkpoint I/O stay in the trainer. Multi-GPU

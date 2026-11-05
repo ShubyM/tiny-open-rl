@@ -10,7 +10,6 @@ import hashlib
 import importlib
 import json
 import os
-import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -68,22 +67,17 @@ class Sampler:
     self.running = None
     self.loading = asyncio.Lock()
 
-  async def start(self) -> float:
+  async def start(self) -> None:
     """Start once; the node excludes this boot time from the worker's first quantum."""
     async with self.loading:
-      if self.running is not None:
-        return 0.0
-      start = time.monotonic()
-      self.running = await self.engine_type.start(self.base, self.lora, self.env)
-      return time.monotonic() - start
+      if self.running is None:
+        self.running = await self.engine_type.start(self.base, self.lora, self.env)
 
-  async def execute(self, cmd: Cmd, run: dict | None, checkpoint: tuple[str, str] | Exception | None) -> Reply:
+  async def execute(self, cmd: Cmd, run: dict | None, checkpoint: tuple[str, str] | None) -> Reply:
     try:
       if run is None:
         raise ValueError(f"no sampling session {cmd.run}")
       job, uri, name = json.loads(cmd.body), run.get("model_path"), None
-      if isinstance(checkpoint, Exception):
-        raise checkpoint
       await self.start()
       async with self.loading:
         if checkpoint:

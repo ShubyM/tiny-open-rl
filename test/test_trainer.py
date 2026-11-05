@@ -544,7 +544,7 @@ class TestTrainer(RedisTest):
     async with asyncio.timeout(10):
       while not predicate():
         self.node.dispatch()
-        await self.node.wait(0.01)
+        await asyncio.sleep(0.01)
 
   async def finish_worker(self, worker):
     await self.until(lambda: worker not in self.node.running)
@@ -733,6 +733,48 @@ class TestTrainer(RedisTest):
     self.assertIsNotNone(await self.bus.parked_checkpoint(wide_run))
     self.assertTrue((await self.bus.wait_for_reply(later_reply, 5)).ok)
 
+  async def test_unplacement_during_stranded_cleanup_preserves_the_wide_checkpoint_gpus(self):
+    self.node.gpus = 2
+    self.node.state.nodes[self.node.id] = (2, 0)
+    run = new_id()
+    await self.bus.create_run(Run(run, "wide", "tiny", 4, lora=LORA, gpus=2))
+    await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      (Op.FORWARD_BACKWARD, proto_body(run)),
+    )
+    await self.node.drain(run)
+    actual = self.node.running["wide"]
+    entered, finish = asyncio.Event(), asyncio.Event()
+    cleanup, child_call = self.bus.fail_stranded_commands, self.node.processes["wide"].call
+    checkpoint_gpus = []
+
+    async def blocked(*args, **kwargs):
+      if args[-1] > 0:
+        entered.set()
+        await finish.wait()
+      return await cleanup(*args, **kwargs)
+
+    async def call(method, *args):
+      if method == "park_all":
+        checkpoint_gpus.append((actual.gpus, actual.since is not None))
+      return await child_call(method, *args)
+
+    self.node.processes["wide"].call = call
+    with patch.object(self.bus, "fail_stranded_commands", side_effect=blocked):
+      try:
+        await asyncio.wait_for(entered.wait(), 5)
+        desired = self.node.state.workers["wide"]
+        desired.node, desired.gpus = None, ()
+        self.node.notify()
+        finish.set()
+        await self.finish_worker("wide")
+      finally:
+        finish.set()
+    self.assertEqual(checkpoint_gpus, [((0, 1), True)])
+    tensors, _ = self.store.get(await self.bus.parked_checkpoint(run))
+    self.assertTrue(any(torch.count_nonzero(tensor) for name, tensor in tensors.items() if name.endswith(".grad")))
+
   @patch("tinyrl.control.node_daemon.LEASE_MS", 100)
   async def test_the_node_recovers_an_uncontested_lease_but_rejects_an_intervening_owner(self):
     run = new_id()
@@ -901,6 +943,72 @@ class TestTrainer(RedisTest):
     self.assertTrue((await self.bus.wait_for_reply(ids[15], 0)).ok)
     self.assertIsNone(await self.bus.wait_for_reply(ids[16], 0))
     self.assertEqual((await self.bus.queued_and_in_flight(run))["queued"], 2)
+
+  async def test_shutdown_waits_for_the_claimed_reader_and_saves_its_completed_work(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    ids = await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(30)],
+      (Op.FORWARD_BACKWARD, proto_body(run)),
+      (Op.OPTIM_STEP, {"adam_params": {}}),
+      (Op.OPTIM_STEP, {"adam_params": {}}),
+    )
+    hooked, entered, finish, claimed, prepared = (asyncio.Event() for _ in range(5))
+    take = self.bus.take_commands
+    reads = calls = 0
+
+    async def read(*args, **kwargs):
+      nonlocal reads
+      reads += 1
+      commands = await take(*args, **kwargs)
+      if reads == 1:
+        await hooked.wait()
+      elif reads == 2:
+        claimed.set()
+        await prepared.wait()
+      return commands
+
+    with patch.object(self.bus, "take_commands", side_effect=read):
+      await self.node.add("p")
+      child = self.node.processes["p"]
+      original = child.call
+
+      async def call(method, *args):
+        nonlocal calls
+        if method == "execute":
+          calls += 1
+          if calls == 2:
+            entered.set()
+            await finish.wait()
+        return await original(method, *args)
+
+      child.call = call
+      hooked.set()
+      try:
+        await asyncio.wait_for(asyncio.gather(entered.wait(), claimed.wait()), 5)
+        self.assertEqual(len((await self.bus.queued_and_in_flight(run))["in_flight"]), 31)
+        self.node.draining = True
+        self.node.notify()
+        finish.set()
+        self.assertTrue((await self.bus.wait_for_reply(ids[1], 5)).ok)
+        self.assertFalse(child.closed)
+        self.assertIsNone(await self.bus.parked_checkpoint(run))
+        self.assertEqual(reads, 2)
+        prepared.set()
+        await self.finish_worker("p")
+      finally:
+        finish.set()
+        prepared.set()
+
+    self.assertEqual((reads, calls), (2, 32))
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)).ok for request in ids[:32]]))
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)) is None for request in ids[32:]]))
+    self.assertEqual((await self.bus.queued_and_in_flight(run))["queued"], 2)
+    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
+    tensors, _ = self.store.get(await self.bus.parked_checkpoint(run))
+    self.assertTrue(any(torch.count_nonzero(tensor) for name, tensor in tensors.items() if name.endswith(".grad")))
 
 
 class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):

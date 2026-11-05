@@ -110,15 +110,14 @@ class NodeDaemon:
 
   def start(self, worker: str) -> asyncio.Task:
     task = self.tasks[worker] = asyncio.create_task(self.work(worker))
-    task.add_done_callback(lambda _: self.notify())
     return task
 
   async def work(self, worker: str) -> None:
     r, task = dataclasses.replace(self.state.workers[worker]), asyncio.current_task()
     owner = f"{self.id}-{os.urandom(8).hex()}"
     sampling = r.kind.role == Role.SAMPLER
-    queue, reader, guard, model = collections.deque(), None, None, None
-    renewed, closing, draining = time.monotonic(), False, False
+    queue, reader, guard, model, closing = collections.deque(), None, None, None, None
+    renewed = time.monotonic()
 
     async def owned():
       nonlocal renewed
@@ -160,18 +159,24 @@ class NodeDaemon:
       runs = {run: await self.bus.get_run(run) for run in dict.fromkeys(c.run for c in commands)}
 
       async def stage(uri):
-        try:
-          version = (await self.registry.get_checkpoint(uri) or {}).get("version")
-          return await asyncio.to_thread(self.store.local_folder, uri, version)
-        except Exception as e:
-          return e
+        version = (await self.registry.get_checkpoint(uri) or {}).get("version")
+        return await asyncio.to_thread(self.store.local_folder, uri, version)
 
       uris = {x["model_path"] for x in runs.values() if x and x.get("model_path")}
-      staged = dict(zip(uris, await asyncio.gather(*(stage(uri) for uri in uris))))
-      return [(c, runs[c.run], staged.get((runs[c.run] or {}).get("model_path"))) for c in commands]
+      staged = dict(zip(uris, await asyncio.gather(*(stage(uri) for uri in uris), return_exceptions=True)))
+      ready = []
+      for cmd in commands:
+        run = runs[cmd.run]
+        checkpoint = staged.get((run or {}).get("model_path"))
+        error = ValueError(f"no sampling session {cmd.run}") if run is None else checkpoint
+        if isinstance(error, Exception):
+          if not await self.bus.write_reply(cmd, Reply.error(error), worker, owner, started=time.time()):
+            raise RuntimeError(f"lost worker {worker}") from error
+        else:
+          ready.append((cmd, run, checkpoint))
+      return ready
 
     async def answer(cmd, run, checkpoint):
-      nonlocal draining
       before = time.time()
       if sampling:
         await owned()
@@ -195,9 +200,85 @@ class NodeDaemon:
       if cmd.op == Op.DELETE_MODEL and reply.ok:
         await self.bus.delete_run(cmd.run, worker)
         await self.registry.unregister_checkpoints(*await self.registry.checkpoints_owned_by_run(cmd.run))
-        draining |= not r.kind.lora
       if DEBUG:
         print(f"{worker} {cmd.request_id} {cmd.op:24s} {(time.time() - before) * 1000:9.2f} ms")
+      return reply
+
+    def wanted():
+      w = self.state.workers.get(worker)
+      return (
+        not self.draining
+        and w
+        and w.node == self.id
+        and scheduler.members(self.state, worker)
+        and (w.gpus == r.gpus or movable(r, self.gpus))
+      )
+
+    def collect():
+      nonlocal reader
+      if reader and reader.done():
+        commands, reader = reader.result(), None
+        enqueue(queue, commands, r.kind.lora)
+        return not commands and not queue
+      return False
+
+    async def activate(warm=False):
+      if not await self.acquire(worker, warm=warm):
+        return
+      await owned()
+      if not sampling:
+        await model.call("resume", r.gpus[0] if movable(r, self.gpus) else None)
+        return
+      await model.resume()  # an uncertain wake keeps its reservation until close
+      try:
+        if model.running is None:
+          await model.start()
+          r.pid = proc().pid if proc() else None
+          r.since = time.time()  # cold boot is outside the first quantum
+          await asyncio.sleep(0.02)
+      except Exception as e:
+        collect()
+        while queue:
+          cmd, _, _ = queue.popleft()
+          if not await self.bus.write_reply(cmd, Reply.error(e), worker, owner):
+            raise RuntimeError(f"lost worker {worker}") from e
+        r.since = None
+        self.notify()
+
+    async def turn(gpus):
+      if (p := proc()) and p.poll() is not None:
+        raise RuntimeError(f"worker {worker} exited")
+      waiting = scheduler.has_waiter(self.running, r.gpus)
+      if r.since is not None and (
+        gpus != r.gpus or (waiting and (not queue or time.time() >= r.since + self.state.quantum))
+      ):
+        await model.park() if sampling else await model.call("park")
+        r.since = None
+        self.notify()
+      if r.gpus != gpus:
+        r.gpus = gpus
+        self.notify()
+      if queue and r.since is None:
+        await activate()
+        return True  # collect anything prepared during activation before choosing the next wave
+      return False
+
+    async def execute():
+      nonlocal queue
+      before, completed = time.time(), None
+      if sampling:
+        sessions = list(dict.fromkeys(c.run for c, _, _ in queue))[: 3 if r.kind.lora else 1]
+        batch = [x for x in queue if x[0].run in sessions]
+        queue = collections.deque(x for x in queue if x[0].run not in sessions)
+        async with asyncio.TaskGroup() as group:
+          for item in batch:
+            group.create_task(answer(*item))
+      else:
+        cmd, run, checkpoint = queue.popleft()
+        if (await answer(cmd, run, checkpoint)).ok:
+          completed = cmd
+      r.busy += time.time() - before
+      return completed
 
     async def cleanup():
       if reader:
@@ -233,111 +314,69 @@ class NodeDaemon:
       if not sampling:
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
       model = self.open_sampler(worker, env) if sampling else self.open_trainer(worker, env)
-      warm = sampling and env.get("TINYRL_WARM_SAMPLER", "0") != "0"
       r.pid = proc().pid if proc() else None
       guard = asyncio.create_task(keepalive())
-      while True:
+      if sampling and env.get("TINYRL_WARM_SAMPLER", "0") != "0" and wanted():
+        reader = asyncio.create_task(read())
+        reader.add_done_callback(lambda _: self.notify())
+        await activate(warm=True)
+
+      # Serve: only this loop may claim more commands or follow a new placement.
+      while wanted():
         changed = self.changed
-        if (p := proc()) and p.poll() is not None:
-          raise RuntimeError(f"worker {worker} exited")
-        w = self.state.workers.get(worker)
-        draining |= (
-          self.draining
-          or not w
-          or w.node != self.id
-          or not scheduler.members(self.state, worker)
-          or (w.gpus != r.gpus and not movable(r, self.gpus))
-        )
-        warm &= not draining
-        if reader and reader.done():
-          commands, reader = reader.result(), None
-          enqueue(queue, commands, r.kind.lora)
-          if not commands and not queue:
-            await self.bus.fail_stranded_commands(scheduler.members(self.state, worker), worker, owner, STRANDED_MS)
-        if not draining and reader is None and len(queue) < (128 if sampling else 16):
+        if collect():
+          await self.bus.fail_stranded_commands(scheduler.members(self.state, worker), worker, owner, STRANDED_MS)
+        if not wanted():
+          break
+        if reader is None and len(queue) < (128 if sampling else 16):
           reader = asyncio.create_task(read())
-        finishing = draining and not queue and reader is None
-        if finishing and (sampling or len(r.gpus) == 1 or r.since is not None):
-          if not sampling:
-            await owned()
-            for saved in await model.call("park_all"):
-              await owned()
-              run = saved.pop("run")
-              await self.registry.register_checkpoint(**saved)
-              if not await self.bus.set_parked_checkpoint(run, saved["uri"], worker, owner):
-                raise RuntimeError(f"lost worker {worker}")
-          return
-        moving = not draining and w.gpus != r.gpus
-        if r.since is not None and (
-          moving
-          or (scheduler.has_waiter(self.running, r.gpus) and (not queue or time.time() >= r.since + self.state.quantum))
-        ):
-          await model.park() if sampling else await model.call("park")
-          r.since = None
-          self.notify()
-          continue
-        if moving:
-          r.gpus = w.gpus
-          self.notify()
-        if r.since is None and (queue or warm or finishing):
-          if not await self.acquire(worker, warm=warm and not queue and not finishing):
-            continue
-          await owned()
-          warm = False
-          if sampling:
-            await model.resume()  # an uncertain wake keeps its reservation until close
-            try:
-              if model.running is None:
-                await model.start()
-                r.pid = proc().pid if proc() else None
-                r.since = time.time()  # cold boot is outside the first quantum
-                await asyncio.sleep(0.02)
-            except Exception as e:
-              if reader and reader.done():
-                enqueue(queue, reader.result(), r.kind.lora)
-                reader = None
-              while queue:
-                cmd, _, _ = queue.popleft()
-                if not await self.bus.write_reply(cmd, Reply.error(e), worker, owner):
-                  raise RuntimeError(f"lost worker {worker}") from e
-              r.since = None
-              self.notify()
-          else:
-            await model.call("resume", r.gpus[0] if movable(r, self.gpus) else None)
+          reader.add_done_callback(lambda _: self.notify())
+        if await turn(self.state.workers[worker].gpus):
           continue
         if queue:
-          before = time.time()
-          if sampling:
-            sessions = list(dict.fromkeys(c.run for c, _, _ in queue))[: 3 if r.kind.lora else 1]
-            batch = [x for x in queue if x[0].run in sessions]
-            queue = collections.deque(x for x in queue if x[0].run not in sessions)
-            async with asyncio.TaskGroup() as group:
-              for item in batch:
-                group.create_task(answer(*item))
-          else:
-            cmd, run, checkpoint = queue.popleft()
-            await answer(cmd, run, checkpoint)
-            if cmd.op == Op.OPTIM_STEP and r.kind.lora and not draining:
-              await asyncio.sleep(0.015)  # let the client's sampler save join before another run's command
-          r.busy += time.time() - before
+          if cmd := await execute():
+            if cmd.op == Op.DELETE_MODEL and not r.kind.lora:
+              break
+            if cmd.op == Op.OPTIM_STEP and r.kind.lora:
+              await asyncio.sleep(0.015)  # let a sampler save join before another run's command
+        else:
+          await changed.wait()
+
+      # Drain: finish every existing claim, including a read still preparing its result.
+      while reader or queue:
+        changed = self.changed
+        collect()
+        if not reader and not queue:
+          break
+        if await turn(r.gpus):
           continue
-        waiting = asyncio.create_task(changed.wait())
-        try:
-          await asyncio.wait([waiting, *([reader] if reader else [])], return_when=asyncio.FIRST_COMPLETED)
-        finally:
-          waiting.cancel()
-          await asyncio.gather(waiting, return_exceptions=True)
+        if queue:
+          await execute()
+        else:
+          await changed.wait()
+
+      # Checkpoint: a parked multi-rank trainer needs its GPUs for the final collective.
+      if not sampling:
+        if len(r.gpus) > 1 and r.since is None:
+          await activate()
+        await owned()
+        for saved in await model.call("park_all"):
+          await owned()
+          run = saved.pop("run")
+          await self.registry.register_checkpoint(**saved)
+          if not await self.bus.set_parked_checkpoint(run, saved["uri"], worker, owner):
+            raise RuntimeError(f"lost worker {worker}")
     finally:
-      closing, r.ticket = True, 0
+      r.ticket = 0
+      closing = asyncio.create_task(cleanup())
       self.notify()
-      done = asyncio.create_task(cleanup())
       while True:
         try:
-          await asyncio.shield(done)
+          await asyncio.shield(closing)
           break
         except asyncio.CancelledError:
-          if done.cancelled():
-            done = asyncio.create_task(cleanup())
+          if closing.cancelled():
+            closing = asyncio.create_task(cleanup())
 
   def dispatch(self) -> None:
     for worker, task in list(self.tasks.items()):
@@ -359,16 +398,7 @@ class NodeDaemon:
   async def tick(self) -> None:
     after = self.after
     workers = {
-      n: {
-        "kind": dataclasses.asdict(r.kind),
-        "node": self.id,
-        "gpus": r.gpus,
-        "on": [(self.id, g) for g in r.gpus],
-        "asked": r.ticket,
-        "since": r.since,
-        "busy": r.busy,
-        "pid": r.pid,
-      }
+      n: dataclasses.asdict(r) | {"asked": r.ticket, "on": [(self.id, g) for g in r.gpus]}
       for n, r in self.running.items()
     }
     await self.bus.node_heartbeat(self.id, self.gpus, workers)
@@ -430,35 +460,24 @@ class NodeDaemon:
             with contextlib.suppress(OSError):
               await asyncio.to_thread(os.unlink, e.path)
 
-  async def wait(self, timeout: float) -> None:
-    with contextlib.suppress(TimeoutError):
-      await asyncio.wait_for(self.changed.wait(), timeout)
-
   async def close(self, graceful: bool = True) -> None:
     self.draining = True
     self.notify()
-    deadline = time.monotonic() + (DRAIN_S if graceful else 0)
-    while self.tasks:
-      if time.monotonic() >= deadline:
-        for task in self.tasks.values():
-          if not task.done() and not task.cancelling():
-            task.cancel()
+    if self.tasks:
+      _, pending = await asyncio.wait(self.tasks.values(), timeout=DRAIN_S if graceful else 0)
+      for task in pending:
+        if not task.cancelling():
+          task.cancel()
+      await asyncio.gather(*self.tasks.values(), return_exceptions=True)
       self.dispatch()
-      await self.wait(TICK)
     await asyncio.to_thread(self.store.upload_pending_saves)
 
   async def serve(self) -> None:
     await self.announce_node()
-    next_tick = 0.0
     try:
       while True:
-        changed = self.changed
-        if time.monotonic() >= next_tick:
-          await self.tick()
-          next_tick = time.monotonic() + TICK
-        self.dispatch()
-        with contextlib.suppress(TimeoutError):
-          await asyncio.wait_for(changed.wait(), max(0.0, next_tick - time.monotonic()))
+        await self.tick()
+        await asyncio.sleep(TICK)
     finally:
       await self.close()
 

@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -13,6 +14,7 @@ import torch
 from test.execution import InlineProcess, TestNode
 from test.helpers import RedisTest, new_id, tiny
 from test.test_process import require_unix
+from test.test_sampler import JOB
 from tinyrl.bus import Ev, Op, Role, Run
 from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import SWEEP_GRACE_S, NodeDaemon
@@ -176,6 +178,130 @@ class TestNodeDaemon(RedisTest):
     finally:
       finish.set()
 
+  async def test_draining_checkpoint_preparation_yields_to_a_waiter_and_never_reads_more(self):
+    node = self.node()
+    uri = "tinker://training/sampler_weights/ready"
+    node.store.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
+    await self.bus.create_run(Run("base", "sampler", "tiny", 4, role=Role.SAMPLER))
+    await self.bus.create_run(Run("sample", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
+    preparing, finish = asyncio.Event(), threading.Event()
+    local, loop = node.store.local_folder, asyncio.get_running_loop()
+
+    def blocked(uri, version):
+      loop.call_soon_threadsafe(preparing.set)
+      if not finish.wait(10):
+        raise TimeoutError("checkpoint preparation was never released")
+      return local(uri, version)
+
+    try:
+      with (
+        patch.object(node.store, "local_folder", side_effect=blocked),
+        patch.object(self.bus, "take_commands", wraps=self.bus.take_commands) as reads,
+      ):
+        running = await node.add("sampler")
+        owner, stopping = await self.bus.lease_owner("sampler"), node.tasks["sampler"]
+        initial = await self.bus.submit_command("base", Op.SAMPLE, json.dumps(JOB).encode())
+        await self.reply(initial, node)
+        self.assertIsNotNone(running.since)
+        first = await self.bus.submit_command("sample", Op.SAMPLE, json.dumps(JOB).encode())
+        await asyncio.wait_for(preparing.wait(), 5)
+        count = len([call for call in reads.call_args_list if call.args[1] == owner])
+        await self.bus.append_event(Ev.UNPLACED, worker="sampler")
+        await node.tick()
+        later = await self.bus.submit_command("sample", Op.SAMPLE, json.dumps(JOB).encode())
+        await self.bus.create_run(Run("other", "other", "tiny", 4, role=Role.SAMPLER))
+        await node.add("other", gpus=[0])
+        contender = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
+        reply = await self.bus.wait_for_reply(contender, 3)
+        self.assertIsNotNone(reply, "draining checkpoint preparation held the GPU until storage completed")
+        self.assertTrue(reply.ok, reply.body)
+        self.assertFalse(finish.is_set())
+        self.assertFalse(stopping.done())
+        self.assertIsNone(running.since)
+        self.assertIsNone(await self.bus.wait_for_reply(first, 0))
+        finish.set()
+        await asyncio.wait_for(asyncio.shield(stopping), 5)
+        self.assertEqual(len([call for call in reads.call_args_list if call.args[1] == owner]), count)
+      self.assertTrue((await self.bus.wait_for_reply(first, 0)).ok)
+      self.assertIsNone(await self.bus.wait_for_reply(later, 0))
+      self.assertEqual(await self.bus.queued_and_in_flight("sample"), {"live": True, "queued": 1, "in_flight": []})
+      node.dispatch()
+      self.assertNotIn("sampler", node.tasks)
+      self.assertIsNone(await self.bus.lease_owner("sampler"))
+    finally:
+      finish.set()
+
+  async def test_a_draining_wide_worker_keeps_its_ticket_and_intake_closed_when_placed_again(self):
+    node = self.node(gpus=2)
+    wide_run, wide = await self.prepared(node, "wide", (0, 1))
+    holder_run, _ = await self.prepared(node, "holder", (0, 1))
+    self.assertIsNone(wide.since)
+    child, task = node.processes["wide"], node.tasks["wide"]
+    owner = await self.bus.lease_owner("wide")
+    executing, finish_work, saving, finish_save = (asyncio.Event() for _ in range(4))
+    execute, save = node.processes["holder"].call, child.call
+
+    async def blocked_work(method, *args):
+      if method == "execute":
+        executing.set()
+        await finish_work.wait()
+      return await execute(method, *args)
+
+    async def blocked_save(method, *args):
+      if method == "park_all":
+        saving.set()
+        await finish_save.wait()
+      return await save(method, *args)
+
+    try:
+      with (
+        patch.object(node.processes["holder"], "call", side_effect=blocked_work),
+        patch.object(child, "call", side_effect=blocked_save),
+      ):
+        await self.bus.submit_command(holder_run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+        await self.until(executing.is_set, node)
+        await self.bus.append_event(Ev.UNPLACED, worker="wide")
+        await self.until(lambda: wide.ticket > 0, node)
+        ticket = wide.ticket
+        await self.bus.create_run(Run("later", "later", "tiny", 4, lora=LORA))
+        later = await node.add("later", gpus=[0])
+        waiting = await self.bus.submit_command(
+          "later", Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
+        )
+        await self.until(lambda: later.ticket > 0, node)
+        self.assertGreater(later.ticket, ticket)
+
+        with patch.object(self.bus, "take_commands", wraps=self.bus.take_commands) as reads:
+          await self.bus.append_event(Ev.PLACED, worker="wide", node=node.id)
+          after_stop = await self.bus.submit_command(wide_run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+          for _ in range(5):
+            await node.tick()
+            await asyncio.sleep(0.01)
+            self.assertEqual(wide.ticket, ticket)
+            self.assertIsNone(wide.since)
+          finish_work.set()
+          await self.until(saving.is_set, node)
+          self.assertEqual(wide.gpus, (0, 1))
+          self.assertIsNotNone(wide.since)
+          self.assertEqual(wide.ticket, 0)
+          self.assertIsNone(later.since)
+          self.assertIsNone(await self.bus.wait_for_reply(waiting, 0))
+          self.assertIsNone(await self.bus.wait_for_reply(after_stop, 0))
+          finish_save.set()
+          await asyncio.wait_for(asyncio.shield(task), 5)
+          self.assertFalse([call for call in reads.call_args_list if call.args[1] == owner])
+        self.assertTrue(child.closed)
+        self.assertIsNone(await self.bus.lease_owner("wide"))
+        self.assertEqual(await self.bus.queued_and_in_flight(wide_run), {"live": True, "queued": 1, "in_flight": []})
+        self.assertIsNone(await self.bus.wait_for_reply(after_stop, 0))
+        uri = await self.bus.parked_checkpoint(wide_run)
+        self.assertIsNotNone(uri)
+        self.assertIsNotNone(await self.registry.get_checkpoint(uri))
+        self.assertTrue((await self.bus.wait_for_reply(waiting, 5)).ok)
+    finally:
+      finish_work.set()
+      finish_save.set()
+
   async def test_a_blocked_close_keeps_its_gpu_and_lease_while_other_gpus_progress(self):
     node = self.node(gpus=2)
     _, a = await self.prepared(node, "a", (0,))
@@ -307,6 +433,42 @@ class TestNodeDaemon(RedisTest):
         finish.set()
         await self.until(lambda: "worker" not in node.running, node)
       self.assertTrue(child.closed)
+      self.assertIsNone(await self.bus.lease_owner("worker"))
+    finally:
+      finish.set()
+
+  @patch("tinyrl.bus.LEASE_MS", 800)
+  @patch("tinyrl.control.node_daemon.LEASE_MS", 800)
+  async def test_uncertain_cleanup_keeps_its_gpu_and_lease_past_the_lease_timeout(self):
+    node = self.node()
+    _, running = await self.prepared(node)
+    child, task = node.processes["worker"], node.tasks["worker"]
+    owner = await self.bus.lease_owner("worker")
+    entered, finish, attempts = asyncio.Event(), asyncio.Event(), []
+    close = child.close
+
+    async def uncertain_close():
+      attempts.append(True)
+      if len(attempts) == 1:
+        raise TimeoutError("child exit has not been confirmed")
+      entered.set()
+      await finish.wait()
+      await close()
+
+    try:
+      with patch.object(child, "close", side_effect=uncertain_close):
+        task.cancel()
+        await self.until(entered.is_set, node)
+        await asyncio.sleep(1.7)  # pass two lease deadlines without advancing the control loop
+        self.assertFalse(task.done())
+        self.assertFalse(child.closed)
+        self.assertIsNotNone(running.since)
+        self.assertEqual(await self.bus.lease_owner("worker"), owner)
+        self.assertFalse(await self.bus.take_lease("worker", "replacement"))
+        finish.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+      self.assertTrue(child.closed)
+      self.assertIsNone(running.since)
       self.assertIsNone(await self.bus.lease_owner("worker"))
     finally:
       finish.set()

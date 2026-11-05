@@ -79,7 +79,8 @@ class TestSamplerDriver(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(wire.sample_json(replies[0].body)["sequences"][0]["tokens"], [3])
     self.assertEqual(engine.calls[0], ("start", "base", True, {"CUDA_VISIBLE_DEVICES": "2"}))
     self.assertEqual(engine.peak, 8)
-    self.assertEqual(await sampler.start(), 0)
+    await sampler.start()
+    self.assertIs(sampler.running, engine)
     await sampler.park()
     await sampler.resume()
     await sampler.close()
@@ -104,12 +105,11 @@ class TestSamplerDriver(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(other.running.calls[1][1], names[0])
     await other.close()
 
-  async def test_failed_staging_replies_without_starting_engine_and_next_command_works(self):
+  async def test_missing_session_replies_without_starting_engine_and_next_command_works(self):
     sampler = Sampler("base", True, {}, engine=RecordingEngine)
-    uri = "tinker://r/sampler_weights/a"
-    reply = await sampler.execute(self.cmd(), {"model_path": uri}, RuntimeError("bucket error"))
+    reply = await sampler.execute(self.cmd(), None, None)
     self.assertFalse(reply.ok)
-    self.assertIn("bucket error", json.loads(reply.body)["error"])
+    self.assertIn("no sampling session s", json.loads(reply.body)["error"])
     self.assertIsNone(sampler.running)
     self.assertTrue((await sampler.execute(self.cmd(), {}, None)).ok)
     await sampler.close()

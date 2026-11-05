@@ -14,7 +14,7 @@ from test.execution import TestNode
 from test.helpers import FakeEngine, RedisTest, tiny
 from tinyrl.api import wire
 from tinyrl.api.gateway import app
-from tinyrl.bus import Ev, Op, Role, Run
+from tinyrl.bus import Ev, Op, Role, Run, key
 from tinyrl.storage.store import Store
 from tinyrl.workers.sampler import Out, Seq, encode
 from tinyrl.workers.vllm import VLLM
@@ -736,23 +736,86 @@ class TestSampler(RedisTest):
       blocked.set()
     self.assertTrue((await self.bus.wait_for_reply(command, 5)).ok)
 
-  async def test_a_run_whose_checkpoint_fails_to_stage_gets_an_error_and_the_sampler_keeps_serving(self):
+  async def test_preparation_errors_reply_while_another_worker_owns_the_gpu(self):
     store = Store(tempfile.mkdtemp())
-    await self.bus.create_run(
-      Run("samp-1", "sampler:base", "base", 1, role=Role.SAMPLER, model_path="tinker://r1/sampler_weights/s0")
-    )
     store.local_folder = MagicMock(side_effect=RuntimeError("bucket error"))
-    node = self.node(store)
-    await node.add("sampler:base")
-    cmd_id = await self.bus.submit_command("samp-1", Op.SAMPLE, json.dumps(JOB).encode())
-    reply = await self.bus.wait_for_reply(cmd_id, 5)
-    self.assertFalse(reply.ok)
-    self.assertIn("RuntimeError: bucket error", json.loads(reply.body)["error"])
+    for run, path in (("busy", None), ("broken", "tinker://r/sampler_weights/missing"), ("missing", None)):
+      await self.bus.create_run(Run(run, run, "base", 4, role=Role.SAMPLER, model_path=path))
+    sampling, finish = asyncio.Event(), asyncio.Event()
 
-    await self.bus.create_run(Run("base", "sampler:base", "base", 1, role=Role.SAMPLER))
+    class Occupied(FakeEngine):
+      async def sample(self, job, name):
+        if job["prompt"] == [11]:
+          sampling.set()
+          await finish.wait()
+        return await super().sample(job, name)
+
+    node = self.node(store, gpus=1, engine=Occupied)
+    for worker in ("busy", "broken", "missing"):
+      await node.add(worker, gpus=[0])
+    holding = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
+    try:
+      await asyncio.wait_for(sampling.wait(), 5)
+      await self.bus.r.delete(key("run", "missing"))
+      for run, error in (("broken", "RuntimeError: bucket error"), ("missing", "no sampling session missing")):
+        request = await self.bus.submit_command(run, Op.SAMPLE, json.dumps(JOB).encode())
+        reply = await self.bus.wait_for_reply(request, 5)
+        self.assertIsNotNone(reply, "preparation errors must not wait for an occupied GPU")
+        self.assertFalse(reply.ok)
+        self.assertIn(error, json.loads(reply.body)["error"])
+        self.assertEqual(node.running[run].ticket, 0)
+        self.assertIsNone(node.running[run].since)
+        self.assertIsNone(node.samplers[run].running)
+      self.assertIsNone(await self.bus.wait_for_reply(holding, 0))
+    finally:
+      finish.set()
+    self.assertTrue((await self.bus.wait_for_reply(holding, 5)).ok)
+
+    await self.bus.create_run(Run("base", "broken", "base", 4, role=Role.SAMPLER))
     await node.sync()
     cmd_id = await self.bus.submit_command("base", Op.SAMPLE, json.dumps(JOB).encode())
     self.assertTrue((await self.bus.wait_for_reply(cmd_id, 5)).ok)
+
+  async def test_a_preparation_error_cannot_overwrite_the_new_lease_owners_reply(self):
+    store = Store(tempfile.mkdtemp())
+    await self.bus.create_run(
+      Run("s", "sampler", "base", 4, role=Role.SAMPLER, model_path="tinker://r/sampler_weights/missing")
+    )
+    staging, finish = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def failing_download(uri, version):
+      loop.call_soon_threadsafe(staging.set)
+      if not finish.wait(5):
+        raise TimeoutError("test never released checkpoint staging")
+      raise RuntimeError("old owner's download failed")
+
+    store.local_folder = failing_download
+    first = self.node(store, gpus=1, node="first")
+    await first.add("sampler")
+    sampler, task = first.samplers["sampler"], first.tasks["sampler"]
+    request = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
+    try:
+      await asyncio.wait_for(staging.wait(), 5)
+      await self.bus.r.delete(key("owner", "sampler"))  # expiry while the old node is still preparing
+      second = self.node(store, gpus=1, node="second")
+      await second.add("sampler")
+      owner = await self.bus.lease_owner("sampler")
+      expected = await self.bus.wait_for_reply(request, 0)
+      self.assertIsNotNone(expected)
+      self.assertFalse(expected.ok)
+      self.assertIn("lost the worker", json.loads(expected.body)["error"])
+      finish.set()
+      async with asyncio.timeout(5):
+        [error] = await asyncio.gather(task, return_exceptions=True)
+      self.assertIsInstance(error, RuntimeError)
+      self.assertIn("lost worker", str(error))
+      self.assertIsNone(sampler.running)
+      self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
+      self.assertEqual((await self.bus.get_run("s"))["failed"], 1)
+      self.assertEqual(await self.bus.lease_owner("sampler"), owner)
+    finally:
+      finish.set()
 
   async def test_a_new_checkpoint_can_stage_while_both_gpus_and_heartbeats_keep_progressing(self):
     store = Store(tempfile.mkdtemp())
