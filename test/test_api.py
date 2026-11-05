@@ -104,6 +104,7 @@ class TestAPI(RedisTest):
 
   async def test_a_call_counts_its_time_in_the_queue_and_running(self):
     run_id = await self.create_model()
+    self.node.note(bus.Ev.UNPLACED, worker=await self.worker(run_id))
     before = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
     submitted = await self.post("forward_backward", content=proto_body(run_id), headers=PROTO)
     await asyncio.sleep(0.3)

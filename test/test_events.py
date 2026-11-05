@@ -50,10 +50,12 @@ class TestEvents(RedisTest):
       request = await self.bus.submit_command(
         "r", Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": {}}).encode()
       )
-      self.assertEqual(await node.step("p", block_ms=10), 1)
-      self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
-      self.assertEqual(await node.step("p", block_ms=10), 0)
+      self.assertTrue((await self.bus.wait_for_reply(request, 10)).ok)
       worker = node.state.workers["p"]
+      for _ in range(100):
+        if worker.idle:
+          break
+        await asyncio.sleep(0.02)
       self.assertEqual(worker.on, ((node.id, 0),))
       self.assertTrue(worker.idle)
       self.assertGreater(worker.busy, 0)

@@ -4,10 +4,11 @@ import asyncio
 import time
 
 from test.helpers import FakeEngine, tiny
-from tinyrl.bus import Ev
+from tinyrl.bus import Ev, Role
 from tinyrl.control import scheduler
-from tinyrl.control.node_daemon import NodeDaemon
+from tinyrl.control.node_daemon import LocalWorker, NodeDaemon, TrainerEngine
 from tinyrl.workers.model import Model
+from tinyrl.workers.sampler import Sampler
 from tinyrl.workers.trainer import Trainer
 
 
@@ -33,14 +34,47 @@ class InlineProcess:
     self.closed = True
 
 
+def watch(process: InlineProcess, delays: dict[str, float] | None = None) -> list[tuple[float, str, tuple]]:
+  log, call = [], process.call
+
+  async def recorded(method, *args):
+    await asyncio.sleep((delays or {}).get(method, 0))
+    log.append((time.time(), method, args))
+    return await call(method, *args)
+
+  process.call = recorded
+  return log
+
+
+def gate(process: InlineProcess, method: str, after: bool = False) -> tuple[asyncio.Event, asyncio.Event]:
+  entered, go, call = asyncio.Event(), asyncio.Event(), process.call
+
+  async def held(name, *args):
+    first = name == method and not entered.is_set()
+    if first and not after:
+      entered.set()
+      await go.wait()
+    result = await call(name, *args)
+    if first and after:
+      entered.set()
+      await go.wait()
+    return result
+
+  process.call = held
+  return entered, go
+
+
 class TestNode(NodeDaemon):
   def __init__(self, bus, store=None, gpus=8, node="test-node", model=tiny, engine=FakeEngine):
     super().__init__(bus, gpus=gpus, node=node, gpu_mib=0, store=store)
     self.factories, self.default_model, self.engine_type = {}, model, engine
     self.note(Ev.NODE_UP, node=self.id, gpus=gpus, memory=0)
 
-  def open_trainer(self, worker, env):
-    return InlineProcess(Trainer(Model(self.factories.get(worker, self.default_model)), self.store))
+  def engine(self, w, lease):
+    if w.kind.role == Role.SAMPLER:
+      return Sampler(w.kind.base, w.kind.lora, scheduler.settings(w.kind, self.gpus, 0), engine=self.engine_type)
+    trainer = Trainer(Model(self.factories.get(lease.worker, self.default_model)), self.store)
+    return TrainerEngine(InlineProcess(trainer), lease, self.registry)
 
   async def sync(self):
     while events := await self.bus.read_events(self.after):
@@ -49,23 +83,18 @@ class TestNode(NodeDaemon):
       self.after = events[-1].id
       self.seen += len(events)
 
-  async def add(self, worker, owner="", gpus=None):
+  async def add(self, worker, gpus=None) -> LocalWorker:
     await self.sync()
-    if worker in self.running:
-      running = self.running[worker]
-      if running.model and running.model.proc.poll() is not None:
-        self.running.pop(worker)  # the production tick reaps completed worker tasks
-      else:
-        self.note(Ev.PLACED, worker=worker, node=self.id, gpus=list(running.gpus))
-        return running
+    if (lw := self.local.get(worker)) and not lw.task.done():
+      self.note(Ev.PLACED, worker=worker, node=self.id, gpus=list(self.state.workers[worker].gpus))
+      return lw
+    self.local.pop(worker, None)
     self.note(Ev.PLACED, worker=worker, node=self.id, **({"gpus": gpus} if gpus is not None else {}))
     self.schedule()
-    running = await self.open_worker(worker, owner)
-    if running is None:
+    if (lw := await self.open(worker)) is None:
       raise AssertionError(f"could not acquire {worker}")
-    if running.sampler is not None:
-      running.sampler.engine_type = self.engine_type
-    return running
+    self.local[worker] = lw
+    return lw
 
   async def worker_for(self, run):
     await self.sync()
@@ -75,22 +104,30 @@ class TestNode(NodeDaemon):
     await self.sync()
     return self.state.runs[run].worker
 
-  async def drain(self, run, model=None):
+  async def drain(self, run, model=None, timeout=30) -> LocalWorker | None:
+    await self.sync()
+    if run not in self.state.runs:
+      return None
     worker = await self.worker_for(run)
     if model is not None:
       self.factories[worker] = model
-    await self.add(worker)
-    while await self.step(worker, block_ms=10):
-      await self.sync()
-      await self.renew()
-    return self.running.get(worker)
+    lw = await self.add(worker)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+      await self.tick()
+      queue = await self.bus.queued_and_in_flight(run)
+      empty = not queue["live"] or (queue["queued"] == 0 and not queue["in_flight"])
+      if empty and (lw.task.done() or (w := self.state.workers.get(worker)) is None or w.idle):
+        return self.local.get(worker)
+      await asyncio.sleep(0.02)
+    raise AssertionError(f"{run} never drained: {queue}")
 
   async def aclose(self):
-    for running in list(self.running.values()):
-      running.stopping = running.lost = True
-      if running.task and not running.task.done():
-        running.task.cancel()
-        await asyncio.gather(running.task, return_exceptions=True)
-    for worker in list(self.running):
-      await self.close_worker(worker)
-      self.running.pop(worker, None)
+    for lw in self.local.values():
+      lw.cancel(lost=True)
+    await asyncio.gather(*(lw.task for lw in self.local.values()), return_exceptions=True)
+    self.local.clear()
+    for task in (self.uploading, self.sweeping):
+      if task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

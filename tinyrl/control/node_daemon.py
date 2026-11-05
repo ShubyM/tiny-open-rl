@@ -1,9 +1,8 @@
-"""The node owns leases, queues and GPU turns. Model processes only execute local commands."""
+"""The node owns leases, GPU turns and replies. Model processes only execute local commands."""
 
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextlib
 import dataclasses
 import json
@@ -14,7 +13,6 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
 
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Ev, Event, Op, Reply, Role
 from tinyrl.control import scheduler
@@ -25,7 +23,7 @@ from tinyrl.storage.store import Store
 from tinyrl.workers.sampler import Sampler
 
 GPUS, DRAIN_S, TICK = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK", 0.25)
-IDLE_MS, STRANDED_MS = getenv("IDLE_MS", 150), 5000
+IDLE_MS, STRANDED_MS, SAVE_WAIT_S = getenv("IDLE_MS", 150), 5000, 0.015
 SWEEP_S, SWEEP_GRACE_S = getenv("SWEEP_S", 60.0), 600
 
 
@@ -43,37 +41,111 @@ def movable(w: scheduler.Worker, gpus: int) -> bool:
   return w.kind.role == Role.TRAINER and w.kind.lora and len(w.gpus) == 1 and gpus > 1
 
 
-def enqueue(queue: collections.deque[Cmd], cmds: list[Cmd], lora: bool) -> None:
-  blocked, front, back = {x.run for x in queue}, [], []
-  for cmd in cmds:
-    (front if lora and cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER and cmd.run not in blocked else back).append(cmd)
-    if cmd.op != Op.SAVE_WEIGHTS_FOR_SAMPLER:
-      blocked.add(cmd.run)
-  queue.extendleft(reversed(front))
-  queue.extend(back)
+def choose(heads: list[tuple[str, Op]], width: int) -> list[str]:
+  return [run for run, op in sorted(heads, key=lambda head: head[1] != Op.SAVE_WEIGHTS_FOR_SAMPLER)][:width]
 
 
-@dataclass
-class Running:
-  owner: str
-  gpus: tuple[int, ...]
-  model: Process | None = None
-  sampler: Sampler | None = None
-  task: asyncio.Task | None = None
-  queue: collections.deque[Cmd] = field(default_factory=collections.deque)
-  stopping: bool = False
-  lost: bool = False
-  awake: bool = False
-  closed: bool = False
-  renewed: float = field(default_factory=time.monotonic)
+class Lease:
+  def __init__(self, bus: Bus, worker: str, owner: str):
+    self.bus, self.worker, self.owner = bus, worker, owner
+    self.renewed, self.lost = time.monotonic(), False
 
-  @property
-  def proc(self):
-    return self.model.proc if self.model else getattr(self.sampler.running, "server", None)
+  @classmethod
+  async def take(cls, bus: Bus, worker: str, owner: str) -> Lease | None:
+    return cls(bus, worker, owner) if await bus.take_lease(worker, owner) else None
 
-  def cancel(self) -> None:
-    self.stopping = self.lost = True
-    if self.task and not self.task.cancelling():
+  def lose(self) -> RuntimeError:
+    self.lost = True
+    return RuntimeError(f"lost worker {self.worker}")
+
+  async def hold(self) -> None:
+    before = time.monotonic()
+    if self.lost or not (
+      await self.bus.renew_lease(self.worker, self.owner)
+      or (not self.lost and await self.bus.take_lease(self.worker, self.owner, recover=True))
+    ):
+      raise self.lose()
+    self.renewed = before
+
+  async def keep(self) -> bool:
+    if time.monotonic() - self.renewed >= LEASE_MS / 4000:
+      with contextlib.suppress(Exception):
+        await self.hold()
+    return not self.lost and time.monotonic() - self.renewed < LEASE_MS / 1000
+
+  async def reply(self, cmd: Cmd, reply: Reply, started: float) -> None:
+    if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, started=started):
+      raise self.lose()
+
+  async def park(self, run: str, uri: str | None) -> None:
+    if not await self.bus.set_parked_checkpoint(run, uri, self.worker, self.owner):
+      raise self.lose()
+
+  async def fail_stranded(self, runs: list[str], min_idle_ms: int) -> None:
+    if not self.lost:
+      await self.bus.fail_stranded_commands(runs, self.worker, self.owner, min_idle_ms)
+
+  async def release(self) -> None:
+    self.lost = True
+    await self.bus.release_lease(self.worker, self.owner)
+
+
+class TrainerEngine:
+  batch, top_up, warm, started = (1, 1), 0, False, True
+
+  def __init__(self, process: Process, lease: Lease, registry: Registry):
+    self.process, self.proc, self.lease, self.registry = process, process.proc, lease, registry
+    self.awake = False
+
+  async def start(self) -> float:
+    return 0.0
+
+  async def resume(self, gpu: int | None) -> None:
+    if not self.awake:
+      await self.process.call("resume", gpu)
+      self.awake = True
+
+  async def park(self) -> None:
+    if self.awake:
+      await self.process.call("park")
+      self.awake = False
+
+  async def execute(self, cmd: Cmd, run: dict | None, staged: dict) -> Reply:
+    version = None
+    if cmd.op == Op.LOAD_WEIGHTS:
+      version = (await self.registry.get_checkpoint(json.loads(cmd.body)["uri"]) or {}).get("version")
+    if parked := await self.lease.bus.parked_checkpoint(cmd.run):
+      parked = (parked, (await self.registry.get_checkpoint(parked) or {}).get("version"))
+    reply, effects = await self.process.call("execute", cmd, run, parked, version)
+    await self.lease.hold()
+    if checkpoint := effects.get("saved"):
+      await self.registry.register_checkpoint(**checkpoint)
+    if restored := effects.get("restored"):
+      await self.lease.park(cmd.run, None)
+      await self.registry.unregister_checkpoints(restored)
+    return reply
+
+  async def park_runs(self) -> None:
+    await self.lease.hold()
+    for saved in await self.process.call("park_all"):
+      await self.lease.hold()
+      run = saved.pop("run")
+      await self.registry.register_checkpoint(**saved)
+      await self.lease.park(run, saved["uri"])
+
+  async def close(self) -> None:
+    await self.process.close()
+
+
+class LocalWorker:
+  def __init__(self, engine: TrainerEngine | Sampler, lease: Lease, serve):
+    self.engine, self.lease, self.name = engine, lease, lease.worker
+    self.task: asyncio.Task = asyncio.create_task(serve(self))
+
+  def cancel(self, lost: bool = False) -> None:
+    if lost:
+      self.lease.lose()
+    if not self.task.cancelling():
       self.task.cancel()
 
 
@@ -85,8 +157,8 @@ class NodeDaemon:
     self.store = store if store is not None else Store()
     self.gpus, self.id = gpus, node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
-    self.running: dict[str, Running] = {}
-    self.state, self.after, self.seen = scheduler.State(), "0-0", 0
+    self.local: dict[str, LocalWorker] = {}
+    self.state, self.after, self.seen, self.stopping = scheduler.State(), "0-0", 0, False
     self.swept, self.uploading, self.sweeping = 0.0, None, None
 
   def note(self, kind: Ev, **body) -> None:
@@ -94,256 +166,177 @@ class NodeDaemon:
 
   def schedule(self) -> None:
     for kind, body in scheduler.local_decide(self.state, self.id, time.time()):
-      r = self.running.get(body["worker"])
-      if body["rule"] == "turn.quantum_expired" and r and r.sampler and r.sampler.running is None:
-        continue  # boot time is charged when start returns; it does not consume a sampling turn
       self.note(kind, **body)
+
+  def wanted(self, worker: str) -> bool:
+    w = self.state.workers.get(worker)
+    if self.stopping or w is None or w.node != self.id or not scheduler.members(self.state, worker):
+      return False
+    return scheduler.placed(w) or movable(w, self.gpus)
 
   async def announce_node(self) -> None:
     await self.bus.node_heartbeat(self.id, self.gpus)
     await self.bus.append_event(Ev.NODE_UP, node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
 
-  async def owned(self, worker: str) -> None:
-    r, before = self.running[worker], time.monotonic()
-    if r.lost or not (
-      await self.bus.renew_lease(worker, r.owner)
-      or (not r.closed and await self.bus.take_lease(worker, r.owner, recover=True))
-    ):
-      r.stopping = r.lost = True
-      raise RuntimeError(f"lost worker {worker}")
-    r.renewed = before
-
   async def renew(self) -> None:
-    for worker, r in list(self.running.items()):
-      if r.task and r.task.done():
-        continue
-      if time.monotonic() - r.renewed >= LEASE_MS / 4000:
-        try:
-          await self.owned(worker)
-        except Exception:
-          if r.lost or time.monotonic() - r.renewed >= LEASE_MS / 1000:
-            r.cancel()
+    for lw in list(self.local.values()):
+      if not lw.task.done() and not await lw.lease.keep():
+        lw.cancel(lost=True)
 
-  def open_trainer(self, worker: str, env: dict[str, str]) -> Process:
-    width, cmd = len(self.running[worker].gpus), [sys.executable]
-    if width > 1:
-      cmd += ["-m", "torch.distributed.run", "--standalone", f"--nproc-per-node={width}"]
-    return Process([*cmd, "-m", "tinyrl.workers.trainer"], env)
-
-  async def open_worker(self, worker: str, owner: str = "") -> Running | None:
-    w, owner = self.state.workers[worker], owner or f"{self.id}-{os.urandom(8).hex()}"
-    if not await self.bus.take_lease(worker, owner):
-      return None
-    r = self.running[worker] = Running(owner, w.gpus)
+  def engine(self, w: scheduler.Worker, lease: Lease) -> TrainerEngine | Sampler:
     env = {**scheduler.settings(w.kind, self.gpus, self.gpu_mib * 2**20), **os.environ}
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, w.gpus))
     env["CKPT"], env["CKPT_CACHE"] = self.store.root, self.store.cache
-    try:
-      if w.kind.role == Role.TRAINER:
-        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        if movable(w, self.gpus):
-          env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(self.gpus)))
-        r.model = self.open_trainer(worker, env)
-      else:
-        r.sampler = Sampler(w.kind.base, w.kind.lora, env)
-      self.note(Ev.STARTED, worker=worker, node=self.id)
-      return r
-    except BaseException:
-      self.running.pop(worker)
-      await self.bus.release_lease(worker, owner)
-      raise
+    if w.kind.role == Role.SAMPLER:
+      return Sampler(w.kind.base, w.kind.lora, env)
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    if movable(w, self.gpus):
+      env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(self.gpus)))
+    cmd = [sys.executable]
+    if len(w.gpus) > 1:
+      cmd += ["-m", "torch.distributed.run", "--standalone", f"--nproc-per-node={len(w.gpus)}"]
+    return TrainerEngine(Process([*cmd, "-m", "tinyrl.workers.trainer"], env), lease, self.registry)
 
-  async def acquire(self, worker: str, drain: bool = False) -> bool:
-    r = self.running[worker]
-    while not r.lost and (not r.stopping or r.queue or drain):
-      w = self.state.workers[worker]
-      w.closing = r.stopping
-      if not r.stopping and not r.awake and w.since is None and movable(w, self.gpus) and r.gpus != w.gpus:
-        r.gpus = w.gpus
-        self.note(Ev.STARTED, worker=worker, node=self.id)
-      self.note(Ev.WANTS_GPU, worker=worker, queued=len(r.queue))
+  async def open(self, worker: str) -> LocalWorker | None:
+    if not (lease := await Lease.take(self.bus, worker, f"{self.id}-{os.urandom(8).hex()}")):
+      return None
+    try:
+      engine = self.engine(self.state.workers[worker], lease)
+    except BaseException:
+      await lease.release()
+      raise
+    self.note(Ev.STARTED, worker=worker, node=self.id)
+    lw = LocalWorker(engine, lease, self.serve_worker)
+    await asyncio.sleep(0)  # its task enters the try whose finally closes it before anyone can cancel it
+    return lw
+
+  async def acquire(self, lw: LocalWorker, leaving: bool = False) -> bool:
+    while not lw.lease.lost and (leaving or self.wanted(lw.name)):
+      w = self.state.workers.get(lw.name)
+      if not w or not w.on:
+        return False
+      if not leaving and w.since is None and not scheduler.placed(w):
+        self.note(Ev.STARTED, worker=lw.name, node=self.id)
+      self.note(Ev.WANTS_GPU, worker=lw.name, booting=not lw.engine.started)
       self.schedule()
       if w.since is not None and not w.revoked:
-        await self.owned(worker)
-        if not r.awake:
-          if r.model:
-            await r.model.call("resume", r.gpus[0] if movable(w, self.gpus) else None)
-          else:
-            await r.sampler.resume()
-          r.awake = True
+        await lw.lease.hold()
+        if not lw.engine.started:
+          with contextlib.suppress(Exception):
+            self.note(Ev.BATCH_DONE, worker=lw.name, boot=await lw.engine.start())
+        await lw.engine.resume(w.on[0][1] if movable(w, self.gpus) else None)
         if not w.revoked:
           return True
-      await self.release(worker)
+      await self.release(lw)
       await asyncio.sleep(TICK)
     return False
 
-  async def release(self, worker: str) -> None:
-    r, w = self.running[worker], self.state.workers[worker]
-    if w.revoked:
-      if r.awake:
-        await r.model.call("park") if r.model else await r.sampler.park()
-        r.awake = False
-      self.note(Ev.RELEASED, worker=worker)
+  async def release(self, lw: LocalWorker) -> None:
+    w = self.state.workers.get(lw.name)
+    if w and w.revoked:
+      await lw.engine.park()
+      self.note(Ev.RELEASED, worker=lw.name)
       self.schedule()
 
-  async def answer_command(self, worker: str, cmd: Cmd, runs=None, staged=None) -> Reply:
-    r = self.running[worker]
-    await self.owned(worker)  # a resumed node checks ownership before sending anything to its child
-    if r.sampler:
-      return await r.sampler.execute(cmd, runs.get(cmd.run), staged)
-    run, parked = await self.bus.get_run(cmd.run), await self.bus.parked_checkpoint(cmd.run)
-    version = None
-    if cmd.op == Op.LOAD_WEIGHTS:
-      version = (await self.registry.get_checkpoint(json.loads(cmd.body)["uri"]) or {}).get("version")
-    saved = (parked, (await self.registry.get_checkpoint(parked) or {}).get("version")) if parked else None
-    reply, effects = await r.model.call("execute", cmd, run, saved, version)
-    await self.owned(worker)
-    if checkpoint := effects.get("saved"):
-      await self.registry.register_checkpoint(**checkpoint)
-    if restored := effects.get("restored"):
-      if await self.bus.set_parked_checkpoint(cmd.run, None, worker, r.owner):
-        await self.registry.unregister_checkpoints(restored)
-    return reply
+  async def stage(self, runs: list[str], records: dict, staged: dict) -> None:
+    new = [r for r in runs if r not in records]
+    records.update(zip(new, await asyncio.gather(*map(self.bus.get_run, new))))
 
-  async def step(self, worker: str, count: int = 16, block_ms: int = 1000) -> int:
-    r, w = self.running[worker], self.state.workers[worker]
-    if r.stopping and not r.queue:
-      return 0
+    async def one(uri):
+      try:
+        version = (await self.registry.get_checkpoint(uri) or {}).get("version")
+        staged[uri] = await asyncio.to_thread(self.store.local_folder, uri, version)
+      except Exception as e:
+        staged[uri] = e
 
-    async def take(block):
-      return await self.bus.take_commands(scheduler.members(self.state, worker), r.owner, count, block)
+    uris = {x["model_path"] for x in records.values() if x and x.get("model_path")} - staged.keys()
+    await asyncio.gather(*map(one, uris))
 
-    if not r.queue:
-      enqueue(r.queue, await take(min(block_ms, IDLE_MS) if r.awake else block_ms), w.kind.lora)
-    if not r.queue:
-      self.note(Ev.IDLE, worker=worker)
+  async def answer(self, lw: LocalWorker, cmd: Cmd, run: dict | None, staged: dict) -> None:
+    before = time.time()
+    reply = await lw.engine.execute(cmd, run, staged)
+    await lw.lease.reply(cmd, reply, before)
+    if cmd.op == Op.DELETE_MODEL and reply.ok:
+      await self.bus.delete_run(cmd.run, lw.name)
+      self.note(Ev.RUN_DELETED, run=cmd.run, worker=lw.name)
+      await self.registry.unregister_checkpoints(*await self.registry.checkpoints_owned_by_run(cmd.run))
+    ms = (time.time() - before) * 1000
+    if DEBUG:
+      print(f"{lw.name} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms" + ("" if reply.ok else f"  {reply.body.decode()}"))
+
+  async def step(self, lw: LocalWorker) -> None:
+    w, members, (width, count) = self.state.workers[lw.name], scheduler.members(self.state, lw.name), lw.engine.batch
+    heads = await self.bus.peek_commands(members, 1000 if w.since is None else IDLE_MS)
+    if not heads:
+      self.note(Ev.IDLE, worker=lw.name)
       self.schedule()
-      await self.release(worker)
-      return 0
-    runs, staged = {}, {}
-
-    async def stage_new():
-      for run in dict.fromkeys(c.run for c in r.queue):
-        if run not in runs:
-          runs[run] = await self.bus.get_run(run)
-
-      async def stage(uri):
-        try:
-          version = (await self.registry.get_checkpoint(uri) or {}).get("version")
-          staged[uri] = await asyncio.to_thread(self.store.local_folder, uri, version)
-        except Exception as e:
-          staged[uri] = e
-
-      await asyncio.gather(
-        *(stage(uri) for uri in {x["model_path"] for x in runs.values() if x and x.get("model_path")} - staged.keys())
-      )
-
-    if r.sampler:
-      await stage_new()
-    if not await self.acquire(worker):
-      return 0
-    start, processed = time.time(), 0
-    if r.sampler and r.sampler.running is None:
-      with contextlib.suppress(Exception):
-        boot = await r.sampler.start()
-        self.note(Ev.BATCH_DONE, worker=worker, boot=boot)
-    if r.sampler and block_ms and not r.stopping:
-      await asyncio.sleep(0.02)
-      r.queue.extend(await take(0))
-      await stage_new()
-
-    async def one(cmd):
-      before = time.time()
-      reply = await self.answer_command(worker, cmd, runs, staged)
-      if not await self.bus.write_reply(cmd, reply, worker, r.owner, started=before):
-        r.stopping = r.lost = True
-        raise RuntimeError(f"lost worker {worker}")
-      if cmd.op == Op.DELETE_MODEL and reply.ok:
-        await self.bus.delete_run(cmd.run, worker)
-        self.note(Ev.RUN_DELETED, run=cmd.run, worker=worker)
-        await self.registry.unregister_checkpoints(*await self.registry.checkpoints_owned_by_run(cmd.run))
-        if not w.kind.lora:
-          r.stopping = True
-      ms = (time.time() - before) * 1000
-      if DEBUG:
-        print(f"{worker} {cmd.request_id} {cmd.op:24s} {ms:9.2f} ms" + ("" if reply.ok else f"  {reply.body.decode()}"))
-
-    while r.queue and not w.revoked and not r.lost:
-      if r.sampler:
-        sessions = list(dict.fromkeys(c.run for c in r.queue))[: 3 if w.kind.lora else 1]
-        batch = [c for c in r.queue if c.run in sessions]
-        r.queue = collections.deque(c for c in r.queue if c.run not in sessions)
-        async with asyncio.TaskGroup() as group:
-          tasks = [group.create_task(one(c)) for c in batch]
-        processed += len(tasks)
-      else:
-        cmd = r.queue.popleft()
-        await one(cmd)
-        processed += 1
-        if w.kind.lora and r.queue and not r.stopping and (cmd.op == Op.OPTIM_STEP or r.queue[0].run != cmd.run):
-          if cmd.op == Op.OPTIM_STEP:
-            await asyncio.sleep(0.015)
-          enqueue(r.queue, await take(0), True)
-      self.schedule()
-    self.note(Ev.BATCH_DONE, worker=worker, queued=len(r.queue), seconds=time.time() - start)
-    await self.release(worker)
-    return processed
-
-  async def park_runs(self, worker: str) -> None:
-    r = self.running[worker]
-    if r.model:
-      if len(r.gpus) > 1 and not r.awake:
-        await self.acquire(worker, drain=True)  # FSDP checkpoint gathers need its CUDA/NCCL group
-      for saved in await r.model.call("park_all"):
-        await self.owned(worker)
-        run = saved.pop("run")
-        await self.registry.register_checkpoint(**saved)
-        if not await self.bus.set_parked_checkpoint(run, saved["uri"], worker, r.owner):
-          r.lost = True
-          break
-
-  async def close_worker(self, worker: str) -> None:
-    r = self.running[worker]
-    if r.closed:
+      return await self.release(lw)
+    records, staged = {}, {}
+    await self.stage([run for run, _ in heads], records, staged)
+    if not await self.acquire(lw):
       return
-    closing = asyncio.create_task(r.model.close() if r.model else r.sampler.close())
+    start = time.time()
+    await asyncio.sleep(lw.engine.top_up)
+    runs = choose(await self.bus.peek_commands(members), width)
+    await self.stage(runs, records, staged)
+    cmds = await self.bus.take_commands(runs, lw.lease.owner, count)
+    await lw.lease.hold()  # a resumed node checks ownership before sending anything to its child
+    async with asyncio.TaskGroup() as group:
+      for cmd in cmds:
+        group.create_task(self.answer(lw, cmd, records.get(cmd.run), staged))
+    self.note(Ev.BATCH_DONE, worker=lw.name, seconds=time.time() - start)
+    self.schedule()
+    if cmds and cmds[-1].op == Op.OPTIM_STEP and len(members) > width:
+      await asyncio.sleep(SAVE_WAIT_S)
+    await self.release(lw)
+
+  async def close(self, lw: LocalWorker) -> None:
+    async def retire():
+      while True:
+        try:
+          await lw.engine.close()
+          break
+        except Exception as e:
+          print(f"{lw.name} did not close, trying again: {e!r}", file=sys.stderr, flush=True)
+          await asyncio.sleep(TICK)
+      self.note(Ev.EXITED, worker=lw.name)  # only the completed reap releases the actual GPUs
+      await lw.lease.fail_stranded(scheduler.members(self.state, lw.name), 0)
+      await lw.lease.release()
+
+    closing = asyncio.ensure_future(retire())
     try:
       await asyncio.shield(closing)
     except asyncio.CancelledError:
       await closing
-    r.closed = True
-    self.note(Ev.EXITED, worker=worker)  # only the completed reap releases the actual GPUs
-    if not r.lost:
-      await self.bus.fail_stranded_commands(scheduler.members(self.state, worker), worker, r.owner, 0)
-    await self.bus.release_lease(worker, r.owner)
 
-  async def serve_worker(self, worker: str) -> None:
-    r = self.running[worker]
+  async def serve_worker(self, lw: LocalWorker) -> None:
     try:
-      await self.bus.fail_stranded_commands(scheduler.members(self.state, worker), worker, r.owner, 0)
-      if r.sampler and r.sampler.env.get("TINYRL_WARM_SAMPLER", "0") != "0" and await self.acquire(worker):
-        with contextlib.suppress(Exception):
-          boot = await r.sampler.start()
-          self.note(Ev.BATCH_DONE, worker=worker, seconds=boot, boot=boot)
-      while not r.stopping or r.queue:
-        await self.step(worker, count=128 if r.sampler else 16)
-        if not r.queue:
-          await self.bus.fail_stranded_commands(scheduler.members(self.state, worker), worker, r.owner, STRANDED_MS)
-      if not r.lost:
-        await self.park_runs(worker)
+      await lw.lease.fail_stranded(scheduler.members(self.state, lw.name), 0)
+      swept = time.monotonic()
+      if lw.engine.warm:
+        await self.acquire(lw)
+      while self.wanted(lw.name) and not lw.lease.lost:
+        await self.step(lw)
+        if time.monotonic() - swept >= STRANDED_MS / 2000:
+          swept = time.monotonic()
+          await lw.lease.fail_stranded(scheduler.members(self.state, lw.name), STRANDED_MS)
+      w = self.state.workers.get(lw.name)
+      if w and scheduler.parks_in_place(w):
+        await self.acquire(lw, leaving=True)  # FSDP checkpoint gathers need its CUDA/NCCL group, resumed on it
+      await lw.engine.park_runs()
     finally:
-      await self.close_worker(worker)
+      await self.close(lw)
 
   async def tick(self) -> None:
     workers = {
-      n: dataclasses.asdict(self.state.workers[n]) | {"pid": r.proc.pid if r.proc else None}
-      for n, r in self.running.items()
+      n: dataclasses.asdict(self.state.workers[n]) | {"pid": lw.engine.proc.pid if lw.engine.proc else None}
+      for n, lw in self.local.items()
       if n in self.state.workers
     }
     await self.bus.node_heartbeat(self.id, self.gpus, workers)
     if await self.bus.event_log_size() < self.seen:
-      for r in self.running.values():
-        r.cancel()
+      for lw in self.local.values():
+        lw.cancel(lost=True)
       self.state, self.after, self.seen = scheduler.State(), "0-0", 0
     while events := await self.bus.read_events(self.after):
       for e in events:
@@ -351,26 +344,20 @@ class NodeDaemon:
       self.after, self.seen = events[-1].id, self.seen + len(events)
     await self.renew()
     self.schedule()
-    mine = {n: w for n, w in self.state.workers.items() if w.node == self.id and scheduler.members(self.state, n)}
-    for worker, r in list(self.running.items()):
-      w = mine.get(worker)
+    for worker, lw in list(self.local.items()):
       if self.id not in self.state.nodes:
-        r.cancel()
-      if not w or (r.gpus != w.gpus and not movable(w, self.gpus)):
-        r.stopping = True
-      if r.proc and r.proc.poll() is not None and r.task and not r.task.done() and not r.task.cancelling():
-        r.task.cancel()
-      if r.task and r.task.done():
-        if not r.task.cancelled() and (error := r.task.exception()):
+        lw.cancel(lost=True)
+      elif lw.engine.proc and lw.engine.proc.poll() is not None:
+        lw.cancel()
+      if lw.task.done():
+        if not lw.task.cancelled() and (error := lw.task.exception()):
           print(f"{worker} stopped: {error!r}", file=sys.stderr, flush=True)
-        if r.closed:
-          del self.running[worker]
-        else:
-          r.task = asyncio.create_task(self.close_worker(worker))
-    for worker in sorted(set(mine) - set(self.running)):
-      if r := await self.open_worker(worker):
-        r.task = asyncio.create_task(self.serve_worker(worker))
-    if self.id not in self.state.nodes and not self.running:
+        del self.local[worker]
+    for worker, w in sorted(self.state.workers.items()):
+      if worker not in self.local and w.node == self.id and scheduler.members(self.state, worker):
+        if lw := await self.open(worker):
+          self.local[worker] = lw
+    if self.id not in self.state.nodes and not self.local:
       await self.announce_node()
     if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
       self.swept = time.time()
@@ -418,17 +405,14 @@ class NodeDaemon:
         await self.tick()
         await asyncio.sleep(TICK)
     finally:
-      for r in self.running.values():
-        r.stopping = True
+      self.stopping = True
       deadline = time.monotonic() + DRAIN_S
-      while any(r.task and not r.task.done() for r in self.running.values()) and time.monotonic() < deadline:
+      while any(not lw.task.done() for lw in self.local.values()) and time.monotonic() < deadline:
         await self.renew()
         await asyncio.sleep(TICK)
-      tasks = [r.task for r in self.running.values() if r.task]
-      for task in tasks:
-        if not task.done() and not task.cancelling():
-          task.cancel()
-      await asyncio.gather(*tasks, return_exceptions=True)
+      for lw in self.local.values():
+        lw.cancel()
+      await asyncio.gather(*(lw.task for lw in self.local.values()), return_exceptions=True)
       await asyncio.to_thread(self.store.upload_pending_saves)
 
 

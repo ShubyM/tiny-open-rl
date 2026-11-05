@@ -65,8 +65,18 @@ class Sampler:
     module, name = self.env.get("ENGINE", "tinyrl.workers.vllm:VLLM").split(":")
     self.engine_type = engine or getattr(importlib.import_module(module), name)
     self.base, self.lora = base, lora
-    self.running = None
+    self.batch, self.top_up = (3 if lora else 1, 128), 0.02
+    self.warm = self.env.get("TINYRL_WARM_SAMPLER", "0") != "0"
+    self.running, self.awake = None, False
     self.loading = asyncio.Lock()
+
+  @property
+  def proc(self):
+    return getattr(self.running, "server", None)
+
+  @property
+  def started(self) -> bool:
+    return self.running is not None
 
   async def start(self) -> float:
     """Start once; the node excludes this boot time from the worker's first quantum."""
@@ -74,7 +84,7 @@ class Sampler:
       if self.running is not None:
         return 0.0
       start = time.monotonic()
-      self.running = await self.engine_type.start(self.base, self.lora, self.env)
+      self.running, self.awake = await self.engine_type.start(self.base, self.lora, self.env), True
       return time.monotonic() - start
 
   async def execute(self, cmd: Cmd, run: dict | None, staged: dict[str, tuple[str, str] | Exception]) -> Reply:
@@ -96,12 +106,16 @@ class Sampler:
       return Reply.error(e)
 
   async def resume(self, gpu: int | None = None) -> None:
-    if self.running:
+    if self.running and not self.awake:
       await self.running.wake()
+      self.awake = True
 
   async def park(self) -> None:
-    if self.running:
+    if self.running and self.awake:
       await self.running.sleep()
+      self.awake = False
+
+  async def park_runs(self) -> None: ...
 
   async def close(self) -> None:
     if self.running:

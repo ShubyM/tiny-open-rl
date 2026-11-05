@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -287,25 +286,31 @@ class Bus:
 
     return f"{run_id}/{entry_id.decode()}"
 
-  async def take_commands(self, runs: list[str], owner: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
-    """Read up to count commands per run. The node already knows its worker's membership from assignments."""
-    if not runs:
+  async def peek_commands(self, runs: list[str], block_ms: int = 0) -> list[tuple[str, Op]]:
+    p = self.r.pipeline(transaction=False)
+    for run_id in runs:
+      p.xinfo_groups(key("q", run_id))
+    groups = zip(runs, await p.execute(raise_on_error=False))
+    # XREAD from the group's last-delivered id returns exactly what nobody has claimed; a deleted run has no stream
+    cursors = {key("q", run_id): g[0]["last-delivered-id"] for run_id, g in groups if not isinstance(g, Exception)}
+    if not cursors:
       await asyncio.sleep(block_ms / 1000)
       return []
+    got = await self.r.xread(cursors, count=1, block=block_ms or None)
+    heads = sorted((tuple(map(int, e[0][0].split(b"-"))), s.decode(), e[0][1]) for s, e in got)
+    return [(stream.removeprefix(key("q", "")), Op(fields[b"op"].decode())) for _, stream, fields in heads]
 
-    runs = random.sample(runs, len(runs))  # so no run always goes first, without changing the caller's list
-    streams = {key("q", run_id): ">" for run_id in runs}
-    try:
-      got = await self.r.xreadgroup(GROUP, owner, streams, count=count, block=block_ms or None)
-    except redis.ResponseError as e:
-      if "NOGROUP" not in str(e):
-        raise
-      return []  # a run was deleted after the node read its assignments
-
+  async def take_commands(self, runs: list[str], owner: str, count: int = 1) -> list[Cmd]:
+    """Each stream is read on its own, so a run deleted after the node listed it costs only itself."""
+    p = self.r.pipeline(transaction=False)
+    for run_id in runs:
+      p.xreadgroup(GROUP, owner, {key("q", run_id): ">"}, count=count)
     cmds = []
-    for stream, entries in got:
-      run_id = stream.decode().removeprefix(key("q", ""))
-      cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
+    for run_id, got in zip(runs, await p.execute(raise_on_error=False)):
+      if isinstance(got, Exception) and "NOGROUP" not in str(got):
+        raise got
+      for _, entries in [] if isinstance(got, Exception) else got:
+        cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
     return cmds
 
   async def write_reply(self, cmd: Cmd, reply: Reply, worker: str, owner: str, started: float | None = None) -> bool:

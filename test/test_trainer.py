@@ -14,7 +14,7 @@ from peft import PeftModel
 from transformers import LlamaConfig, LlamaForCausalLM
 
 import tinyrl.workers.model
-from test.execution import TestNode
+from test.execution import TestNode, gate, watch
 from test.helpers import RedisTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl.api import wire
@@ -537,8 +537,11 @@ class TestTrainer(RedisTest):
       for op, body in cmds
     ]
 
+  async def replies(self, ids: list[str], timeout: float = 5) -> list:
+    return [await self.bus.wait_for_reply(request_id, timeout) for request_id in ids]
+
   def model(self, worker):
-    return self.node.running[worker].model.trainer.model
+    return self.node.local[worker].engine.process.trainer.model
 
   async def test_commands_flow_through_the_node_and_delete_drops_the_run(self):
     run = new_id()
@@ -551,7 +554,7 @@ class TestTrainer(RedisTest):
       (Op.DELETE_MODEL, {}),
     )
     await self.node.drain(run)
-    replies = [await self.bus.wait_for_reply(request_id, 0) for request_id in request_ids]
+    replies = await self.replies(request_ids, 0)
     bodies = [json.loads(reply.body) for reply in replies]
     self.assertEqual([reply.ok for reply in replies], [True, False, True, True])
     self.assertEqual([body.get("type") for body in bodies], ["create_model", None, "optim_step", "delete_model"])
@@ -559,34 +562,98 @@ class TestTrainer(RedisTest):
     self.assertEqual((await self.bus.get_run(run))["steps"], 1)
     self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))
 
-  async def test_a_node_told_to_stop_during_a_batch_finishes_claimed_work_and_stays_stopping(self):
+  async def test_a_stop_finishes_the_running_command_and_leaves_the_rest_queued(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
     ids = await self.submit(
-      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.DELETE_MODEL, {})
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(5)],
     )
-    running = await self.node.add("p")
-    original = running.model.call
+    lw = await self.node.add("p")
+    entered, go = gate(lw.engine.process, "execute")
+    await asyncio.wait_for(entered.wait(), 5)
+    self.assertEqual(len((await self.bus.queued_and_in_flight(run))["in_flight"]), 1)
+    self.node.note(Ev.UNPLACED, worker="p")
+    go.set()
+    await asyncio.wait_for(lw.task, 10)
+    self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
+    self.assertEqual(await self.bus.queued_and_in_flight(run), {"live": True, "queued": 5, "in_flight": []})
+    self.assertIsNotNone(await self.bus.parked_checkpoint(run))
+    self.assertIsNone(await self.bus.lease_owner("p"))
+    await self.node.add("p")
+    self.assertTrue(all([reply.ok for reply in await self.replies(ids[1:], 10)]))
+    self.assertEqual((await self.bus.get_run(run))["steps"], 5)
 
-    async def call(method, *args):
-      if method == "execute":
-        running.stopping = True  # graceful shutdown arrives while the first command executes
-      return await original(method, *args)
+  async def test_a_revoked_trainer_finishes_the_running_command_then_parks_and_takes_its_next_turn(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    ids = await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(5)],
+    )
+    lw = await self.node.add("p")
+    calls = watch(lw.engine.process)
+    entered, go = gate(lw.engine.process, "execute")
+    await asyncio.wait_for(entered.wait(), 5)
+    self.node.note(Ev.REVOKED, worker="p")
+    go.set()
+    self.assertTrue(all([reply.ok for reply in await self.replies(ids, 10)]))
+    methods = [method for _, method, _ in calls]
+    self.assertEqual(methods[:5], ["resume", "execute", "park", "resume", "execute"])
+    self.assertEqual(methods.count("execute"), 6)
 
-    running.model.call = call
-    self.assertEqual(await self.node.step("p", block_ms=10), 2)
-    self.assertTrue(running.stopping)
-    self.assertTrue(all([(await self.bus.wait_for_reply(request_id, 1)).ok for request_id in ids]))
+  async def test_a_revoked_busy_trainer_parks_after_at_most_one_more_command(self):
+    await self.node.aclose()
+    self.node = TestNode(self.bus, store=self.store, gpus=1)
+    self.node.state.quantum = 0.01
+    create = (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA})
+    a, b = new_id(), new_id()
+    for run, worker in ((a, "a"), (b, "b")):
+      await self.bus.create_run(Run(run, worker, "tiny", 4, lora=LORA))
+    [created] = await self.submit(a, create)
+    lw = await self.node.add("a")
+    entered, go = gate(lw.engine.process, "execute")
+    await asyncio.wait_for(entered.wait(), 5)
+    calls = watch(lw.engine.process, {"execute": 0.1})
+    steps = await self.submit(a, *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(16)])
+    go.set()
+    self.assertTrue((await self.bus.wait_for_reply(created, 10)).ok)
+    await asyncio.sleep(0.15)
+    asked = time.time()
+    await self.node.add("b")
+    [created] = await self.submit(b, create)
+    self.assertTrue((await self.bus.wait_for_reply(created, 10)).ok)
+    parked = next(t for t, method, _ in calls if method == "park" and t > asked)
+    sent = [t for t, method, _ in calls if method == "execute" and asked < t < parked]
+    self.assertLessEqual(len(sent), 2, f"{len(sent)} commands ran after another trainer asked for the GPU")
+    self.assertTrue(all([reply.ok for reply in await self.replies(steps, 30)]))
+
+  async def test_a_command_s_busy_ms_is_its_own_running_time(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    [created] = await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    lw = await self.node.add("p")
+    entered, go = gate(lw.engine.process, "execute")
+    await asyncio.wait_for(entered.wait(), 5)
+    watch(lw.engine.process, {"execute": 0.1})
+    steps = await self.submit(run, *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(10)])
+    go.set()
+    self.assertTrue((await self.bus.wait_for_reply(created, 10)).ok)
+    before = (await self.bus.get_run(run))["busy_ms"]
+    self.assertTrue(all([reply.ok for reply in await self.replies(steps, 30)]))
+    busy = (await self.bus.get_run(run))["busy_ms"] - before
+    self.assertGreaterEqual(busy, 1000)
+    self.assertLess(busy, 2000, f"10 commands of 0.1 s counted {busy} ms busy")
 
   async def test_a_new_node_owner_fails_what_a_dead_one_left_in_flight(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4))
     [request_id] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}}))
-    await self.bus.take_commands([run], "dead", block_ms=10)
-    running = await self.node.add("p", owner="new")
-    running.stopping = True  # startup reconciliation still runs before the loop exits
-    await self.node.serve_worker("p")
-    reply = await self.bus.wait_for_reply(request_id, 1)
+    await self.bus.take_commands([run], "dead")
+    await self.node.add("p")
+    reply = await self.bus.wait_for_reply(request_id, 5)
     self.assertFalse(reply.ok)
     self.assertEqual(json.loads(reply.body)["category"], "server")
     self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
@@ -595,9 +662,9 @@ class TestTrainer(RedisTest):
     run = new_id()
     await self.bus.create_run(Run(run, run, "tiny", 0))
     await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
-    running = await self.node.add(run)
-    await asyncio.wait_for(self.node.serve_worker(run), 10)
-    self.assertTrue(running.model.closed)
+    lw = await self.node.add(run)
+    await asyncio.wait_for(lw.task, 10)
+    self.assertTrue(lw.engine.process.closed)
     self.assertIsNone(await self.bus.lease_owner(run))
 
   async def test_a_run_moves_between_node_owned_models_through_the_store(self):
@@ -647,11 +714,12 @@ class TestTrainer(RedisTest):
           )
         await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
         await self.node.drain(r)
-      await self.node.park_runs(f"p-{rank}")
+      leaving = self.node.local[f"p-{rank}"]
+      self.node.note(Ev.UNPLACED, worker=f"p-{rank}")
+      await asyncio.wait_for(leaving.task, 10)
       parked = await self.bus.parked_checkpoint(run)
       self.assertIsNotNone(parked)
       self.assertIsNotNone(await self.registry.get_checkpoint(parked))
-      await self.node.close_worker(f"p-{rank}")
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
@@ -663,17 +731,20 @@ class TestTrainer(RedisTest):
   async def test_the_node_recovers_an_uncontested_lease_but_rejects_an_intervening_owner(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4))
-    running = await self.node.add("p")
+    lw = await self.node.add("p")
     await self.bus.r.delete("tinyrl:owner:p")
-    running.renewed = 0
+    lw.lease.renewed = 0
     await self.node.renew()
-    self.assertEqual(await self.bus.lease_owner("p"), running.owner)
-    self.assertFalse(running.lost)
+    self.assertEqual(await self.bus.lease_owner("p"), lw.lease.owner)
+    self.assertFalse(lw.lease.lost)
     await self.bus.r.set("tinyrl:last_owner:p", "another")
     await self.bus.r.delete("tinyrl:owner:p")
-    running.renewed = 0
+    lw.lease.renewed = 0
     await self.node.renew()
-    self.assertTrue(running.lost)
+    self.assertTrue(lw.lease.lost)
+    await asyncio.wait_for(asyncio.gather(lw.task, return_exceptions=True), 5)
+    self.assertTrue(lw.task.cancelled())
+    self.assertTrue(lw.engine.process.closed)
     self.assertIsNone(await self.bus.lease_owner("p"))
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
@@ -682,8 +753,10 @@ class TestTrainer(RedisTest):
     await self.submit(
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
     )
-    await self.node.drain(run)
-    await self.node.close_worker("p")  # a lost process has no park checkpoint
+    lw = await self.node.drain(run)
+    lw.engine.process.kill()
+    await self.node.tick()
+    await asyncio.wait_for(asyncio.gather(lw.task, return_exceptions=True), 5)
     ids = await self.submit(
       run,
       (Op.OPTIM_STEP, {"adam_params": {}}),
@@ -691,7 +764,7 @@ class TestTrainer(RedisTest):
       (Op.OPTIM_STEP, {"adam_params": {}}),
     )
     await self.node.drain(run)
-    replies = [await self.bus.wait_for_reply(request_id, 1) for request_id in ids]
+    replies = await self.replies(ids, 1)
     self.assertEqual([reply.ok for reply in replies], [False, True, True])
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
 
@@ -704,102 +777,66 @@ class TestTrainer(RedisTest):
     self.assertTrue((await self.bus.wait_for_reply(request_id, 1)).ok)
     self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))
 
-  async def test_sampler_save_is_processed_before_other_runs_finish_without_overtaking_its_own_updates(self):
+  async def test_a_sampler_save_passes_other_runs_but_never_its_own_earlier_commands(self):
     runs = [new_id() for _ in range(3)]
     for run in runs:
       await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
       await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-    await self.node.drain(runs[0])
-    opt_ids = {}
-    for run in runs:
-      ids = await self.submit(run, (Op.FORWARD_BACKWARD, proto_body(run)), (Op.OPTIM_STEP, {"adam_params": {}}))
-      opt_ids[run] = ids[-1]
-    done_at = {}
-
-    async def watch(name, request_id):
-      reply = await self.bus.wait_for_reply(request_id, 5)
-      done_at[name] = time.monotonic()
-      return reply
-
-    opt_tasks = {run: asyncio.create_task(watch(run, request_id)) for run, request_id in opt_ids.items()}
-
-    async def first_save():
-      finished, _ = await asyncio.wait(opt_tasks.values(), return_when=asyncio.FIRST_COMPLETED)
-      first = next(run for run, task in opt_tasks.items() if task in finished)
-      [request_id] = await self.submit(first, (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": "tinker://r/sampler_weights/s0"}))
-      return first, await watch("save", request_id)
-
-    save = asyncio.create_task(first_save())
-    self.assertEqual(await self.node.step("p", count=16, block_ms=10), 7)
-    first, reply = await save
-    await asyncio.gather(*opt_tasks.values())
-    self.assertTrue(reply.ok)
-    self.assertLess(done_at["save"], max(t for name, t in done_at.items() if name not in (first, "save")))
+      await self.node.drain(run)
+    process = self.node.local["p"].engine.process
+    calls = watch(process)
+    entered, go = gate(process, "execute")
+    fb, save = Op.FORWARD_BACKWARD, Op.SAVE_WEIGHTS_FOR_SAMPLER
+    ids = await self.submit(runs[0], (fb, proto_body(runs[0])))
+    await asyncio.wait_for(entered.wait(), 5)
+    for run, op in ((runs[1], fb), (runs[2], fb), (runs[0], save), (runs[1], save)):
+      body = proto_body(run) if op == fb else {"uri": f"tinker://{run}/sampler_weights/s0"}
+      ids += await self.submit(run, (op, body))
+      await asyncio.sleep(0.002)  # entry ids order runs against each other at millisecond resolution
+    go.set()
+    self.assertTrue(all([reply.ok for reply in await self.replies(ids, 10)]))
+    executed = [(args[0].run, args[0].op) for _, method, args in calls if method == "execute"]
+    self.assertEqual(executed, [(runs[0], fb), (runs[0], save), (runs[1], fb), (runs[1], save), (runs[2], fb)])
     causal = runs[0]
     pipelined = await self.submit(
       causal,
-      (Op.FORWARD_BACKWARD, proto_body(causal)),
+      (fb, proto_body(causal)),
       (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.1}}),
-      (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{causal}/sampler_weights/s1"}),
+      (save, {"uri": f"tinker://{causal}/sampler_weights/s1"}),
     )
-    self.assertEqual(await self.node.step("p", count=16, block_ms=10), 3)
-    self.assertTrue(all([(await self.bus.wait_for_reply(request, 1)).ok for request in pipelined]))
-    self.assertEqual((await self.bus.get_run(causal))["steps"], 2)
+    self.assertTrue(all([reply.ok for reply in await self.replies(pipelined, 10)]))
+    executed = [(args[0].run, args[0].op) for _, method, args in calls if method == "execute"]
+    self.assertEqual(executed[5:], [(causal, fb), (causal, Op.OPTIM_STEP), (causal, save)])
+    self.assertEqual((await self.bus.get_run(causal))["steps"], 1)
 
-  async def test_revocation_finishes_one_command_and_shutdown_drains_the_claimed_remainder(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    ids = await self.submit(
-      run,
-      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(9)],
-    )
-    running = await self.node.add("p")
-    original = running.model.call
-    calls = 0
-
-    async def call(method, *args):
-      nonlocal calls
-      result = await original(method, *args)
-      if method == "execute":
-        calls += 1
-        if calls == 1:
-          self.node.note(Ev.REVOKED, worker="p")
-      return result
-
-    running.model.call = call
-    self.assertEqual(await self.node.step("p", count=10, block_ms=10), 1)
-    self.assertEqual(len(running.queue), 9)
-    self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
-    self.assertIsNone(await self.bus.wait_for_reply(ids[1], 0))
-    running.stopping = True
-    self.assertEqual(await self.node.step("p", count=10, block_ms=10), 9)
-    self.assertEqual(await self.node.step("p", count=10, block_ms=10), 0)
-    self.assertEqual(calls, 10)
-
-  async def test_shutdown_does_not_fetch_another_batch(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    ids = await self.submit(
-      run,
-      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(11)],
-    )
-    running = await self.node.add("p")
-    original = running.model.call
-
-    async def call(method, *args):
-      if method == "execute":
-        running.stopping = True
-      return await original(method, *args)
-
-    running.model.call = call
-    self.assertEqual(await self.node.step("p", count=10, block_ms=10), 10)
-    self.assertEqual(await self.node.step("p", count=10, block_ms=10), 0)
-    self.assertEqual(list(running.queue), [])
-    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
-    self.assertTrue((await self.bus.wait_for_reply(ids[9], 0)).ok)
-    self.assertIsNone(await self.bus.wait_for_reply(ids[10], 0))
+  async def test_a_sampler_save_sent_while_the_trainer_waits_for_its_turn_passes_other_runs_not_its_own(self):
+    await self.node.aclose()
+    self.node = TestNode(self.bus, store=self.store, gpus=1)
+    create = (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA})
+    a, b, other = new_id(), new_id(), new_id()
+    for run, worker in ((a, "p"), (b, "p"), (other, "q")):
+      await self.bus.create_run(Run(run, worker, "tiny", 4, lora=LORA))
+    p = await self.node.add("p")
+    created = await self.submit(a, create) + await self.submit(b, create)
+    self.assertTrue(all([reply.ok for reply in await self.replies(created, 10)]))
+    q = await self.node.add("q")
+    entered, go = gate(q.engine.process, "execute")
+    await self.submit(other, create)
+    await asyncio.wait_for(entered.wait(), 10)
+    calls = watch(p.engine.process)
+    step, save = Op.OPTIM_STEP, Op.SAVE_WEIGHTS_FOR_SAMPLER
+    ids = await self.submit(b, (step, {"adam_params": {}}))
+    for _ in range(100):
+      if self.node.state.workers["p"].asked:
+        break
+      await asyncio.sleep(0.02)
+    self.assertTrue(self.node.state.workers["p"].asked, "p never peeked b's optim_step to wait for its turn")
+    for run in (b, a):
+      ids += await self.submit(run, (save, {"uri": f"tinker://{run}/sampler_weights/s0"}))
+    go.set()
+    self.assertTrue(all([reply.ok for reply in await self.replies(ids, 10)]))
+    executed = [(args[0].run, args[0].op) for _, method, args in calls if method == "execute"]
+    self.assertEqual(executed, [(a, save), (b, step), (b, save)])
 
 
 class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):

@@ -132,10 +132,9 @@ class VLLM:
     except Exception:
       print(f"vLLM could not be saved to {folder} and restored, so it boots again", file=sys.stderr, flush=True)
       traceback.print_exc()
-      await engine.close()
-      return await boot()
     finally:
       await engine.close()
+    return await boot()
 
   @classmethod
   async def restore(cls, folder: str, base: str, lora: bool, env: dict[str, str]) -> VLLM:

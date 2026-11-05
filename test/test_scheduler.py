@@ -222,6 +222,29 @@ class TestTurns(unittest.TestCase):
     self.assertEqual(log.tick(at=64.9), [])
     self.assertEqual(log.tick(at=65), [("revoked", "a", QUANTUM)])
 
+  def test_a_booting_holder_is_not_revoked_until_its_engine_is_up(self):
+    log = self.one_gpu("a", "b")
+    log("wants_gpu", worker="a", booting=True)
+    log("wants_gpu", at=1, worker="b")
+    self.assertEqual(log.tick(at=100), [])
+    self.assertEqual(log("batch_done", at=120, worker="a", boot=120.0, seconds=121.0), [])
+    self.assertEqual(log.tick(at=149.9), [])
+    self.assertEqual(log.tick(at=150), [("revoked", "a", QUANTUM)])
+
+  def test_a_moved_single_gpu_worker_is_revoked_and_a_moved_multi_gpu_trainer_is_settled(self):
+    log = Log(self)
+    log.node(4)
+    log.worker("lora:a", gpus=(0,))
+    log.worker("wide", gpus=(1, 2))
+    log("wants_gpu", worker="lora:a")
+    log("wants_gpu", worker="wide")
+    log.append("placed", {"worker": "lora:a", "node": "n", "gpus": [3], "rule": "test"})
+    self.assertEqual(log.tick(), [("revoked", "lora:a", "turn.moved")])
+    log.append("placed", {"worker": "wide", "node": "n", "gpus": [2, 3], "rule": "test"})
+    self.assertEqual(log.tick(), [])
+    log("released", worker="wide")
+    self.assertEqual(log("wants_gpu", worker="wide"), [("granted", "wide", GRANTED)])
+
   def test_workers_that_fit_together_hold_a_gpu_at_once_and_the_rest_take_turns(self):
     log = Log(self)
     log.node(1, memory=80 * GIB)

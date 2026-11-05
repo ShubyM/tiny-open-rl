@@ -89,7 +89,7 @@ class Worker:
   revoked: bool = False  # told to give its GPUs back
   idle: bool = False  # its worker found no commands since its last batch
   busy: float = 0.0  # seconds its batches took, so far
-  closing: bool = False  # drain and checkpoint on its actual GPUs before leaving a placement
+  booting: bool = False
 
 
 @dataclass
@@ -132,8 +132,7 @@ def members(s: State, worker: str) -> list[str]:
 
 def stop(w: Worker) -> None:
   """Its process is gone, and its turn with it."""
-  w.on, w.asked, w.since, w.revoked, w.idle = (), 0, None, False, False
-  w.closing = False
+  w.on, w.asked, w.since, w.revoked, w.idle, w.booting = (), 0, None, False, False, False
 
 
 # ***** fold *****
@@ -184,11 +183,11 @@ def fold(state: State, e: Event) -> State:
     case Ev.EXITED if w:
       stop(w)
     case Ev.WANTS_GPU if w and w.on:
-      w.idle = False
+      w.idle, w.booting = False, b.get("booting", False)
       if w.since is None and not w.asked:
         w.asked = s.n
     case Ev.BATCH_DONE if w:
-      w.idle, w.busy = False, w.busy + b.get("seconds", 0.0)
+      w.idle, w.busy, w.booting = False, w.busy + b.get("seconds", 0.0), False
       if w.since is not None:
         w.since += b.get("boot", 0.0)
     case Ev.IDLE if w:
@@ -252,14 +251,23 @@ def place_next(s: State, now: float) -> tuple[Ev, dict] | None:
     return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
 
 
+def placed(w: Worker) -> bool:
+  return w.on == tuple((w.node, g) for g in w.gpus)
+
+
+def parks_in_place(w: Worker) -> bool:
+  """A multi-GPU trainer saves its runs with collectives on the GPUs its process is on, so it takes one last turn there before it leaves them."""
+  return w.kind.role == Role.TRAINER and len(w.on) > 1
+
+
+def settled(w: Worker) -> bool:
+  return placed(w) or parks_in_place(w)
+
+
 def grant(s: State, now: float) -> tuple[Ev, dict] | None:
   for _, name in sorted((w.asked, name) for name, w in s.workers.items() if w.asked):
     w = s.workers[name]
-    if (
-      w.on
-      and (w.closing or w.on == tuple((w.node, g) for g in w.gpus))
-      and all(first_in_line(s, k) == name and fits(s, k, name) for k in w.on)
-    ):
+    if w.on and settled(w) and all(first_in_line(s, k) == name and fits(s, k, name) for k in w.on):
       return Ev.GRANTED, {"worker": name, "rule": "turn.granted"}
 
 
@@ -267,13 +275,13 @@ def revoke(s: State, now: float) -> tuple[Ev, dict] | None:
   for name, w in sorted(s.workers.items()):
     if w.since is None or w.revoked:
       continue
-    if not w.closing and w.on != tuple((w.node, g) for g in w.gpus):
+    if not settled(w):
       return Ev.REVOKED, {"worker": name, "rule": "turn.moved"}
     if not any(first_in_line(s, k) for k in w.on):
       continue
     if w.idle:
       return Ev.REVOKED, {"worker": name, "rule": "turn.idle_holder_yields"}
-    if now >= w.since + s.quantum:
+    if now >= w.since + s.quantum and not w.booting:
       return Ev.REVOKED, {"worker": name, "rule": "turn.quantum_expired"}
 
 
