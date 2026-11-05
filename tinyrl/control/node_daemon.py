@@ -160,13 +160,17 @@ class NodeDaemon:
     self.local: dict[str, LocalWorker] = {}
     self.state, self.after, self.seen, self.stopping = scheduler.State(), "0-0", 0, False
     self.swept, self.uploading, self.sweeping = 0.0, None, None
+    self.decided = asyncio.Event()
 
   def note(self, kind: Ev, **body) -> None:
     scheduler.fold(self.state, Event("", time.time(), kind, body))
 
   def schedule(self) -> None:
-    for kind, body in scheduler.local_decide(self.state, self.id, time.time()):
-      self.note(kind, **body)
+    if decisions := scheduler.local_decide(self.state, self.id, time.time()):
+      for kind, body in decisions:
+        self.note(kind, **body)
+      self.decided.set()
+      self.decided = asyncio.Event()
 
   def wanted(self, worker: str) -> bool:
     w = self.state.workers.get(worker)
@@ -212,7 +216,7 @@ class NodeDaemon:
 
   async def acquire(self, lw: LocalWorker, leaving: bool = False) -> bool:
     while not lw.lease.lost and (leaving or self.wanted(lw.name)):
-      w = self.state.workers.get(lw.name)
+      decided, w = self.decided, self.state.workers.get(lw.name)
       if not w or not w.on:
         return False
       if not leaving and w.since is None and not scheduler.placed(w):
@@ -228,7 +232,8 @@ class NodeDaemon:
         if not w.revoked:
           return True
       await self.release(lw)
-      await asyncio.sleep(TICK)
+      with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(decided.wait(), TICK)
     return False
 
   async def release(self, lw: LocalWorker) -> None:

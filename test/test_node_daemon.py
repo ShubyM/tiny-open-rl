@@ -153,6 +153,20 @@ class TestNodeDaemon(RedisTest):
     await asyncio.wait_for(waiting, 10)
     self.assertEqual(scheduler.holders(node.state, (node.id, 0)), ["b"])
 
+  @patch("tinyrl.control.node_daemon.TICK", 5.0)
+  async def test_a_waiting_worker_takes_its_turn_as_soon_as_the_holder_gives_it_back(self):
+    node = self.node()
+    a = await self.served(node, "ra", "a", [0])
+    entered, go = gate(a.engine.process, "execute")
+    await self.bus.submit_command("ra", Op.OPTIM_STEP, b'{"adam_params":{}}')
+    await asyncio.wait_for(entered.wait(), 5)
+    waiting = self.background(self.served(node, "rb", "b", [0]))
+    await self.until(lambda: (b := node.state.workers.get("b")) is not None and b.asked)
+    start = time.monotonic()
+    go.set()
+    await asyncio.wait_for(waiting, 10)
+    self.assertLess(time.monotonic() - start, 1.0, "the waiter slept out TICK after the holder gave the GPU back")
+
   async def test_a_closing_process_keeps_its_gpu_until_exit(self):
     node = self.node()
     a = await self.served(node, "ra", "a", [0])
@@ -274,27 +288,25 @@ class TestNodeDaemon(RedisTest):
     self.assertIsNotNone(await self.bus.parked_checkpoint("rw"))
     self.assertIsNone(await self.bus.lease_owner("wide"))
 
-  async def wide_granted_while_asleep_in_acquire(self):
+  async def wide_waiting_behind_a_parking_holder(self):
     node = self.node(gpus=2)
     await self.bus.create_run(Run("rw", "wide", "tiny", 4, lora=LORA, gpus=2))
     await node.add("wide", gpus=[0, 1])
     await self.create("rw")
     x = await self.served(node, "rx", "x", [0])
     wide = node.local["wide"]
-    x_entered, x_go = gate(x.engine.process, "execute")
-    await self.bus.submit_command("rx", Op.OPTIM_STEP, b'{"adam_params":{}}')
-    await asyncio.wait_for(x_entered.wait(), 5)
+    parked, x_go = gate(x.engine.process, "park", after=True)
     await self.bus.submit_command("rw", Op.OPTIM_STEP, b'{"adam_params":{}}')
-    await self.until(lambda: node.state.workers["wide"].asked)
-    x_go.set()
-    await self.until(lambda: node.state.workers["wide"].since is not None)
+    await asyncio.wait_for(parked.wait(), 10)
+    self.assertIsNone(node.state.workers["wide"].since)
     self.assertFalse(wide.engine.awake)
-    return node, wide
+    return node, wide, x_go
 
-  async def leaves_resumed_after_a_grant_landed_in_its_sleep(self, leave):
-    node, wide = await self.wide_granted_while_asleep_in_acquire()
+  async def leaves_resumed_after_a_grant_landed_in_its_wait(self, leave):
+    node, wide, x_go = await self.wide_waiting_behind_a_parking_holder()
     entered, finish = gate(wide.engine.process, "park_all")
     leave(node)
+    x_go.set()
     try:
       await asyncio.wait_for(entered.wait(), 10)
       self.assertTrue(wide.engine.awake, "park_all ran with the FSDP trainer still parked on host")
@@ -304,13 +316,11 @@ class TestNodeDaemon(RedisTest):
     await asyncio.wait_for(wide.task, 10)
     self.assertIsNotNone(await self.bus.parked_checkpoint("rw"))
 
-  @patch("tinyrl.control.node_daemon.TICK", 1.5)
-  async def test_a_multi_gpu_trainer_granted_while_it_slept_resumes_before_parking_on_shutdown(self):
-    await self.leaves_resumed_after_a_grant_landed_in_its_sleep(lambda node: setattr(node, "stopping", True))
+  async def test_a_multi_gpu_trainer_granted_as_it_leaves_resumes_before_parking_on_shutdown(self):
+    await self.leaves_resumed_after_a_grant_landed_in_its_wait(lambda node: setattr(node, "stopping", True))
 
-  @patch("tinyrl.control.node_daemon.TICK", 1.5)
-  async def test_a_multi_gpu_trainer_granted_while_it_slept_resumes_before_parking_on_a_move(self):
-    await self.leaves_resumed_after_a_grant_landed_in_its_sleep(
+  async def test_a_multi_gpu_trainer_granted_as_it_leaves_resumes_before_parking_on_a_move(self):
+    await self.leaves_resumed_after_a_grant_landed_in_its_wait(
       lambda node: node.note(Ev.PLACED, worker="wide", node="elsewhere")
     )
 
