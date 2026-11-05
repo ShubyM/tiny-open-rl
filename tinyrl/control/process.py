@@ -23,7 +23,7 @@ def die_with_parent(sig: int = signal.SIGKILL) -> None:
     expected = parent
   if ctypes.CDLL(None).prctl(1, sig) != 0:  # PR_SET_PDEATHSIG
     raise OSError("could not arrange process cleanup on parent death")
-  if parent != expected or os.getppid() != parent or parent == 1:
+  if parent != expected or os.getppid() != parent or (parent == 1 and os.environ.get("TINYRL_PARENT_PID") != "1"):
     os.kill(os.getpid(), sig)
 
 

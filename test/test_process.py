@@ -13,7 +13,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from tinyrl.control.process import Process, launch, reap, target_pid
+from tinyrl.control.process import Process, die_with_parent, launch, reap, target_pid
 
 SERVER = """
 import os, socket, sys, time
@@ -168,6 +168,34 @@ class TestUnixProcess(unittest.IsolatedAsyncioTestCase):
 
 
 class TestProcessOwnership(unittest.TestCase):
+  def test_a_container_init_can_be_the_explicit_parent(self):
+    with (
+      patch.dict(os.environ, {"TINYRL_PARENT_PID": "1"}, clear=True),
+      patch("os.getppid", return_value=1),
+      patch("os.getpid", return_value=42),
+      patch("ctypes.CDLL") as libc,
+      patch("os.kill") as kill,
+    ):
+      libc.return_value.prctl.return_value = 0
+      die_with_parent(signal.SIGUSR1)
+    libc.return_value.prctl.assert_called_once_with(1, signal.SIGUSR1)
+    kill.assert_not_called()
+
+  def test_orphaned_and_reparented_children_still_die(self):
+    # No marker, a dead expected parent, an exec child's own marker, or loss while installing the handler.
+    for marker, parents in ((None, [1, 1]), ("9", [1, 1]), ("42", [1, 1]), ("9", [9, 1])):
+      with (
+        self.subTest(marker=marker, parents=parents),
+        patch.dict(os.environ, {} if marker is None else {"TINYRL_PARENT_PID": marker}, clear=True),
+        patch("os.getppid", side_effect=parents),
+        patch("os.getpid", return_value=42),
+        patch("ctypes.CDLL") as libc,
+        patch("os.kill") as kill,
+      ):
+        libc.return_value.prctl.return_value = 0
+        die_with_parent()
+      kill.assert_called_once_with(42, signal.SIGKILL)
+
   def test_termination_is_forwarded_and_the_handle_waits_for_the_command(self):
     cmd = """
 import signal, sys, time
