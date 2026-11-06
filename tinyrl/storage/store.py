@@ -34,6 +34,7 @@ if TYPE_CHECKING:
   import torch
 
 from tinyrl.helpers import getenv
+from tinyrl.trace import span
 
 CKPT = getenv("CKPT", "/tmp/tinyrl")
 CKPT_CACHE = getenv("CKPT_CACHE", "/tmp/tinyrl-cache")
@@ -265,6 +266,7 @@ class Store:
     )
     return [*files, *weights]
 
+  @span("store.put")
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
     dest = self.path(uri)
     if self.remote:
@@ -523,6 +525,7 @@ class Store:
       folder = os.path.join(os.path.dirname(folder), os.readlink(folder))
     return sorted(glob.glob(f"{folder}/*.safetensors"))
 
+  @span("store.get")
   def get(self, uri: str, version: str | None = None) -> tuple[dict[str, torch.Tensor], dict]:
     import safetensors
 

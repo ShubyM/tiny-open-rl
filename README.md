@@ -107,6 +107,7 @@ to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/sch
 |---|---:|---|
 | [tinyrl/bus.py](tinyrl/bus.py) | 350 | runs, sessions, commands, replies, leases, node heartbeats and `tinyrl:events` on Redis |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | typed `getenv` and the `DEBUG` flag |
+| [tinyrl/trace.py](tinyrl/trace.py) | 15 | `span`, an NVTX range for Nsight Systems |
 | [tinyrl/__init__.py](tinyrl/__init__.py) | 1 | top-level `Bus`, `Cmd`, `Reply` and `Run` exports |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | 303 | the Tinker HTTP routes for sessions, runs, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | 155 | Tinker requests and replies between protobuf, numpy and JSON |
@@ -151,6 +152,17 @@ counters:
 | failure rate | `sum by (worker) (rate(tinyrl_failed_total[5m])) / sum by (worker) (rate(tinyrl_cmds_total[5m]))` |
 
 A run's wait includes waiting on its own earlier calls, since a run's calls run in order.
+
+Every model call (`model.<method>`), vLLM request (`vllm/<path>`) and checkpoint `store.put` or `store.get` is an NVTX range
+in the `tinyrl` domain. Without a profiler attached a range costs about a microsecond. To see where a node's time goes, run
+its node daemon under Nsight Systems, which follows the trainers and samplers it starts:
+
+```sh
+nsys profile --trace=nvtx --sample=none --cpuctxsw=none --duration=240 --kill=none python -m tinyrl.control.node_daemon
+```
+
+On the 23-job benchmark, `--trace=nvtx` adds nothing measurable. `--trace=cuda,nvtx` also records every kernel, and costs
+about 5 to 7 s of a 112 s run. vLLM servers restored from a snapshot aren't traced, since nsys didn't start them.
 
 ## Throughput simulator
 

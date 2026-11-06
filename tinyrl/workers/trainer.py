@@ -27,6 +27,7 @@ from tinyrl.control.turns import IDLE_MS, GpuTurn
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store, nbytes
+from tinyrl.trace import span
 from tinyrl.workers.model import Model
 
 STRANDED_MS = 5000  # a command in flight this long while its worker's owner has nothing in flight was stranded
@@ -82,7 +83,8 @@ class Trainer:
     if self.world_size > 1:
       dist.broadcast_object_list([(method, args)], src=0)
     try:
-      return None if method == "stop" else getattr(self.model, method)(*args)
+      with span(f"model.{method}"):
+        return None if method == "stop" else getattr(self.model, method)(*args)
     except Exception as e:
       # the other ranks may be waiting in a collective this rank left, so torchrun restarts them all
       if self.world_size > 1 and not isinstance(e, (ValueError, KeyError)):
