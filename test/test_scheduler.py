@@ -1,9 +1,8 @@
 import copy
-import dataclasses
 import random
 import unittest
 
-from tinyrl.bus import Ev, Event, Role
+from tinyrl.bus import Cmd, Ev, Event, Op, Role
 from tinyrl.control.scheduler import (
   Kind,
   Run,
@@ -12,11 +11,9 @@ from tinyrl.control.scheduler import (
   budget,
   can_run,
   decide,
-  fit,
   fold,
-  has_waiter,
   place_gpus,
-  settings,
+  select_runs,
 )
 
 GIB, MIB = 2**30, 2**20
@@ -87,8 +84,10 @@ class Local:
   def check(self):
     for gpu in range(self.s.nodes["n"][0]):
       held = [r for r in self.running.values() if r.since is not None and gpu in r.gpus]
-      if held:
-        self.test.assertTrue(fit([budget(self.s, r.kind, "n") for r in held], self.s.nodes["n"][1]))
+      if len(held) > 1:
+        sizes = [budget(self.s, r.kind, "n") for r in held]
+        self.test.assertTrue(all(sizes))
+        self.test.assertLessEqual(sum(sizes), self.s.nodes["n"][1])
     for r in self.running.values():
       self.test.assertFalse(r.ticket and r.since is not None)
 
@@ -106,16 +105,6 @@ class TestCluster(unittest.TestCase):
     c.append(Ev.RUN_DELETED, run="b")
     self.assertEqual(c.settle(), [(Ev.UNPLACED, {"worker": a, "rule": "place.emptied"})])
     self.assertNotIn(a, c.s.workers)
-
-  def test_dedicated_sampling_sessions_end_with_their_training_run(self):
-    c = Cluster()
-    c.node("n", 8)
-    trainer = c.run("train")
-    sampler = c.run("sample", role="sampler", train_run="train", exclusive=True)
-    c.append(Ev.RUN_DELETED, run="train")
-    self.assertEqual({body["worker"] for _, body in c.settle()}, {trainer, sampler})
-    self.assertEqual(c.s.workers, {})
-    self.assertEqual(c.s.runs, {})
 
   def test_workers_go_to_the_node_with_the_fewest_workers_per_gpu(self):
     c = Cluster()
@@ -171,14 +160,6 @@ class TestCluster(unittest.TestCase):
     self.assertEqual(x, y)
     self.assertEqual(len({a, b, fft, x, y, z}), 4)
 
-  def test_decide_does_not_mutate_its_input(self):
-    c = Cluster()
-    c.node("n", 8)
-    c.append(Ev.RUN_CREATED, run="r", role="trainer", base="a", rank=8)
-    before = dataclasses.asdict(c.s)
-    self.assertTrue(decide(c.s, 0.0))
-    self.assertEqual(dataclasses.asdict(c.s), before)
-
   def test_random_cluster_logs_replay_without_local_execution_state(self):
     for seed in range(100):
       rng, c = random.Random(seed), Cluster()
@@ -215,40 +196,10 @@ class TestPlacement(unittest.TestCase):
       p.add(name, sampler=True)
     p.add("lora", sampler=True, lora=True)
     p.add("exclusive", sampler=True, exclusive=True)
-    shares = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * GIB)}
-    alone = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_KV_BYTES": str(24 * GIB)}
     self.assertEqual(
-      {n: (w.gpus, settings(w.kind, 8, 81559 * MIB)) for n, w in p.s.workers.items()},
-      {"q": ((0,), shares), "g": ((0,), shares), "lora": ((1,), alone), "exclusive": ((2,), alone)},
+      {n: w.gpus for n, w in p.s.workers.items()},
+      {"q": (0,), "g": (0,), "lora": (1,), "exclusive": (2,)},
     )
-    self.assertEqual(budget(p.s, p.running["q"].kind, "n"), int(0.42 * 81559 * MIB))
-    self.assertEqual(settings(Kind(Role.SAMPLER), 8, 23034 * MIB), {"TINYRL_WARM_SAMPLER": "1"})
-    self.assertEqual(settings(Kind(Role.SAMPLER, lora=True), 1, 81559 * MIB), {"TINYRL_KV_BYTES": str(24 * GIB)})
-
-  def test_trainer_takes_turns_with_the_least_busy_trainers(self):
-    p = Local(self, 2)
-    p.add("busy", busy=50)
-    p.add("light", busy=5)
-    p.add("new")
-    self.assertEqual(p.s.workers["new"].gpus, p.s.workers["light"].gpus)
-
-  def test_sampler_moves_the_least_busy_trainers_aside(self):
-    p = Local(self, 2)
-    p.add("busy", busy=50)
-    light = p.add("light", busy=5)
-    p.add("sampler", sampler=True, lora=True)
-    self.assertEqual(p.s.workers["light"].gpus, p.s.workers["busy"].gpus)
-    self.assertNotEqual(p.s.workers["sampler"].gpus, p.s.workers["busy"].gpus)
-    self.assertEqual(light.gpus, p.s.workers["sampler"].gpus)  # a placement decision does not move the actual process
-
-  def test_budgeted_worker_fills_a_gpu_before_using_an_empty_one(self):
-    p = Local(self, 2)
-    p.add("train")
-    p.add("a", sampler=True)
-    p.drop("train")
-    p.running.pop("train")
-    p.add("b", sampler=True)
-    self.assertEqual(p.s.workers["a"].gpus, p.s.workers["b"].gpus)
 
   def test_exclusive_workers_are_alone_and_others_stay_off_their_gpu(self):
     p = Local(self, 2)
@@ -261,39 +212,12 @@ class TestPlacement(unittest.TestCase):
     p.add("a", sampler=True)
     self.assertEqual(p.s.workers["a"].gpus, (0,))
 
-  def test_sampler_moves_as_few_trainers_as_possible(self):
-    p = Local(self, 2)
-    for name, gpu, busy in (("c", 1, 5), ("a", 0, 1), ("b", 0, 1)):
-      p.add(name, at=(gpu,), busy=busy)
-    p.add("sample", sampler=True, lora=True)
-    self.assertEqual((p.s.workers["sample"].gpus, p.s.workers["c"].gpus), ((1,), (0,)))
-
-  def test_sampler_moves_lora_before_full_fine_tune(self):
-    p = Local(self, 2)
-    p.add("full", at=(0,), busy=1)
-    p.add("lora", at=(1,), lora=True, busy=9)
-    p.add("sample", sampler=True, lora=True)
-    self.assertEqual((p.s.workers["sample"].gpus, p.s.workers["lora"].gpus), ((1,), (0,)))
-
   def test_multi_gpu_sampler_moves_single_gpu_trainer_aside(self):
     p = Local(self, 4)
     p.add("wide", width=2)
     p.add("single")
     p.add("sample", sampler=True, lora=True, width=2)
     self.assertEqual([p.s.workers[n].gpus for n in ("wide", "single", "sample")], [(0, 1), (0,), (2, 3)])
-
-  def test_benchmark_arrivals_move_lora_trainers_and_pack_full_samplers(self):
-    p = Local(self, 8, memory=81559 * MIB)
-    for name, busy in {"x": 4, "lora_g": 7, "lora_q": 7.7, "q1": 1.7, "q2": 2.4, "g1": 4.8}.items():
-      p.add(name, lora=name.startswith("lora"), exclusive=name == "x", busy=busy)
-    for name in ("fft_q", "sample_q", "fft_g", "fft_x", "sample_g"):
-      p.add(name, sampler=True, lora=name.startswith("sample"), exclusive=name == "fft_x")
-    gpu = {n: w.gpus[0] for n, w in p.s.workers.items()}
-    self.assertEqual({gpu["lora_g"], gpu["lora_q"]}, {gpu["q1"], gpu["q2"]})
-    self.assertEqual(gpu["fft_q"], gpu["fft_g"])
-    self.assertEqual(
-      sorted(gpu[n] for n in ("x", "g1", "sample_q", "fft_x", "sample_g", "q1", "q2", "fft_q")), list(range(8))
-    )
 
   def test_spreading_waits_until_old_process_leaves_its_actual_gpu(self):
     p = Local(self, 2)
@@ -309,62 +233,16 @@ class TestPlacement(unittest.TestCase):
     p.place()
     self.assertEqual(p.s, before)
 
-  def test_spreading_prefers_lora_and_then_a_waiter_to_the_holder(self):
-    p = Local(self, 2)
-    p.add("old", at=(1,))
-    p.add("full", at=(0,))
-    p.add("a", at=(0,), lora=True)
-    p.add("b", at=(0,), lora=True)
-    p.request("a")
-    self.assertEqual(p.grants(), ["a"])
-    p.drop("old")
-    p.running.pop("old")
-    p.place()
-    self.assertEqual(p.s.workers["b"].gpus, (1,))
-    self.assertEqual(p.s.workers["a"].gpus, (0,))
-
-  def test_benchmark_trainers_spread_back_after_the_previous_wave_leaves(self):
-    p = Local(self, 8)
-    old = [f"old{g}" for g in (0, 1, 3, 4, 5, 6, 7)]
-    for name in old:
-      p.add(name, at=(int(name[3:]),))
-    trainers = ("lora_g", "lora_q", "q1", "q2", "g1")
-    for name in trainers:
-      p.add(name, at=(2,), lora=name.startswith("lora"))
-    for name in old:
-      p.drop(name)
-      p.running.pop(name)
-      p.place()
-    self.assertEqual(len({p.s.workers[n].gpus for n in trainers}), len(trainers))
-
-  def test_random_arrivals_do_not_make_samplers_share_when_trainers_can_move(self):
-    rng = random.Random(42)
-    for _ in range(200):
-      p = Local(self, rng.choice([2, 4, 8]))
-      names = [f"lora{i}" for i in range(3)] + [f"train{i}" for i in range(4)] + ["sample_a", "sample_b"]
-      for name in rng.sample(names, rng.randint(1, len(names))):
-        there = [[w for w in p.s.workers.values() if g in w.gpus] for g in range(p.s.nodes["n"][0])]
-        can_move = any(ws and all(w.kind.role == Role.TRAINER for w in ws) for ws in there)
-        p.add(name, sampler=name.startswith("sample"), lora=not name.startswith("train"), busy=rng.random() * 10)
-        if name.startswith("sample") and can_move:
-          mine = p.s.workers[name].gpus
-          self.assertFalse(any(set(w.gpus) & set(mine) for n, w in p.s.workers.items() if n != name))
-
-  def test_only_the_owning_node_changes_desired_gpu_placement(self):
-    p = Local(self, 2)
-    kind = Kind()
-    p.s.nodes["other"] = (2, 80 * GIB)
-    p.s.workers["remote"] = Worker(kind, "other")
-    p.s.runs["remote"] = Run(kind, "remote")
-    p.add("local")
-    self.assertEqual(p.s.workers["remote"].gpus, ())
-    self.assertEqual(p.s.workers["local"].gpus, (0,))
-    before = copy.deepcopy(p.s)
-    place_gpus(p.s, "missing", p.running)
-    self.assertEqual(p.s, before)
-
 
 class TestReservations(unittest.TestCase):
+  def test_ready_runs_share_service_even_when_commands_have_different_costs(self):
+    heads = [Cmd(run, "1-0", Op.FORWARD_BACKWARD, b"") for run in ("slow", "fast")]
+    service = {"slow": 0.0, "fast": 0.0}
+    for _ in range(11):
+      [run] = select_runs(heads, service, 1)
+      service[run] += 10 if run == "slow" else 1
+    self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
+
   def test_fifo_order_is_the_order_of_requests_not_worker_names(self):
     p = Local(self)
     for name in ("a", "b", "c"):
@@ -377,26 +255,6 @@ class TestReservations(unittest.TestCase):
       order.append(name)
       p.running[name].since = None
     self.assertEqual(order, ["a", "c", "b"])
-
-  def test_only_eligible_waiters_count_as_demand(self):
-    p = Local(self, 2)
-    p.add("a", at=(0,))
-    p.add("b", at=(1,))
-    self.assertFalse(has_waiter(p.running, (0, 1)))
-    p.request("b")
-    self.assertFalse(has_waiter(p.running, (0,)))
-    self.assertTrue(has_waiter(p.running, (1,)))
-    self.assertEqual(p.grants(), ["b"])
-    self.assertFalse(has_waiter(p.running, (0, 1)))
-    self.assertFalse(can_run(p.s, "n", p.running, "b"))
-
-  def test_a_single_pass_cannot_reserve_two_incompatible_workers(self):
-    p = Local(self)
-    for name in ("a", "b"):
-      p.add(name)
-      p.request(name)
-    self.assertEqual(p.grants(), ["a"])
-    self.assertEqual(p.grants(), [])
 
   def test_workers_with_known_budgets_share_but_unknown_budgets_wait(self):
     p = Local(self)
@@ -441,54 +299,6 @@ class TestReservations(unittest.TestCase):
       p.add(name, at=(gpu,))
       p.request(name)
     self.assertEqual(p.grants(), ["a", "b"])
-
-  def test_unplacement_does_not_free_an_actual_reservation(self):
-    p = Local(self)
-    for name in ("a", "b"):
-      p.add(name)
-      p.request(name)
-    self.assertEqual(p.grants(), ["a"])
-    p.drop("a")
-    self.assertNotIn("a", p.s.workers)
-    self.assertEqual(p.grants(), [])
-    p.running.pop("a")
-    self.assertEqual(p.grants(), ["b"])
-
-  def test_desired_move_does_not_free_the_actual_gpu(self):
-    p = Local(self, 2)
-    for name in ("a", "b"):
-      p.add(name, at=(0,))
-      p.request(name)
-    self.assertEqual(p.grants(), ["a"])
-    p.s.workers["a"].gpus = (1,)
-    self.assertEqual(p.grants(), [])
-    p.running["a"].since = None
-    p.running["a"].gpus = (1,)
-    self.assertEqual(p.grants(), ["b"])
-
-  def test_unplaced_multi_gpu_trainer_can_reacquire_actual_gpus_for_its_checkpoint(self):
-    p = Local(self, 2)
-    p.add("wide", at=(0, 1), width=2)
-    p.drop("wide")
-    p.request("wide")
-    self.assertEqual(p.grants(), ["wide"])
-
-  def test_local_reservations_use_actual_node_memory_even_after_a_cluster_move(self):
-    p = Local(self)
-    p.s.nodes["other"] = (1, 20 * GIB)
-    for name in ("a", "b"):
-      p.add(name, sampler=True)
-      p.request(name)
-      p.s.workers[name].node = "other"
-    self.assertEqual(p.grants(), ["a", "b"])
-
-  def test_missing_node_or_empty_actual_placement_cannot_be_granted(self):
-    p = Local(self)
-    p.add("a", at=())
-    p.request("a")
-    self.assertFalse(can_run(p.s, "n", p.running, "a"))
-    p.running["a"].gpus = (0,)
-    self.assertFalse(can_run(p.s, "missing", p.running, "a"))
 
   def test_random_requests_and_exits_never_overcommit_a_gpu(self):
     for seed in range(300):

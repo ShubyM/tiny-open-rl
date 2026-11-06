@@ -36,12 +36,12 @@ class InlineProcess:
 class TestNode(NodeDaemon):
   def __init__(self, bus, store=None, gpus=8, node="test-node", model=tiny, engine=FakeEngine, gpu_mib=0):
     super().__init__(bus, gpus=gpus, node=node, gpu_mib=gpu_mib, store=store)
-    self.factories, self.default_model, self.engine_type = {}, model, engine
+    self.default_model, self.engine_type = model, engine
     self.processes, self.samplers = {}, {}
     self.state.nodes[self.id] = (gpus, gpu_mib * 2**20)
 
   def open_trainer(self, worker, env):
-    process = InlineProcess(Trainer(Model(self.factories.get(worker, self.default_model)), self.store))
+    process = InlineProcess(Trainer(Model(self.default_model), self.store))
     self.processes[worker] = process
     return process
 
@@ -84,12 +84,10 @@ class TestNode(NodeDaemon):
     await self.sync()
     return r.worker if (r := self.state.runs.get(run)) else None
 
-  async def drain(self, run, model=None):
+  async def drain(self, run):
     """Let the real worker coroutines finish the commands visible in their Redis streams."""
     if (worker := await self.worker_for(run)) is None:
       return None  # a live worker may already have completed the run's DELETE_MODEL
-    if model is not None:
-      self.factories[worker] = model
     await self.add(worker)
     async with asyncio.timeout(15):
       while True:

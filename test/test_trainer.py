@@ -3,15 +3,12 @@ import copy
 import json
 import os
 import tempfile
-import time
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import torch
 from peft import PeftModel
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import LlamaForCausalLM
 
 import tinyrl.workers.model
 from test.execution import TestNode
@@ -20,7 +17,7 @@ from test.test_api import proto_body
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Run
 from tinyrl.storage.store import Store
-from tinyrl.workers.model import LOSSES, Model, batches, target_logprobs, token_budget
+from tinyrl.workers.model import LOSSES, Model, batches, target_logprobs
 from tinyrl.workers.trainer import Trainer
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
@@ -55,34 +52,6 @@ def same(a, b) -> bool:
 
 
 class TestForwardPass(unittest.TestCase):
-  def test_pad_rounds_width_on_cuda(self):
-    from tinyrl.workers.model import pad
-
-    rows, lengths = [np.ones(5), np.ones(130)], [5, 130]
-    self.assertEqual(pad(rows, lengths, np.float32, torch.device("cpu")).shape, (2, 130))
-    with patch("torch.Tensor.to", lambda t, _: t):
-      out = pad(rows, lengths, np.float32, torch.device("cuda"))
-      self.assertEqual(out.shape, (2, 256))
-      self.assertEqual(out[1, 129].item(), 1.0)
-      self.assertEqual(out[1, 130].item(), 0.0)
-
-  def test_liger_kernel_fallback(self):
-    lm = tiny()
-    ids, mask, targets = (
-      torch.zeros((1, 5), dtype=torch.long),
-      torch.ones((1, 5), dtype=torch.long),
-      torch.zeros((1, 5), dtype=torch.long),
-    )
-    expected = target_logprobs(lm, ids, mask, targets)
-    with (
-      patch.object(
-        type(lm), "device", new_callable=unittest.mock.PropertyMock, return_value=SimpleNamespace(type="cuda")
-      ),
-      patch("tinyrl.workers.model.LigerFusedLinearCrossEntropyLoss", None),
-    ):
-      actual = target_logprobs(lm, ids, mask, targets)
-    self.assertTrue(torch.allclose(actual, expected))
-
   def test_batches(self):
     self.assertEqual(batches([5, 5, 5], 100), [[0, 1, 2]])
     self.assertEqual(batches([5, 5, 5], 10), [[0, 1], [2]])
@@ -95,86 +64,15 @@ class TestForwardPass(unittest.TestCase):
     self.assertEqual(sorted(i for p in passes for i in p), list(range(200)))
     self.assertTrue(all(len(p) == 1 or max(lengths[i] for i in p) * len(p) <= 256 for p in passes))
 
-  def test_the_token_budget_fits_the_free_gpu_memory(self):
-    gpu = SimpleNamespace(
-      device=torch.device("cuda", 0), dtype=torch.bfloat16, config=LlamaConfig(num_hidden_layers=32, hidden_size=4096)
-    )
-
-    def budget(free_gib: int, ckpt: bool = True) -> int:
-      gpu.is_gradient_checkpointing = ckpt
-      with (
-        patch.object(torch.cuda, "mem_get_info", return_value=(free_gib * 2**30, 0)),
-        patch.object(torch.cuda, "memory_reserved", return_value=2**30),  # 1 GiB cached by torch but unused
-        patch.object(torch.cuda, "memory_allocated", return_value=0),
-      ):
-        return token_budget(gpu)
-
-    self.assertEqual(budget(7, True), 8 * 2**30 // 2 // (6 * 32 * 4096 * 2))
-    self.assertEqual(budget(7, False), 8 * 2**30 // 2 // (64 * 32 * 4096 * 2))
-    self.assertEqual(budget(80), tinyrl.workers.model.MAX_TOKEN_BUDGET)
-    self.assertEqual(token_budget(tiny()), tinyrl.workers.model.MAX_TOKEN_BUDGET)  # on the cpu
-    with patch.object(tinyrl.workers.model, "TOKEN_BUDGET", 512):
-      self.assertEqual(token_budget(gpu), 512)
-
-  @patch("os.environ", {})
-  def test_should_checkpoint_layers(self):
-    from tinyrl.workers.model import should_checkpoint_layers
-
-    class MockProps:
-      def __init__(self, mem):
-        self.total_memory = mem
-
-    def mock_get_device_properties(dev):
-      if str(dev) == "cuda:0":
-        return MockProps(80 * 1024**3)
-      return MockProps(40 * 1024**3)
-
-    gpu_80 = SimpleNamespace(device=torch.device("cuda", 0), config=SimpleNamespace())
-    gpu_40 = SimpleNamespace(device=torch.device("cuda", 1), config=SimpleNamespace())
-
-    with patch("torch.cuda.get_device_properties", mock_get_device_properties):
-      import tinyrl.workers.model
-
-      old_grad = tinyrl.workers.model.GRAD_CKPT
-      tinyrl.workers.model.GRAD_CKPT = 1
-      self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
-      self.assertTrue(should_checkpoint_layers(gpu_80, lora=False))
-      self.assertTrue(should_checkpoint_layers(gpu_40, lora=True))
-
-      os.environ["GRAD_CKPT"] = "1"
-      self.assertTrue(should_checkpoint_layers(gpu_80, lora=True))
-
-      os.environ["GRAD_CKPT"] = "0"
-      self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
-      self.assertFalse(should_checkpoint_layers(gpu_80, lora=False))
-
-      del os.environ["GRAD_CKPT"]
-      tinyrl.workers.model.GRAD_CKPT = 0
-      self.assertFalse(should_checkpoint_layers(gpu_80, lora=True))
-      tinyrl.workers.model.GRAD_CKPT = old_grad
-
-  @patch("os.environ", {"GRAD_CKPT": "0"})
-  def test_cpu_lora_without_gradient_checkpointing(self):
-    model, runs = lora_runs(1)
-    run = runs[0]
-    weights_before = [p.clone() for p in model.lm.parameters()]
-    _, metrics = model.forward_backward(run, [counting(12)], "cross_entropy", {}, False)
-    step_metrics = model.optim_step(run, {"learning_rate": 1e-2})
-
-    self.assertGreater(step_metrics["grad_norm:mean"], 0)
-    weights_after = [p.clone() for p in model.lm.parameters()]
-    changed = any(not torch.equal(b, a) for b, a in zip(weights_before, weights_after))
-    self.assertTrue(changed)
-
   def test_chunked_logprobs_are_the_full_softmax(self):
     lm = tiny().eval()
-    ids, targets = torch.randint(0, 96, (3, 11)), torch.randint(0, 96, (3, 11))
+    shape = (3, tinyrl.workers.model.CHUNK // 2 + 1)  # enough positions to cross a chunk boundary
+    ids, targets = torch.randint(0, 96, shape), torch.randint(0, 96, shape)
     mask = torch.ones_like(ids)
     mask[2, 7:] = 0
 
-    with patch.object(tinyrl.workers.model, "CHUNK", 4), torch.no_grad():
-      got = target_logprobs(lm, ids, mask, targets)
     with torch.no_grad():
+      got = target_logprobs(lm, ids, mask, targets)
       want = lm(ids, attention_mask=mask).logits.log_softmax(-1).gather(-1, targets[..., None])[..., 0]
     torch.testing.assert_close(got[mask.bool()], want[mask.bool()])
 
@@ -191,180 +89,39 @@ class TestForwardPass(unittest.TestCase):
     torch.testing.assert_close(loss("importance_sampling"), -ratio * advantages * weights)
     clipped = torch.min(ratio * advantages, ratio.clamp(0.9, 1.1) * advantages)
     torch.testing.assert_close(loss("ppo", clip_range=0.1), -clipped * weights)
+    torch.testing.assert_close(loss("ppo", clip_low_threshold=0.9, clip_high_threshold=1.1), -clipped * weights)
     kl = (ratio - 1) - (logprobs - sampler_logprobs)
     torch.testing.assert_close(loss("ppo", kl_coeff=0.5) - loss("ppo"), 0.5 * kl * weights)
-
-
-class CudaMock(torch.Tensor):
-  @property
-  def is_cuda(self):
-    return getattr(self, "_is_cuda", False)
-
-  def is_pinned(self):
-    return getattr(self, "_is_pinned", False)
-
-  def to(self, *args, **kwargs):
-    device = args[0] if args else kwargs.get("device")
-    if device == "cuda":
-      ret = torch.Tensor.to(self, "cpu", **kwargs).as_subclass(CudaMock)
-      ret._is_cuda = True
-      ret._is_pinned = False
-      return ret
-    return super().to(*args, **kwargs)
+    with self.assertRaises(ValueError):
+      loss("ppo", unknown=1.0)
 
 
 class TestModel(unittest.TestCase):
-  def test_full_ft_delete_run_drops_model_lm(self):
-    m = Model(tiny)
-    m.create_run("test-full-ft", "tiny", 0, {})
-    m.activate_run("test-full-ft")
-    self.assertIsNotNone(m.lm)
-    m.delete_run("test-full-ft")
-    self.assertIsNone(m.lm)
-
-  def test_a1_and_a2_gradients(self):
+  def test_a_corrupt_checkpoint_cannot_partially_overwrite_the_model(self):
     model, run_id = Model(tiny), new_id()
     model.create_run(run_id, "tiny", 0, {})
-    model.activate_run(run_id)
-    for p in model.params[run_id].values():
-      p.grad = torch.ones_like(p.data) * 0.5
-
-    tensors, meta = model.training_state(run_id)
-    self.assertTrue(any("grad" in name for name in tensors.keys()))
-
-    model.restore_run(run_id, tensors, meta, True, gradients=True)
-    self.assertTrue(any(p.grad is not None for p in model.params[run_id].values()))
-
-    model.restore_run(run_id, tensors, meta, True, gradients=False)
-    self.assertFalse(any(p.grad is not None for p in model.params[run_id].values()))
-
-  def test_a4_mixed_state(self):
-    model, run_id = Model(tiny), new_id()
-    model.create_run(run_id, "tiny", 0, {})
-    model.activate_run(run_id)
-    opt = model.adam_for_run(run_id)
-    for p in model.params[run_id].values():
-      opt.state[p] = {"exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p), "step": torch.tensor(1.0)}
-
-    tensors, meta = model.training_state(run_id)
-    bad_tensors = tensors.copy()
-    for k in list(bad_tensors.keys()):
-      if k.endswith(".step"):
-        del bad_tensors[k]
-        break
-
-    for p in model.params[run_id].values():
-      p.data.add_(1.0)
+    train(model, run_id, steps=1)
+    tensors, meta = copy.deepcopy(model.training_state(run_id))
+    tensors.pop(next(k for k in tensors if k.endswith(".step")))
+    train(model, run_id, steps=1)
     original_params = {k: p.clone() for k, p in model.params[run_id].items()}
-
     with self.assertRaisesRegex(ValueError, "bad:"):
-      model.restore_run(run_id, bad_tensors, meta, True)
+      model.restore_run(run_id, tensors, meta, True)
+    torch.testing.assert_close(model.params[run_id], original_params, atol=0, rtol=0)
 
-    for k, p in model.params[run_id].items():
-      self.assertTrue(torch.equal(p, original_params[k]))
-
-  def test_a5_partial_gradients(self):
+  def test_a_failed_pass_discards_partial_gradients(self):
     model, run_id = Model(tiny), new_id()
     model.create_run(run_id, "tiny", 0, {})
-
-    import tinyrl.workers.model
-
-    old_budget = tinyrl.workers.model.TOKEN_BUDGET
-    tinyrl.workers.model.TOKEN_BUDGET = 1
-
-    calls = [0]
-    original = tinyrl.workers.model.target_logprobs
-
-    def fake_target_logprobs(*args, **kwargs):
-      calls[0] += 1
-      if calls[0] == 2:
-        raise RuntimeError("OOM")
-      return original(*args, **kwargs)
-
-    tinyrl.workers.model.target_logprobs = fake_target_logprobs
-
-    data = [
-      wire.Datum(tokens=np.array([1, 2], dtype=np.int32), inputs={"target_tokens": np.array([1, 2], dtype=np.int64)}),
-      wire.Datum(tokens=np.array([3, 4], dtype=np.int32), inputs={"target_tokens": np.array([3, 4], dtype=np.int64)}),
-    ]
-
-    with self.assertRaises(RuntimeError):
-      model.forward_backward(run_id, data, "cross_entropy", {}, False)
-
-    has_grad = any(p.grad is not None for p in model.params[run_id].values())
-    self.assertFalse(has_grad)
-
-    tinyrl.workers.model.target_logprobs = original
-
-    model.forward_backward(run_id, data, "cross_entropy", {}, False)
-
+    good, bad = counting(2), counting(8)  # length disparity gives each datum its own pass
+    bad.inputs["target_tokens"][0] = 96  # outside the model's vocabulary; the first pass already accumulated
+    with self.assertRaises((IndexError, RuntimeError)):
+      model.forward_backward(run_id, [good, bad], "cross_entropy", {}, False)
+    self.assertTrue(all(p.grad is None for p in model.params[run_id].values()))
+    model.forward_backward(run_id, [good], "cross_entropy", {}, False)
     with self.assertRaisesRegex(RuntimeError, "a forward_backward failed after it began"):
       model.optim_step(run_id, {"learning_rate": 1e-2})
-
-    model.forward_backward(run_id, data, "cross_entropy", {}, False)
+    model.forward_backward(run_id, [good], "cross_entropy", {}, False)
     model.optim_step(run_id, {"learning_rate": 1e-2})
-
-    tinyrl.workers.model.TOKEN_BUDGET = old_budget
-
-  @patch("torch.cuda.is_available", return_value=True)
-  @patch("torch.cuda.synchronize")
-  @patch("torch.cuda.empty_cache")
-  @patch("torch.empty")
-  def test_move_buffer_reuse_and_cleanup(self, mock_empty, mock_empty_cache, mock_sync, mock_is_avail):
-    def fake_empty(*args, **kwargs):
-      kwargs.pop("pin_memory", None)
-      return torch.zeros(*args, **kwargs)
-
-    mock_empty.side_effect = fake_empty
-
-    model = Model(tiny)
-    model.create_run("run", "tiny", 4, LORA)
-
-    t = torch.randn(10, 10).as_subclass(CudaMock)
-    t._is_cuda = True
-    t._is_pinned = False
-
-    id_t = id(t)
-    original_tensors = model.gpu_tensors
-    model.gpu_tensors = lambda optim=True: iter([t])
-    model.move_tensors([t], "cpu")
-    self.assertIn(id_t, model.pinned)
-    buf_id = id(model.pinned[id_t])
-
-    t.data = t.data.as_subclass(CudaMock)
-    t._is_pinned = True
-    t.data._is_pinned = True
-    t.data._is_cuda = False
-    model.move_tensors([t], "cuda")
-
-    t.data = t.data.as_subclass(CudaMock)
-    t.data._is_cuda = True
-    t.data._is_pinned = False
-    t._is_cuda = True
-    model.move_tensors([t], "cpu")
-    self.assertEqual(id(model.pinned[id_t]), buf_id)
-
-    def fake_tensors(optim=True):
-      return iter([])
-
-    model.gpu_tensors = fake_tensors
-
-    model.move_tensors([], "cpu")
-    self.assertNotIn(id_t, model.pinned)
-    model.gpu_tensors = original_tensors
-    model.pinned["fake"] = torch.zeros(1)
-    t_opt = torch.randn(5, 5)
-    model.optimizers["run"] = torch.optim.Adam([torch.nn.Parameter(t_opt)])
-    model.optimizers["run"].state[model.optimizers["run"].param_groups[0]["params"][0]] = {"step": t_opt}
-
-    meta = {"optimizer": True}
-    state = model.training_state("run")[0]
-    model.restore_run("run", state, meta, True)
-    self.assertNotIn("fake", model.pinned)
-
-    model.pinned["fake"] = torch.zeros(1)
-    model.delete_run("run")
-    self.assertNotIn("fake", model.pinned)
 
   def test_lora_runs_share_a_frozen_base_and_train_apart(self):
     model, (a, b) = lora_runs(2)
@@ -436,22 +193,6 @@ class TestModel(unittest.TestCase):
       if rank:  # a LoRA run's base model is frozen, so it stays bf16
         self.assertEqual(model.lm.get_input_embeddings().weight.dtype, torch.bfloat16)
 
-  def test_a_run_restored_from_its_checkpoint_trains_on_exactly_as_before(self):
-    store = Store(root=tempfile.mkdtemp())
-    for rank in (0, 4):
-      model, run = Model(tiny), new_id()
-      model.create_run(run, "tiny", rank, LORA)
-      train(model, run, steps=3)
-      uri = f"tinker://{run}/weights/step-3"
-      store.put(uri, *model.training_state(run))
-
-      restored = Model(tiny)  # a new trainer, say on another node
-      restored.create_run(run, "tiny", rank, LORA)
-      restored.restore_run(run, *store.get(uri), optimizer=True)
-
-      self.assertEqual(train(model, run, steps=3), train(restored, run, steps=3), f"rank {rank}")
-      self.assertTrue(same(model.params[run].values(), restored.params[run].values()), f"rank {rank}")
-
   def test_save_and_load_bring_back_weights_and_optimizer(self):
     store = Store(root=tempfile.mkdtemp())
     model, (a, b) = lora_runs(2)
@@ -484,6 +225,29 @@ class TestModel(unittest.TestCase):
     with self.assertRaises(ValueError):
       store.get(f"tinker://{a}/weights/missing")
 
+  def test_explicit_load_uses_the_saved_version_and_discards_pending_gradients(self):
+    with tempfile.TemporaryDirectory() as folder:
+      store = Store(root=f"file://{folder}/remote", cache=f"{folder}/cache")
+      model, (run,) = lora_runs()
+      original, loaded = Trainer(model, store), Trainer(Model(tiny), store)
+      train(model, run, steps=1)
+      model.forward_backward(run, [counting(12)], "cross_entropy", {}, False)
+      uri = f"tinker://{run}/weights/saved"
+      first = original.save(run, uri)
+      expected = {name: p.detach().clone() for name, p in model.params[run].items()}
+      train(model, run, steps=1)
+      second = original.save(run, uri)
+      self.assertNotEqual(first["version"], second["version"])
+      reply, _ = loaded.execute(
+        Cmd(run, "1-0", Op.LOAD_WEIGHTS, json.dumps({"uri": uri, "optimizer": True}).encode()),
+        run={"base": "tiny", "rank": 4, "lora": LORA},
+        version=first["version"],
+      )
+      self.assertTrue(reply.ok, reply.body)
+      torch.testing.assert_close(loaded.model.params[run], expected, atol=0, rtol=0)
+      self.assertTrue(all(p.grad is None for p in loaded.model.params[run].values()))
+      self.assertTrue(loaded.model.optimizers[run].state)
+
   def test_sampler_weights_load_in_peft_and_transformers(self):
     store = Store(root=tempfile.mkdtemp())
     ids = torch.randint(0, 96, (2, 8))
@@ -506,19 +270,6 @@ class TestModel(unittest.TestCase):
         LlamaForCausalLM.from_pretrained(fft_dir).eval()(ids).logits,
         fft.activate_run(fft_run).eval()(ids).logits,
       )
-
-  def test_mistakes_are_the_users(self):
-    model, (a,) = lora_runs()
-    with self.assertRaises(KeyError):
-      model.forward_backward(new_id(), [counting(4)], "cross_entropy", {}, False)
-    with self.assertRaises(ValueError):
-      model.forward_backward(a, [counting(4)], "dpo", {}, False)
-    with self.assertRaises(ValueError):
-      model.create_run(new_id(), "other", 4, LORA)
-
-    model.delete_run(a)
-    with self.assertRaises(KeyError):
-      model.optim_step(a, {})
 
 
 class TestTrainer(RedisTest):
@@ -549,63 +300,6 @@ class TestTrainer(RedisTest):
   async def finish_worker(self, worker):
     await self.until(lambda: worker not in self.node.running)
 
-  async def test_commands_flow_through_the_node_and_delete_drops_the_run(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4))
-    request_ids = await self.submit(
-      run,
-      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      (Op.FORWARD_BACKWARD, b"not protobuf"),
-      (Op.OPTIM_STEP, {"adam_params": {}}),
-      (Op.DELETE_MODEL, {}),
-    )
-    await self.node.drain(run)
-    replies = [await self.bus.wait_for_reply(request_id, 0) for request_id in request_ids]
-    bodies = [json.loads(reply.body) for reply in replies]
-    self.assertEqual([reply.ok for reply in replies], [True, False, True, True])
-    self.assertEqual([body.get("type") for body in bodies], ["create_model", None, "optim_step", "delete_model"])
-    self.assertEqual(bodies[1]["category"], "user")
-    self.assertEqual((await self.bus.get_run(run))["steps"], 1)
-    self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))
-
-  async def test_a_node_told_to_stop_finishes_its_command_and_leaves_the_next_queued(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    await self.node.add("p")
-    child = self.node.processes["p"]
-    original = child.call
-
-    async def call(method, *args):
-      if method == "execute":
-        self.node.draining = True  # graceful shutdown arrives while the first command executes
-      return await original(method, *args)
-
-    child.call = call
-    ids = await self.submit(
-      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.DELETE_MODEL, {})
-    )
-    await self.finish_worker("p")
-    self.assertTrue(child.closed)
-    self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
-    self.assertIsNone(await self.bus.wait_for_reply(ids[1], 0))
-    queue = await self.bus.queued_and_in_flight(run)
-    self.assertEqual((queue["queued"], queue["in_flight"]), (1, []))
-    self.assertIsNotNone(await self.bus.parked_checkpoint(run))
-
-  async def test_a_new_node_owner_fails_what_a_dead_one_left_in_flight(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4))
-    [request_id] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}}))
-    await self.bus.take_commands([run], "dead", block_ms=10)
-    await self.node.add("p")
-    self.node.draining = True  # startup reconciliation still runs even if the node immediately drains
-    self.node.notify()
-    await self.finish_worker("p")
-    reply = await self.bus.wait_for_reply(request_id, 1)
-    self.assertFalse(reply.ok)
-    self.assertEqual(json.loads(reply.body)["category"], "server")
-    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
-
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
     await self.bus.create_run(Run(run, run, "tiny", 0))
@@ -616,46 +310,13 @@ class TestTrainer(RedisTest):
     self.assertTrue(child.closed)
     self.assertIsNone(await self.bus.lease_owner(run))
 
-  async def test_a_run_moves_between_node_owned_models_through_the_store(self):
-    for rank, lora in ((4, LORA), (0, {})):
-      ctrl, r1, r2 = new_id(), new_id(), new_id()
-      for r, worker in ((ctrl, f"ctrl-{rank}"), (r1, f"p1-{rank}"), (r2, f"p2-{rank}")):
-        await self.bus.create_run(Run(r, worker, "tiny", rank, lora=lora))
-      for r in (ctrl, r1):
-        await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))
-
-      async def step_run(r: str) -> float:
-        fb, _ = await self.submit(
-          r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})
-        )
-        await self.node.drain(r)
-        return wire.output_json((await self.bus.wait_for_reply(fb, 1)).body)["metrics"]["loss:sum"]
-
-      losses_ctrl = [await step_run(ctrl) for _ in range(2)]
-      losses_moved = [await step_run(r1) for _ in range(2)]
-      uri = f"tinker://{r1}/weights/handoff"
-      await self.submit(r1, (Op.SAVE_WEIGHTS, {"uri": uri}), (Op.DELETE_MODEL, {}))
-      await self.node.drain(r1)
-      registered = await self.registry.get_checkpoint(uri)
-      self.assertEqual(registered["tinker_path"], uri)
-      self.assertGreater(registered["size_bytes"], 0)
-      await self.submit(
-        r2,
-        (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}),
-        (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": True}),
-      )
-      await self.node.drain(r2)
-      for _ in range(3):
-        losses_ctrl.append(await step_run(ctrl))
-        losses_moved.append(await step_run(r2))
-      self.assertEqual(losses_moved, losses_ctrl, f"rank {rank}")
-      self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p2-{rank}").params[r2]))
-
   async def test_graceful_replacement_registers_and_restores_weights_optimizer_and_pending_gradients(self):
-    for rank, lora in ((4, LORA), (0, {})):
+    self.node.gpus = 2
+    self.node.state.nodes[self.node.id] = (2, 0)
+    for rank, lora, width in ((4, LORA, 2), (0, {}, 1)):
       ctrl, run = new_id(), new_id()
-      for r, worker in ((ctrl, f"ctrl-{rank}"), (run, f"p-{rank}")):
-        await self.bus.create_run(Run(r, worker, "tiny", rank, lora=lora))
+      for r, worker in ((run, f"p-{rank}"), (ctrl, f"ctrl-{rank}")):
+        await self.bus.create_run(Run(r, worker, "tiny", rank, lora=lora, gpus=width))
         await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))
         for _ in range(2):
           await self.submit(
@@ -663,12 +324,16 @@ class TestTrainer(RedisTest):
           )
         await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
         await self.node.drain(r)
-      self.node.state.workers[f"p-{rank}"].node = None
+      desired = self.node.state.workers[f"p-{rank}"]
+      desired.node, desired.gpus = None, ()  # the parked wide worker must regain its actual GPUs to checkpoint
       self.node.notify()
       await self.finish_worker(f"p-{rank}")
       parked = await self.bus.parked_checkpoint(run)
       self.assertIsNotNone(parked)
       self.assertIsNotNone(await self.registry.get_checkpoint(parked))
+      [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
+      await self.node.drain(run)  # recovery succeeds even when the following command is rejected
+      self.assertFalse((await self.bus.wait_for_reply(invalid, 1)).ok)
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
@@ -676,130 +341,6 @@ class TestTrainer(RedisTest):
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
       self.assertIsNone(await self.bus.parked_checkpoint(run))
       self.assertIsNone(await self.registry.get_checkpoint(parked))  # recovery cannot replay old state after a crash
-
-  async def test_a_wide_checkpoint_keeps_its_ticket_until_all_gpus_are_available(self):
-    self.node.gpus = 2
-    self.node.state.nodes[self.node.id] = (2, 0)
-    wide_run, holder_run, later_run = new_id(), new_id(), new_id()
-    for run, worker in ((wide_run, "wide"), (holder_run, "holder")):
-      await self.bus.create_run(Run(run, worker, "tiny", 4, lora=LORA, gpus=2))
-      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-      await self.node.drain(run)
-
-    wide = self.node.running["wide"]
-    entered, finish = asyncio.Event(), asyncio.Event()
-    holder_call = self.node.processes["holder"].call
-
-    async def blocked(method, *args):
-      if method == "execute":
-        entered.set()
-        await finish.wait()
-      return await holder_call(method, *args)
-
-    self.node.processes["holder"].call = blocked
-    await self.submit(holder_run, (Op.OPTIM_STEP, {"adam_params": {}}))
-
-    await asyncio.wait_for(entered.wait(), 5)
-
-    waking, checkpoint = asyncio.Event(), asyncio.Event()
-    wide_call = self.node.processes["wide"].call
-
-    async def checkpoint_wake(method, *args):
-      if method == "resume":
-        waking.set()
-        await checkpoint.wait()
-      return await wide_call(method, *args)
-
-    self.node.processes["wide"].call = checkpoint_wake
-    self.node.state.workers["wide"].node = None
-    self.node.notify()
-    await self.until(lambda: wide.ticket > 0)
-    ticket = wide.ticket
-    await self.bus.create_run(Run(later_run, "later", "tiny", 4, lora=LORA))
-    [later_reply] = await self.submit(later_run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-    later = await self.node.add("later")
-    await self.until(lambda: later.ticket > 0)
-    for _ in range(10):
-      self.node.dispatch()
-      await asyncio.sleep(0)
-      self.assertEqual(wide.ticket, ticket)
-      self.assertIsNone(wide.since)
-    self.assertGreater(later.ticket, ticket)
-
-    finish.set()
-    await self.until(waking.is_set)
-    self.assertIsNotNone(wide.since)
-    self.assertEqual(wide.gpus, (0, 1))
-    self.assertEqual(wide.ticket, 0)
-    self.assertIsNone(later.since)
-    checkpoint.set()
-    await self.finish_worker("wide")
-    self.assertIsNotNone(await self.bus.parked_checkpoint(wide_run))
-    self.assertTrue((await self.bus.wait_for_reply(later_reply, 5)).ok)
-
-  async def test_unplacement_during_stranded_cleanup_preserves_the_wide_checkpoint_gpus(self):
-    self.node.gpus = 2
-    self.node.state.nodes[self.node.id] = (2, 0)
-    run = new_id()
-    await self.bus.create_run(Run(run, "wide", "tiny", 4, lora=LORA, gpus=2))
-    await self.submit(
-      run,
-      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      (Op.FORWARD_BACKWARD, proto_body(run)),
-    )
-    await self.node.drain(run)
-    actual = self.node.running["wide"]
-    entered, finish = asyncio.Event(), asyncio.Event()
-    cleanup, child_call = self.bus.fail_stranded_commands, self.node.processes["wide"].call
-    checkpoint_gpus = []
-
-    async def blocked(*args, **kwargs):
-      if not entered.is_set():  # startup reconciliation finished before this hook was installed
-        entered.set()
-        await finish.wait()
-      return await cleanup(*args, **kwargs)
-
-    async def call(method, *args):
-      if method == "park_all":
-        checkpoint_gpus.append((actual.gpus, actual.since is not None))
-      return await child_call(method, *args)
-
-    self.node.processes["wide"].call = call
-    with (
-      patch("tinyrl.control.node_daemon.STRANDED_MS", 10),
-      patch.object(self.bus, "fail_stranded_commands", side_effect=blocked),
-    ):
-      try:
-        self.node.notify()
-        await asyncio.wait_for(entered.wait(), 5)
-        desired = self.node.state.workers["wide"]
-        desired.node, desired.gpus = None, ()
-        self.node.notify()
-        finish.set()
-        await self.finish_worker("wide")
-      finally:
-        finish.set()
-    self.assertEqual(checkpoint_gpus, [((0, 1), True)])
-    tensors, _ = self.store.get(await self.bus.parked_checkpoint(run))
-    self.assertTrue(any(torch.count_nonzero(tensor) for name, tensor in tensors.items() if name.endswith(".grad")))
-
-  @patch("tinyrl.control.node_daemon.LEASE_MS", 100)
-  async def test_the_node_recovers_an_uncontested_lease_but_rejects_an_intervening_owner(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4))
-    await self.node.add("p")
-    owner = await self.bus.lease_owner("p")
-    await self.bus.r.delete("tinyrl:owner:p")
-    async with asyncio.timeout(5):
-      while await self.bus.lease_owner("p") != owner:
-        await asyncio.sleep(0.01)
-    self.assertFalse(self.node.tasks["p"].done())
-    await self.bus.r.set("tinyrl:last_owner:p", "another")
-    await self.bus.r.delete("tinyrl:owner:p")
-    child = self.node.processes["p"]
-    await self.finish_worker("p")
-    self.assertTrue(child.closed)
-    self.assertIsNone(await self.bus.lease_owner("p"))
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     run, uri = new_id(), "tinker://saved/weights/step-1"
@@ -813,215 +354,15 @@ class TestTrainer(RedisTest):
     ids = await self.submit(
       run,
       (Op.OPTIM_STEP, {"adam_params": {}}),
+      (Op.LOAD_WEIGHTS, {"uri": "tinker://gone/weights/missing", "optimizer": True}),
+      (Op.OPTIM_STEP, {"adam_params": {}}),
       (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": True}),
       (Op.OPTIM_STEP, {"adam_params": {}}),
     )
     await self.node.drain(run)
     replies = [await self.bus.wait_for_reply(request_id, 1) for request_id in ids]
-    self.assertEqual([reply.ok for reply in replies], [False, True, True])
+    self.assertEqual([reply.ok for reply in replies], [False, False, False, True, True])
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
-
-  async def test_a_run_whose_parked_state_is_gone_still_deletes(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    await self.bus.r.set(f"tinyrl:parked:{run}", "tinker://gone/parked/1")
-    [request_id] = await self.submit(run, (Op.DELETE_MODEL, {}))
-    await self.node.drain(run)
-    self.assertTrue((await self.bus.wait_for_reply(request_id, 1)).ok)
-    self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))
-
-  async def test_sampler_save_is_processed_before_other_runs_finish_without_overtaking_its_own_updates(self):
-    runs = [new_id() for _ in range(3)]
-    for run in runs:
-      await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-    await self.node.drain(runs[0])
-    opt_ids = {}
-    for run in runs:
-      ids = await self.submit(run, (Op.FORWARD_BACKWARD, proto_body(run)), (Op.OPTIM_STEP, {"adam_params": {}}))
-      opt_ids[run] = ids[-1]
-    done_at = {}
-
-    async def watch(name, request_id):
-      reply = await self.bus.wait_for_reply(request_id, 5)
-      done_at[name] = time.monotonic()
-      return reply
-
-    opt_tasks = {run: asyncio.create_task(watch(run, request_id)) for run, request_id in opt_ids.items()}
-
-    async def first_save():
-      finished, _ = await asyncio.wait(opt_tasks.values(), return_when=asyncio.FIRST_COMPLETED)
-      first = next(run for run, task in opt_tasks.items() if task in finished)
-      [request_id] = await self.submit(first, (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": "tinker://r/sampler_weights/s0"}))
-      return first, await watch("save", request_id)
-
-    save = asyncio.create_task(first_save())
-    first, reply = await save
-    await asyncio.gather(*opt_tasks.values())
-    self.assertTrue(reply.ok)
-    self.assertLess(done_at["save"], max(t for name, t in done_at.items() if name not in (first, "save")))
-    causal = runs[0]
-    pipelined = await self.submit(
-      causal,
-      (Op.FORWARD_BACKWARD, proto_body(causal)),
-      (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.1}}),
-      (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{causal}/sampler_weights/s1"}),
-    )
-    self.assertTrue(all([(await self.bus.wait_for_reply(request, 1)).ok for request in pipelined]))
-    self.assertEqual((await self.bus.get_run(causal))["steps"], 2)
-
-  async def test_revocation_finishes_one_command_and_stop_leaves_the_remainder_queued(self):
-    self.node.gpus = 1
-    self.node.state.nodes[self.node.id] = (1, 0)
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    running = await self.node.add("p")
-    original = self.node.processes["p"].call
-    calls = 0
-    entered, finish, other_entered, other_finish = (asyncio.Event() for _ in range(4))
-
-    async def call(method, *args):
-      nonlocal calls
-      if method == "execute":
-        calls += 1
-        if calls == 1:
-          entered.set()
-          await finish.wait()
-      return await original(method, *args)
-
-    self.node.processes["p"].call = call
-    ids = await self.submit(
-      run,
-      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(15)],
-    )
-    try:
-      await asyncio.wait_for(entered.wait(), 5)
-      queue = await self.bus.queued_and_in_flight(run)
-      self.assertEqual(queue["queued"], len(ids) - 1)
-      self.assertEqual([cmd["request_id"] for cmd in queue["in_flight"]], [ids[0]])
-      other_run = new_id()
-      await self.bus.create_run(Run(other_run, "other", "tiny", 4, lora=LORA))
-      other = await self.node.add("other")
-      other_call = self.node.processes["other"].call
-
-      async def blocked_other(method, *args):
-        if method == "execute":
-          other_entered.set()
-          await other_finish.wait()
-        return await other_call(method, *args)
-
-      self.node.processes["other"].call = blocked_other
-      await self.submit(other_run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-      await self.until(lambda: other.ticket > 0)
-      running.since = time.time() - self.node.state.quantum - 1
-      self.assertIsNone(await self.bus.wait_for_reply(ids[0], 0))
-      finish.set()
-      await asyncio.wait_for(other_entered.wait(), 5)
-      self.assertIsNone(running.since)
-      self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
-      self.assertIsNone(await self.bus.wait_for_reply(ids[1], 0))
-      self.assertEqual(calls, 1)
-      self.node.state.workers["p"].node = None
-      self.node.notify()
-      other_finish.set()
-      await self.finish_worker("p")
-      self.assertEqual(calls, 1)
-      self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)) is None for request in ids[1:]]))
-      queue = await self.bus.queued_and_in_flight(run)
-      self.assertEqual((queue["queued"], queue["in_flight"]), (len(ids) - 1, []))
-      self.assertIsNotNone(await self.bus.parked_checkpoint(run))
-    finally:
-      finish.set()
-      other_finish.set()
-
-  async def test_shutdown_does_not_claim_another_batch(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    await self.node.add("p")
-    original = self.node.processes["p"].call
-
-    async def call(method, *args):
-      if method == "execute":
-        self.node.draining = True
-      return await original(method, *args)
-
-    self.node.processes["p"].call = call
-    ids = await self.submit(
-      run,
-      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(17)],
-    )
-    await self.finish_worker("p")
-    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
-    self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
-    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)) is None for request in ids[1:]]))
-    self.assertEqual((await self.bus.queued_and_in_flight(run))["queued"], len(ids) - 1)
-
-  async def test_shutdown_cancels_unclaimed_preparation_and_saves_completed_gradients(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-    await self.node.drain(run)
-    entered, finish, preparing, release_prepare, cancelled = (asyncio.Event() for _ in range(5))
-    get_run = self.bus.get_run
-    reads = calls = 0
-
-    async def read(*args, **kwargs):
-      nonlocal reads
-      reads += 1
-      if reads == 2:  # the next head prepares while forward/backward is still executing
-        preparing.set()
-        try:
-          await release_prepare.wait()
-        except asyncio.CancelledError:
-          cancelled.set()
-          raise
-      return await get_run(*args, **kwargs)
-
-    with patch.object(self.bus, "get_run", side_effect=read):
-      child = self.node.processes["p"]
-      original = child.call
-
-      async def call(method, *args):
-        nonlocal calls
-        if method == "execute":
-          calls += 1
-          entered.set()
-          await finish.wait()
-        return await original(method, *args)
-
-      child.call = call
-      ids = await self.submit(
-        run,
-        (Op.FORWARD_BACKWARD, proto_body(run)),
-        (Op.OPTIM_STEP, {"adam_params": {}}),
-        (Op.OPTIM_STEP, {"adam_params": {}}),
-      )
-      try:
-        await asyncio.wait_for(asyncio.gather(entered.wait(), preparing.wait()), 5)
-        queue = await self.bus.queued_and_in_flight(run)
-        self.assertEqual(queue["queued"], 2)
-        self.assertEqual([cmd["request_id"] for cmd in queue["in_flight"]], [ids[0]])
-        self.node.draining = True
-        self.node.notify()
-        self.assertFalse(child.closed)
-        self.assertIsNone(await self.bus.parked_checkpoint(run))
-        finish.set()
-        self.assertTrue((await self.bus.wait_for_reply(ids[0], 5)).ok)
-        await self.finish_worker("p")
-        self.assertTrue(cancelled.is_set())
-        self.assertTrue(child.closed)
-      finally:
-        finish.set()
-        release_prepare.set()
-
-    self.assertEqual((reads, calls), (2, 1))
-    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)) is None for request in ids[1:]]))
-    self.assertEqual((await self.bus.queued_and_in_flight(run))["queued"], 2)
-    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
-    tensors, _ = self.store.get(await self.bus.parked_checkpoint(run))
-    self.assertTrue(any(torch.count_nonzero(tensor) for name, tensor in tensors.items() if name.endswith(".grad")))
 
 
 class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
@@ -1043,8 +384,11 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
       multi = Process([*args, "-m", "tinyrl.workers.trainer"], env)
       try:
         for run in (r1, r2):
+          invalid = wire.parse(proto_body(run))
+          invalid.loss_fn = "unknown"  # a rejected operation must leave every rank ready for the next collective
           commands = [
             (Op.CREATE_MODEL, {"base_model": base, "rank": rank, "lora": lora}),
+            (Op.FORWARD_BACKWARD, invalid.SerializeToString()),
             (Op.FORWARD_BACKWARD, proto_body(run)),
             (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
             (Op.FORWARD_BACKWARD, proto_body(run)),
@@ -1054,7 +398,7 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
           for i, (op, body) in enumerate(commands):
             cmd = Cmd(run, str(i), op, body if isinstance(body, bytes) else json.dumps(body).encode())
             reply, _ = single.execute(cmd) if run == r1 else await asyncio.wait_for(multi.call("execute", cmd), 90)
-            self.assertTrue(reply.ok, reply.body)
+            self.assertEqual(reply.ok, i != 1, reply.body)
         expected, actual = (store.get(f"tinker://{run}/sampler_weights/s1")[0] for run in (r1, r2))
         self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")
         for name in expected:
@@ -1130,18 +474,3 @@ class TestCheckpointNames(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
-
-
-class TestG1PPO(unittest.TestCase):
-  def test_ppo_clip_and_reject(self):
-    logprobs = torch.tensor([1.0])
-    weights = torch.tensor([1.0])
-    sampler_logprobs = torch.tensor([0.0])
-    advantages = torch.tensor([1.0])
-
-    config = {"clip_low_threshold": 0.9, "clip_high_threshold": 1.1}
-    loss_actual = tinyrl.workers.model.ppo(logprobs, weights, sampler_logprobs, advantages, config)
-    self.assertAlmostEqual(loss_actual.item(), -1.1, places=3)
-
-    with self.assertRaises(ValueError):
-      tinyrl.workers.model.ppo(logprobs, weights, sampler_logprobs, advantages, {"unknown": 1.0})

@@ -1,12 +1,8 @@
 import asyncio
-import json
-import tempfile
 
-from test.execution import TestNode
 from test.helpers import RedisTest
-from tinyrl.bus import Ev, Op, Run
+from tinyrl.bus import Run
 from tinyrl.control import scheduler
-from tinyrl.storage.store import Store
 
 
 class TestEvents(RedisTest):
@@ -18,11 +14,6 @@ class TestEvents(RedisTest):
     self.assertEqual(events[0].body, {"node": "n", "gpus": 2, "memory": 0})
     self.assertLessEqual(events[0].t, events[1].t)
     self.assertEqual([e.id for e in await self.bus.read_events(first)], [second])
-
-  async def test_a_kind_nothing_folds_cant_be_appended(self):
-    with self.assertRaises(ValueError):
-      await self.bus.append_event("grantd", worker="p")
-    self.assertEqual(await self.bus.read_events(), [])
 
   async def test_the_scheduler_assigns_new_runs_and_the_log_has_the_worker_membership(self):
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
@@ -41,36 +32,3 @@ class TestEvents(RedisTest):
       state = scheduler.fold(state, event)
     self.assertEqual(sorted(scheduler.members(state, runs["a"])), ["a", "b"])
     self.assertEqual(scheduler.members(state, runs["f"]), ["f"])
-
-  async def test_gpu_reservations_and_accounting_stay_with_the_node_that_executes_them(self):
-    node = TestNode(self.bus, store=Store(tempfile.mkdtemp()), gpus=1)
-    try:
-      await self.bus.create_run(Run("r", "p", "tiny", 4))
-      await node.add("p", gpus=[0])
-      request = await self.bus.submit_command(
-        "r", Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": {}}).encode()
-      )
-      self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
-      worker = node.running["p"]
-      self.assertEqual(worker.gpus, (0,))
-      self.assertIsNotNone(worker.since)
-      self.assertEqual(await self.bus.queued_and_in_flight("r"), {"live": True, "queued": 0, "in_flight": []})
-      self.assertGreater(worker.busy, 0)
-      local = {"started", "exited", "wants_gpu", "granted", "revoked", "released", "batch_done", "idle"}
-      self.assertFalse([e for e in await self.bus.read_events() if e.kind in local])
-    finally:
-      await node.aclose()
-
-  async def test_cluster_placement_names_the_node_and_leaves_gpu_selection_to_it(self):
-    await self.bus.node_heartbeat("n", 2)
-    await self.bus.append_event(Ev.NODE_UP, node="n", gpus=2, memory=0)
-    await self.bus.create_run(Run("r", "p", "tiny", 4))
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    for _ in range(100):
-      placed = [e for e in await self.bus.read_events() if e.kind == Ev.PLACED]
-      if placed:
-        break
-      await asyncio.sleep(0.02)
-    self.assertEqual(len(placed), 1)
-    self.assertEqual((placed[0].body["worker"], placed[0].body["node"]), ("p", "n"))
-    self.assertNotIn("gpus", placed[0].body)

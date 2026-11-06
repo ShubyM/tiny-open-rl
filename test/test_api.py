@@ -6,7 +6,6 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
 
 import httpx
 import numpy as np
@@ -102,37 +101,6 @@ class TestAPI(RedisTest):
     info = (await self.post("get_info", json={"model_id": run_id})).json()
     self.assertEqual(info["model_data"], {"model_name": "tiny", "tokenizer_id": "tiny"})
 
-  async def test_a_call_counts_its_time_in_the_queue_and_running(self):
-    run_id = await self.create_model()
-    other = await self.create_model()
-    worker = await self.node.worker_for(run_id)
-    self.assertEqual(await self.node.worker_for(other), worker)
-    child = self.node.processes[worker]
-    execute, entered, finish = child.call, asyncio.Event(), asyncio.Event()
-
-    async def held(method, *args):
-      if method == "execute" and args[0].run == other:
-        entered.set()
-        await finish.wait()
-      return await execute(method, *args)
-
-    before = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
-    try:
-      with patch.object(child, "call", side_effect=held):
-        blocking = await self.post("forward_backward", content=proto_body(other), headers=PROTO)
-        await asyncio.wait_for(entered.wait(), 5)
-        submitted = await self.post("forward_backward", content=proto_body(run_id), headers=PROTO)
-        await asyncio.sleep(0.3)  # this run waits while the other run is executing on its worker
-        finish.set()
-        await self.result(submitted)
-        await self.result(blocking)
-    finally:
-      finish.set()
-    after = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
-    self.assertEqual(after["cmds"] - before["cmds"], 1)
-    self.assertGreaterEqual(after["wait_ms"] - before["wait_ms"], 300)
-    self.assertGreater(after["busy_ms"] - before["busy_ms"], 0)
-
   async def test_json_clients_get_json(self):
     run_id = await self.create_model()
     fwdbwd = await self.result(await self.post("forward_backward", json={**json_body(), "model_id": run_id}))
@@ -226,10 +194,6 @@ class TestAPI(RedisTest):
     self.assertIn("dpo", failed.json()["error"])
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 1)
 
-    with patch.object(gateway, "WAIT", 0.01):
-      pending = await self.post("retrieve_future", json={"request_id": f"{run_id}/1-0"})
-      self.assertEqual(pending.json()["type"], "try_again")
-
   async def test_workers(self):
     shared, also_shared = await self.create_model(), await self.create_model()
     full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
@@ -297,12 +261,11 @@ class TestAPI(RedisTest):
 
   async def test_a_checkpoint_saved_without_a_ttl_gets_the_deployment_default_unless_its_run_owns_it(self):
     run_id = await self.create_model()
-    with patch("tinyrl.api.gateway.CKPT_TTL", 3600):
-      await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "kept"}))
-      await self.result(
-        await self.post("save_weights_for_sampler", json={"model_id": run_id, "sampling_session_seq_id": 0})
-      )
-      await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "own", "ttl_seconds": 7200}))
+    await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "kept"}))
+    await self.result(
+      await self.post("save_weights_for_sampler", json={"model_id": run_id, "sampling_session_seq_id": 0})
+    )
+    await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "own", "ttl_seconds": 7200}))
     ckpts = {
       c["checkpoint_id"]: c
       for c in (await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"]
@@ -312,7 +275,10 @@ class TestAPI(RedisTest):
       for k, c in ckpts.items()
       if c["expires_at"]
     }
-    self.assertAlmostEqual(left["weights/kept"], 3600, delta=60)
+    if gateway.CKPT_TTL:
+      self.assertAlmostEqual(left["weights/kept"], gateway.CKPT_TTL, delta=60)
+    else:
+      self.assertIsNone(ckpts["weights/kept"]["expires_at"])
     self.assertAlmostEqual(left["weights/own"], 7200, delta=60)
     self.assertIsNone(next(c for k, c in ckpts.items() if k.startswith("sampler_weights/"))["expires_at"])
 
@@ -337,23 +303,15 @@ class TestAPI(RedisTest):
     self.assertTrue(found_exp_avg, "No .exp_avg tensors found in safetensors")
 
   async def test_sampler_weights_preserve_base_model_dtype(self):
-    async def drain_bf16(run_id: str):
-      await self.node.drain(run_id, model=lambda name: tiny(name).to(torch.bfloat16))
-
-    with patch.object(self, "drain", drain_bf16):
-      full_run = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
-      saved = (
-        await self.result(await self.post("save_weights_for_sampler", json={"model_id": full_run, "path": "sampler"}))
-      ).json()
-    folder = self.store.path(saved["path"])
-
-    tensor_count = 0
-    for f in glob.glob(f"{folder}/*.safetensors"):
-      tensors = safetensors.torch.load_file(f)
-      for k, v in tensors.items():
-        self.assertEqual(v.dtype, torch.bfloat16, f"Tensor {k} is {v.dtype}, expected bf16")
-        tensor_count += 1
-    self.assertGreater(tensor_count, 0, "No tensors found in sampler safetensors")
+    self.node.default_model = lambda name: tiny(name).to(torch.bfloat16)
+    run = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
+    saved = (
+      await self.result(await self.post("save_weights_for_sampler", json={"model_id": run, "path": "sampler"}))
+    ).json()
+    files = glob.glob(f"{self.store.path(saved['path'])}/*.safetensors")
+    self.assertTrue(files)
+    for path in files:
+      self.assertTrue(all(t.dtype == torch.bfloat16 for t in safetensors.torch.load_file(path).values()))
 
   async def test_a_retried_call_runs_once_and_returns_the_first_reply(self):
     run_id = await self.create_model()

@@ -438,19 +438,19 @@ failed rather than replayed. The model process has no Redis client, lease timer 
 parked checkpoint pointers use the same ownership fence. A lease can be recovered after expiry only if no intervening
 owner served the worker. When ownership is lost, the node kills and reaps the old group and discards its result.
 
-Before a worker begins serving commands, and when it has no prepared commands or operation in flight, the node uses
-`XAUTOCLAIM` to fail abandoned commands. An empty prefetch read does not sweep commands that are still executing.
+Before a worker begins serving commands, and periodically between batches, the node uses
+`XAUTOCLAIM` to fail abandoned commands. Peeking leaves queued commands unclaimed.
 This also reconciles a stream read whose Redis claim succeeded but whose response was lost. SDK retries reuse the
 original queued request and future through ingress deduplication.
 
-On SIGTERM, each worker stops claiming new commands, finishes the work already claimed (including preparation still
-in progress), saves its training state and closes. `DRAIN_S` (20 seconds by default) gives that work and checkpointing
+On SIGTERM, each worker stops claiming new commands, finishes its current batch, saves its training state and closes.
+Unclaimed work stays queued. `DRAIN_S` (20 seconds by default) gives the current batch and checkpointing
 a grace period. When it expires, the node aborts unfinished work, waits for process cleanup to acknowledge, and then
 flushes pending uploads. `DRAIN_S` does not bound total shutdown time; a pod's termination grace must also allow for
 cleanup and uploads.
 
-`test/test_lease.py` covers stale-parent dispatch, stale results, intervening owners, real paused-node takeover and
-SIGTERM checkpoint publication. `test/test_trainer.py` and `test/test_trainer_child.py` verify exact restore of weights,
+`test/test_lease.py` exercises real paused-node takeover and SIGTERM checkpoint publication.
+`test/test_trainer.py` verifies exact restore of weights,
 optimizer state and pending gradients. The proposed immutable-ref transactions and storage tiers elsewhere in this
 document are additional work, not guarantees of the current registry implementation.
 

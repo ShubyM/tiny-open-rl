@@ -87,10 +87,9 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeEngine:
-  """A sampling engine that needs no GPU: each sample counts up from the last prompt token, every logprob is -1, and `calls` records what the sampler asked of it."""
+  """A CPU sampling engine: tokens count up from the last prompt token, with logprob -1."""
 
   def __init__(self):
-    self.calls = []
     self.loaded: set[str] = set()
     self.lora = True
 
@@ -98,28 +97,23 @@ class FakeEngine:
   async def start(cls, base: str, lora: bool, env: dict[str, str] | None = None) -> "FakeEngine":
     engine = cls()
     engine.lora = lora
-    engine.calls.append(("start", base, lora))
     return engine
 
   async def load_checkpoint(self, name: str, path: str) -> None:
-    if name in self.loaded:
-      return
-    self.calls.append(("load", name, path))
     self.loaded = self.loaded | {name} if self.lora else {name}
 
   async def sleep(self) -> None:
-    self.calls.append(("sleep",))
+    pass
 
   async def wake(self) -> None:
-    self.calls.append(("wake",))
+    pass
 
   async def close(self) -> None:
-    self.calls.append(("close",))
+    pass
 
   async def sample(self, job: dict, name: str | None):
     from tinyrl.workers.sampler import Out, Seq
 
-    self.calls.append(("sample", name))
     tokens = [(job["prompt"][-1] + 1 + i) % 32 for i in range(job["max_tokens"])]
     top = [{t: -1.0, 0: -2.0} for t in tokens]
     seqs = [Seq(tokens, [-1.0] * len(tokens), top, False) for _ in range(job["num_samples"])]
