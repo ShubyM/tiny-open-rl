@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 
+from tinyrl import spans
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Ev, Event, Op, Reply, Role
 from tinyrl.control import scheduler
 from tinyrl.control.process import Process
@@ -115,7 +116,9 @@ class TrainerEngine:
       version = (await self.registry.get_checkpoint(json.loads(cmd.body)["uri"]) or {}).get("version")
     if parked := await self.lease.bus.parked_checkpoint(cmd.run):
       parked = (parked, (await self.registry.get_checkpoint(parked) or {}).get("version"))
-    reply, effects = await self.process.call("execute", cmd, run, parked, version)
+    with spans.span("call"):
+      reply, effects = await self.process.call("execute", cmd, run, parked, version)
+    spans.absorb(effects.get("spans", []))
     await self.lease.hold()
     if checkpoint := effects.get("saved"):
       await self.registry.register_checkpoint(**checkpoint)
@@ -158,9 +161,11 @@ class NodeDaemon:
     self.local: dict[str, LocalWorker] = {}
     self.state, self.after, self.seen, self.stopping = scheduler.State(), "0-0", 0, False
     self.swept, self.uploading, self.sweeping, self.decided = 0.0, None, None, asyncio.Event()
+    self.trace = spans.Trace(self.id)
 
   def note(self, kind: Ev, **body) -> None:
-    scheduler.fold(self.state, Event("", time.time(), kind, body))
+    self.trace.event(kind, t := time.time(), body)
+    scheduler.fold(self.state, Event("", t, kind, body))
 
   def schedule(self) -> None:
     if decisions := scheduler.local_decide(self.state, self.id, time.time()):
@@ -254,8 +259,10 @@ class NodeDaemon:
 
   async def answer(self, lw: LocalWorker, cmd: Cmd, run: dict | None, staged: dict) -> None:
     before = time.time()
-    reply = await lw.engine.execute(cmd, run, staged)
-    await lw.lease.reply(cmd, reply, before)
+    with spans.span(cmd.op):
+      reply = await lw.engine.execute(cmd, run, staged)
+      with spans.span("reply"):
+        await lw.lease.reply(cmd, reply, before)
     if cmd.op == Op.DELETE_MODEL and reply.ok:
       await self.bus.delete_run(cmd.run, lw.name)
       self.note(Ev.RUN_DELETED, run=cmd.run, worker=lw.name)
@@ -266,23 +273,27 @@ class NodeDaemon:
 
   async def step(self, lw: LocalWorker) -> None:
     w, members, (width, count) = self.state.workers[lw.name], scheduler.members(self.state, lw.name), lw.engine.batch
-    heads = await self.bus.peek_commands(members, 1000 if w.since is None else IDLE_MS)
+    with spans.span("peek"):
+      heads = await self.bus.peek_commands(members, 1000 if w.since is None else IDLE_MS)
     if not heads:
       self.note(Ev.IDLE, worker=lw.name)
       self.schedule()
       return await self.release(lw)
     records, staged, held = {}, {}, w.since is not None and not w.revoked
-    await self.stage(choose(heads, width), records, staged)  # only what it is about to serve: a Redis read per run
-    if not await self.acquire(lw):
-      return
+    with spans.span("stage"):
+      await self.stage(choose(heads, width), records, staged)  # only what it is about to serve: a Redis read per run
+    with spans.span("acquire"):
+      if not await self.acquire(lw):
+        return
     start = time.time()
-    if lw.engine.top_up or not held:  # a wave gathers for the top-up, and a turn waited for may have aged the heads
-      await asyncio.sleep(lw.engine.top_up)
-      heads = await self.bus.peek_commands(members)
-    runs = choose(heads, width)
-    await self.stage(runs, records, staged)
-    cmds = await self.bus.take_commands(runs, lw.lease.owner, count)
-    await lw.lease.hold()  # a resumed node checks ownership before sending anything to its child
+    with spans.span("take"):
+      if lw.engine.top_up or not held:  # a wave gathers for the top-up, and a turn waited for may have aged the heads
+        await asyncio.sleep(lw.engine.top_up)
+        heads = await self.bus.peek_commands(members)
+      runs = choose(heads, width)
+      await self.stage(runs, records, staged)
+      cmds = await self.bus.take_commands(runs, lw.lease.owner, count)
+      await lw.lease.hold()  # a resumed node checks ownership before sending anything to its child
     while cmds:
       if len(cmds) == 1:
         await self.answer(lw, cmds[0], records.get(cmds[0].run), staged)
@@ -295,10 +306,12 @@ class NodeDaemon:
       if count > 1 or self.stopping or w.revoked or not scheduler.placed(w):
         break
       # a one-command engine serves its run's chain (forward_backward, optim_step, its sampler save) in this turn, each claimed only when it is next
-      cmds = await self.bus.take_commands([cmds[0].run], lw.lease.owner, count) if await lw.lease.keep() else []
-    self.note(Ev.BATCH_DONE, worker=lw.name, seconds=time.time() - start)
-    self.schedule()
-    await self.release(lw)
+      with spans.span("take"):
+        cmds = await self.bus.take_commands([cmds[0].run], lw.lease.owner, count) if await lw.lease.keep() else []
+    with spans.span("post"):
+      self.note(Ev.BATCH_DONE, worker=lw.name, seconds=time.time() - start)
+      self.schedule()
+      await self.release(lw)
 
   async def close(self, lw: LocalWorker) -> None:
     died = lw.engine.proc is not None and lw.engine.proc.poll() is not None  # exited on its own, before the reap
@@ -322,6 +335,7 @@ class NodeDaemon:
       await closing
 
   async def serve_worker(self, lw: LocalWorker) -> None:
+    spans.worker.set(lw.name)
     try:
       await lw.lease.fail_stranded(scheduler.members(self.state, lw.name))
       if lw.engine.warm:
@@ -330,7 +344,8 @@ class NodeDaemon:
         await self.step(lw)
         if time.monotonic() - lw.swept > 0.5:  # a dead owner's claims fail within a second, not after every command
           lw.swept = time.monotonic()
-          await lw.lease.fail_stranded(scheduler.members(self.state, lw.name))
+          with spans.span("sweep"):
+            await lw.lease.fail_stranded(scheduler.members(self.state, lw.name))
       if (w := self.state.workers.get(lw.name)) and scheduler.parks_in_place(w):
         await self.acquire(lw, leaving=True)  # FSDP checkpoint gathers need its CUDA/NCCL group, resumed on it
       await lw.engine.park_runs()
@@ -352,6 +367,7 @@ class NodeDaemon:
       for e in events:
         scheduler.fold(self.state, e)
       self.after, self.seen, block_ms = events[-1].id, self.seen + len(events), 0
+    await self.trace.flush(self.bus.r)
     await self.renew()
     self.schedule()
     for worker, lw in list(self.local.items()):
@@ -408,10 +424,13 @@ class NodeDaemon:
 
   async def serve(self) -> None:
     await self.announce_node()
+    lag = asyncio.create_task(self.trace.watch_lag()) if spans.TRACE else None
     try:
       while True:
         await self.tick(int(TICK * 1000))
     finally:
+      if lag:
+        lag.cancel()
       self.stopping = True
       deadline = time.monotonic() + DRAIN_S
       while any(not lw.task.done() for lw in self.local.values()) and time.monotonic() < deadline:

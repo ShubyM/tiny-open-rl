@@ -14,6 +14,7 @@ import time
 import torch
 import torch.distributed as dist
 
+from tinyrl import spans
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Reply
 from tinyrl.storage.store import Store, nbytes
@@ -65,6 +66,13 @@ class Trainer:
     self.call_model("restore_run", run, *self.store.get(uri, version), optimizer, gradients)
 
   def execute(
+    self, cmd: Cmd, run: dict | None = None, parked: tuple[str, str | None] | None = None, version: str | None = None
+  ) -> tuple[Reply, dict]:
+    with spans.span("child"):
+      reply, effects = self.answer(cmd, run, parked, version)
+    return reply, effects | {"spans": spans.report()}
+
+  def answer(
     self, cmd: Cmd, run: dict | None = None, parked: tuple[str, str | None] | None = None, version: str | None = None
   ) -> tuple[Reply, dict]:
     effects, created = {}, False
@@ -149,7 +157,8 @@ def main(path: str) -> None:
       serve_follower(Model())
     else:
       trainer = Trainer()
-      serve(path, lambda method, *args: getattr(trainer, method)(*args))
+      with spans.profiled(f"trainer-{os.getpid()}"):
+        serve(path, lambda method, *args: getattr(trainer, method)(*args))
   finally:
     if dist.is_initialized():
       dist.destroy_process_group()

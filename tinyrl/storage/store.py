@@ -33,6 +33,7 @@ import numpy as np
 if TYPE_CHECKING:
   import torch
 
+from tinyrl import spans
 from tinyrl.helpers import getenv
 
 CKPT = getenv("CKPT", "/tmp/tinyrl")
@@ -238,6 +239,7 @@ class Store:
             pending[-1][0].record(stream)
       flush(0)
 
+  @spans.timed
   def write_checkpoint_files(self, folder: str, tensors: dict[str, torch.Tensor], info: dict) -> list[str]:
     """Write a checkpoint into folder, and return its file names, with the weights last."""
     lora, cfg, total = info.get("lora"), info.get("config"), sum(map(nbytes, tensors.values()))
@@ -265,6 +267,7 @@ class Store:
     )
     return [*files, *weights]
 
+  @spans.timed
   def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
     dest = self.path(uri)
     if self.remote:
@@ -331,6 +334,7 @@ class Store:
     with open(pointer) as f:
       return f.read()
 
+  @spans.timed
   def upload_version(self, dest: str, version: str, names: list[str]) -> None:
     folder, rel = f"{self.cache}/{version}", dest[len(self.base) + 1 :]
     info, files = {"version": version, "dir": f"{rel}/{version}", "files": names}, [f"{folder}/{n}" for n in names]
@@ -415,6 +419,7 @@ class Store:
 
   # ***** get *****
 
+  @spans.timed
   def local_folder(self, uri: str, version: str | None = None) -> tuple[str, str]:
     """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again. With a version, from a store on another node, it waits for that version to land."""
     dest = self.path(uri)
@@ -470,9 +475,11 @@ class Store:
         shutil.rmtree(tmp, ignore_errors=True)
     return folder
 
+  @spans.timed
   def download_files(self, src: str, names: list[str], folder: str) -> None:
     parallel(lambda n: self.fs.get_file(f"{src}/{n}", f"{folder}/{n}"), names)
 
+  @spans.timed
   def rebuild_chain_link(self, links: str, version: str, whole: str, names: list[str], folder: str) -> None:
     """Make a link of a chain in folder, from the newest link before it this node has, or else the newest one uploaded whole, or the base model, by XORing in each link after that. The CRCs check the result is the exact bytes saved."""
     import safetensors
@@ -523,6 +530,7 @@ class Store:
       folder = os.path.join(os.path.dirname(folder), os.readlink(folder))
     return sorted(glob.glob(f"{folder}/*.safetensors"))
 
+  @spans.timed
   def get(self, uri: str, version: str | None = None) -> tuple[dict[str, torch.Tensor], dict]:
     import safetensors
 

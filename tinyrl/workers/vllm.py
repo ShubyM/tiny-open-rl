@@ -17,6 +17,7 @@ import traceback
 
 import httpx
 
+from tinyrl import spans
 from tinyrl.control.process import launch, reap, target_pid
 from tinyrl.storage import models
 from tinyrl.workers import snapshot
@@ -60,6 +61,7 @@ class VLLM:
     self.clean: bool = True
 
   @classmethod
+  @spans.timed
   async def start(cls, base: str, lora: bool, env: dict[str, str] | None = None) -> VLLM:
     options = dict(os.environ if env is None else env)
     path = await asyncio.to_thread(models.local, base)  # served under the reference's name, which requests use
@@ -137,6 +139,7 @@ class VLLM:
     return await boot()
 
   @classmethod
+  @spans.timed
   async def restore(cls, folder: str, base: str, lora: bool, env: dict[str, str]) -> VLLM:
     """Restore a snapshot of vLLM asleep at level 2, then wake it with its weights read again from the model files."""
     namespaces, sock = await snapshot.restore(folder, env.get("CUDA_VISIBLE_DEVICES", "0"), env)
@@ -152,6 +155,7 @@ class VLLM:
       await engine.close()
       raise
 
+  @spans.timed
   async def ready(self) -> VLLM:
     try:
       while self.server.poll() is None:
@@ -184,6 +188,7 @@ class VLLM:
           raise
     raise AssertionError
 
+  @spans.timed
   async def load_checkpoint(self, name: str, path: str) -> None:
     if name in self.loaded:
       return
@@ -205,9 +210,11 @@ class VLLM:
       self.clean = False
       self.loaded = {name}
 
+  @spans.timed
   async def sleep(self) -> None:
     await self.post("/sleep", params={"level": 1})
 
+  @spans.timed
   async def wake(self) -> None:
     await self.post("/wake_up")
 

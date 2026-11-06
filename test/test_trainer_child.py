@@ -50,6 +50,7 @@ class TestTrainerChild(unittest.TestCase):
     reply, effects = trainer.execute(command(run_id, op, body), **metadata)
     self.assertTrue(reply.ok, reply.body)
     json.dumps(effects)  # checkpoint metadata can travel to the node without any model tensors
+    effects.pop("spans")
     return reply, effects
 
   def create(self, trainer: Trainer, rank: int = 4, run: str | None = None) -> str:
@@ -188,6 +189,7 @@ class TestTrainerChild(unittest.TestCase):
         self.assertFalse(reply.ok)
         self.assertNotIn(run, replacement.model.params)
       reply, effects = replacement.execute(command(run, Op.OPTIM_STEP, {"adam_params": {}}), run=metadata)
+      effects.pop("spans")
       self.assertFalse(reply.ok)
       self.assertIn("lost its unsaved steps", json.loads(reply.body)["error"])
       self.assertEqual(effects, {})
@@ -212,6 +214,7 @@ class TestTrainerChild(unittest.TestCase):
           parked=(f"tinker://{run}/parked/missing", None),
         )
         self.assertFalse(reply.ok)
+        effects.pop("spans")
         self.assertEqual(effects, {})
         self.assertNotIn(run, trainer.model.params)
 
@@ -226,6 +229,7 @@ class TestTrainerChild(unittest.TestCase):
     )
     self.assertFalse(reply.ok)
     self.assertEqual(json.loads(reply.body)["category"], "user")
+    effects.pop("spans")
     self.assertEqual(effects, {"restored": saved["uri"]})
     self.assertIn(run, restored.model.params)
 

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 
+from tinyrl import spans
 from tinyrl.control.process import launch, reap, target_pid
 
 RUN = "/run/tinyrl-vllm"  # each server's socket and log, private to every restored copy
@@ -79,6 +80,7 @@ def cuda_pids(pid: int) -> list[int]:
   ]
 
 
+@spans.timed
 def save(pid: int, folder: str, name: str, visible: str) -> None:
   """Save the asleep server whose root process is `pid`, and whose socket and log are `name`.sock and `name`.log, to `folder`. This ends the server."""
   pids = cuda_pids(pid)
@@ -109,6 +111,7 @@ def save(pid: int, folder: str, name: str, visible: str) -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+@spans.timed
 async def restore(folder: str, visible: str, env: dict[str, str]) -> tuple[subprocess.Popen, str]:
   """Restore onto the engine's GPU. The node owns the namespace process even while waiting for it to start."""
   target = await asyncio.to_thread(gpu, visible)

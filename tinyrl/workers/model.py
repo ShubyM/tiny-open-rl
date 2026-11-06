@@ -19,6 +19,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
+from tinyrl import spans
 from tinyrl.api import wire
 from tinyrl.helpers import getenv
 from tinyrl.storage import models
@@ -177,6 +178,7 @@ def like_param(t: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
   return distribute_tensor(t.to(p.device), p.device_mesh, p.placements) if isinstance(p, DTensor) else t.to(p.device)
 
 
+@spans.timed
 def load(name: str) -> PreTrainedModel:
   """The class the checkpoint names in its config, which is the one vLLM serves, so the weights and adapters a trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and vLLM drops an adapter whose names it can't map, without an error."""
   name = models.local(name)
@@ -262,6 +264,7 @@ class Model:
       self.lm.set_adapter(run)
     return self.lm
 
+  @spans.timed
   def forward_backward(self, run: str, data: list[wire.Datum], loss_fn: str, config: dict, forward_only: bool):
     """Run the loss over every datum, accumulating gradients unless forward_only. Returns each datum's target logprobs, and the loss metrics."""
     if loss_fn not in LOSSES:
@@ -321,6 +324,7 @@ class Model:
       self.optimizers[run] = torch.optim.AdamW(params, fused=bool(params and params[0].is_cuda))
     return self.optimizers[run]
 
+  @spans.timed
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
     if run in self.needs_recovery:
       self.needs_recovery.remove(run)
@@ -346,6 +350,7 @@ class Model:
     self.dirty.add(run)
     return {"grad_norm:mean": grad_norm}
 
+  @spans.timed
   def training_state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """A run's portable training checkpoint: fp32 master weights and named AdamW state, with no pickle."""
     self.activate_run(run)
@@ -359,6 +364,7 @@ class Model:
           tensors[f"{name}.{k}"] = full_tensor(optim.state[p][k].detach())
     return tensors, {"optimizer": True}
 
+  @spans.timed
   def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
     lm = self.activate_run(run)
@@ -371,6 +377,7 @@ class Model:
     untouched = not self.lora and run not in self.dirty
     return tensors, {"base": self.base, "lora": self.lora, "optimizer": False, "untouched": untouched, "config": cfg}
 
+  @spans.timed
   def restore_run(
     self, run: str, tensors: dict[str, torch.Tensor], meta: dict, optimizer: bool, gradients: bool = False
   ) -> None:
@@ -430,6 +437,7 @@ class Model:
     if optim:
       yield from self.adam_moments()
 
+  @spans.timed
   def move_tensors(self, tensors, device: str) -> None:
     tensors = list(tensors)
     if device == "cpu":
@@ -456,11 +464,13 @@ class Model:
         for k in set(self.pinned) - {id(x) for x in self.gpu_tensors()}:
           del self.pinned[k]
 
+  @spans.timed
   def park_on_host(self) -> None:
     """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume_on_gpu() undoes it."""
     self.move_tensors(self.gpu_tensors(), "cpu")
     self.parked = True
 
+  @spans.timed
   def resume_on_gpu(self) -> None:
     self.move_tensors(self.gpu_tensors(optim=self.lora), "cuda")
     self.parked = False
