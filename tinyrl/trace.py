@@ -2,14 +2,19 @@
 
 from contextlib import contextmanager
 
-import nvtx
+try:
+  import nvtx
+except ImportError:  # macOS, which has no nvtx wheels
+  nvtx = None
 
 
 @contextmanager
 def span(name: str):
-  token = nvtx.start_range(
-    name, domain="tinyrl"
-  )  # start and end, not push and pop: asyncio tasks interleave on a thread
+  if nvtx is None:
+    yield
+    return
+  # start and end, not push and pop: asyncio tasks interleave on a thread
+  token = nvtx.start_range(name, domain="tinyrl")
   try:
     yield
   finally:

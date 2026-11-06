@@ -107,7 +107,7 @@ to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/sch
 |---|---:|---|
 | [tinyrl/bus.py](tinyrl/bus.py) | 350 | runs, sessions, commands, replies, leases, node heartbeats and `tinyrl:events` on Redis |
 | [tinyrl/helpers.py](tinyrl/helpers.py) | 12 | typed `getenv` and the `DEBUG` flag |
-| [tinyrl/trace.py](tinyrl/trace.py) | 9 | `span`, an NVTX range for Nsight Systems |
+| [tinyrl/trace.py](tinyrl/trace.py) | 15 | `span`, an NVTX range for Nsight Systems |
 | [tinyrl/__init__.py](tinyrl/__init__.py) | 1 | top-level `Bus`, `Cmd`, `Reply` and `Run` exports |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | 303 | the Tinker HTTP routes for sessions, runs, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | 155 | Tinker requests and replies between protobuf, numpy and JSON |
