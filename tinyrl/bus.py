@@ -274,7 +274,9 @@ class Bus:
 
   async def submit_command(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
     """Queue a command on a run's stream. Returns its request id, or None if there is no such run. A call retried with the same seq_id gets the first call's request id and is queued once."""
-    seq = [] if seq_id is None else ["IDMP", run_id, seq_id]
+    if seq_id is not None and (first := await self.r.get(key("seq", run_id, str(seq_id)))):
+      return first.decode()  # a retry, even of a deleted run's command, a pre-IDMP one, or one older than IDMP's window
+    seq = [] if seq_id is None else ["IDMP", run_id, seq_id]  # and two racing retries still queue once
     # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
     fields = ["op", op, "body", body, *(["seq", seq_id] if seq else [])]
     entry_id = await self.r.execute_command("XADD", key("q", run_id), "NOMKSTREAM", *seq, "*", *fields)

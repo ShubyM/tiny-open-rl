@@ -79,6 +79,13 @@ class TestBus(RedisTest):
     self.assertNotEqual(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=6), first)
     self.assertEqual(await self.bus.r.xlen(key("q", run_id)), 2)
 
+  async def test_a_retry_after_its_run_was_deleted_gets_the_first_request_id(self):
+    run_id = await self.new_run()
+    first = await self.bus.submit_command(run_id, Op.DELETE_MODEL, b"", seq_id=3)
+    await self.bus.delete_run(run_id, "p")
+    self.assertEqual(await self.bus.submit_command(run_id, Op.DELETE_MODEL, b"", seq_id=3), first)
+    self.assertIsNone(await self.bus.submit_command(run_id, Op.DELETE_MODEL, b"", seq_id=4))
+
   async def test_unknown_and_deleted_runs_take_no_work(self):
     self.assertIsNone(await self.bus.submit_command(new_id(), Op.OPTIM_STEP, b""))
 
