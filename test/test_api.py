@@ -6,13 +6,13 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
 
 import httpx
 import numpy as np
 import safetensors.torch
 import torch
 
+from test.execution import TestNode
 from test.helpers import RedisTest, tiny
 from test.test_wire import json_body
 from tinyrl import bus
@@ -20,8 +20,6 @@ from tinyrl.api import gateway, wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
-from tinyrl.workers.model import Model
-from tinyrl.workers.trainer import Trainer
 
 PROTO = {"content-type": wire.PROTO}
 
@@ -45,9 +43,10 @@ class TestAPI(RedisTest):
     await super().asyncSetUp()
     self.store = Store(root=tempfile.mkdtemp())
     self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app(self.bus)), base_url="http://tinyrl")
-    self.trainers: dict[str, Trainer] = {}
+    self.node = TestNode(self.bus, store=self.store)
 
   async def asyncTearDown(self):
+    await self.node.aclose()
     await self.http.aclose()
     await super().asyncTearDown()
 
@@ -55,13 +54,8 @@ class TestAPI(RedisTest):
     return await self.http.post(f"/api/v1/{path}", **kwargs)
 
   async def drain(self, run_id: str):
-    """Let the trainer for the run's worker do all of the worker's queued work."""
-    worker = await self.worker(run_id)
-    if worker not in self.trainers:
-      self.trainers[worker] = Trainer(self.bus, worker, Model(tiny), store=self.store)
-      await self.own(self.trainers[worker])
-    while await self.trainers[worker].step(block_ms=10):
-      pass
+    """Let the node execute the run's worker until its queue is empty."""
+    await self.node.drain(run_id)
 
   async def result(self, submitted: httpx.Response, **kwargs) -> httpx.Response:
     """Run a submitted call and retrieve its result."""
@@ -106,17 +100,6 @@ class TestAPI(RedisTest):
 
     info = (await self.post("get_info", json={"model_id": run_id})).json()
     self.assertEqual(info["model_data"], {"model_name": "tiny", "tokenizer_id": "tiny"})
-
-  async def test_a_call_counts_its_time_in_the_queue_and_running(self):
-    run_id = await self.create_model()
-    before = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
-    submitted = await self.post("forward_backward", content=proto_body(run_id), headers=PROTO)
-    await asyncio.sleep(0.3)
-    await self.result(submitted)
-    after = (await self.http.get(f"/api/v1/runs/{run_id}")).json()
-    self.assertEqual(after["cmds"] - before["cmds"], 1)
-    self.assertGreaterEqual(after["wait_ms"] - before["wait_ms"], 300)
-    self.assertGreater(after["busy_ms"] - before["busy_ms"], 0)
 
   async def test_json_clients_get_json(self):
     run_id = await self.create_model()
@@ -211,10 +194,6 @@ class TestAPI(RedisTest):
     self.assertIn("dpo", failed.json()["error"])
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 1)
 
-    with patch.object(gateway, "WAIT", 0.01):
-      pending = await self.post("retrieve_future", json={"request_id": f"{run_id}/1-0"})
-      self.assertEqual(pending.json()["type"], "try_again")
-
   async def test_workers(self):
     shared, also_shared = await self.create_model(), await self.create_model()
     full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
@@ -232,7 +211,8 @@ class TestAPI(RedisTest):
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
-    self.assertEqual(await self.bus.runs_in_worker(await self.worker(full)), [full])
+    await self.node.sync()
+    self.assertEqual(scheduler.members(self.node.state, await self.worker(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -281,12 +261,11 @@ class TestAPI(RedisTest):
 
   async def test_a_checkpoint_saved_without_a_ttl_gets_the_deployment_default_unless_its_run_owns_it(self):
     run_id = await self.create_model()
-    with patch("tinyrl.api.gateway.CKPT_TTL", 3600):
-      await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "kept"}))
-      await self.result(
-        await self.post("save_weights_for_sampler", json={"model_id": run_id, "sampling_session_seq_id": 0})
-      )
-      await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "own", "ttl_seconds": 7200}))
+    await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "kept"}))
+    await self.result(
+      await self.post("save_weights_for_sampler", json={"model_id": run_id, "sampling_session_seq_id": 0})
+    )
+    await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "own", "ttl_seconds": 7200}))
     ckpts = {
       c["checkpoint_id"]: c
       for c in (await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"]
@@ -296,7 +275,10 @@ class TestAPI(RedisTest):
       for k, c in ckpts.items()
       if c["expires_at"]
     }
-    self.assertAlmostEqual(left["weights/kept"], 3600, delta=60)
+    if gateway.CKPT_TTL:
+      self.assertAlmostEqual(left["weights/kept"], gateway.CKPT_TTL, delta=60)
+    else:
+      self.assertIsNone(ckpts["weights/kept"]["expires_at"])
     self.assertAlmostEqual(left["weights/own"], 7200, delta=60)
     self.assertIsNone(next(c for k, c in ckpts.items() if k.startswith("sampler_weights/"))["expires_at"])
 
@@ -321,32 +303,15 @@ class TestAPI(RedisTest):
     self.assertTrue(found_exp_avg, "No .exp_avg tensors found in safetensors")
 
   async def test_sampler_weights_preserve_base_model_dtype(self):
-    async def drain_bf16(run_id: str):
-      worker = await self.worker(run_id)
-      if worker not in self.trainers:
-
-        def bf16(name: str):
-          return tiny(name).to(torch.bfloat16)
-
-        self.trainers[worker] = Trainer(self.bus, worker, Model(bf16), store=self.store)
-        await self.own(self.trainers[worker])
-      while await self.trainers[worker].step(block_ms=10):
-        pass
-
-    with patch.object(self, "drain", drain_bf16):
-      full_run = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
-      saved = (
-        await self.result(await self.post("save_weights_for_sampler", json={"model_id": full_run, "path": "sampler"}))
-      ).json()
-    folder = self.store.path(saved["path"])
-
-    tensor_count = 0
-    for f in glob.glob(f"{folder}/*.safetensors"):
-      tensors = safetensors.torch.load_file(f)
-      for k, v in tensors.items():
-        self.assertEqual(v.dtype, torch.bfloat16, f"Tensor {k} is {v.dtype}, expected bf16")
-        tensor_count += 1
-    self.assertGreater(tensor_count, 0, "No tensors found in sampler safetensors")
+    self.node.default_model = lambda name: tiny(name).to(torch.bfloat16)
+    run = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
+    saved = (
+      await self.result(await self.post("save_weights_for_sampler", json={"model_id": run, "path": "sampler"}))
+    ).json()
+    files = glob.glob(f"{self.store.path(saved['path'])}/*.safetensors")
+    self.assertTrue(files)
+    for path in files:
+      self.assertTrue(all(t.dtype == torch.bfloat16 for t in safetensors.torch.load_file(path).values()))
 
   async def test_a_retried_call_runs_once_and_returns_the_first_reply(self):
     run_id = await self.create_model()

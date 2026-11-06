@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import os
+import shutil
+import sys
 import time
 
+from redis.exceptions import WatchError
+
 from tinyrl.bus import Bus, key
+from tinyrl.storage.store import Store
 
 
 class Registry:
   def __init__(self, bus: Bus):
-    self.bus = bus
-
-  @property
-  def r(self):
-    return self.bus.r  # read when used, so a worker made without a bus, as tests do, still starts
+    self.r = bus.r
 
   async def register_checkpoint(
     self, uri: str, size: int, ttl: int | None = None, owned: bool = False, version: str | None = None
@@ -54,15 +58,21 @@ class Registry:
 
   async def set_checkpoint_ttl(self, uri: str, ttl: int | None) -> bool:
     """Make a checkpoint expire ttl seconds from now, or never with None."""
-    if (info := await self.get_checkpoint(uri)) is None:
-      return False
     run, cid = uri.removeprefix("tinker://").split("/", 1)
-    info["expires_at"] = time.time() + ttl if ttl else None
-    p = self.r.pipeline(transaction=True)
-    p.hset(key("ckpt", run), cid, json.dumps(info))
-    p.zadd(key("expiry"), {uri: info["expires_at"]}) if ttl else p.zrem(key("expiry"), uri)
-    await p.execute()
-    return True
+    while True:
+      try:
+        async with self.r.pipeline(transaction=True) as p:
+          await p.watch(key("ckpt", run))
+          if (data := await p.hget(key("ckpt", run), cid)) is None:
+            return False
+          info = json.loads(data) | {"expires_at": time.time() + ttl if ttl else None}
+          p.multi()
+          p.hset(key("ckpt", run), cid, json.dumps(info))
+          p.zadd(key("expiry"), {uri: info["expires_at"]}) if ttl else p.zrem(key("expiry"), uri)
+          await p.execute()
+          return True
+      except WatchError:
+        continue
 
   async def unregister_checkpoints(self, *uris: str) -> int:
     """Take checkpoints out of the registry. The node daemons' sweeps then delete their files."""
@@ -93,3 +103,36 @@ class Registry:
     """When the first checkpoint was registered. A sweep leaves files older than that alone."""
     since = await self.r.get(key("ckpt_since"))
     return float(since) if since else None
+
+  async def sweep(self, store: Store, grace: float) -> None:
+    """Delete the checkpoints in this node's store that the registry doesn't have: deleted, expired, or their run's. Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before. Then the links of full sampler weight chains no registered checkpoint is built from. It also keeps the node's cache of a bucket store under CKPT_CACHE_BYTES."""
+    await asyncio.to_thread(store.trim_cache)
+    if (since := await self.first_registered_at()) is None:
+      return
+    for uri in await asyncio.to_thread(store.list_checkpoints):
+      try:
+        if await self.get_checkpoint(uri) is None:
+          saved = await asyncio.to_thread(store.saved_at, uri)
+          if since < saved < time.time() - grace:
+            await asyncio.to_thread(store.delete, uri)
+      except Exception as e:  # one checkpoint it can't read or delete mustn't stop the rest of the sweep
+        print(f"sweep could not delete {uri}, trying again next sweep: {e!r}", file=sys.stderr, flush=True)
+    await asyncio.to_thread(
+      store.delete_unused_chain_links,
+      await self.registered_versions(),
+      since,
+      time.time() - grace,
+    )
+    if os.path.isdir(store.cache):
+      for e in list(os.scandir(store.cache)):
+        if e.name.endswith(".upload") and since < e.stat().st_mtime < time.time() - grace:
+          try:
+            with open(e.path) as f:
+              uri = json.load(f)["uri"]
+          except Exception:
+            continue
+          if await self.get_checkpoint(uri) is None:
+            version = e.name.removesuffix(".upload")
+            await asyncio.to_thread(shutil.rmtree, f"{store.cache}/{version}", ignore_errors=True)
+            with contextlib.suppress(OSError):
+              await asyncio.to_thread(os.unlink, e.path)

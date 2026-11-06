@@ -1,22 +1,21 @@
 """Runs, sessions, commands and replies, all on Redis.
 
-Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The trainer for a worker reads its runs' streams through one consumer group, so Redis itself knows:
+Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The node owning a worker reads its runs' streams through one consumer group, so Redis itself knows:
 
   what is queued       XINFO GROUPS, the group's lag
-  what is in flight    XPENDING: which trainer took each command, and how long ago
+  what is in flight    XPENDING: which owner took each command, and how long ago
   what a dead trainer  XAUTOCLAIM, so the next trainer can fail it instead of leaving a client waiting
   left unfinished
 
 A reply is a stream with a single entry, tinyrl:f:<request_id>. XREAD from id 0 blocks until it is written and never consumes it, so a client can retry retrieve_future, or many clients can wait on one, and every one gets the same answer.
 
-A worker has one owner, the trainer holding its lease, tinyrl:owner:<worker>. Replies are written in a WATCH/MULTI/EXEC transaction on the lease key, so a trainer that lost its worker, say after a long pause, can't answer for it.
+A worker has one owner, the node holding its lease, tinyrl:owner:<worker>. Replies are written in a WATCH/MULTI/EXEC transaction on the lease key, so a node that lost its worker, say after a long pause, can't answer for it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import random
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -27,12 +26,12 @@ from redis.backoff import ExponentialBackoff
 
 from tinyrl.helpers import getenv
 
-GROUP = "trainer"  # the consumer group every worker's trainer reads through
+GROUP = "trainer"  # the consumer group used by node-owned readers (name retained for stream compatibility)
 LIVE_SECONDS = 30  # a session is live this long after its last heartbeat, which the SDK sends every 10 s
 SESSION_GRACE = getenv("SESSION_GRACE", 60)  # and its runs are deleted this long after it
 REPLY_TTL = getenv("REPLY_TTL", 3600)
 SESSION_TTL = getenv("SESSION_TTL", 7 * 24 * 3600)
-LEASE_MS = getenv("LEASE_MS", 10000)  # a trainer owns its worker this long after its last renewal
+LEASE_MS = getenv("LEASE_MS", 10000)  # a node owns its worker this long after its last renewal
 NODE_MS = 30000  # a node daemon is live this long after its last heartbeat
 
 
@@ -52,7 +51,7 @@ class Op(StrEnum):
 
 
 class Ev(StrEnum):
-  """The kinds of entry in the log, tinyrl:events. See scheduler.py for what each means."""
+  """Cluster assignments and membership, replayed from Redis, then the turns nodes decide, which only traces read."""
 
   RUN_CREATED = "run_created"
   ASSIGNED = "assigned"
@@ -64,11 +63,9 @@ class Ev(StrEnum):
   STARTED = "started"
   EXITED = "exited"
   WANTS_GPU = "wants_gpu"
-  BATCH_DONE = "batch_done"
-  IDLE = "idle"
-  RELEASED = "released"
   GRANTED = "granted"
-  REVOKED = "revoked"
+  RELEASED = "released"
+  BATCH_DONE = "batch_done"
 
 
 class Role(StrEnum):
@@ -97,7 +94,6 @@ class Cmd:
   entry_id: str
   op: Op
   body: bytes
-  seq: int | None = None
 
   @property
   def request_id(self) -> str:
@@ -120,8 +116,7 @@ class Reply:
 
 
 def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
-  seq = int(fields[b"seq"]) if b"seq" in fields else None
-  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"], seq=seq)
+  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"])
 
 
 def connect(url: str) -> redis.Redis:
@@ -204,7 +199,7 @@ class Bus:
   # ***** runs *****
 
   async def create_run(self, run: Run) -> None:
-    # one transaction, so a run is in its worker exactly when its stream and consumer group exist
+    # one transaction creates the run record, stream and consumer group
     record = json.dumps({**asdict(run), "created": time.time()})
     p = self.r.pipeline(transaction=True)
     p.xgroup_create(key("q", run.id), GROUP, id="0", mkstream=True)
@@ -213,7 +208,6 @@ class Bus:
     p.sadd(key("runs"), run.id)
     mapping = {"record": record, "steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0}
     if run.worker:
-      p.sadd(key("worker", run.worker), run.id)
       mapping["worker"] = run.worker
     p.hset(key("run", run.id), mapping=mapping)
     if run.session:
@@ -228,7 +222,6 @@ class Bus:
     """The scheduler's assignment of a run to a worker, with its log entry, at once. Only the scheduler writes it."""
     p = self.r.pipeline(transaction=True)
     p.hset(key("run", run), "worker", worker)
-    p.sadd(key("worker", worker), run)
     p.xadd(key("events"), {"kind": Ev.ASSIGNED, "body": json.dumps({"run": run, "worker": worker})})
     await p.execute()
 
@@ -242,9 +235,6 @@ class Bus:
       record["worker"] = worker.decode()
     counters = {name.decode(): int(value) for name, value in fields.items()}  # steps, failed, cmds, busy_ms, wait_ms
     return {**record, **counters}
-
-  async def runs_in_worker(self, worker: str) -> list[str]:
-    return [run_id.decode() for run_id in await self.r.smembers(key("worker", worker))]
 
   async def join_sampling_session(self, run_id: str) -> int:
     return int(await self.r.incr(key("clients", run_id)))
@@ -264,7 +254,6 @@ class Bus:
   async def delete_run(self, run_id: str, worker: str) -> None:
     """Take a deleted run out of its worker and delete its stream, in one transaction."""
     p = self.r.pipeline(transaction=True)
-    p.srem(key("worker", worker), run_id)
     p.srem(key("runs"), run_id)
     p.delete(key("q", run_id), key("parked", run_id))
     await p.execute()
@@ -287,54 +276,63 @@ class Bus:
       await self.r.set(key("seq", run_id, str(seq_id)), request_id, ex=SESSION_TTL)
     return request_id
 
-  async def take_commands(self, worker: str, owner: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
-    """The next commands for a worker's trainer: up to `count` from each run that has work."""
-    runs = await self.runs_in_worker(worker)
-    if not runs:
+  async def peek_commands(self, runs: list[str], block_ms: int = 0) -> list[Cmd]:
+    """Unclaimed heads, in arrival order. Looking and preparing never change stream ownership."""
+    p = self.r.pipeline(transaction=False)
+    for run in runs:
+      p.xinfo_groups(key("q", run))
+    cursors = {}
+    for run, groups in zip(runs, await p.execute(raise_on_error=False)):
+      if isinstance(groups, Exception):
+        if "no such key" not in str(groups):
+          raise groups
+        continue
+      if group := next((g for g in groups if g["name"] == GROUP.encode()), None):
+        cursors[key("q", run)] = group["last-delivered-id"]
+    if not cursors:
       await asyncio.sleep(block_ms / 1000)
       return []
+    got = await self.r.xread(cursors, count=1, block=block_ms or None)
+    cmds = [parse_cmd(stream.decode().removeprefix(key("q", "")), *entries[0]) for stream, entries in got]
+    return sorted(cmds, key=lambda c: (*map(int, c.entry_id.split("-")), c.run))
 
-    random.shuffle(runs)  # so no run always goes first
-    streams = {key("q", run_id): ">" for run_id in runs}
-    try:
-      got = await self.r.xreadgroup(GROUP, owner, streams, count=count, block=block_ms or None)
-    except redis.ResponseError as e:
-      if "NOGROUP" not in str(e):
-        raise
-      return []  # a run was deleted after it was listed, and the next take lists the worker again
-
+  async def take_commands(self, runs: list[str], owner: str, count: int = 16, block_ms: int = 0) -> list[Cmd]:
+    """Claim only the selected work. A stream deleted during admission cannot hide another run."""
+    p = self.r.pipeline(transaction=False)
+    for run in runs:
+      p.xreadgroup(GROUP, owner, {key("q", run): ">"}, count=count)
     cmds = []
-    for stream, entries in got:
-      run_id = stream.decode().removeprefix(key("q", ""))
-      cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
+    for run, got in zip(runs, await p.execute(raise_on_error=False)):
+      if isinstance(got, Exception):
+        if "NOGROUP" not in str(got):
+          raise got
+        continue
+      cmds += [parse_cmd(run, entry_id, fields) for _, entries in got for entry_id, fields in entries]
+    if not cmds and block_ms:
+      await self.peek_commands(runs, block_ms)
+      return await self.take_commands(runs, owner, count)
     return cmds
 
-  async def write_reply(
-    self, cmd: Cmd, reply: Reply, worker: str, owner: str, repeat: bool = False, started: float | None = None
-  ) -> bool:
+  async def write_reply(self, cmd: Cmd, reply: Reply, worker: str, owner: str, started: float | None = None) -> bool:
     """Write a command's reply, acknowledge the command, and count it, all at once, if `owner` still owns the worker. Returns False, having written nothing, if it doesn't: another trainer took the worker over and fails the command. A command run at time.time() `started` also counts its wait since it was queued, and how long it ran."""
-    counts = {}
-    if not repeat:
-      if not reply.ok:
-        counts["failed"] = 1
-      elif cmd.op == Op.OPTIM_STEP:
-        counts["steps"] = 1
-      if started is not None:
-        queued_ms = int(cmd.entry_id.split("-")[0])  # a stream entry id starts with redis' clock when it was added
-        counts |= {
-          "cmds": 1,
-          "wait_ms": max(0, int(started * 1000) - queued_ms),
-          "busy_ms": int((time.time() - started) * 1000),
-        }
+    counts = {"failed": 1} if not reply.ok else {"steps": 1} if cmd.op == Op.OPTIM_STEP else {}
+    if started is not None:
+      queued_ms = int(cmd.entry_id.split("-")[0])  # a stream entry id starts with Redis' clock when it was added
+      counts |= {
+        "cmds": 1,
+        "wait_ms": max(0, int(started * 1000) - queued_ms),
+        "busy_ms": int((time.time() - started) * 1000),
+      }
 
-    k = key("owner", worker)
+    k, deleting = key("owner", worker), cmd.op == Op.DELETE_MODEL and reply.ok
     while True:
       try:
         async with self.r.pipeline(transaction=True) as p:
-          await p.watch(k)
+          await p.watch(k, *([key("ckpt", cmd.run)] if deleting else []))
           if await p.get(k) != owner.encode():
             await p.unwatch()
             return False
+          checkpoints = await p.hgetall(key("ckpt", cmd.run)) if deleting else {}
           p.multi()
           fields = {"ok": int(reply.ok), "content_type": reply.content_type, "body": reply.body}
           p.xadd(key("f", cmd.request_id), fields, maxlen=1, approximate=False)
@@ -343,26 +341,30 @@ class Bus:
           p.xdel(key("q", cmd.run), cmd.entry_id)
           for name, n in counts.items():
             p.hincrby(key("run", cmd.run), name, n)
+          if deleting:
+            # Completion includes deletion; a client observing its reply sees no owned checkpoint or live queue.
+            for cid, data in checkpoints.items():
+              if json.loads(data)["owned"]:
+                uri = f"tinker://{cmd.run}/{cid.decode()}"
+                p.hdel(key("ckpt", cmd.run), cid)
+                p.zrem(key("ckpts"), uri)
+                p.zrem(key("expiry"), uri)
+            p.srem(key("runs"), cmd.run)
+            p.delete(key("q", cmd.run), key("parked", cmd.run))
+            p.xadd(
+              key("events"),
+              {"kind": Ev.RUN_DELETED, "body": json.dumps({"run": cmd.run, "worker": worker})},
+              maxlen=1_000_000,
+              approximate=True,
+            )
           await p.execute()
           return True
       except redis.WatchError:
         continue
 
-  async def reply_to_repeated_command(self, cmd: Cmd) -> Reply | None:
-    if cmd.seq is None:
-      return None
-    request_id = await self.r.get(key("seq", cmd.run, str(cmd.seq)))
-    if not request_id:
-      return None
-    got = await self.r.xrange(key("f", request_id.decode()), "-", "+")
-    if not got:
-      return None
-    fields = got[0][1]
-    return Reply(fields[b"ok"] == b"1", fields[b"content_type"].decode(), fields[b"body"])
-
-  async def fail_stranded_commands(self, worker: str, owner: str, min_idle_ms: int = 0) -> None:
-    """Fail the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by its owner with nothing in flight itself, everything it claims was left by a trainer that died or lost the worker."""
-    for run_id in await self.runs_in_worker(worker):
+  async def fail_stranded_commands(self, runs: list[str], worker: str, owner: str, min_idle_ms: int = 0) -> None:
+    """Fail the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by the node only when it has nothing in flight; claims are failed, never replayed."""
+    for run_id in runs:
       stream = key("q", run_id)
       try:
         _, entries, _ = await self.r.xautoclaim(stream, GROUP, owner, min_idle_time=min_idle_ms, count=10000)
@@ -432,15 +434,17 @@ class Bus:
 
   # ***** nodes *****
 
-  async def node_heartbeat(self, node: str, gpus: int) -> None:
-    await self.r.hset(key("nodes"), node, json.dumps({"gpus": gpus, "until": time.time() + NODE_MS / 1000}))
+  async def node_heartbeat(self, node: str, gpus: int, workers: dict | None = None) -> None:
+    await self.r.hset(
+      key("nodes"), node, json.dumps({"gpus": gpus, "until": time.time() + NODE_MS / 1000, "workers": workers or {}})
+    )
 
-  async def live_nodes(self) -> dict[str, int]:
+  async def live_nodes(self, details: bool = False) -> dict:
     """The GPU count of every live node daemon, by id."""
     nodes = {k.decode(): json.loads(v) for k, v in (await self.r.hgetall(key("nodes"))).items()}
     if dead := [k for k, v in nodes.items() if v["until"] < time.time()]:
       await self.r.hdel(key("nodes"), *dead)
-    return {k: v["gpus"] for k, v in nodes.items() if k not in dead}
+    return {k: v if details else v["gpus"] for k, v in nodes.items() if k not in dead}
 
   # ***** replies *****
 

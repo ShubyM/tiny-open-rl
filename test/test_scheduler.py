@@ -1,554 +1,320 @@
+import copy
 import random
 import unittest
 
-from tinyrl.bus import Event
-from tinyrl.control.scheduler import QUANTUM, RULES, Kind, State, budget, decide, fold, holders, settings, uses
+from tinyrl.bus import Cmd, Ev, Event, Op, Role
+from tinyrl.control.scheduler import (
+  Kind,
+  Run,
+  State,
+  Worker,
+  budget,
+  can_run,
+  decide,
+  fold,
+  place_gpus,
+  select_runs,
+)
 
-GIB = 1024**3
-
-
-def check(s: State) -> list[str]:
-  """Every broken invariant of the scheduler's state, as one message each."""
-  bad = []
-  for node, (gpus, gpu) in sorted(s.nodes.items()):
-    for k in [(node, i) for i in range(gpus)]:
-      held = holders(s, k)
-      memory = [uses(s, s.workers[n]) for n in held]
-      if len(held) > 1 and not (gpu and all(memory) and sum(memory) <= gpu):
-        bad.append(f"{k} has holders that do not fit together")
-  for name, p in sorted(s.workers.items()):
-    if p.node is not None and p.node not in s.nodes:
-      bad.append(f"{name} is placed on {p.node}, which is not up")
-    if any(node not in s.nodes for node, _ in p.on):
-      bad.append(f"{name} runs on a node that is not up")
-    if p.asked and p.since is not None:
-      bad.append(f"{name} holds its GPUs and waits for them")
-    if p.revoked and p.since is None:
-      bad.append(f"{name} is revoked but holds nothing")
-  return bad
+GIB, MIB = 2**30, 2**20
 
 
-class Log:
-  """Appends facts the way workers and node daemons do, then decides the way the scheduler does, folding each decision back as it would read it from the log. Checks the invariants after every entry, and that nothing is decided twice."""
+class Cluster:
+  """Only cluster assignments are logged. Local GPU placement and reservations never enter this log."""
 
-  def __init__(self, test: unittest.TestCase, quantum: float = QUANTUM):
-    self.test, self.s, self.t, self.entries = test, State(quantum=quantum), 0.0, []
+  def __init__(self):
+    self.s, self.entries = State(), []
 
-  def append(self, kind: str, body: dict) -> None:
-    # name the worker's kind the way main's names did
-    if kind in ("run_created", "sampler_warmed") and "role" not in body:
-      worker = body["worker"]
-      role = "sampler" if worker.startswith("sampler:") else "trainer"
-      rank = 0 if worker.startswith("sampler:fft:") or (role == "trainer" and not worker.startswith("lora:")) else 8
-      kind, body = "run_created", {"run": f"{worker}-session", "role": role, "base": worker, "rank": rank} | body
-    self.entries.append(Event(str(len(self.entries)), self.t, kind, body))
-    self.s = fold(self.s, self.entries[-1])
-    self.test.assertEqual(check(self.s), [])
+  def append(self, kind, **body):
+    self.entries.append(Event(str(len(self.entries)), 0.0, kind, body))
+    fold(self.s, self.entries[-1])
 
-  def __call__(self, kind: str, /, at: float | None = None, **body) -> list[tuple[str, str, str]]:
-    self.t = self.t if at is None else at
-    self.append(kind, body)
-    return self.tick()
+  def settle(self):
+    decisions = decide(self.s, 0.0)
+    for kind, body in decisions:
+      self.append(kind, **body)
+    return decisions
 
-  def tick(self, at: float | None = None) -> list[tuple[str, str, str]]:
-    """What the scheduler decides at time `at`, as (kind, worker, rule)."""
-    self.t = self.t if at is None else at
-    decided = decide(self.s, self.t)
-    for kind, body in decided:
-      self.test.assertIn(body["rule"], RULES)
-      self.append(kind, body)
-    self.test.assertEqual(decide(self.s, self.t), [])
-    return [(kind, body["worker"], body["rule"]) for kind, body in decided]
+  def node(self, name, gpus):
+    self.append(Ev.NODE_UP, node=name, gpus=gpus, memory=80 * GIB)
+    self.settle()
 
-  def node(self, gpus: int, memory: int = 80 * GIB, node: str = "n") -> None:
-    self("node_up", node=node, gpus=gpus, memory=memory)
-
-  def worker(self, name: str, gpus: tuple[int, ...] = (0,), node: str = "n") -> None:
-    """A worker with a run, placed where the test says rather than where decide would, and its process started."""
-    self.append("run_created", {"run": f"{name}-run", "worker": name})
-    self.append("placed", {"worker": name, "node": node, "gpus": list(gpus), "rule": "test"})
-    self("started", worker=name, node=node)
+  def run(self, name, **body):
+    self.append(Ev.RUN_CREATED, **({"run": name, "role": "trainer", "base": "a", "rank": 0} | body))
+    self.settle()
+    return self.s.runs[name].worker
 
 
-GRANTED, IDLE, QUANTUM = "turn.granted", "turn.idle_holder_yields", "turn.quantum_expired"
-PLACED, EMPTIED, SPREAD = "place.least_loaded_node", "place.emptied", "place.spread"
-MIB = 2**20
+class Local:
+  """Direct placement and reservations, with the same small runtime fields the node owns."""
+
+  def __init__(self, test, gpus=1, memory=80 * GIB):
+    self.test, self.s, self.running, self.ticket = test, State(nodes={"n": (gpus, memory)}), {}, 0
+
+  def add(self, name, *, at=None, sampler=False, lora=False, exclusive=False, width=1, busy=0.0):
+    kind = Kind(Role.SAMPLER if sampler else Role.TRAINER, name, lora, exclusive, gpus=width)
+    self.s.workers[name] = Worker(kind, "n", () if at is None else tuple(at))
+    self.s.runs[name] = Run(kind, name)
+    if at is None:
+      self.place()
+    self.running[name] = Worker(kind, "n", self.s.workers[name].gpus, busy=busy)
+    return self.running[name]
+
+  def place(self):
+    place_gpus(self.s, "n", self.running)
+
+  def drop(self, name):
+    self.s.runs.pop(name)
+    self.s.workers.pop(name)
+    self.place()
+
+  def request(self, name):
+    self.ticket += 1
+    self.running[name].ticket = self.ticket
+
+  def grants(self, now=0.0):
+    granted = []
+    for name in sorted(self.running, key=lambda n: (self.running[n].ticket, n)):
+      if can_run(self.s, "n", self.running, name):
+        self.running[name].since, self.running[name].ticket = now, 0
+        granted.append(name)
+    self.check()
+    return granted
+
+  def check(self):
+    for gpu in range(self.s.nodes["n"][0]):
+      held = [r for r in self.running.values() if r.since is not None and gpu in r.gpus]
+      if len(held) > 1:
+        sizes = [budget(self.s, r.kind, "n") for r in held]
+        self.test.assertTrue(all(sizes))
+        self.test.assertLessEqual(sum(sizes), self.s.nodes["n"][1])
+    for r in self.running.values():
+      self.test.assertFalse(r.ticket and r.since is not None)
+
+
+class TestCluster(unittest.TestCase):
+  def test_runs_are_assigned_and_empty_workers_are_removed(self):
+    c = Cluster()
+    c.node("n", 8)
+    a = c.run("a", rank=8)
+    self.assertEqual(c.run("b", rank=8), a)
+    self.assertEqual(c.s.workers[a].node, "n")
+    self.assertEqual(c.s.workers[a].gpus, ())  # the cluster never chooses local GPUs
+    c.append(Ev.RUN_DELETED, run="a")
+    self.assertEqual(c.settle(), [])
+    c.append(Ev.RUN_DELETED, run="b")
+    self.assertEqual(c.settle(), [(Ev.UNPLACED, {"worker": a, "rule": "place.emptied"})])
+    self.assertNotIn(a, c.s.workers)
+
+  def test_workers_go_to_the_node_with_the_fewest_workers_per_gpu(self):
+    c = Cluster()
+    c.node("a", 1)
+    c.node("b", 2)
+    workers = [c.run(name) for name in ("r1", "r2", "r3")]
+    self.assertEqual([c.s.workers[w].node for w in workers], ["a", "b", "b"])
+
+  def test_full_fine_tune_sampler_stays_near_its_training_run(self):
+    c = Cluster()
+    c.node("a", 1)
+    c.node("b", 1)
+    a, b = c.run("a"), c.run("b")
+    self.assertEqual([c.s.workers[w].node for w in (a, b)], ["a", "b"])
+    sampler = c.run("sample", role="sampler", train_run="b")
+    self.assertEqual(c.s.workers[sampler].node, "b")
+
+  def test_lost_node_workers_are_reassigned_and_forget_their_desired_gpus(self):
+    c = Cluster()
+    c.node("a", 1)
+    w = c.run("r")
+    c.s.workers[w].gpus = (0,)
+    c.node("b", 1)
+    c.append(Ev.NODE_LOST, node="a")
+    self.assertEqual(c.s.workers[w].gpus, ())
+    c.settle()
+    self.assertEqual((c.s.workers[w].node, c.s.workers[w].gpus), ("b", ()))
+
+  def test_multi_gpu_worker_waits_for_a_node_that_has_enough_gpus(self):
+    c = Cluster()
+    c.node("a", 1)
+    w = c.run("wide", gpus=2)
+    self.assertIsNone(c.s.workers[w].node)
+    c.node("b", 4)
+    self.assertEqual(c.s.workers[w].node, "b")
+
+  def test_lora_runs_share_but_full_or_exclusive_runs_get_their_own_workers(self):
+    c = Cluster()
+    a, b = c.run("a", rank=8), c.run("b", rank=8)
+    others = [c.run("c", rank=8, base="b"), c.run("f"), c.run("x", rank=8, exclusive=True)]
+    self.assertEqual(a, b)
+    self.assertEqual(len({a, b, *others}), 4)
+
+  def test_sampling_sessions_share_only_their_kind_and_exclusive_training_run(self):
+    c = Cluster()
+    a = c.run("a", role="sampler", rank=8, train_run="A")
+    b = c.run("b", role="sampler", rank=8, train_run="B")
+    fft = c.run("f", role="sampler", train_run="A")
+    x = c.run("x", role="sampler", rank=8, train_run="X", exclusive=True)
+    y = c.run("y", role="sampler", rank=8, train_run="X", exclusive=True)
+    z = c.run("z", role="sampler", rank=8, train_run="Z", exclusive=True)
+    self.assertEqual(a, b)
+    self.assertEqual(x, y)
+    self.assertEqual(len({a, b, fft, x, y, z}), 4)
+
+  def test_random_cluster_logs_replay_without_local_execution_state(self):
+    for seed in range(100):
+      rng, c = random.Random(seed), Cluster()
+      for _ in range(100):
+        roll, name = rng.random(), str(rng.randrange(8))
+        if roll < 0.15:
+          c.node(name, rng.choice([1, 2, 4]))
+        elif roll < 0.25:
+          c.append(Ev.NODE_LOST, node=name)
+        elif roll < 0.8 and name not in c.s.runs:
+          c.run(name, rank=rng.choice([0, 8]), base=str(rng.randrange(3)), gpus=rng.choice([1, 2]))
+        else:
+          c.append(Ev.RUN_DELETED, run=name)
+        c.settle()
+        self.assertEqual(decide(c.s, 0.0), [])
+        self.assertTrue(all(w.node is None or w.node in c.s.nodes for w in c.s.workers.values()))
+      replay = State()
+      for event in c.entries:
+        fold(replay, event)
+      self.assertEqual(replay, c.s)
+      self.assertTrue(all(w.gpus == () for w in replay.workers.values()))
 
 
 class TestPlacement(unittest.TestCase):
-  def test_a_worker_with_runs_is_placed_and_an_emptied_one_unplaced(self):
-    log = Log(self)
-    log.node(8)
-    self.assertEqual(log("run_created", run="r1", worker="lora:a:0"), [("placed", "lora:a:0", PLACED)])
-    self.assertEqual(log("run_created", run="r2", worker="lora:a:0"), [])
-    self.assertEqual(log("run_deleted", run="r1", worker="lora:a:0"), [])
-    self.assertEqual(log("run_deleted", run="r2", worker="lora:a:0"), [("unplaced", "lora:a:0", EMPTIED)])
+  def test_workers_take_empty_gpus_while_available(self):
+    p = Local(self, 8)
+    for n in ("a", "b", "c"):
+      p.add(n, lora=True)
+    self.assertEqual([p.s.workers[n].gpus for n in ("a", "b", "c")], [(0,), (1,), (2,)])
 
-  def test_a_dedicated_sampler_cools_with_its_run(self):
-    log = Log(self)
-    log.node(8)
-    log("run_created", run="r", worker="r")
-    decided = log("sampler_warmed", worker="sampler:fft:r", train_run="r", exclusive=True)
-    self.assertEqual(decided, [("placed", "sampler:fft:r", "place.near_its_trainer")])
+  def test_shared_fft_samplers_pack_their_memory_budgets(self):
+    p = Local(self, 8, memory=81559 * MIB)
+    for name in ("q", "g"):
+      p.add(name, sampler=True)
+    p.add("lora", sampler=True, lora=True)
+    p.add("exclusive", sampler=True, exclusive=True)
     self.assertEqual(
-      log("run_deleted", run="r", worker="r"), [("unplaced", "r", EMPTIED), ("unplaced", "sampler:fft:r", EMPTIED)]
+      {n: w.gpus for n, w in p.s.workers.items()},
+      {"q": (0,), "g": (0,), "lora": (1,), "exclusive": (2,)},
     )
 
-  def test_workers_go_to_the_node_with_the_fewest_workers_per_gpu(self):
-    log = Log(self)
-    log.node(1, node="a")
-    log.node(2, node="b")
-    for run in ("r1", "r2", "r3"):
-      log("run_created", run=run, worker=run)
-    self.assertEqual([log.s.workers[run].node for run in ("r1", "r2", "r3")], ["a", "b", "b"])
+  def test_exclusive_workers_are_alone_and_others_stay_off_their_gpu(self):
+    p = Local(self, 2)
+    p.add("exclusive", exclusive=True)
+    p.add("a")
+    p.add("b")
+    self.assertEqual([p.s.workers[n].gpus for n in ("exclusive", "a", "b")], [(0,), (1,), (1,)])
+    p = Local(self, 2)
+    p.add("exclusive", at=(1,), sampler=True, exclusive=True)
+    p.add("a", sampler=True)
+    self.assertEqual(p.s.workers["a"].gpus, (0,))
 
-  def test_a_full_fine_tune_s_sampler_goes_to_its_trainer_s_node(self):
-    log = Log(self)
-    log.node(1, node="a")
-    log.node(1, node="b")
-    log("run_created", run="r", worker="r")
-    log("run_created", run="q", worker="q")
-    self.assertEqual([log.s.workers[w].node for w in ("r", "q")], ["a", "b"])
-    decided = log("run_created", run="s", worker="sampler:fft:q", train_run="q")  # both nodes hold one worker
-    self.assertEqual(decided, [("placed", "sampler:fft:q", "place.near_its_trainer")])
-    self.assertEqual(log.s.workers["sampler:fft:q"].node, "b")
+  def test_multi_gpu_sampler_moves_single_gpu_trainer_aside(self):
+    p = Local(self, 4)
+    p.add("wide", width=2)
+    p.add("single")
+    p.add("sample", sampler=True, lora=True, width=2)
+    self.assertEqual([p.s.workers[n].gpus for n in ("wide", "single", "sample")], [(0, 1), (0,), (2, 3)])
 
-  def test_a_lost_node_s_workers_move_to_a_live_one(self):
-    log = Log(self)
-    log.node(1, node="a")
-    log("run_created", run="r", worker="r")
-    log("started", worker="r", node="a")
-    log.node(1, node="b")
-    self.assertEqual(log("node_lost", node="a"), [("placed", "r", PLACED)])
-    self.assertEqual((log.s.workers["r"].node, log.s.workers["r"].on), ("b", ()))
-
-  def test_each_worker_gets_an_empty_gpu_while_there_is_one(self):
-    log = Log(self)
-    log.node(8)
-    for name in ("lora:a:0", "lora:b:0", "lora:c:0"):
-      log("run_created", run=name, worker=name)
-    self.assertEqual([log.s.workers[n].gpus for n in ("lora:a:0", "lora:b:0", "lora:c:0")], [(0,), (1,), (2,)])
-
-  def test_shared_fft_samplers_get_a_memory_budget_on_large_gpus(self):
-    log = Log(self)
-    log.node(8, memory=81559 * MIB)
-    log("sampler_warmed", worker="sampler:fft:Qwen")
-    log("sampler_warmed", worker="sampler:fft:Gemma")
-    log("sampler_warmed", worker="sampler:Qwen")
-    log("sampler_warmed", worker="sampler:fft:Llama", exclusive=True)
-    shares = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_GPU_MEM": "0.42", "TINYRL_KV_BYTES": str(16 * 1024**3)}
-    alone = {"TINYRL_WARM_SAMPLER": "1", "TINYRL_KV_BYTES": str(24 * 1024**3)}
-    placed = {name: (p.gpus, settings(p.kind, 8, 81559 * MIB)) for name, p in log.s.workers.items()}
-    self.assertEqual(
-      placed,
-      {
-        "sampler:fft:Qwen": ((0,), shares),
-        "sampler:fft:Gemma": ((0,), shares),
-        "sampler:Qwen": ((1,), alone),
-        "sampler:fft:Llama": ((2,), alone),
-      },
-    )
-    self.assertEqual(budget(log.s, log.s.workers["sampler:fft:Qwen"].kind, "n"), int(0.42 * 81559 * MIB))
-    self.assertEqual(settings(Kind("sampler", lora=False), 8, 23034 * MIB), {"TINYRL_WARM_SAMPLER": "1"})
-    self.assertEqual(settings(Kind("sampler", lora=True), 1, 81559 * MIB), {"TINYRL_KV_BYTES": str(24 * 1024**3)})
+  def test_spreading_waits_until_old_process_leaves_its_actual_gpu(self):
+    p = Local(self, 2)
+    p.add("old", at=(1,))
+    for name in ("a", "b"):
+      p.add(name, at=(0,))
+    p.drop("old")
+    self.assertEqual([p.s.workers[n].gpus for n in ("a", "b")], [(0,), (0,)])
+    p.running.pop("old")
+    p.place()
+    self.assertEqual([p.s.workers[n].gpus for n in ("a", "b")], [(1,), (0,)])
+    before = copy.deepcopy(p.s)
+    p.place()
+    self.assertEqual(p.s, before)
 
 
-class TestTurns(unittest.TestCase):
-  def one_gpu(self, *names: str) -> Log:
-    log = Log(self)
-    log.node(1)
-    for name in names:
-      log.worker(name)
-    return log
+class TestReservations(unittest.TestCase):
+  def test_ready_runs_share_service_even_when_commands_have_different_costs(self):
+    heads = [Cmd(run, "1-0", Op.FORWARD_BACKWARD, b"") for run in ("slow", "fast")]
+    service = {"slow": 0.0, "fast": 0.0}
+    for _ in range(11):
+      [run] = select_runs(heads, service, 1)
+      service[run] += 10 if run == "slow" else 1
+    self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
 
-  def test_waiters_get_the_gpu_in_first_ask_order(self):
-    log = self.one_gpu("a", "b", "c")
-    self.assertEqual(log("wants_gpu", worker="a"), [("granted", "a", GRANTED)])
-    log("wants_gpu", worker="c")
-    log("wants_gpu", worker="b")
-    order = ["a"]
-    for _ in range(2):
-      self.assertEqual(log("idle", worker=order[-1]), [("revoked", order[-1], IDLE)])
-      order += [worker for kind, worker, _ in log("released", worker=order[-1]) if kind == "granted"]
+  def test_fifo_order_is_the_order_of_requests_not_worker_names(self):
+    p = Local(self)
+    for name in ("a", "b", "c"):
+      p.add(name)
+    for name in ("a", "c", "b"):
+      p.request(name)
+    order = []
+    for _ in range(3):
+      [name] = p.grants()
+      order.append(name)
+      p.running[name].since = None
     self.assertEqual(order, ["a", "c", "b"])
 
-  def test_one_pass_never_grants_two_workers_that_do_not_fit(self):
-    log = self.one_gpu("a", "b")
-    log.append("wants_gpu", {"worker": "a"})
-    log.append("wants_gpu", {"worker": "b"})
-    self.assertEqual(log.tick(), [("granted", "a", GRANTED)])
+  def test_workers_with_known_budgets_share_but_unknown_budgets_wait(self):
+    p = Local(self)
+    for name in ("a", "b", "c"):
+      p.add(name, sampler=True)
+      p.request(name)
+    p.add("trainer")
+    p.request("trainer")
+    self.assertEqual(p.grants(), ["a", "b"])
+    p.running["a"].since = None
+    self.assertEqual(p.grants(), ["c"])
+    p.running["b"].since = None
+    self.assertEqual(p.grants(), [])
+    p.running["c"].since = None
+    self.assertEqual(p.grants(), ["trainer"])
 
-  def test_a_holder_with_nobody_waiting_keeps_the_gpu(self):
-    log = self.one_gpu("a")
-    log("wants_gpu", worker="a")
-    log("idle", worker="a")
-    for t in range(10, 300, 10):
-      self.assertEqual(log.tick(at=t), [])
+  def test_unknown_gpu_memory_never_allows_concurrent_reservations(self):
+    p = Local(self, memory=0)
+    for name in ("a", "b"):
+      p.add(name, sampler=True)
+      p.request(name)
+    self.assertEqual(p.grants(), ["a"])
 
-  def test_an_idle_holder_yields_as_soon_as_someone_waits(self):
-    log = self.one_gpu("a", "b")
-    log("wants_gpu", worker="a")
-    log("idle", at=1, worker="a")
-    self.assertEqual(log("wants_gpu", at=2, worker="b"), [("revoked", "a", IDLE)])
+  def test_multi_gpu_reservation_is_atomic_and_cannot_be_bypassed_on_either_gpu(self):
+    p = Local(self, 2)
+    p.add("holder", at=(0,))
+    p.add("wide", at=(0, 1), width=2)
+    p.add("later", at=(1,))
+    for name in ("holder", "wide", "later"):
+      p.request(name)
+    self.assertEqual(p.grants(), ["holder"])
+    self.assertIsNone(p.running["wide"].since)
+    self.assertIsNone(p.running["later"].since)
+    p.running["holder"].since = None
+    self.assertEqual(p.grants(), ["wide"])
+    p.running["wide"].since = None
+    self.assertEqual(p.grants(), ["later"])
 
-  def test_a_busy_holder_is_revoked_after_its_quantum(self):
-    log = self.one_gpu("a", "b")
-    log("wants_gpu", worker="a")
-    self.assertEqual(log("wants_gpu", at=1, worker="b"), [])
-    self.assertEqual(log.tick(at=29.9), [])
-    self.assertEqual(log.tick(at=30), [("revoked", "a", QUANTUM)])
+  def test_different_gpus_can_run_concurrently(self):
+    p = Local(self, 2)
+    for name, gpu in (("a", 0), ("b", 1)):
+      p.add(name, at=(gpu,))
+      p.request(name)
+    self.assertEqual(p.grants(), ["a", "b"])
 
-  def test_engine_boot_does_not_count_toward_the_quantum(self):
-    log = self.one_gpu("a", "b")
-    log("wants_gpu", worker="a")
-    log("wants_gpu", at=1, worker="b")
-    self.assertEqual(log("batch_done", at=35, worker="a", boot=35.0, seconds=36.0), [])
-    self.assertEqual(log.tick(at=64.9), [])
-    self.assertEqual(log.tick(at=65), [("revoked", "a", QUANTUM)])
-
-  def test_workers_that_fit_together_hold_a_gpu_at_once_and_the_rest_take_turns(self):
-    log = Log(self)
-    log.node(1, memory=80 * GIB)
-    for name in ("sampler:fft:a", "sampler:fft:b", "t"):  # shared full fine-tune samplers each get 0.42 of a GPU
-      log.worker(name)
-    self.assertEqual(log("wants_gpu", worker="sampler:fft:a"), [("granted", "sampler:fft:a", GRANTED)])
-    self.assertEqual(log("wants_gpu", worker="sampler:fft:b"), [("granted", "sampler:fft:b", GRANTED)])
-    self.assertEqual(log("wants_gpu", worker="t"), [])
-    self.assertEqual(log("idle", at=5, worker="sampler:fft:a"), [("revoked", "sampler:fft:a", IDLE)])
-    self.assertEqual(log("released", at=6, worker="sampler:fft:a"), [])  # t still doesn't fit next to b
-    self.assertEqual(log("idle", at=7, worker="sampler:fft:b"), [("revoked", "sampler:fft:b", IDLE)])
-    self.assertEqual(log("released", at=8, worker="sampler:fft:b"), [("granted", "t", GRANTED)])
-
-  def test_a_wide_worker_is_granted_only_with_every_gpu(self):
-    log = Log(self)
-    log.node(2)
-    log.worker("w", gpus=(0, 1))
-    log.worker("x")
-    log("wants_gpu", worker="x")
-    self.assertEqual(log("wants_gpu", worker="w"), [])
-    log("idle", worker="x")
-    self.assertEqual(log("released", worker="x"), [("granted", "w", GRANTED)])
-
-  def test_a_dead_worker_loses_its_turn_and_the_next_in_line_gets_it(self):
-    log = self.one_gpu("a", "b")
-    log("wants_gpu", worker="a")
-    log("wants_gpu", worker="b")
-    self.assertEqual(log("exited", worker="a"), [("granted", "b", GRANTED)])
-    log.worker("a")
-    self.assertEqual(log("wants_gpu", worker="a"), [])
-
-  def test_an_unplaced_worker_keeps_its_turn_until_its_process_exits(self):
-    log = self.one_gpu("a", "b")
-    log("wants_gpu", worker="a")
-    log("wants_gpu", worker="b")
-    self.assertEqual(log("run_deleted", run="a-run", worker="a"), [("unplaced", "a", EMPTIED)])
-    self.assertEqual(log("exited", worker="a"), [("granted", "b", GRANTED)])
-    self.assertNotIn("a", log.s.workers)
-
-  def test_a_moved_worker_keeps_its_old_gpus_until_its_process_exits(self):
-    log = Log(self)
-    log.node(2)
-    log.worker("a", gpus=(0,))
-    log.worker("b", gpus=(0,))
-    log("wants_gpu", worker="a")
-    log("wants_gpu", worker="b")
-    log.append("placed", {"worker": "a", "node": "n", "gpus": [1], "rule": "test"})
-    self.assertEqual(log.tick(), [])  # a's process is still on GPU 0
-    self.assertEqual(log("exited", worker="a"), [("granted", "b", GRANTED)])
-
-  def test_a_restarted_node_daemon_takes_its_processes_turns_with_it(self):
-    log = self.one_gpu("a", "b")
-    log("wants_gpu", worker="a")
-    log("wants_gpu", worker="b")
-    log.node(1)
-    self.assertEqual([(p.on, p.since, p.asked) for p in log.s.workers.values()], [((), None, 0)] * 2)
-    self.assertEqual({p.node for p in log.s.workers.values()}, {"n"})  # still placed, so its node daemon restarts them
-
-
-class TestLog(unittest.TestCase):
-  def random_log(self, rng: random.Random) -> Log:
-    """Random facts, faults included: workers restarting elsewhere, dead workers that never release, nodes restarting and lost, runs coming and going."""
-    log = Log(self)
-    nodes = {f"n{i}": rng.choice([1, 2, 4, 8]) for i in range(rng.choice([1, 1, 2, 4]))}
-    for node, gpus in nodes.items():
-      log.node(gpus, node=node)
-    names = [rng.choice(("p", "sampler:fft:p")) + str(i) for i in range(rng.randint(1, 12))]  # those samplers share
-    for _ in range(rng.randint(20, 200)):
-      name, roll = rng.choice(names), rng.random()
-      if roll < 0.15 and log.s.nodes:
-        node = rng.choice(sorted(log.s.nodes))
-        width = rng.choice([w for w in (1, 2, 4) if w <= nodes[node]])
-        first = rng.randrange(0, nodes[node] - width + 1, width)
-        log.worker(name, range(first, first + width), node)
-      elif roll < 0.4:
-        log("wants_gpu", worker=name)
-      elif roll < 0.55:
-        log("batch_done", at=log.t + rng.random() * 20, worker=name, boot=rng.choice([0.0, 0.0, 30.0]), seconds=1.0)
-      elif roll < 0.65:
-        log("released", worker=name)
-      elif roll < 0.75:
-        log.tick(at=log.t + rng.random() * 40)
-      elif roll < 0.8:
-        log("exited", worker=name)
-      elif roll < 0.82:
-        node = rng.choice(sorted(nodes))
-        log.node(nodes[node], node=node)
-      elif roll < 0.84:
-        log("node_lost", node=rng.choice(sorted(nodes)))
-      elif roll < 0.88:
-        log("run_created", run=f"r{rng.randint(0, 20)}", worker=name, exclusive=rng.random() < 0.2)
-      elif roll < 0.92:
-        log("run_deleted", run=f"r{rng.randint(0, 20)}", worker=name)
-      elif roll < 0.94:
-        log("sampler_warmed", worker=f"sampler:{name}")
-      elif roll < 0.97 and (p := log.s.workers.get(name)) and p.node:
-        log("started", worker=name, node=p.node)
-      else:
-        log("idle", worker=name)
-    return log
-
-  def test_random_logs_keep_every_invariant(self):
+  def test_random_requests_and_exits_never_overcommit_a_gpu(self):
     for seed in range(300):
-      self.random_log(random.Random(seed))
-
-  def test_replay_rebuilds_the_same_state(self):
-    log = self.random_log(random.Random(7))
-    s = State()
-    for e in log.entries:
-      s = fold(s, e)
-    self.assertEqual(s, log.s)
-
-  def test_every_waiter_gets_a_turn_within_its_place_in_line_times_the_quantum(self):
-    log = Log(self, quantum=30.0)
-    log.node(1)
-    names = [f"p{i}" for i in range(6)]
-    for name in names:
-      log.worker(name)
-    asked, granted = {}, {}
-
-    def note(decisions: list) -> list:
-      for kind, worker, _ in decisions:
-        if kind == "granted":
-          granted.setdefault(worker, log.t)
-      return decisions
-
-    for name in names:
-      asked[name] = log.t = log.t + 1
-      note(log("wants_gpu", worker=name))
-    for _ in range(400):  # a bound, so a broken rule fails the test where it would wait forever
-      for kind, worker, _ in note(log.tick(at=log.t + 1)):
-        if kind == "revoked":
-          note(log("released", at=log.t + 1, worker=worker))
-    for place, name in enumerate(names):
-      self.assertLessEqual(granted[name] - asked[name], (place + 1) * 32.0, name)
-
-
-class TestWorkersAndGpus(unittest.TestCase):
-  def test_a_trainer_takes_turns_with_the_least_busy_trainers(self):
-    log = Log(self)
-    log.node(2)
-    for worker, busy in (("busy", 50.0), ("light", 5.0)):
-      log("run_created", run=worker, worker=worker)
-      log("batch_done", worker=worker, seconds=busy)
-    log("run_created", run="t", worker="t")
-    self.assertEqual(log.s.workers["t"].gpus, log.s.workers["light"].gpus)
-
-  def test_a_sampler_moves_the_least_busy_trainers_aside_and_never_takes_turns(self):
-    log = Log(self)
-    log.node(2)
-    for worker, busy in (("busy", 50.0), ("light", 5.0)):
-      log("run_created", run=worker, worker=worker)
-      log("batch_done", worker=worker, seconds=busy)
-    decided = log("sampler_warmed", worker="sampler:b")
-    self.assertEqual([(k, p) for k, p, _ in decided], [("placed", "light"), ("placed", "sampler:b")])
-    self.assertEqual(log.s.workers["light"].gpus, log.s.workers["busy"].gpus)
-    self.assertNotEqual(log.s.workers["sampler:b"].gpus, log.s.workers["busy"].gpus)
-
-  def test_a_worker_with_a_memory_budget_fills_a_gpu_it_fits_on_before_an_empty_one(self):
-    log = Log(self)
-    log.node(2, memory=80 * GIB)
-    log("run_created", run="t", worker="t")
-    log("sampler_warmed", worker="sampler:fft:a")
-    log("run_deleted", run="t", worker="t")
-    log("exited", worker="t")
-    log("sampler_warmed", worker="sampler:fft:b")
-    self.assertEqual(log.s.workers["sampler:fft:b"].gpus, log.s.workers["sampler:fft:a"].gpus)
-
-  def test_no_worker_fits_next_to_an_exclusive_one_whatever_their_budgets(self):
-    log = Log(self)
-    log.node(2, memory=80 * GIB)
-    log.append("run_created", {"run": "x", "worker": "x", "exclusive": True})
-    log.append("placed", {"worker": "x", "node": "n", "gpus": [1], "rule": "test"})
-    log("sampler_warmed", worker="sampler:fft:a")
-    self.assertEqual(log.s.workers["sampler:fft:a"].gpus, (0,))
-
-  def test_a_sampler_moves_as_few_trainers_as_it_can(self):
-    log = Log(self)
-    log.node(2)
-    for worker, gpu, busy in (("c", 1, 5.0), ("a", 0, 1.0), ("b", 0, 1.0)):
-      log.worker(worker, gpus=(gpu,))
-      log("batch_done", worker=worker, seconds=busy)
-    log("sampler_warmed", worker="sampler:s")
-    self.assertEqual((log.s.workers["sampler:s"].gpus, log.s.workers["c"].gpus), ((1,), (0,)))
-
-  def test_a_sampler_moves_a_lora_trainer_aside_before_a_full_fine_tune(self):
-    log = Log(self)
-    log.node(2)
-    for worker, gpu, busy in (("full", 0, 1.0), ("lora:a", 1, 9.0)):
-      log.worker(worker, gpus=(gpu,))
-      log("batch_done", worker=worker, seconds=busy)
-    log("sampler_warmed", worker="sampler:s")
-    self.assertEqual((log.s.workers["sampler:s"].gpus, log.s.workers["lora:a"].gpus), ((1,), (0,)))
-
-  def test_an_exclusive_worker_gets_a_gpu_to_itself_and_others_stay_off_it(self):
-    log = Log(self)
-    log.node(2)
-    log("run_created", run="x", worker="x", exclusive=True)
-    log("run_created", run="a", worker="a")
-    log("run_created", run="b", worker="b")
-    self.assertEqual([log.s.workers[n].gpus for n in ("x", "a", "b")], [(0,), (1,), (1,)])
-
-  def test_a_multi_gpu_worker_takes_that_many_gpus_on_a_node_that_has_them(self):
-    log = Log(self)
-    log.node(1, node="a")
-    log.node(4, node="b")
-    log("run_created", run="t", worker="t")
-    self.assertEqual(log.s.workers["t"].node, "a")
-    log("run_created", run="w2", worker="w2", gpus=2)
-    self.assertEqual((log.s.workers["w2"].node, log.s.workers["w2"].gpus), ("b", (0, 1)))
-    log("run_created", run="t2", worker="t2")
-    self.assertEqual((log.s.workers["t2"].node, log.s.workers["t2"].gpus), ("b", (2,)))
-    decided = log("sampler_warmed", worker="sampler:s2", gpus=2)
-    self.assertEqual([(k, w) for k, w, _ in decided], [("placed", "t2"), ("placed", "sampler:s2")])
-    self.assertEqual((log.s.workers["sampler:s2"].gpus, log.s.workers["t2"].gpus), ((2, 3), (0,)))
-
-  def test_the_benchmark_s_arrivals_move_lora_trainers_and_leave_samplers_alone(self):
-    log = Log(self)
-    log.node(8, memory=81559 * MIB)
-    trainers = {"x": 4.0, "lora:g:0": 7.0, "lora:q:0": 7.7, "q1": 1.7, "q2": 2.4, "g1": 4.8}
-    for worker, busy in trainers.items():
-      log("run_created", run=worker, worker=worker, exclusive=worker == "x")
-      log("batch_done", worker=worker, seconds=busy)
-    for worker in ("sampler:fft:q", "sampler:q", "sampler:fft:g", "sampler:fft:x", "sampler:g"):
-      log("sampler_warmed", worker=worker, exclusive=worker == "sampler:fft:x")
-    gpu = {name: p.gpus[0] for name, p in log.s.workers.items()}
-    self.assertEqual({gpu["lora:g:0"], gpu["lora:q:0"]}, {gpu["q1"], gpu["q2"]})
-    self.assertEqual(gpu["sampler:fft:q"], gpu["sampler:fft:g"])
-    alone = [gpu[n] for n in ("x", "g1", "sampler:q", "sampler:fft:x", "sampler:g")]
-    self.assertEqual(sorted(alone + [gpu["q1"], gpu["q2"], gpu["sampler:fft:q"]]), list(range(8)))
-
-  def test_a_trainer_taking_turns_moves_to_a_gpu_once_it_empties(self):
-    log = Log(self)
-    log.node(2)
-    for worker, gpu in (("x", 1), ("a", 0), ("b", 0)):
-      log.worker(worker, gpus=(gpu,))
-    # x's process still runs on GPU 1, so nothing moves there yet
-    self.assertEqual(log("run_deleted", run="x-run", worker="x"), [("unplaced", "x", EMPTIED)])
-    self.assertEqual(log("exited", worker="x"), [("placed", "a", SPREAD)])
-    self.assertEqual([log.s.workers[n].gpus for n in ("a", "b")], [(1,), (0,)])
-    self.assertEqual(log.tick(), [])
-
-  def test_a_lora_trainer_moves_before_a_full_fine_tune_and_a_waiter_before_the_holder(self):
-    log = Log(self)
-    log.node(2)
-    for worker, gpu in (("x", 1), ("full", 0), ("lora:a", 0), ("lora:b", 0)):
-      log.worker(worker, gpus=(gpu,))
-    self.assertEqual(log("wants_gpu", worker="lora:a"), [("granted", "lora:a", GRANTED)])
-    log("run_deleted", run="x-run", worker="x")
-    self.assertEqual(log("exited", worker="x"), [("placed", "lora:b", SPREAD)])
-
-  def test_the_benchmark_s_trainers_spread_back_out_when_the_last_wave_s_workers_leave(self):
-    log = Log(self)
-    log.node(8)
-    old = [f"old{g}" for g in (0, 1, 3, 4, 5, 6, 7)]
-    for g, worker in zip((0, 1, 3, 4, 5, 6, 7), old):
-      log.worker(worker, gpus=(g,))
-    for worker in ("lora:g", "lora:q", "q1", "q2", "g1"):  # squeezed onto the one GPU left, as on the cluster
-      log.worker(worker, gpus=(2,))
-    for worker in old:
-      log("run_deleted", run=f"{worker}-run", worker=worker)
-      log("exited", worker=worker)
-    gpus = [log.s.workers[n].gpus[0] for n in ("lora:g", "lora:q", "q1", "q2", "g1")]
-    self.assertEqual(len(set(gpus)), 5)
-
-  def test_random_arrivals_never_make_a_sampler_take_turns_while_trainers_could_move(self):
-    rnd = random.Random(42)
-    for _ in range(200):
-      log, gpus = Log(self), rnd.choice([2, 4, 8])
-      log.node(gpus)
-      names = [f"lora:b-{i}:0" for i in range(3)] + [f"ts-{i}" for i in range(4)] + ["sampler:b-0", "sampler:c-0"]
-      for name in rnd.sample(names, rnd.randint(1, len(names))):
-        on = {g: [(q, p) for q, p in log.s.workers.items() if p.gpus == (g,)] for g in range(gpus)}
-        movable = [g for g, ps in on.items() if ps and all(q.startswith(("lora:", "ts-")) for q, _ in ps)]
-        before = len(log.entries)
-        log("run_created" if not name.startswith("sampler:") else "sampler_warmed", run=name, worker=name)
-        log("batch_done", worker=name, seconds=rnd.random() * 10)
-        [mine] = [e for e in log.entries[before:] if e.kind == "placed" and e.body["worker"] == name]
-        if name.startswith("sampler:") and movable:
-          self.assertIn(mine.body["gpu_rule"], ("empty_gpu", "fits_next_to_others"), name)
-
-
-def workers_after(*runs: dict) -> dict[str, str]:
-  """Each run's worker once the scheduler has decided, for runs created with these requirements."""
-  s, n = State(), 0
-  for r in runs:
-    body = {"role": "trainer", "base": "a", "rank": 8, "exclusive": False, "train_run": None} | r
-    s, n = fold(s, Event(str(n), 0.0, "run_created", body)), n + 1
-  for kind, body in decide(s, 0.0):
-    s = fold(s, Event("", 0.0, kind, body))
-  return {name: r.worker for name, r in s.runs.items()}
-
-
-class TestChooseWorker(unittest.TestCase):
-  def test_lora_runs_of_one_base_share_a_worker_and_full_or_exclusive_runs_get_their_own(self):
-    worker = workers_after(
-      {"run": "A"}, {"run": "B"}, {"run": "C", "base": "b"}, {"run": "F", "rank": 0}, {"run": "X", "exclusive": True}
-    )
-    self.assertEqual(worker["A"], worker["B"])
-    self.assertEqual(len(set(worker.values())), 4)
-
-  def test_sampling_sessions_share_their_base_and_kinds_sampler(self):
-    sampler = {"role": "sampler", "rank": 1}
-    worker = workers_after(
-      sampler | {"run": "s1", "train_run": "A"},
-      sampler | {"run": "s2", "train_run": "B"},
-      sampler | {"run": "f", "rank": 0, "train_run": "A"},
-      sampler | {"run": "x1", "exclusive": True, "train_run": "X"},
-      sampler | {"run": "x2", "exclusive": True, "train_run": "X"},
-    )
-    self.assertEqual(worker["s1"], worker["s2"])
-    self.assertEqual(worker["x1"], worker["x2"])
-    self.assertEqual(len(set(worker.values())), 3)
-
-
-class TestFold(unittest.TestCase):
-  def test_replaying_a_log_in_place_rebuilds_the_same_state_as_folding_copies(self):
-    import copy
-
-    events = [
-      Event("1", 0.0, "node_up", {"node": "n", "gpus": 8, "memory": 80}),
-      Event("2", 0.0, "run_created", {"run": "x", "role": "trainer", "base": "a", "rank": 8, "exclusive": False}),
-      Event("3", 0.0, "assigned", {"run": "x", "worker": "w1"}),
-    ]
-    s_inplace = State()
-    s_copy = State()
-    for e in events:
-      s_inplace = fold(s_inplace, e)
-      s_copy = fold(copy.deepcopy(s_copy), e)
-    self.assertEqual(s_inplace, s_copy)
-
-  def test_decide_does_not_mutate_state_it_is_given(self):
-    import dataclasses
-
-    s = State()
-    s = fold(s, Event("1", 0.0, "node_up", {"node": "n", "gpus": 8, "memory": 80}))
-    s = fold(
-      s, Event("2", 0.0, "run_created", {"run": "x", "role": "trainer", "base": "a", "rank": 8, "exclusive": False})
-    )
-    s = fold(s, Event("3", 0.0, "assigned", {"run": "x", "worker": "w1"}))
-    original = dataclasses.asdict(s)
-    decide(s, 0.0)
-    self.assertEqual(dataclasses.asdict(s), original)
+      rng, p = random.Random(seed), Local(self, 4)
+      for i in range(10):
+        width = rng.choice([1, 1, 2, 4])
+        first = rng.randrange(5 - width)
+        p.add(str(i), at=tuple(range(first, first + width)), width=width, sampler=rng.random() < 0.5)
+      for _ in range(100):
+        name = rng.choice(list(p.running))
+        r = p.running[name]
+        if r.since is not None:
+          r.since = None  # parking or process exit has completed
+        elif not r.ticket:
+          p.request(name)
+        p.grants()
 
 
 if __name__ == "__main__":

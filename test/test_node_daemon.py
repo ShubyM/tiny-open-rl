@@ -2,365 +2,178 @@ import asyncio
 import contextlib
 import json
 import os
-import pathlib
-import socket
-import subprocess
-import sys
+import signal
 import tempfile
-import time
 import unittest
-import uuid
-from unittest.mock import MagicMock, patch
 
 import torch
 
+from test.execution import TestNode
 from test.helpers import RedisTest, new_id, tiny
-from tinyrl.bus import Op, Run
+from test.test_process import require_unix
+from test.test_sampler import JOB
+from tinyrl.bus import Op, Role, Run
 from tinyrl.control import scheduler
-from tinyrl.control.node_daemon import SWEEP_GRACE_S, NodeDaemon, reap
+from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.storage.store import Store
 
-LEASE_MS = 2000
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
 class TestNodeDaemon(RedisTest):
-  async def test_the_node_daemon_starts_a_trainer_for_a_worker_with_runs_and_again_when_it_dies(self):
-    base = f"{tempfile.mkdtemp()}/tiny"
-    tiny().save_pretrained(base)
-    worker, run = f"lora:{base}", new_id()
-    await self.bus.create_run(Run(run, worker, base, 4))
-    await self.bus.create_run(Run(new_id(), "empty", base, 4))
-    await self.bus.delete_run((await self.bus.runs_in_worker("empty"))[0], "empty")
+  async def asyncSetUp(self):
+    await super().asyncSetUp()
+    self.nodes, self.tasks = [], []
 
-    with patch.dict(os.environ, {"REDIS_URL": self.url, "LEASE_MS": str(LEASE_MS)}):
-      daemon = NodeDaemon(self.bus, gpus=2)
-      await daemon.announce_node()
-      scheduling = asyncio.create_task(scheduler.run(self.bus))  # it places the worker and grants GPU turns
-      try:
-        await self.until(lambda: daemon.procs, daemon)
-        self.assertEqual(list(daemon.procs), [worker])  # not the worker whose runs are all gone
-        request_id = await self.bus.submit_command(
-          run, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
-        )
-        self.assertTrue((await self.bus.wait_for_reply(request_id, 60)).ok)
+  def node(self, gpus=1, store=None, real=False):
+    if store is None:
+      folder = tempfile.TemporaryDirectory()
+      self.addCleanup(folder.cleanup)
+      store = Store(root=folder.name)
+    daemon = (NodeDaemon if real else TestNode)(self.bus, gpus=gpus, node="node", store=store, gpu_mib=0)
+    self.nodes.append(daemon)
+    return daemon
 
-        gpu, first = daemon.procs[worker]
-        await daemon.tick()
-        self.assertIs(daemon.procs[worker][1], first)  # one trainer per worker
+  def background(self, coro):
+    task = asyncio.create_task(coro)
+    self.tasks.append(task)
+    return task
 
-        first.kill()
-        await asyncio.to_thread(first.wait)
-        while await self.bus.lease_owner(worker):  # its lease runs out
-          await asyncio.sleep(0.1)
-        await daemon.tick()
-        self.assertIsNot(daemon.procs[worker][1], first)
-        request_id = await self.bus.submit_command(
-          run, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
-        )
-        self.assertTrue((await self.bus.wait_for_reply(request_id, 60)).ok)
-      finally:
-        scheduling.cancel()
-        for _, proc in daemon.procs.values():
-          proc.terminate()
-          proc.wait()
+  async def asyncTearDown(self):
+    for task in self.tasks:
+      task.cancel()
+    await asyncio.gather(*self.tasks, return_exceptions=True)
+    for node in self.nodes:
+      await node.close(graceful=False)
+      for task in (node.uploading, node.sweeping):
+        if task:
+          task.cancel()
+          await asyncio.gather(task, return_exceptions=True)
+    await super().asyncTearDown()
 
-  async def until(self, done, *daemons: NodeDaemon, tries: int = 100) -> None:
-    """Tick the node daemons until `done` says yes."""
-    for _ in range(tries):
-      for daemon in daemons:
-        await daemon.tick()
-      if done():
-        return
-      await asyncio.sleep(0.05)
-    self.fail("never happened")
+  async def until(self, done, node):
+    async with asyncio.timeout(60):
+      while not done():
+        await node.tick()
+        await asyncio.sleep(0.01)
 
-  @patch("tinyrl.bus.NODE_MS", 600)
-  async def test_workers_spread_over_nodes_and_move_off_a_dead_one(self):
-    for run in ("r1", "r2"):
-      await self.bus.create_run(Run(run, f"worker-{run}", "base", 4))
-    a, b = NodeDaemon(self.bus, gpus=1, node="a"), NodeDaemon(self.bus, gpus=1, node="b")
-    await a.announce_node()
-    await b.announce_node()
-    scheduling = asyncio.create_task(scheduler.run(self.bus))
-    try:
-      with patch("subprocess.Popen", side_effect=lambda *_, **__: MagicMock(**{"poll.return_value": None})):
-        await self.until(lambda: len(a.procs) == len(b.procs) == 1, a, b)  # one worker on each node
+  async def reply(self, request, node):
+    waiting = self.background(self.bus.wait_for_reply(request, 60))
+    await self.until(waiting.done, node)
+    reply = waiting.result()
+    self.assertIsNotNone(reply)
+    self.assertTrue(reply.ok, reply.body)
+    return reply
 
-        await self.until(lambda: sorted(b.procs) == ["worker-r1", "worker-r2"], b)  # a stops ticking, so it dies
-
-        proc = b.procs["worker-r1"][1]
-        await self.bus.delete_run("r1", "worker-r1")
-        await self.until(lambda: sorted(b.procs) == ["worker-r2"], b)  # an empty worker's process is stopped
-        proc.terminate.assert_called()
-    finally:
-      scheduling.cancel()
-
-  async def test_a_single_gpu_trainer_moved_on_its_node_keeps_its_process(self):
-    await self.bus.create_run(Run("ra", "a", "base", 4))
-    daemon = NodeDaemon(self.bus, gpus=2, node="n", gpu_mib=0)
-    await daemon.announce_node()
-    await self.bus.append_event("placed", worker="a", node="n", gpus=[0], rule="test")
-    with patch("subprocess.Popen", side_effect=lambda *a, **kw: MagicMock(**{"poll.return_value": None})):
-      await daemon.tick()
-      proc = daemon.procs["a"][1]
-      self.assertEqual(daemon.procs["a"][0], [0])
-
-      await self.bus.append_event("placed", worker="a", node="n", gpus=[1], rule="test")
-      await daemon.tick()
-      proc.terminate.assert_not_called()
-      self.assertEqual(daemon.procs["a"][0], [1])
-
-      await self.bus.append_event("unplaced", worker="a")
-      await daemon.tick()
-      proc.terminate.assert_called_once()
-
-      await self.bus.create_run(Run("rb", "b", "base", 4))
-      await self.bus.append_event("placed", worker="b", node="n", gpus=[0], rule="test")
-      await daemon.tick()
-      proc2 = daemon.procs["b"][1]
-      await self.bus.append_event("placed", worker="b", node="m", gpus=[0], rule="test")
-      await daemon.tick()
-      proc2.terminate.assert_called_once()
-
-  async def test_a_stopped_process_keeps_its_turn_until_it_exits(self):
-    await self.bus.create_run(Run("ra", "a", "base", 4))
-    daemon, proc = NodeDaemon(self.bus, gpus=1, node="n", gpu_mib=0), MagicMock(**{"poll.return_value": None})
-    await daemon.announce_node()
-    scheduling = asyncio.create_task(scheduler.run(self.bus))
-    try:
-      with patch("subprocess.Popen", return_value=proc):
-        await self.until(lambda: daemon.procs, daemon)
-        await self.bus.delete_run("ra", "a")
-        await self.until(lambda: proc.terminate.called, daemon)
-        for _ in range(5):
-          await daemon.tick()
-        self.assertNotIn("exited", [e.kind for e in await self.bus.read_events()])  # it may still be saving on its GPU
-        proc.poll.return_value = 0
-        await daemon.tick()
-        self.assertIn("exited", [e.kind for e in await self.bus.read_events()])
-    finally:
-      scheduling.cancel()
-
-  def test_reaping_a_process_kills_what_it_started(self):
-    spawn = "import subprocess, sys; print(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']).pid)"
-    proc = subprocess.Popen([sys.executable, "-c", spawn], stdout=subprocess.PIPE, text=True, start_new_session=True)
-    child = int(proc.stdout.readline())
-    proc.wait()
-    reap(proc)
-    for _ in range(100):
-      try:
-        if pathlib.Path(f"/proc/{child}/stat").read_text().rsplit(") ", 1)[1][0] == "Z":
-          break
-      except FileNotFoundError:
-        break
-      time.sleep(0.01)
-    else:
-      self.fail("the process a worker started outlived it")
-
-  @patch("tinyrl.control.node_daemon.subprocess.Popen")
-  def test_a_process_starts_on_its_placed_gpus_with_its_placed_settings(self, popen):
-    daemon = NodeDaemon(None, gpus=8, node="n")
-    daemon.gpu_mib = 81559
-    daemon.start_worker_process("sampler:fft:a", scheduler.Worker(scheduler.Kind("sampler", lora=False), gpus=(6,)))
-    env = popen.call_args[1]["env"]
-    self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["GPU"]), ("6", f"{socket.gethostname()}:6"))
-    self.assertEqual(env["TINYRL_GPU_MEM"], "0.42")
-    self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", env)
-
-  @patch("tinyrl.control.node_daemon.subprocess.Popen")
-  def test_start_sets_cuda_alloc_conf_on_trainer(self, popen):
-    daemon = NodeDaemon(None, gpus=2, node="n")
-    daemon.start_worker_process("lora:base:0", scheduler.Worker(gpus=(0,)))
-    self.assertEqual(popen.call_args[1]["env"]["PYTORCH_CUDA_ALLOC_CONF"], "expandable_segments:True")
-    with patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"}):
-      daemon.start_worker_process("lora:base:1", scheduler.Worker(gpus=(0,)))
-      self.assertEqual(popen.call_args[1]["env"]["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
-    daemon.start_worker_process("fft:2gpu", scheduler.Worker(scheduler.Kind(gpus=2), gpus=(2, 3)))
-    self.assertEqual(
-      popen.call_args[0][0],
-      [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc-per-node=2",
-        "-m",
-        "tinyrl.workers.trainer",
-        "fft:2gpu",
-      ],
+  async def create(self, run, base, node):
+    request = await self.bus.submit_command(
+      run, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
     )
-    self.assertEqual(popen.call_args[1]["env"]["CUDA_VISIBLE_DEVICES"], "2,3")
+    await self.reply(request, node)
 
-  async def test_started_is_in_the_log_before_the_process_spawns(self):
-    await self.bus.create_run(Run("r1", "worker", "base", 4))
-    daemon = NodeDaemon(self.bus, gpus=1, node="n", gpu_mib=0)
-    await daemon.announce_node()
-    await self.bus.append_event("placed", worker="worker", node="n", gpus=[0], rule="test")
-    import redis
-
-    seen = []
-
-    def spawn(*_, **__):
-      with redis.Redis.from_url(self.url) as r:
-        seen.extend(f[b"kind"].decode() for _, entries in r.xread({"tinyrl:events": "0-0"}) for _, f in entries)
-      return MagicMock(**{"poll.return_value": None})
-
-    with patch("subprocess.Popen", side_effect=spawn):
-      await daemon.tick()
-    self.assertIn("started", seen)
-
-  async def test_a_slow_sweep_never_holds_up_the_heartbeat(self):
-    daemon, sweeps, done = NodeDaemon(self.bus, node="n", gpu_mib=0), [], asyncio.Event()
-
-    async def slow_sweep():
-      sweeps.append(time.time())
-      await done.wait()  # deleting a wave's checkpoints from a bucket took 85 s on the cluster
-
-    daemon.sweep_checkpoints = slow_sweep
-    with patch("tinyrl.control.node_daemon.SWEEP_S", 0):
-      await asyncio.wait_for(daemon.tick(), 5)
-      await asyncio.wait_for(daemon.tick(), 5)  # and heartbeats again while the sweep runs
-    self.assertEqual(len(sweeps), 1)  # one sweep at a time
-    done.set()
-
-  async def test_a_node_the_scheduler_found_lost_announces_itself_again(self):
-    daemon = NodeDaemon(self.bus, gpus=1, node="n", gpu_mib=0)
-    await daemon.announce_node()
-    await daemon.tick()
-    await self.bus.append_event("node_lost", node="n")  # its heartbeat ran out while it was still running
-    await daemon.tick()
-    await daemon.tick()
-    self.assertEqual([e.kind for e in await self.bus.read_events()], ["node_up", "node_lost", "node_up"])
-    self.assertIn("n", daemon.state.nodes)
-
-  async def test_a_lost_node_announces_itself_only_once_its_stopped_processes_exited(self):
-    await self.bus.create_run(Run("ra", "a", "base", 4))
-    daemon, proc = NodeDaemon(self.bus, gpus=1, node="n", gpu_mib=0), MagicMock(**{"poll.return_value": None})
-    await daemon.announce_node()
-    await self.bus.append_event("placed", worker="a", node="n", gpus=[0], rule="test")
-    with patch("subprocess.Popen", return_value=proc):
-      await daemon.tick()
-      await self.bus.append_event("node_lost", node="n")
-      await daemon.tick()
-      proc.terminate.assert_called()
-      await daemon.tick()
-      # a trainer still saving from the GPU: a node_up now would let the scheduler grant that GPU to another worker
-      self.assertEqual([e.kind for e in await self.bus.read_events()].count("node_up"), 1)
-      proc.poll.return_value = 0
-      await daemon.tick()
-    self.assertEqual([e.kind for e in await self.bus.read_events()][-2:], ["exited", "node_up"])
-
-  async def test_reap_kills_process_tree(self):
-    env = os.environ.copy()
-    env.update({"LOCAL_RANK": "0", "WORLD_SIZE": "1", "REDIS_URL": self.url})
-    script = """
-import subprocess, sys
-proc = subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", "dummy_worker"], start_new_session=True, stdout=sys.stdout)
-print(proc.pid, flush=True)
-proc.wait()
-"""
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
-      f.write(script)
-    try:
-      parent = subprocess.Popen([sys.executable, f.name], env=env, stdout=subprocess.PIPE, start_new_session=True)
-      child_pid = int(parent.stdout.readline().decode().strip())
-      for _ in range(100):
-        if await self.bus.r.keys("tinyrl:owner:dummy_worker"):
-          break
-        await asyncio.sleep(0.1)
-
-      reap(parent)
-
-      await asyncio.sleep(0.5)
-      with self.assertRaises(OSError, msg="kernel killed child"):
-        os.kill(child_pid, 0)
-    finally:
-      os.unlink(f.name)
-      if parent.poll() is None:
-        reap(parent)
-      with contextlib.suppress(OSError):
-        os.kill(child_pid, 9)
-
-  async def test_a_single_gpu_trainer_process_serves_and_stops_on_sigterm(self):
-    env = {**os.environ, "REDIS_URL": self.url, "CUDA_VISIBLE_DEVICES": ""}
-    env.pop("LOCAL_RANK", None)
-    proc = subprocess.Popen([sys.executable, "-m", "tinyrl.workers.trainer", "solo"], env=env)
-    try:
-      for _ in range(200):
-        if await self.bus.lease_owner("solo") or proc.poll() is not None:
-          break
-        await asyncio.sleep(0.1)
-      self.assertIsNotNone(await self.bus.lease_owner("solo"), "the trainer took its worker's lease")
-      proc.terminate()
-      self.assertEqual(proc.wait(30), 0)
-    finally:
-      if proc.poll() is None:
-        proc.kill()
-
-  async def test_a_sweep_deletes_only_what_the_registry_lets_go(self):
-    store = Store(root=tempfile.mkdtemp())
-    old = time.time() - SWEEP_GRACE_S - 60
-    for name in ("before", "kept", "deleted", "young"):
-      store.put(f"tinker://r/weights/{name}", {"w": torch.ones(2)})
-    os.utime(store.path("tinker://r/weights/before"), (old - 3600, old - 3600), follow_symlinks=False)
-    await self.registry.register_checkpoint("tinker://r/weights/kept", 8)  # the registry starts here
-    await self.registry.register_checkpoint("tinker://r/weights/deleted", 8)
-    await self.registry.unregister_checkpoints("tinker://r/weights/deleted")
-    await self.bus.r.set("tinyrl:ckpt_since", old - 1800)
-    for name in ("kept", "deleted"):
-      os.utime(store.path(f"tinker://r/weights/{name}"), (old, old), follow_symlinks=False)
-    await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
-    names = sorted(u.rsplit("/", 1)[1] for u in store.list_checkpoints())
-    self.assertEqual(names, ["before", "kept", "young"])  # older than the registry, registered, still being saved
-
-  async def test_the_node_daemon_uploads_what_its_node_saved(self):
-    store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
-    store.put("tinker://r/weights/w", {"w": torch.ones(2)})  # a trainer exits right after, leaving it to the daemon
-    daemon = NodeDaemon(self.bus, node="n", gpu_mib=0, store=store)
-    await daemon.tick()
-    await daemon.uploading
-    self.assertEqual(store.list_checkpoints(), ["tinker://r/weights/w"])
-
-  async def test_a_sweep_keeps_the_chain_links_a_registered_checkpoint_builds_on(self):
-    store, v = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp()), []
-    for step in range(3):
-      store.put(
-        f"tinker://r/sampler_weights/{step}", {"w": torch.full((64,), float(step))}, {"config": {"model_type": "x"}}
+  async def test_a_backlogged_run_yields_to_a_ready_sibling(self):
+    node, a, b = self.node(), new_id(), new_id()
+    creates = {}
+    for run in (a, b):
+      await self.bus.create_run(Run(run, "worker", "tiny", 4, lora=LORA))
+      creates[run] = await self.bus.submit_command(
+        run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
       )
-      v.append(store.versions[f"tinker://r/sampler_weights/{step}"])
-    store.upload_pending_saves()
-    await self.registry.register_checkpoint("tinker://r/sampler_weights/1", 128, version=v[1])
-    await self.bus.r.set("tinyrl:ckpt_since", 0)
-    with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
-      await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
-    self.assertEqual(sorted(p.rsplit("/", 1)[1] for p in store.fs.glob(f"{store.base}/r/_versions/*")), v[:2])
+    for _ in range(12):
+      await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    await node.add("worker")
+    child = node.processes["worker"]
+    self.assertTrue((await self.bus.wait_for_reply(creates[b], 5)).ok)
+    self.assertLessEqual((await self.bus.get_run(a))["steps"], 4)
+    self.assertGreater((await self.bus.queued_and_in_flight(a))["queued"], 0)
+    await node.drain(a)
+    self.assertEqual((await self.bus.get_run(a))["steps"], 12)
+    self.assertIs(node.processes["worker"], child)
 
-  async def test_a_sweep_moves_on_past_a_checkpoint_it_cannot_delete(self):
-    store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
-    for name in ("a", "b"):
-      store.put(f"tinker://r/weights/{name}", {"w": torch.ones(2)})
-    store.upload_pending_saves()
-    await self.bus.r.set("tinyrl:ckpt_since", 0)
-    delete = store.delete
-    store.delete = lambda uri: (_ for _ in ()).throw(OSError("503")) if uri.endswith("/a") else delete(uri)
-    with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
-      await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
-    self.assertEqual(store.list_checkpoints(), ["tinker://r/weights/a"])
+  async def test_an_unpublished_checkpoint_does_not_block_ready_work_or_gpu_handoff(self):
+    with tempfile.TemporaryDirectory() as folder:
+      writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
+      node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
+      uri = "tinker://training/sampler_weights/slow"
+      writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
+      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri])
+      await self.bus.create_run(Run("slow", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
+      await self.bus.create_run(Run("ready", "sampler", "tiny", 4, role=Role.SAMPLER))
+      resident = await node.add("sampler")
+      slow = await self.bus.submit_command("slow", Op.SAMPLE, json.dumps(JOB).encode())
+      try:
+        ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
+        await self.reply(ready, node)
+        await self.bus.create_run(Run("other", "other", "tiny", 4, role=Role.SAMPLER))
+        contender = await node.add("other", gpus=[0])
+        request = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
+        await self.reply(request, node)
+        self.assertIsNone(resident.since)
+        self.assertIsNotNone(contender.since)
+        self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
+        self.assertEqual(await self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
+      finally:
+        await asyncio.to_thread(writer.upload_pending_saves)
+      await self.reply(slow, node)
 
-  async def test_a_sweep_deletes_a_save_whose_upload_never_finished(self):
-    store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
-    store.put("tinker://r/weights/w", {"w": torch.ones(2)})
-    pipe = store.fs.pipe_file
-    with patch.object(
-      store.fs, "pipe_file", lambda p, d: (_ for _ in ()).throw(OSError("429")) if p.endswith("_latest") else pipe(p, d)
-    ):
-      store.upload_pending_saves()  # its files went up, but not the _latest that names them
-    self.assertTrue(store.fs.find(store.path("tinker://r/weights/w")))
-    await self.bus.r.set("tinyrl:ckpt_since", 0)
-    with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
-      await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
-    self.assertFalse(store.fs.exists(store.path("tinker://r/weights/w")))
+  async def test_admission_waits_for_the_previous_model_process_to_park(self):
+    require_unix()
+    node = self.node(real=True)
+    base = f"{node.store.root}/base"
+    tiny().save_pretrained(base)
+    a, b = new_id(), new_id()
+    for run, worker in ((a, "a"), (b, "b")):
+      await self.bus.create_run(Run(run, worker, base, 4, lora=LORA))
+    await node.announce_node()
+    self.background(scheduler.run(self.bus))
+    await self.create(a, base, node)
+    holder = node.running["a"]
+    os.killpg(holder.pid, signal.SIGSTOP)
+    try:
+      request = await self.bus.submit_command(
+        b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
+      )
+      await self.until(lambda: "b" in node.running and node.running["b"].ticket > 0, node)
+      self.assertIsNotNone(holder.since)
+      self.assertIsNone(node.running["b"].since)
+      self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})
+      heartbeat = (await self.bus.live_nodes(details=True))[node.id]["until"]
+      await node.tick()
+      self.assertGreater((await self.bus.live_nodes(details=True))[node.id]["until"], heartbeat)
+    finally:
+      with contextlib.suppress(ProcessLookupError):
+        os.killpg(holder.pid, signal.SIGCONT)
+    await self.reply(request, node)
+    self.assertIsNone(holder.since)
+
+  async def test_real_model_process_serves_moves_and_restarts(self):
+    require_unix()
+    node = self.node(gpus=2, real=True)
+    base = f"{node.store.root}/base"
+    tiny().save_pretrained(base)
+    run = new_id()
+    await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
+    await node.announce_node()
+    self.background(scheduler.run(self.bus))
+    await self.create(run, base, node)
+    first = node.running["worker"].pid
+    node.state.workers["worker"].gpus = (1,)
+    request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    await self.reply(request, node)
+    self.assertEqual(node.running["worker"].pid, first)
+    self.assertEqual(node.running["worker"].gpus, (1,))
+    os.killpg(first, signal.SIGKILL)
+    await self.until(lambda: "worker" in node.running and node.running["worker"].pid != first, node)
+    await self.create(run, base, node)
+
+  async def test_the_node_uploads_what_its_model_saved(self):
+    with tempfile.TemporaryDirectory() as folder:
+      store = Store(f"file://{folder}/bucket", cache=f"{folder}/cache")
+      store.put("tinker://r/weights/w", {"w": torch.ones(2)})
+      node = self.node(store=store)
+      await node.tick()
+      await node.uploading
+      self.assertEqual(store.list_checkpoints(), ["tinker://r/weights/w"])
 
 
 if __name__ == "__main__":
