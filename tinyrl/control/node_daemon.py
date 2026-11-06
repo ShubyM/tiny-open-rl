@@ -58,13 +58,22 @@ class NodeDaemon:
     self.changed, self.draining = asyncio.Event(), False
     self.heartbeat = time.monotonic()
     self.swept, self.uploading, self.sweeping = 0.0, None, None
-    self.logging: set[asyncio.Task] = set()
+    self.turns: asyncio.Queue | None = None
+    self.logging: asyncio.Task | None = None
 
   def log(self, kind: Ev, worker: str, **body) -> None:
-    """Append a turn to the event log, without waiting, for traces and the dashboard. No scheduler folds it."""
-    task = asyncio.create_task(self.bus.append_event(kind, worker=worker, **body))
-    self.logging.add(task)
-    task.add_done_callback(self.logging.discard)
+    """Append a turn to the event log, in order and without waiting, for traces and the dashboard. No scheduler folds it."""
+    if self.logging is None:
+      self.turns, self.logging = asyncio.Queue(), asyncio.create_task(self.append_turns())
+    self.turns.put_nowait((kind, {"worker": worker, **body}))
+
+  async def append_turns(self) -> None:
+    while True:
+      kind, body = await self.turns.get()
+      try:
+        await self.bus.append_event(kind, **body)
+      except Exception as e:  # a trace that misses a turn is better than a worker that stops
+        print(f"could not log {kind}: {e!r}", file=sys.stderr, flush=True)
 
   def notify(self) -> None:
     changed, self.changed = self.changed, asyncio.Event()
@@ -482,6 +491,8 @@ class NodeDaemon:
           task.cancel()
       await asyncio.gather(*self.tasks.values(), return_exceptions=True)
       self.dispatch()
+    if self.logging:
+      self.logging.cancel()
     await asyncio.to_thread(self.store.upload_pending_saves)
 
   async def serve(self) -> None:
