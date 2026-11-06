@@ -22,7 +22,7 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path  # a P
 
 ```sh
 pip install -e .
-redis-server &                                          # Redis 8.4 or newer
+redis-server &                                          # Redis 8.6 or newer
 python -m tinyrl.api.gateway &                          # the Tinker HTTP API, on :8000
 python -m tinyrl.control.scheduler &                    # assigns runs, places workers and grants GPU turns
 python -m tinyrl.control.node_daemon                    # runs a trainer or sampler for each worker placed on it
