@@ -58,6 +58,13 @@ class NodeDaemon:
     self.changed, self.draining = asyncio.Event(), False
     self.heartbeat = time.monotonic()
     self.swept, self.uploading, self.sweeping = 0.0, None, None
+    self.logging: set[asyncio.Task] = set()
+
+  def log(self, kind: Ev, worker: str, **body) -> None:
+    """Append a turn to the event log, without waiting, for traces and the dashboard. No scheduler folds it."""
+    task = asyncio.create_task(self.bus.append_event(kind, worker=worker, **body))
+    self.logging.add(task)
+    task.add_done_callback(self.logging.discard)
 
   def notify(self) -> None:
     changed, self.changed = self.changed, asyncio.Event()
@@ -72,10 +79,12 @@ class NodeDaemon:
       with trace("node.request_gpu", worker):
         self.serial += 1
         r.ticket = self.serial
+      self.log(Ev.WANTS_GPU, worker)
       self.notify()
     if scheduler.can_run(self.state, self.id, self.running, worker):
       with trace("node.grant_gpu", worker):
         r.since, r.ticket = time.time(), 0
+      self.log(Ev.GRANTED, worker)
       self.notify()
       return True
     return False
@@ -252,6 +261,7 @@ class NodeDaemon:
         with trace("node.park", worker):
           await model.park() if sampling else await model.call("park")
         r.since = None
+        self.log(Ev.RELEASED, worker)
         self.notify()
       if r.gpus != gpus:
         r.gpus = gpus
@@ -299,6 +309,13 @@ class NodeDaemon:
         reply = await answer(cmd, inputs[cmd.run])
       seconds = time.monotonic() - before
       r.busy += seconds
+      self.log(
+        Ev.BATCH_DONE,
+        worker,
+        seconds=seconds,
+        queued=len(heads),
+        ops=[[c.op, seconds * 1000 / len(cmds)] for c in cmds],
+      )
       for cmd in cmds:
         service[cmd.run] = service.get(cmd.run, 0.0) + seconds * len(r.gpus) / len(cmds)
       active = {c.run for c in [*ready(), *cmds]}
@@ -321,7 +338,10 @@ class NodeDaemon:
           except (Exception, asyncio.CancelledError) as e:
             print(f"{worker} could not close, retrying: {e!r}", file=sys.stderr, flush=True)
             await asyncio.sleep(TICK)
+      if r.since is not None:
+        self.log(Ev.RELEASED, worker)
       r.since = None  # release only after the child has acknowledged park or close
+      self.log(Ev.EXITED, worker)
       self.notify()
       if guard:
         guard.cancel()
@@ -346,6 +366,7 @@ class NodeDaemon:
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
       model = self.open_sampler(worker, env) if sampling else self.open_trainer(worker, env)
       r.pid = model.proc.pid if model.proc else None
+      self.log(Ev.STARTED, worker, node=self.id)
       guard = asyncio.create_task(keepalive())
       reader = asyncio.create_task(read())
       reader.add_done_callback(lambda _: self.notify())

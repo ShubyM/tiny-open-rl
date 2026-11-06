@@ -51,7 +51,7 @@ class Op(StrEnum):
 
 
 class Ev(StrEnum):
-  """Cluster assignments and membership, replayed from Redis."""
+  """Cluster assignments and membership, replayed from Redis, then the turns nodes decide, which only traces read."""
 
   RUN_CREATED = "run_created"
   ASSIGNED = "assigned"
@@ -60,6 +60,12 @@ class Ev(StrEnum):
   NODE_LOST = "node_lost"
   PLACED = "placed"
   UNPLACED = "unplaced"
+  STARTED = "started"
+  EXITED = "exited"
+  WANTS_GPU = "wants_gpu"
+  GRANTED = "granted"
+  RELEASED = "released"
+  BATCH_DONE = "batch_done"
 
 
 class Role(StrEnum):

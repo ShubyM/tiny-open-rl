@@ -15,7 +15,7 @@ import subprocess
 import sys
 import traceback
 
-import httpx
+import aiohttp
 
 from tinyrl.control.process import launch, reap, target_pid
 from tinyrl.storage import models
@@ -35,11 +35,13 @@ def by_id(logprobs: dict) -> dict[int, float]:
   return {int(k.removeprefix("token_id:")): v["logprob"] if isinstance(v, dict) else v for k, v in logprobs.items()}
 
 
-def unix_client(sock: str) -> httpx.AsyncClient:
-  limits = httpx.Limits(max_connections=1024, max_keepalive_connections=256, keepalive_expiry=2.0)
-  return httpx.AsyncClient(
-    base_url="http://vllm", timeout=None, transport=httpx.AsyncHTTPTransport(uds=sock, limits=limits)
-  )
+def session(url: str, connector: aiohttp.BaseConnector) -> aiohttp.ClientSession:
+  # aiohttp, not httpx: httpx's pool bookkeeping grows with the square of open connections, hundreds per sampler
+  return aiohttp.ClientSession(url, connector=connector, timeout=aiohttp.ClientTimeout(total=None))
+
+
+def unix_client(sock: str) -> aiohttp.ClientSession:
+  return session("http://vllm", aiohttp.UnixConnector(path=sock, limit=0, keepalive_timeout=2))
 
 
 class VLLM:
@@ -49,10 +51,10 @@ class VLLM:
     base: str,
     lora: bool,
     server: subprocess.Popen | None = None,
-    client: httpx.AsyncClient | None = None,
+    client: aiohttp.ClientSession | None = None,
   ):
-    limits = httpx.Limits(max_connections=1024, max_keepalive_connections=256, keepalive_expiry=2.0)
-    self.http = client or httpx.AsyncClient(base_url=url, timeout=None, limits=limits)
+    # vLLM closes an idle connection after 5 s, so reuse one for less than that
+    self.http = client or session(url, aiohttp.TCPConnector(limit=0, keepalive_timeout=2))
     self.base = base
     self.lora = lora
     self.server = server
@@ -162,9 +164,10 @@ class VLLM:
   async def ready(self) -> VLLM:
     try:
       while self.server.poll() is None:
-        with contextlib.suppress(httpx.HTTPError):
-          if (await self.http.get("/health", timeout=1)).is_success:
-            return self
+        with contextlib.suppress(aiohttp.ClientError, TimeoutError):
+          async with self.http.get("/health", timeout=aiohttp.ClientTimeout(total=1)) as res:
+            if res.ok:
+              return self
         await asyncio.sleep(0.2)
       raise RuntimeError(f"vllm serve exited with {self.server.returncode}")
     except BaseException:
@@ -178,15 +181,15 @@ class VLLM:
         await asyncio.to_thread(self.server.wait)
         self.server = None
     finally:
-      await self.http.aclose()
+      await self.http.close()
 
-  async def post(self, path: str, **kwargs) -> httpx.Response:
+  async def post(self, path: str, **kwargs) -> bytes:
     for attempt in range(3):
       try:
-        res = await self.http.post(path, **kwargs)
-        res.raise_for_status()
-        return res
-      except httpx.TransportError:
+        async with self.http.post(path, **kwargs) as res:
+          res.raise_for_status()
+          return await res.read()
+      except aiohttp.ClientConnectionError:
         if attempt == 2 or (self.server and self.server.poll() is not None):
           raise
     raise AssertionError
@@ -237,7 +240,7 @@ class VLLM:
       "return_token_ids": True,
       "return_tokens_as_token_ids": True,  # so logprobs are keyed "token_id:<id>", not by text two tokens can share
     }
-    choices = sorted((await self.post("/v1/completions", json=req)).json()["choices"], key=lambda c: c["index"])
+    choices = sorted(json.loads(await self.post("/v1/completions", json=req))["choices"], key=lambda c: c["index"])
     seqs = [
       Seq(
         c["token_ids"],
