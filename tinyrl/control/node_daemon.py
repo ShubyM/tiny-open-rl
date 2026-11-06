@@ -19,7 +19,7 @@ from tinyrl.control.process import Process
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
-from tinyrl.trace import trace
+from tinyrl.trace import span
 from tinyrl.workers.sampler import Sampler
 
 GPUS, DRAIN_S, TICK = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK", 0.25)
@@ -76,13 +76,13 @@ class NodeDaemon:
     if r.since is not None:
       return True
     if not r.ticket:
-      with trace("node.request_gpu", worker):
+      with span("node.request_gpu"):
         self.serial += 1
         r.ticket = self.serial
       self.log(Ev.WANTS_GPU, worker)
       self.notify()
     if scheduler.can_run(self.state, self.id, self.running, worker):
-      with trace("node.grant_gpu", worker):
+      with span("node.grant_gpu"):
         r.since, r.ticket = time.time(), 0
       self.log(Ev.GRANTED, worker)
       self.notify()
@@ -146,7 +146,7 @@ class NodeDaemon:
             return
 
     async def prepare(cmd):
-      with trace("node.prepare", cmd.request_id):
+      with span("node.prepare"):
         try:
           run, checkpoint = await self.bus.get_run(cmd.run), None
           if sampling:
@@ -184,7 +184,7 @@ class NodeDaemon:
 
     async def answer(cmd, inputs):
       before = time.time()
-      with trace("node.execute", cmd.request_id):
+      with span("node.execute"):
         if isinstance(inputs, Exception):
           reply = Reply.error(inputs)
         else:
@@ -206,7 +206,7 @@ class NodeDaemon:
               if not await self.bus.set_parked_checkpoint(cmd.run, None, worker, owner):
                 raise RuntimeError(f"lost worker {worker}")
               await self.registry.unregister_checkpoints(restored)
-      with trace("node.publish", cmd.request_id):
+      with span("node.publish"):
         if not await self.bus.write_reply(cmd, reply, worker, owner, started=before):
           raise RuntimeError(f"lost worker {worker}")
       if DEBUG:
@@ -225,7 +225,7 @@ class NodeDaemon:
 
     async def activate():
       if r.since is None:
-        with trace("node.wait_gpu", worker):
+        with span("node.wait_gpu"):
           while True:  # only final checkpointing waits here; ordinary admission never blocks the ready loop
             changed = self.changed
             if self.reserve(worker):
@@ -233,7 +233,7 @@ class NodeDaemon:
             await changed.wait()
       try:
         await owned()
-        with trace("node.resume", worker):
+        with span("node.resume"):
           if not sampling:
             await model.call("resume", r.gpus[0] if movable(r, self.gpus) else None)
           else:
@@ -258,7 +258,7 @@ class NodeDaemon:
       if r.since is not None and (
         gpus != r.gpus or (waiting and (not runnable or time.time() >= r.since + self.state.quantum))
       ):
-        with trace("node.park", worker):
+        with span("node.park"):
           await model.park() if sampling else await model.call("park")
         r.since = None
         self.log(Ev.RELEASED, worker)
@@ -288,7 +288,7 @@ class NodeDaemon:
         reader.cancel()
         await asyncio.gather(reader, return_exceptions=True)
       await owned()
-      with trace("node.claim", worker):
+      with span("node.claim"):
         cmds = await self.bus.take_commands(runs, owner, SAMPLE_COMMANDS if sampling and not failed else 1)
       reader = asyncio.create_task(read())
       reader.add_done_callback(lambda _: self.notify())
@@ -332,7 +332,7 @@ class NodeDaemon:
       if model:
         while True:
           try:
-            with trace("node.close", worker):
+            with span("node.close"):
               await model.close()
             break
           except (Exception, asyncio.CancelledError) as e:

@@ -19,6 +19,7 @@ import aiohttp
 
 from tinyrl.control.process import launch, reap, target_pid
 from tinyrl.storage import models
+from tinyrl.trace import span
 from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
 
@@ -186,9 +187,10 @@ class VLLM:
   async def post(self, path: str, **kwargs) -> bytes:
     for attempt in range(3):
       try:
-        async with self.http.post(path, **kwargs) as res:
-          res.raise_for_status()
-          return await res.read()
+        with span(f"vllm{path}"):
+          async with self.http.post(path, **kwargs) as res:
+            res.raise_for_status()
+            return await res.read()
       except aiohttp.ClientConnectionError:
         if attempt == 2 or (self.server and self.server.poll() is not None):
           raise

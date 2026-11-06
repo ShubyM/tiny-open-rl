@@ -1,19 +1,20 @@
-"""Optional Nsight ranges. Process ranges may overlap across asyncio tasks."""
+"""NVTX ranges, for a timeline of tinyrl's steps next to its CUDA kernels in Nsight Systems. Without a profiler attached, a range costs about a microsecond."""
 
 from contextlib import contextmanager
 
-from tinyrl.helpers import getenv
+try:
+  import nvtx
+except ImportError:  # macOS, which has no nvtx wheels
+  nvtx = None
 
 
 @contextmanager
-def trace(name: str, request_id: str = ""):
-  if not getenv("TINYRL_NVTX"):
+def span(name: str):
+  if nvtx is None:
     yield
     return
-  import nvtx
-
-  # Keep registered messages bounded; the same request bytes correlate parent and child.
-  token = nvtx.start_range(name, domain="tinyrl", payload=request_id.encode() if request_id else None)
+  # start and end, not push and pop: asyncio tasks interleave on a thread
+  token = nvtx.start_range(name, domain="tinyrl")
   try:
     yield
   finally:

@@ -17,7 +17,7 @@ import torch.distributed as dist
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Reply
 from tinyrl.storage.store import Store, nbytes
-from tinyrl.trace import trace
+from tinyrl.trace import span
 from tinyrl.workers.model import Model
 
 
@@ -42,7 +42,8 @@ class Trainer:
     try:
       if self.world_size > 1:
         dist.broadcast_object_list([(method, args)], src=0)
-      return getattr(self.model, method)(*args)
+      with span(f"model.{method}"):
+        return getattr(self.model, method)(*args)
     except Exception as e:
       # The other ranks may be waiting in a collective this rank left; torchrun must restart them all.
       if self.world_size > 1 and not isinstance(e, (ValueError, KeyError)):
@@ -68,7 +69,7 @@ class Trainer:
   def execute(
     self, cmd: Cmd, run: dict | None = None, parked: tuple[str, str | None] | None = None, version: str | None = None
   ) -> tuple[Reply, dict]:
-    with trace("trainer.execute", cmd.request_id):
+    with span("trainer.execute"):
       effects, created = {}, False
       try:
         if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:

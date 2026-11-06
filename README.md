@@ -188,6 +188,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 | [tinyrl/storage/store.py](tinyrl/storage/store.py) | safetensors, chunked saves, uploads, caching and delta chains |
 | [tinyrl/storage/registry.py](tinyrl/storage/registry.py) | checkpoint owners, versions, TTLs and cleanup of unregistered files |
 | [tinyrl/storage/models.py](tinyrl/storage/models.py) | base-model fetching and caching |
+| [tinyrl/trace.py](tinyrl/trace.py) | NVTX ranges for Nsight Systems |
 
 `python sz.py` counts token-bearing lines the way tinygrad does, and CI caps `tinyrl/` at 3,400 lines. Outside `tinyrl/`,
 [examples/tinker_sdk.py](examples/tinker_sdk.py) trains and samples through the unmodified SDK. The rest of the repo holds
@@ -221,10 +222,18 @@ A run's wait includes waiting on its own earlier calls, since a run's calls run 
 `GET /api/v1/scheduling` combines cluster assignments with the latest live-node heartbeat: actual GPUs, waiting workers,
 reservations, accumulated busy time, and the owned process PID (or `null` before a sampling engine starts). These local
 snapshots are diagnostic; the node's live GPU state governs admission. Per-command timing is available with `DEBUG=1`.
-The Redis event log contains cluster assignments.
+The Redis event log contains cluster assignments, and each node's GPU turns for traces.
 
-For CPU/GPU timelines, enable `TINYRL_NVTX=1` and follow [Profiling with Nsight Systems](docs/profiling.md).
-Command elapsed time includes waits and CPU work; use the profiler to distinguish those from CUDA activity.
+Every model call (`model.<method>`), vLLM request (`vllm/<path>`) and checkpoint `store.put` or `store.get` is an NVTX range
+in the `tinyrl` domain. Without a profiler attached a range costs about a microsecond. To see where a node's time goes, run
+its node daemon under Nsight Systems, which follows the trainers and samplers it starts:
+
+```sh
+nsys profile --trace=nvtx --sample=none --cpuctxsw=none --duration=240 --kill=none python -m tinyrl.control.node_daemon
+```
+
+On the 23-job benchmark, `--trace=nvtx` adds nothing measurable. `--trace=cuda,nvtx` also records every kernel, and costs
+about 5 to 7 s of a 112 s run. vLLM servers restored from a snapshot aren't traced, since nsys didn't start them.
 
 ## Throughput simulator
 
