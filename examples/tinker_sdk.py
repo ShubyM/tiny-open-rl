@@ -37,7 +37,6 @@ print(f"sampler {sampler}")
 assert losses[-1] < losses[0] * 0.7, f"the loss barely moved: {losses}"
 
 sampler_client = trainer.save_weights_and_get_sampling_client()
-print(f"sampler_session {sampler_client._sampling_session_id}")
 
 prompt_tokens = [1, 2, 3]
 out = sampler_client.sample(
