@@ -143,15 +143,6 @@ class Event:
 class Bus:
   def __init__(self, r: redis.Redis | None = None):
     self.r = r if r is not None else connect(getenv("REDIS_URL", "redis://localhost:6379"))
-    self._submit = self.r.register_script("""
-      local existing = redis.call('GET', KEYS[1])
-      if existing then return existing end
-      local entry_id = redis.call('XADD', KEYS[2], 'NOMKSTREAM', '*', 'op', ARGV[1], 'body', ARGV[2], 'seq', ARGV[3])
-      if not entry_id then return false end
-      local req_id = ARGV[4] .. entry_id
-      redis.call('SET', KEYS[1], req_id, 'EX', ARGV[5])
-      return req_id
-    """)
 
   # ***** sessions *****
 
@@ -217,6 +208,8 @@ class Bus:
     record = json.dumps({**asdict(run), "created": time.time()})
     p = self.r.pipeline(transaction=True)
     p.xgroup_create(key("q", run.id), GROUP, id="0", mkstream=True)
+    # how long XADD IDMP recognizes a retried call: Redis's longest window, a day, and its most ids
+    p.execute_command("XCFGSET", key("q", run.id), "IDMP-DURATION", 86400, "IDMP-MAXSIZE", 10000)
     p.sadd(key("runs"), run.id)
     mapping = {"record": record, "steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0}
     if run.worker:
@@ -280,20 +273,19 @@ class Bus:
   # ***** commands *****
 
   async def submit_command(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
-    """Queue a command on a run's stream. Returns its request id, or None if there is no such run."""
-    if seq_id is not None:
-      res = await self._submit(
-        keys=[key("seq", run_id, str(seq_id)), key("q", run_id)],
-        args=[op, body, str(seq_id), f"{run_id}/", SESSION_TTL],
-      )
-      return res.decode() if res else None
-
+    """Queue a command on a run's stream. Returns its request id, or None if there is no such run. A call retried with the same seq_id gets the first call's request id and is queued once."""
+    if seq_id is not None and (first := await self.r.get(key("seq", run_id, str(seq_id)))):
+      return first.decode()  # a retry, even of a deleted run's command, a pre-IDMP one, or one older than IDMP's window
+    seq = [] if seq_id is None else ["IDMP", run_id, seq_id]  # and two racing retries still queue once
     # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
-    entry_id = await self.r.xadd(key("q", run_id), {"op": op, "body": body}, nomkstream=True)
+    fields = ["op", op, "body", body, *(["seq", seq_id] if seq else [])]
+    entry_id = await self.r.execute_command("XADD", key("q", run_id), "NOMKSTREAM", *seq, "*", *fields)
     if entry_id is None:
       return None
-
-    return f"{run_id}/{entry_id.decode()}"
+    request_id = f"{run_id}/{entry_id.decode()}"
+    if seq:  # the gateway and a repeated command look the first call's request id up by its seq_id
+      await self.r.set(key("seq", run_id, str(seq_id)), request_id, ex=SESSION_TTL)
+    return request_id
 
   async def take_commands(self, worker: str, owner: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
     """The next commands for a worker's trainer: up to `count` from each run that has work."""

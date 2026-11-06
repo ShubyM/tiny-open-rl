@@ -70,6 +70,22 @@ class TestBus(RedisTest):
     self.assertEqual(await self.bus.wait_for_reply(request_id, 10), ok(n=1))
     await answering
 
+  async def test_a_retried_call_is_queued_once_even_if_its_seq_key_is_gone(self):
+    run_id = await self.new_run()
+    first = await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=5)
+    await self.bus.r.delete(key("seq", run_id, "5"))  # as if the gateway died between queueing it and recording it
+    self.assertEqual(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=5), first)
+    self.assertEqual(await self.bus.r.get(key("seq", run_id, "5")), first.encode())
+    self.assertNotEqual(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=6), first)
+    self.assertEqual(await self.bus.r.xlen(key("q", run_id)), 2)
+
+  async def test_a_retry_after_its_run_was_deleted_gets_the_first_request_id(self):
+    run_id = await self.new_run()
+    first = await self.bus.submit_command(run_id, Op.DELETE_MODEL, b"", seq_id=3)
+    await self.bus.delete_run(run_id, "p")
+    self.assertEqual(await self.bus.submit_command(run_id, Op.DELETE_MODEL, b"", seq_id=3), first)
+    self.assertIsNone(await self.bus.submit_command(run_id, Op.DELETE_MODEL, b"", seq_id=4))
+
   async def test_unknown_and_deleted_runs_take_no_work(self):
     self.assertIsNone(await self.bus.submit_command(new_id(), Op.OPTIM_STEP, b""))
 
