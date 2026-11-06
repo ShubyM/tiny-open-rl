@@ -630,6 +630,80 @@ class TestTrainer(RedisTest):
     self.assertLessEqual(len(sent), 2, f"{len(sent)} commands ran after another trainer asked for the GPU")
     self.assertTrue(all([reply.ok for reply in await self.replies(steps, 30)]))
 
+  async def test_serving_a_command_reads_only_its_own_run(self):
+    """With many runs on one trainer, a command's cost must not grow with the number of runs: that throughput margin decides whether the trainer keeps up with the sampler."""
+    runs = [new_id() for _ in range(8)]
+    for run in runs:
+      await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    lw = await self.node.add("p")
+    created = [
+      i
+      for run in runs
+      for i in await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    ]
+    self.assertTrue(all([reply.ok for reply in await self.replies(created, 20)]))
+    reads, peeks, get_run, peek = [], [], self.bus.get_run, self.bus.peek_commands
+
+    async def counted(run):
+      reads.append(run)
+      return await get_run(run)
+
+    async def peeked(runs, block_ms=0):
+      peeks.append(runs)
+      return await peek(runs, block_ms)
+
+    self.bus.get_run, self.bus.peek_commands = counted, peeked
+    entered, go = gate(lw.engine.process, "execute")
+    steps = [i for run in runs for i in await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}}))]
+    await asyncio.wait_for(entered.wait(), 5)
+    go.set()
+    self.assertTrue(all([reply.ok for reply in await self.replies(steps, 20)]))
+    self.assertLessEqual(len(reads), 3 * len(steps), f"{len(reads)} run records read to serve {len(steps)} commands")
+    self.assertLessEqual(len(peeks), len(steps) + 3, f"{len(peeks)} peeks at the queues to serve {len(steps)} commands")
+
+  async def test_a_run_s_queued_chain_is_served_in_one_turn_but_claimed_one_command_at_a_time(self):
+    """A step's forward_backward, optim_step and sampler save run back to back without the trainer peeking the queues or asking for the GPU again, yet nothing is claimed before it is next: a turn revoked mid-chain ends after the command in flight."""
+    runs = [new_id() for _ in range(3)]
+    for run in runs:
+      await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    lw = await self.node.add("p")
+    create = (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA})
+    self.assertTrue(
+      all([r.ok for r in await self.replies([i for run in runs for i in await self.submit(run, create)], 20)])
+    )
+    peeks, peek = [], self.bus.peek_commands
+
+    async def peeked(members, block_ms=0):
+      peeks.append(members)
+      return await peek(members, block_ms)
+
+    self.bus.peek_commands = peeked
+    calls = watch(lw.engine.process)
+    entered, go = gate(lw.engine.process, "execute")
+    step = lambda run: [  # noqa: E731
+      (Op.FORWARD_BACKWARD, proto_body(run)),
+      (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.1}}),
+      (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{run}/sampler_weights/s0"}),
+    ]
+    ids = [i for run in runs for i in await self.submit(run, *step(run))]
+    await asyncio.wait_for(entered.wait(), 5)
+    queue = await self.bus.queued_and_in_flight(runs[0])
+    self.assertEqual((queue["queued"], len(queue["in_flight"])), (2, 1), "claimed ahead of the command in flight")
+    go.set()
+    self.assertTrue(all([reply.ok for reply in await self.replies(ids, 20)]))
+    executed = [(args[0].run, args[0].op) for _, method, args in calls if method == "execute"]
+    self.assertEqual(executed, [(run, op) for run in runs for op, _ in step(run)])
+    self.assertLessEqual(len(peeks), len(runs) + 2, f"{len(peeks)} peeks to serve {len(runs)} chains")
+    self.assertEqual([m for _, m, _ in calls if m in ("park", "resume")], [], "the turn was given up inside a chain")
+    entered, go = gate(lw.engine.process, "execute", after=True)
+    ids = await self.submit(runs[0], *step(runs[0]))
+    await asyncio.wait_for(entered.wait(), 5)
+    self.node.note(Ev.REVOKED, worker="p")
+    go.set()
+    self.assertTrue(all([reply.ok for reply in await self.replies(ids, 20)]))
+    methods = [m for _, m, _ in calls if m != "execute" or True][len(executed) :]
+    self.assertEqual(methods[:4], ["execute", "park", "resume", "execute"])
+
   async def test_a_command_s_busy_ms_is_its_own_running_time(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
