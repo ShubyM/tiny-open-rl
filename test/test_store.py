@@ -11,7 +11,6 @@ from unittest.mock import patch
 
 import torch
 
-import tinyrl.storage.store
 from tinyrl.storage.store import Store
 
 
@@ -110,34 +109,28 @@ class TestStore(unittest.TestCase):
       keys = f.keys()
       self.assertNotEqual("t1" in keys, "t2" in keys)
 
-  def test_stage_below_and_above_max_pin_bytes(self):
-    old_max = tinyrl.storage.store.MAX_PIN_BYTES
-    tinyrl.storage.store.MAX_PIN_BYTES = 64
-    try:
-      store = Store(root=tempfile.mkdtemp())
-      tensors = {
-        "scalar": torch.tensor(3.0, dtype=torch.float32),
-        "f32": torch.arange(10, dtype=torch.float32),
-        "i64": torch.arange(20, dtype=torch.int64),
-        "bf16": torch.arange(30, dtype=torch.bfloat16),
-      }
-      cpu = store.copy_to_host(tensors, is_cuda=lambda _: True)
-      for k, v in tensors.items():
-        self.assertEqual(cpu[k].shape, v.shape)
-        self.assertTrue(torch.equal(cpu[k], v))
-      store.put("tinker://r/weights/chunked", cpu, {"optimizer": True})
-      got, _ = store.get("tinker://r/weights/chunked")
-      for k, v in tensors.items():
-        self.assertEqual(got[k].shape, v.shape)
-        self.assertTrue(torch.equal(got[k], v))
+  def test_writes_the_same_bytes_as_safetensors(self):
+    import safetensors.torch
 
-      tinyrl.storage.store.MAX_PIN_BYTES = 1000000
-      cpu = store.copy_to_host(tensors, is_cuda=lambda _: True)
-      for k, v in tensors.items():
-        self.assertEqual(cpu[k].shape, v.shape)
-        self.assertTrue(torch.equal(cpu[k], v))
-    finally:
-      tinyrl.storage.store.MAX_PIN_BYTES = old_max
+    tensors = {
+      "scalar": torch.tensor(3.0, dtype=torch.float32),
+      "empty": torch.zeros(0, 4, dtype=torch.float16),
+      "f64": torch.arange(5, dtype=torch.float64),
+      "i64": torch.arange(20, dtype=torch.int64).view(4, 5).t(),
+      "i8": torch.arange(-3, 3, dtype=torch.int8),
+      "u8": torch.arange(7, dtype=torch.uint8),
+      "bool": torch.tensor([True, False, True]),
+      "bf16": torch.arange(30, dtype=torch.bfloat16),
+    }
+    folder = tempfile.mkdtemp()
+    Store(root=folder).write_safetensors(0, f"{folder}/mine.safetensors", tensors, {"meta": "{}"})
+    got = safetensors.torch.load_file(f"{folder}/mine.safetensors")
+    self.assertEqual(set(got), set(tensors))
+    for k, v in tensors.items():
+      self.assertEqual((got[k].dtype, got[k].shape), (v.dtype, v.shape))
+      self.assertTrue(torch.equal(got[k], v))
+    with safetensors.safe_open(f"{folder}/mine.safetensors", framework="pt") as f:
+      self.assertEqual(f.metadata(), {"meta": "{}"})
 
   @unittest.mock.patch("tinyrl.storage.store.SHARD_BYTES", 64)
   def test_remote_sharded_upload_is_atomic_and_cleans_stale_shards(self):
