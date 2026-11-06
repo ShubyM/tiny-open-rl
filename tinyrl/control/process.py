@@ -27,10 +27,10 @@ def die_with_parent(sig: int = signal.SIGKILL) -> None:
     os.kill(os.getpid(), sig)
 
 
-def launch(cmd: list[str], env: dict[str, str], **kwargs) -> subprocess.Popen:
-  """The returned supervisor lives until the command exits; parent death kills its entire group."""
+def launch(cmd: list[str], env: dict[str, str], *, checkpointable: bool = False, **kwargs) -> subprocess.Popen:
+  """Own the command's group until it exits. A checkpointable target omits the parent-death signal CRIU would save."""
   return subprocess.Popen(
-    [sys.executable, "-m", __name__, *cmd],
+    [sys.executable, "-m", __name__, *(["--checkpointable"] if checkpointable else []), *cmd],
     env={**env, "TINYRL_PARENT_PID": str(os.getpid())},
     start_new_session=True,
     **kwargs,
@@ -53,14 +53,15 @@ def target_pid(proc: subprocess.Popen) -> int:
   raise RuntimeError(f"process exited with {proc.returncode}")
 
 
-def supervise(cmd: list[str]) -> None:
+def supervise(cmd: list[str], checkpointable: bool = False) -> None:
   signal.signal(signal.SIGUSR1, lambda *_: os.killpg(0, signal.SIGKILL))
   die_with_parent(signal.SIGUSR1)
   os.environ["TINYRL_PARENT_PID"] = str(os.getpid())
   # This fresh, single-threaded supervisor is the only place we fork before setting parent-death state and exec.
   child = os.fork()
   if child == 0:
-    die_with_parent()
+    if not checkpointable:
+      die_with_parent()
     os.environ["TINYRL_PARENT_PID"] = str(os.getpid())
     os.execvp(cmd[0], cmd)
 
@@ -143,4 +144,5 @@ class Process:
 
 
 if __name__ == "__main__":
-  supervise(sys.argv[1:])
+  checkpointable = sys.argv[1:2] == ["--checkpointable"]
+  supervise(sys.argv[2:] if checkpointable else sys.argv[1:], checkpointable)

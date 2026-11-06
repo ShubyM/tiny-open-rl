@@ -67,6 +67,10 @@ class Sampler:
     self.running = None
     self.loading = asyncio.Lock()
 
+  @property
+  def proc(self):
+    return getattr(self.running, "server", None)
+
   async def start(self) -> None:
     """Start once; the node excludes this boot time from the worker's first quantum."""
     async with self.loading:

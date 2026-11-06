@@ -89,6 +89,199 @@ class TestNodeDaemon(RedisTest):
     await self.create(run)
     return run, running
 
+  async def test_a_backlogged_run_yields_to_a_sibling_within_the_command_budget(self):
+    node = self.node()
+    a, _ = await self.prepared(node)
+    b = new_id()
+    await self.bus.create_run(Run(b, "worker", "tiny", 4, lora=LORA))
+    await self.create(b)
+    child, executed = node.processes["worker"], []
+    entered, finish = asyncio.Event(), asyncio.Event()
+    original = child.call
+
+    async def execute(method, *args):
+      if method == "execute" and args[0].op == Op.OPTIM_STEP:
+        executed.append(args[0].run)
+        if len(executed) == 1:
+          entered.set()
+          await finish.wait()
+      return await original(method, *args)
+
+    try:
+      with (
+        patch.object(child, "call", side_effect=execute),
+        patch("tinyrl.control.node_daemon.RUN_COMMANDS", 4),
+        patch("tinyrl.control.node_daemon.RUN_QUANTUM", 60.0),
+        patch("tinyrl.control.node_daemon.SAVE_WAIT_S", 0),
+      ):
+        queued = [await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}') for _ in range(12)]
+        await self.until(entered.is_set, node)
+        other = await self.bus.submit_command(b, Op.OPTIM_STEP, b'{"adam_params":{}}')
+        queue = await self.bus.queued_and_in_flight(a)
+        self.assertEqual((queue["queued"], len(queue["in_flight"])), (11, 1))
+        finish.set()
+        await self.reply(other, node)
+        self.assertEqual(executed[0], a)
+        self.assertLessEqual(executed.index(b), 4)
+        await node.drain(a)
+        self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)).ok for request in queued]))
+      self.assertIs(node.processes["worker"], child)
+    finally:
+      finish.set()
+
+  async def test_commands_are_not_claimed_while_waiting_for_gpu_admission(self):
+    node = self.node()
+    run, holder = await self.prepared(node, "holder")
+    await self.bus.create_run(Run("waiting", "waiting", "tiny", 4, lora=LORA))
+    waiter = await node.add("waiting", gpus=[0])
+    entered, finish = asyncio.Event(), asyncio.Event()
+    child = node.processes["holder"]
+    original = child.call
+
+    async def execute(method, *args):
+      if method == "execute":
+        entered.set()
+        await finish.wait()
+      return await original(method, *args)
+
+    try:
+      with patch.object(child, "call", side_effect=execute):
+        await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+        await self.until(entered.is_set, node)
+        first = await self.bus.submit_command(
+          "waiting", Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
+        )
+        later = await self.bus.submit_command("waiting", Op.OPTIM_STEP, b'{"adam_params":{}}')
+        await self.until(lambda: waiter.ticket > 0, node)
+        self.assertIsNotNone(holder.since)
+        self.assertIsNone(waiter.since)
+        self.assertEqual(await self.bus.queued_and_in_flight("waiting"), {"live": True, "queued": 2, "in_flight": []})
+        finish.set()
+        await self.reply(first, node)
+        await self.reply(later, node)
+    finally:
+      finish.set()
+
+  async def test_a_run_does_not_bank_service_credit_while_its_preparation_is_blocked(self):
+    node = self.node()
+    a, _ = await self.prepared(node)
+    b = new_id()
+    await self.bus.create_run(Run(b, "worker", "tiny", 4, lora=LORA))
+    await self.create(b)
+    child, executed = node.processes["worker"], []
+    preparing, finish = asyncio.Event(), asyncio.Event()
+    original, get_run = child.call, self.bus.get_run
+
+    async def prepare(run):
+      if run == b and not finish.is_set():
+        preparing.set()
+        await finish.wait()
+      return await get_run(run)
+
+    async def execute(method, *args):
+      if method == "execute" and args[0].op == Op.OPTIM_STEP:
+        executed.append(args[0].run)
+        if executed.count(a) == 20:
+          finish.set()
+        await asyncio.sleep(0.004)
+      return await original(method, *args)
+
+    def a_resumed():
+      return b in executed and a in executed[executed.index(b) + 1 :]
+
+    try:
+      with (
+        patch.object(self.bus, "get_run", side_effect=prepare),
+        patch.object(child, "call", side_effect=execute),
+        patch("tinyrl.control.node_daemon.RUN_COMMANDS", 4),
+        patch("tinyrl.control.node_daemon.RUN_QUANTUM", 60.0),
+        patch("tinyrl.control.node_daemon.SAVE_WAIT_S", 0),
+      ):
+        for _ in range(50):
+          await self.bus.submit_command(b, Op.OPTIM_STEP, b'{"adam_params":{}}')
+        await self.until(preparing.is_set, node)
+        for _ in range(50):
+          await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
+        await self.until(a_resumed, node)
+        first = executed.index(b)
+        resumed = executed.index(a, first)
+        self.assertGreaterEqual(first, 20)
+        self.assertLessEqual(resumed - first, 4, "blocked preparation accumulated service credit")
+        await node.drain(a)
+    finally:
+      finish.set()
+
+  async def test_a_ready_run_executes_while_its_siblings_checkpoint_is_loading(self):
+    node = self.node()
+    uri = "tinker://training/sampler_weights/slow"
+    node.store.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
+    await self.bus.create_run(Run("slow", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
+    await self.bus.create_run(Run("ready", "sampler", "tiny", 4, role=Role.SAMPLER))
+    await node.add("sampler")
+    preparing, finish = asyncio.Event(), threading.Event()
+    local, loop = node.store.local_folder, asyncio.get_running_loop()
+
+    def blocked(uri, version):
+      loop.call_soon_threadsafe(preparing.set)
+      if not finish.wait(10):
+        raise TimeoutError("checkpoint preparation was never released")
+      return local(uri, version)
+
+    try:
+      with patch.object(node.store, "local_folder", side_effect=blocked):
+        slow = await self.bus.submit_command("slow", Op.SAMPLE, json.dumps(JOB).encode())
+        await self.until(preparing.is_set, node)
+        ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
+        reply = await self.bus.wait_for_reply(ready, 3)
+        self.assertIsNotNone(reply, "one run's checkpoint download blocked its ready sibling")
+        self.assertTrue(reply.ok, reply.body)
+        self.assertFalse(finish.is_set())
+        self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
+        self.assertEqual(await self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
+        finish.set()
+        await self.reply(slow, node)
+    finally:
+      finish.set()
+
+  async def test_checkpoint_preparation_does_not_prevent_a_resident_worker_from_yielding(self):
+    node = self.node()
+    uri = "tinker://training/sampler_weights/slow"
+    node.store.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
+    await self.bus.create_run(Run("base", "sampler", "tiny", 4, role=Role.SAMPLER))
+    await self.bus.create_run(Run("slow", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
+    resident = await node.add("sampler")
+    initial = await self.bus.submit_command("base", Op.SAMPLE, json.dumps(JOB).encode())
+    await self.reply(initial, node)
+    self.assertIsNotNone(resident.since)
+    preparing, finish = asyncio.Event(), threading.Event()
+    local, loop = node.store.local_folder, asyncio.get_running_loop()
+
+    def blocked(uri, version):
+      loop.call_soon_threadsafe(preparing.set)
+      if not finish.wait(10):
+        raise TimeoutError("checkpoint preparation was never released")
+      return local(uri, version)
+
+    try:
+      with patch.object(node.store, "local_folder", side_effect=blocked):
+        slow = await self.bus.submit_command("slow", Op.SAMPLE, json.dumps(JOB).encode())
+        await self.until(preparing.is_set, node)
+        await self.bus.create_run(Run("other", "other", "tiny", 4, role=Role.SAMPLER))
+        contender = await node.add("other", gpus=[0])
+        request = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
+        reply = await self.bus.wait_for_reply(request, 3)
+        self.assertIsNotNone(reply, "checkpoint preparation prevented the resident worker from yielding")
+        self.assertTrue(reply.ok, reply.body)
+        self.assertFalse(finish.is_set())
+        self.assertIsNone(resident.since)
+        self.assertIsNotNone(contender.since)
+        self.assertFalse(node.tasks["sampler"].done())
+        self.assertEqual(await self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
+        finish.set()
+        await self.reply(slow, node)
+    finally:
+      finish.set()
+
   async def test_a_node_starts_only_nonempty_workers_and_restarts_a_dead_child(self):
     run, empty = new_id(), new_id()
     await self.bus.create_run(Run(run, "worker", "tiny", 4, lora=LORA))
@@ -107,6 +300,38 @@ class TestNodeDaemon(RedisTest):
     await self.until(lambda: "worker" in node.running and node.processes["worker"] is not first, node)
     self.assertTrue(first.closed)
     await self.create(run)
+
+  async def test_a_child_that_dies_before_claiming_answers_each_waiting_run(self):
+    node = self.node()
+    a, b = new_id(), new_id()
+    waiting = []
+    for run in (a, b):
+      await self.bus.create_run(Run(run, "worker", "tiny", 4, lora=LORA))
+      waiting.append(
+        await self.bus.submit_command(
+          run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
+        )
+      )
+    later = await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    factory = node.open_trainer
+
+    def failed_start(worker, env):
+      child = factory(worker, env)
+      child.kill()
+      return child
+
+    with patch.object(node, "open_trainer", side_effect=failed_start):
+      await node.add("worker")
+      await asyncio.wait_for(asyncio.gather(node.tasks["worker"], return_exceptions=True), 5)
+    for request in waiting:
+      reply = await self.bus.wait_for_reply(request, 0)
+      self.assertIsNotNone(reply, "a child that died before claiming left its client waiting")
+      self.assertFalse(reply.ok)
+      self.assertEqual(json.loads(reply.body)["category"], "server")
+    self.assertTrue(node.processes["worker"].closed)
+    self.assertIsNone(await self.bus.lease_owner("worker"))
+    self.assertIsNone(await self.bus.wait_for_reply(later, 0))
+    self.assertEqual(await self.bus.queued_and_in_flight(a), {"live": True, "queued": 1, "in_flight": []})
 
   @patch("tinyrl.bus.NODE_MS", 600)
   @patch("tinyrl.bus.LEASE_MS", 400)
@@ -178,7 +403,7 @@ class TestNodeDaemon(RedisTest):
     finally:
       finish.set()
 
-  async def test_draining_checkpoint_preparation_yields_to_a_waiter_and_never_reads_more(self):
+  async def test_unplacement_cancels_preparation_and_leaves_unclaimed_work_queued(self):
     node = self.node()
     uri = "tinker://training/sampler_weights/ready"
     node.store.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
@@ -213,25 +438,23 @@ class TestNodeDaemon(RedisTest):
         await node.add("other", gpus=[0])
         contender = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
         reply = await self.bus.wait_for_reply(contender, 3)
-        self.assertIsNotNone(reply, "draining checkpoint preparation held the GPU until storage completed")
+        self.assertIsNotNone(reply, "checkpoint preparation held the GPU after unplacement")
         self.assertTrue(reply.ok, reply.body)
         self.assertFalse(finish.is_set())
-        self.assertFalse(stopping.done())
+        await asyncio.wait_for(asyncio.shield(stopping), 5)
         self.assertIsNone(running.since)
         self.assertIsNone(await self.bus.wait_for_reply(first, 0))
-        finish.set()
-        await asyncio.wait_for(asyncio.shield(stopping), 5)
         self.assertEqual(len([call for call in reads.call_args_list if call.args[1] == owner]), count)
-      self.assertTrue((await self.bus.wait_for_reply(first, 0)).ok)
+      self.assertIsNone(await self.bus.wait_for_reply(first, 0))
       self.assertIsNone(await self.bus.wait_for_reply(later, 0))
-      self.assertEqual(await self.bus.queued_and_in_flight("sample"), {"live": True, "queued": 1, "in_flight": []})
+      self.assertEqual(await self.bus.queued_and_in_flight("sample"), {"live": True, "queued": 2, "in_flight": []})
       node.dispatch()
       self.assertNotIn("sampler", node.tasks)
       self.assertIsNone(await self.bus.lease_owner("sampler"))
     finally:
       finish.set()
 
-  async def test_a_draining_wide_worker_keeps_its_ticket_and_intake_closed_when_placed_again(self):
+  async def test_a_retiring_wide_worker_keeps_its_ticket_and_intake_closed_when_placed_again(self):
     node = self.node(gpus=2)
     wide_run, wide = await self.prepared(node, "wide", (0, 1))
     holder_run, _ = await self.prepared(node, "holder", (0, 1))
@@ -655,11 +878,11 @@ class TestNodeDaemon(RedisTest):
   async def test_a_slow_sweep_never_holds_up_the_heartbeat(self):
     node, sweeps, finish = self.node(), [], asyncio.Event()
 
-    async def slow_sweep():
+    async def slow_sweep(_store, _grace):
       sweeps.append(time.time())
       await finish.wait()
 
-    node.sweep_checkpoints = slow_sweep
+    node.registry.sweep = slow_sweep
     try:
       with patch("tinyrl.control.node_daemon.SWEEP_S", 0):
         await asyncio.wait_for(node.tick(), 5)
@@ -713,7 +936,7 @@ class TestNodeDaemon(RedisTest):
     await self.bus.r.set("tinyrl:ckpt_since", old - 1800)
     for name in ("kept", "deleted"):
       os.utime(store.path(f"tinker://r/weights/{name}"), (old, old), follow_symlinks=False)
-    await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
+    await self.registry.sweep(store, SWEEP_GRACE_S)
     names = sorted(u.rsplit("/", 1)[1] for u in store.list_checkpoints())
     self.assertEqual(names, ["before", "kept", "young"])  # older than the registry, registered, still being saved
 
@@ -735,8 +958,7 @@ class TestNodeDaemon(RedisTest):
     store.upload_pending_saves()
     await self.registry.register_checkpoint("tinker://r/sampler_weights/1", 128, version=v[1])
     await self.bus.r.set("tinyrl:ckpt_since", 0)
-    with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
-      await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
+    await self.registry.sweep(store, -60)
     self.assertEqual(sorted(p.rsplit("/", 1)[1] for p in store.fs.glob(f"{store.base}/r/_versions/*")), v[:2])
 
   async def test_a_sweep_moves_on_past_a_checkpoint_it_cannot_delete(self):
@@ -747,8 +969,7 @@ class TestNodeDaemon(RedisTest):
     await self.bus.r.set("tinyrl:ckpt_since", 0)
     delete = store.delete
     store.delete = lambda uri: (_ for _ in ()).throw(OSError("503")) if uri.endswith("/a") else delete(uri)
-    with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
-      await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
+    await self.registry.sweep(store, -60)
     self.assertEqual(store.list_checkpoints(), ["tinker://r/weights/a"])
 
   async def test_a_sweep_deletes_a_save_whose_upload_never_finished(self):
@@ -761,8 +982,7 @@ class TestNodeDaemon(RedisTest):
       store.upload_pending_saves()  # its files went up, but not the _latest that names them
     self.assertTrue(store.fs.find(store.path("tinker://r/weights/w")))
     await self.bus.r.set("tinyrl:ckpt_since", 0)
-    with patch("tinyrl.control.node_daemon.SWEEP_GRACE_S", -60):
-      await NodeDaemon(self.bus, node="n", gpu_mib=0, store=store).sweep_checkpoints()
+    await self.registry.sweep(store, -60)
     self.assertFalse(store.fs.exists(store.path("tinker://r/weights/w")))
 
 

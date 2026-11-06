@@ -1,3 +1,4 @@
+import asyncio
 import glob
 import json
 import os
@@ -11,6 +12,9 @@ from unittest.mock import patch
 
 import torch
 
+from test.helpers import RedisTest, new_id
+from tinyrl.bus import Bus, Op, Reply, Run, connect, key
+from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 
 
@@ -454,23 +458,20 @@ class TestStore(unittest.TestCase):
   def test_d_pending_upload_unregistered_is_skipped(self):
     import asyncio
 
-    from tinyrl.bus import Bus
-    from tinyrl.control.node_daemon import NodeDaemon
+    from tinyrl.storage.registry import Registry
 
     store = Store(root=f"memory://test-{uuid.uuid4()}", cache=tempfile.mkdtemp())
-    bus = unittest.mock.AsyncMock(spec=Bus, r=unittest.mock.AsyncMock())
-    daemon = NodeDaemon(bus=bus, store=store)
-    daemon.registry = unittest.mock.AsyncMock()
-    daemon.registry.first_registered_at.return_value = 0.0
-    daemon.registry.get_checkpoint.return_value = None
-    daemon.registry.registered_versions.return_value = set()
+    registry = unittest.mock.AsyncMock(spec=Registry)
+    registry.first_registered_at.return_value = 0.0
+    registry.get_checkpoint.return_value = None
+    registry.registered_versions.return_value = set()
     uri = "tinker://r/weights/skip"
     store.put(uri, {"w": torch.ones(1)})
     v = store.versions[uri]
     upload_file = f"{store.cache}/{v}.upload"
     old_time = time.time() - 700
     os.utime(upload_file, (old_time, old_time))
-    asyncio.run(daemon.sweep_checkpoints())
+    asyncio.run(Registry.sweep(registry, store, 600))
     self.assertFalse(os.path.exists(upload_file))
     self.assertFalse(os.path.exists(f"{store.cache}/{v}"))
 
@@ -519,6 +520,44 @@ class TestStore(unittest.TestCase):
       del view
       gc.collect()
       self.assertEqual([e[0] for e in events], ["reg", "unreg"])
+
+
+class TestRegistry(RedisTest):
+  async def test_a_ttl_update_cannot_restore_a_checkpoint_deleted_with_its_run(self):
+    run = new_id()
+    await self.bus.create_run(Run(id=run, worker="p", base="base", rank=8))
+    await self.bus.take_lease("p", "w0")
+    uri = f"tinker://{run}/sampler_weights/session"
+    await self.registry.register_checkpoint(uri, 1, ttl=60, owned=True)
+    await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
+    [cmd] = await self.bus.take_commands([run], "w0", count=1)
+    updater = Bus(connect(self.url))
+    self.addAsyncCleanup(updater.r.aclose)
+    registry = Registry(updater)
+    pipeline = updater.r.pipeline(transaction=True)
+    execute, read, finish = pipeline.execute, asyncio.Event(), asyncio.Event()
+
+    async def pause_after_read():
+      read.set()  # TTL metadata has been read; its transaction has not committed.
+      await finish.wait()
+      return await execute()
+
+    with (
+      patch.object(updater.r, "pipeline", return_value=pipeline),
+      patch.object(pipeline, "execute", side_effect=pause_after_read),
+    ):
+      updating = asyncio.create_task(registry.set_checkpoint_ttl(uri, 600))
+      try:
+        await asyncio.wait_for(read.wait(), 5)
+        self.assertTrue(await self.bus.write_reply(cmd, Reply(True, "application/json", b"{}"), "p", "w0"))
+      finally:
+        finish.set()
+        updated = await asyncio.wait_for(updating, 5)
+
+    self.assertFalse(updated)
+    self.assertIsNone(await self.registry.get_checkpoint(uri))
+    self.assertIsNone(await self.bus.r.zscore(key("ckpts"), uri))
+    self.assertIsNone(await self.bus.r.zscore(key("expiry"), uri))
 
 
 if __name__ == "__main__":

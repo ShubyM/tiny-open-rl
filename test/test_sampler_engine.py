@@ -1,8 +1,11 @@
 import asyncio
 import json
 import os
+import signal
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -241,6 +244,59 @@ class TestEngineLaunch(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSnapshotOwnership(unittest.IsolatedAsyncioTestCase):
+  async def test_snapshot_saves_the_target_without_its_parent_death_signal(self):
+    with tempfile.TemporaryDirectory() as folder:
+      marker = Path(folder) / "target.json"
+      server = Path(folder) / "vllm"
+      server.write_text(
+        f"#!{sys.executable}\n"
+        "import ctypes, json, os, time\n"
+        "sig = ctypes.c_int()\n"
+        "if ctypes.CDLL(None).prctl(2, ctypes.byref(sig)) != 0: raise OSError('PR_GET_PDEATHSIG failed')\n"
+        "with open(os.environ['TARGET_INFO'], 'w') as f: json.dump({'pid': os.getpid(), 'signal': sig.value}, f)\n"
+        "time.sleep(60)\n"
+      )
+      server.chmod(0o700)
+
+      def target():
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+          try:
+            return json.loads(marker.read_text())
+          except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.01)
+        raise TimeoutError("snapshot target did not start")
+
+      saved = {}
+
+      def save(pid, *_):
+        saved.update(target(), dumped_pid=pid)
+        os.kill(pid, signal.SIGKILL)  # a successful CRIU dump ends the source process
+
+      restored = object()
+      client = httpx.AsyncClient(base_url="http://vllm", transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+      self.addAsyncCleanup(client.aclose)
+      with (
+        patch("tinyrl.workers.vllm.models.local", return_value="/model"),
+        patch("tinyrl.workers.vllm.unix_client", return_value=client),
+        patch("tinyrl.workers.vllm.target_pid", side_effect=lambda _: target()["pid"]),
+        patch.object(snapshot, "RUN", f"{folder}/run"),
+        patch.object(snapshot, "site", return_value=folder),
+        patch.object(snapshot, "key", return_value="image"),
+        patch.object(snapshot, "save", side_effect=save),
+        patch.object(VLLM, "restore", new_callable=AsyncMock, return_value=restored),
+      ):
+        env = dict(os.environ) | {
+          "PATH": f"{folder}:{os.environ['PATH']}",
+          "TARGET_INFO": str(marker),
+          "TINYRL_SNAPSHOTS": f"{folder}/snapshots",
+          "CUDA_VISIBLE_DEVICES": "0",
+        }
+        self.assertIs(await asyncio.wait_for(VLLM.start("base", False, env), 10), restored)
+      self.assertEqual(saved["dumped_pid"], saved["pid"])
+      self.assertEqual(saved["signal"], 0)
+      self.assertTrue(client.is_closed)
+
   async def test_concurrent_saves_from_one_daemon_publish_a_complete_snapshot(self):
     with tempfile.TemporaryDirectory() as folder:
       destination = f"{folder}/image"

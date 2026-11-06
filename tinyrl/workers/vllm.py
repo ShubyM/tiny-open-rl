@@ -117,10 +117,16 @@ class VLLM:
     saving = (
       env | snapshot.ENV | {"PYTHONPATH": os.pathsep.join([snapshot.site(), *filter(None, [env.get("PYTHONPATH")])])}
     )
-    # its own stdin and log: a snapshot can't hold files from outside it
+    # CRIU saves the target's parent-death signal, so omit it: restore -d exits before the restored server.
+    # The supervisor stays outside the snapshot and still owns the source group until it exits.
     with open(f"{name}.log", "ab") as log:
       server = launch(
-        serve("--uds", f"{name}.sock"), env=saving, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT
+        serve("--uds", f"{name}.sock"),
+        env=saving,
+        checkpointable=True,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
       )
     engine = await cls("http://vllm", base, lora, server, unix_client(f"{name}.sock")).ready()
     try:

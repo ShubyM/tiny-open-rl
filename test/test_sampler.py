@@ -310,15 +310,15 @@ class TestSampler(RedisTest):
     self.assertEqual(peak, 3)
     self.assertEqual(len([c for c in node.samplers["sampler"].running.calls if c[0] == "load"]), 4)
 
-  async def test_empty_prefetch_reads_never_fail_a_sample_that_is_still_running(self):
+  async def test_empty_peeks_never_fail_a_sample_that_is_still_running(self):
     await self.bus.create_run(Run("s", "sampler", "base", 4, role=Role.SAMPLER))
-    sampling, finish, prefetched = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    take = self.bus.take_commands
+    sampling, finish, peeked = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    peek = self.bus.peek_commands
 
     async def read(*args, **kwargs):
-      commands = await take(*args, **kwargs)
+      commands = await peek(*args, **kwargs)
       if not commands and sampling.is_set():
-        prefetched.set()
+        peeked.set()
       return commands
 
     class SlowSample(FakeEngine):
@@ -332,12 +332,12 @@ class TestSampler(RedisTest):
     with (
       patch("tinyrl.control.node_daemon.STRANDED_MS", 0),
       patch("tinyrl.control.node_daemon.IDLE_MS", 5),
-      patch.object(self.bus, "take_commands", side_effect=read),
+      patch.object(self.bus, "peek_commands", side_effect=read),
     ):
       self.pump(node)
       request = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
       try:
-        await asyncio.wait_for(prefetched.wait(), 5)
+        await asyncio.wait_for(peeked.wait(), 5)
         self.assertIsNone(await self.bus.wait_for_reply(request, 0))
         run = await self.bus.get_run("s")
         self.assertEqual((run["cmds"], run["failed"]), (0, 0))
@@ -426,30 +426,14 @@ class TestSampler(RedisTest):
     await self.bus.create_run(
       Run("sess", "sampler:base", "base", 1, role=Role.SAMPLER, model_path="tinker://r1/sampler_weights/s0")
     )
-    booting, submitted, prepared = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    take, local, loop = self.bus.take_commands, store.local_folder, asyncio.get_running_loop()
-    reads = stages = active = peak = 0
-
-    async def read(*args, **kwargs):
-      nonlocal reads
-      reads += 1
-      if reads == 2:
-        await submitted.wait()  # both late commands arrive before this prefetch claims them
-      return await take(*args, **kwargs)
-
-    def stage(uri, version):
-      nonlocal stages
-      result = local(uri, version)
-      stages += 1
-      if stages == 2:
-        loop.call_soon_threadsafe(prepared.set)
-      return result
+    booting, finish_boot = asyncio.Event(), asyncio.Event()
+    active = peak = 0
 
     class SlowStartEngine(FakeEngine):
       @classmethod
       async def start(cls, base: str, lora: bool, env=None):
         booting.set()
-        await prepared.wait()
+        await finish_boot.wait()
         return await super().start(base, lora, env)
 
       async def sample(self, job, name):
@@ -460,34 +444,26 @@ class TestSampler(RedisTest):
         active -= 1
         return await super().sample(job, name)
 
-    store.local_folder = stage
     node = self.node(store, gpus=1, engine=SlowStartEngine)
     requests = [await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode())]
-    with patch.object(self.bus, "take_commands", side_effect=read):
-      await node.add("sampler:base")
-      try:
-        await asyncio.wait_for(booting.wait(), 5)
-        requests += [await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(2)]
-        submitted.set()
-        self.assertTrue(all([(await self.bus.wait_for_reply(request, 5)).ok for request in requests]))
-      finally:
-        submitted.set()
-        prepared.set()
+    await node.add("sampler:base")
+    try:
+      await asyncio.wait_for(booting.wait(), 5)
+      requests += [await self.bus.submit_command("sess", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(2)]
+      self.assertEqual(await self.bus.queued_and_in_flight("sess"), {"live": True, "queued": 3, "in_flight": []})
+    finally:
+      finish_boot.set()
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 5)).ok for request in requests]))
     self.assertEqual(peak, 3)
 
-  async def test_failed_boot_fails_its_already_prepared_prefetch_without_booting_again(self):
+  async def test_failed_boot_answers_waiting_heads_and_leaves_later_work_unclaimed(self):
     store = Store(tempfile.mkdtemp())
     uri = "tinker://r/sampler_weights/new"
     store.put(uri, {}, {"base": "base", "lora": True, "config": {}})
     await self.bus.create_run(Run("first", "sampler", "base", 4, role=Role.SAMPLER))
     await self.bus.create_run(Run("later", "sampler", "base", 4, role=Role.SAMPLER, model_path=uri))
-    booting, prepared = asyncio.Event(), asyncio.Event()
-    local, loop, starts = store.local_folder, asyncio.get_running_loop(), 0
-
-    def stage(uri, version):
-      result = local(uri, version)
-      loop.call_soon_threadsafe(prepared.set)
-      return result
+    booting, finish_boot = asyncio.Event(), asyncio.Event()
+    starts = 0
 
     class Broken(FakeEngine):
       @classmethod
@@ -495,26 +471,34 @@ class TestSampler(RedisTest):
         nonlocal starts
         starts += 1
         booting.set()
-        await prepared.wait()
-        await asyncio.sleep(0.02)  # preparation finishes before the startup failure is reported
+        await finish_boot.wait()
         raise RuntimeError("engine boot failed")
 
-    store.local_folder = stage
     node = self.node(store, gpus=1, engine=Broken)
     first = await self.bus.submit_command("first", Op.SAMPLE, json.dumps(JOB).encode())
-    await node.add("sampler")
+    reservation = await node.add("sampler")
+    sampler, task = node.samplers["sampler"], node.tasks["sampler"]
     try:
       await asyncio.wait_for(booting.wait(), 5)
       later = await self.bus.submit_command("later", Op.SAMPLE, json.dumps(JOB).encode())
+      future = await self.bus.submit_command("later", Op.SAMPLE, json.dumps(JOB).encode())
+      self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 2, "in_flight": []})
+      finish_boot.set()
       for request in (first, later):
         reply = await self.bus.wait_for_reply(request, 5)
         self.assertIsNotNone(reply)
         self.assertFalse(reply.ok)
         self.assertIn("engine boot failed", json.loads(reply.body)["error"])
       self.assertEqual(starts, 1)
-      self.assertFalse(node.tasks["sampler"].done())
+      [error] = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+      self.assertIsInstance(error, RuntimeError)
+      self.assertIsNone(sampler.running)
+      self.assertIsNone(reservation.since)
+      self.assertIsNone(await self.bus.lease_owner("sampler"))
+      self.assertIsNone(await self.bus.wait_for_reply(future, 0))
+      self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
     finally:
-      prepared.set()
+      finish_boot.set()
 
   async def test_sampler_step_groups_non_exclusive_fft_interleaved(self):
     store = Store(tempfile.mkdtemp())
@@ -603,7 +587,7 @@ class TestSampler(RedisTest):
     self.assertNotIn(("sleep",), calls[:sampled])
     self.assertTrue((await self.bus.wait_for_reply(other, 5)).ok)
 
-  async def test_failed_warm_start_replies_with_error_and_the_sampler_keeps_going(self):
+  async def test_failed_warm_start_replies_with_error_and_a_replacement_sampler_recovers(self):
     class Broken(FakeEngine):
       @classmethod
       async def start(cls, base: str, lora: bool, env=None):
@@ -611,17 +595,24 @@ class TestSampler(RedisTest):
 
     await self.bus.create_run(Run("s", "sampler:base", "base", 1, role=Role.SAMPLER))
     node = self.node(gpus=2, engine=Broken)
-    await node.add("sampler:base")
-    self.pump(node)
     command = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
+    with patch.dict(os.environ, {"TINYRL_WARM_SAMPLER": "1"}):
+      reservation = await node.add("sampler:base")
+    sampler, task = node.samplers["sampler:base"], node.tasks["sampler:base"]
     reply = await self.bus.wait_for_reply(command, 5)
     self.assertIsNotNone(reply)
     self.assertFalse(reply.ok)
     self.assertIn("no GPU memory", json.loads(reply.body)["error"])
-    self.assertFalse(node.tasks["sampler:base"].done())
-    node.samplers["sampler:base"].engine_type = FakeEngine
+    [error] = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+    self.assertIsInstance(error, RuntimeError)
+    self.assertIsNone(sampler.running)
+    self.assertIsNone(reservation.since)
+    self.assertIsNone(await self.bus.lease_owner("sampler:base"))
+    node.engine_type = FakeEngine
     command = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
+    await node.add("sampler:base")
     self.assertTrue((await self.bus.wait_for_reply(command, 5)).ok)
+    self.assertIsNot(node.samplers["sampler:base"], sampler)
 
   async def test_unplacing_a_waiting_warm_sampler_closes_it_without_booting(self):
     for run in ("a", "b"):
@@ -776,6 +767,77 @@ class TestSampler(RedisTest):
     cmd_id = await self.bus.submit_command("base", Op.SAMPLE, json.dumps(JOB).encode())
     self.assertTrue((await self.bus.wait_for_reply(cmd_id, 5)).ok)
 
+  async def test_a_new_preparation_error_replies_while_its_worker_is_waiting_for_gpu(self):
+    store = Store(tempfile.mkdtemp())
+    store.local_folder = MagicMock(side_effect=RuntimeError("bucket error"))
+    for run, worker, path in (
+      ("busy", "busy", None),
+      ("ready", "waiting", None),
+      ("broken", "waiting", "tinker://r/sampler_weights/missing"),
+    ):
+      await self.bus.create_run(Run(run, worker, "base", 4, role=Role.SAMPLER, model_path=path))
+    sampling, finish = asyncio.Event(), asyncio.Event()
+
+    class Occupied(FakeEngine):
+      async def sample(self, job, name):
+        if job["prompt"] == [11]:
+          sampling.set()
+          await finish.wait()
+        return await super().sample(job, name)
+
+    node = self.node(store, gpus=1, engine=Occupied)
+    node.state.quantum = 0.01
+    await node.add("busy", gpus=[0])
+    waiting = await node.add("waiting", gpus=[0])
+    self.pump(node)
+    holding = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
+    try:
+      await asyncio.wait_for(sampling.wait(), 5)
+      ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.until(lambda: bool(waiting.ticket))
+      ticket = waiting.ticket
+      broken = await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode())
+      reply = await self.bus.wait_for_reply(broken, 3)
+      self.assertIsNotNone(reply, "a healthy head waiting for GPU must not hold up a preparation error")
+      self.assertFalse(reply.ok)
+      self.assertIn("bucket error", json.loads(reply.body)["error"])
+      self.assertEqual(waiting.ticket, ticket)
+      self.assertIsNone(waiting.since)
+      self.assertIsNone(node.samplers["waiting"].running)
+      self.assertEqual(await self.bus.queued_and_in_flight("ready"), {"live": True, "queued": 1, "in_flight": []})
+      self.assertIsNone(await self.bus.wait_for_reply(holding, 0))
+    finally:
+      finish.set()
+    self.assertTrue((await self.bus.wait_for_reply(holding, 5)).ok)
+    self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
+
+  async def test_invalid_backlog_does_not_starve_a_ready_sibling(self):
+    for run in ("broken", "ready"):
+      await self.bus.create_run(Run(run, "sampler", "base", 4, role=Role.SAMPLER))
+    await self.bus.r.delete(key("run", "broken"))
+    requests = [await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(32)]
+    ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
+    completed, write = [], self.bus.write_reply
+
+    async def publish(cmd, *args, **kwargs):
+      result = await write(cmd, *args, **kwargs)
+      completed.append(cmd.run)
+      if cmd.run == "broken":
+        await asyncio.sleep(0.005)  # the next invalid head is ready while this publication finishes
+      return result
+
+    node = self.node(gpus=1)
+    with patch.object(self.bus, "write_reply", side_effect=publish):
+      await node.add("sampler")
+      reply = await self.bus.wait_for_reply(ready, 5)
+      self.assertIsNotNone(reply)
+      self.assertTrue(reply.ok)
+      await self.until(lambda: "ready" in completed)
+      self.assertEqual(completed[0], "broken")
+      self.assertLess(completed.index("ready"), len(requests), "ready work waited for the whole invalid backlog")
+      self.assertFalse((await self.bus.wait_for_reply(requests[-1], 5)).ok)
+    self.assertEqual(int(await self.bus.r.hget(key("run", "broken"), "failed")), len(requests))
+
   async def test_a_preparation_error_cannot_overwrite_the_new_lease_owners_reply(self):
     store = Store(tempfile.mkdtemp())
     await self.bus.create_run(
@@ -797,14 +859,17 @@ class TestSampler(RedisTest):
     request = await self.bus.submit_command("s", Op.SAMPLE, json.dumps(JOB).encode())
     try:
       await asyncio.wait_for(staging.wait(), 5)
+      self.assertEqual(await self.bus.queued_and_in_flight("s"), {"live": True, "queued": 1, "in_flight": []})
       await self.bus.r.delete(key("owner", "sampler"))  # expiry while the old node is still preparing
-      second = self.node(store, gpus=1, node="second")
+      replacement_store = Store(tempfile.mkdtemp())
+      replacement_store.local_folder = MagicMock(side_effect=RuntimeError("new owner's download failed"))
+      second = self.node(replacement_store, gpus=1, node="second")
       await second.add("sampler")
       owner = await self.bus.lease_owner("sampler")
-      expected = await self.bus.wait_for_reply(request, 0)
+      expected = await self.bus.wait_for_reply(request, 5)
       self.assertIsNotNone(expected)
       self.assertFalse(expected.ok)
-      self.assertIn("lost the worker", json.loads(expected.body)["error"])
+      self.assertIn("new owner's download failed", json.loads(expected.body)["error"])
       finish.set()
       async with asyncio.timeout(5):
         [error] = await asyncio.gather(task, return_exceptions=True)

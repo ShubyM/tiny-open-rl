@@ -71,10 +71,11 @@ class TestLease(RedisTest):
   async def test_a_stale_parent_checks_ownership_before_dispatching_to_its_child(self):
     first, run = await self.prepared()
     owner, child = await self.bus.lease_owner("worker"), first.processes["worker"]
-    entered, finish, get_run = asyncio.Event(), asyncio.Event(), self.bus.get_run
+    # This metadata read follows the claim, so takeover must fail it before the old child can execute it.
+    entered, finish, parked_checkpoint = asyncio.Event(), asyncio.Event(), self.bus.parked_checkpoint
 
     async def delayed(name):
-      result = await get_run(name)
+      result = await parked_checkpoint(name)
       if name == run and not entered.is_set():
         entered.set()
         await finish.wait()
@@ -82,7 +83,7 @@ class TestLease(RedisTest):
 
     try:
       with (
-        patch.object(self.bus, "get_run", side_effect=delayed),
+        patch.object(self.bus, "parked_checkpoint", side_effect=delayed),
         patch.object(child, "call", wraps=child.call) as call,
       ):
         request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
@@ -196,10 +197,10 @@ class TestLease(RedisTest):
   async def test_an_intervening_owner_prevents_recovery_even_after_it_released_the_lease(self):
     first, run = await self.prepared()
     child = first.processes["worker"]
-    entered, finish, get_run = asyncio.Event(), asyncio.Event(), self.bus.get_run
+    entered, finish, parked_checkpoint = asyncio.Event(), asyncio.Event(), self.bus.parked_checkpoint
 
     async def delayed(name):
-      result = await get_run(name)
+      result = await parked_checkpoint(name)
       if name == run and not entered.is_set():
         entered.set()
         await finish.wait()
@@ -207,7 +208,7 @@ class TestLease(RedisTest):
 
     try:
       with (
-        patch.object(self.bus, "get_run", side_effect=delayed),
+        patch.object(self.bus, "parked_checkpoint", side_effect=delayed),
         patch.object(child, "call", wraps=child.call) as call,
       ):
         request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')

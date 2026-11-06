@@ -568,12 +568,9 @@ class TestTrainer(RedisTest):
     self.assertEqual((await self.bus.get_run(run))["steps"], 1)
     self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))
 
-  async def test_a_node_told_to_stop_during_a_batch_finishes_claimed_work_and_closes(self):
+  async def test_a_node_told_to_stop_finishes_its_command_and_leaves_the_next_queued(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    ids = await self.submit(
-      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.DELETE_MODEL, {})
-    )
     await self.node.add("p")
     child = self.node.processes["p"]
     original = child.call
@@ -584,9 +581,16 @@ class TestTrainer(RedisTest):
       return await original(method, *args)
 
     child.call = call
+    ids = await self.submit(
+      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.DELETE_MODEL, {})
+    )
     await self.finish_worker("p")
     self.assertTrue(child.closed)
-    self.assertTrue(all([(await self.bus.wait_for_reply(request_id, 1)).ok for request_id in ids]))
+    self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
+    self.assertIsNone(await self.bus.wait_for_reply(ids[1], 0))
+    queue = await self.bus.queued_and_in_flight(run)
+    self.assertEqual((queue["queued"], queue["in_flight"]), (1, []))
+    self.assertIsNotNone(await self.bus.parked_checkpoint(run))
 
   async def test_a_new_node_owner_fails_what_a_dead_one_left_in_flight(self):
     run = new_id()
@@ -750,7 +754,7 @@ class TestTrainer(RedisTest):
     checkpoint_gpus = []
 
     async def blocked(*args, **kwargs):
-      if args[-1] > 0:
+      if not entered.is_set():  # startup reconciliation finished before this hook was installed
         entered.set()
         await finish.wait()
       return await cleanup(*args, **kwargs)
@@ -761,8 +765,12 @@ class TestTrainer(RedisTest):
       return await child_call(method, *args)
 
     self.node.processes["wide"].call = call
-    with patch.object(self.bus, "fail_stranded_commands", side_effect=blocked):
+    with (
+      patch("tinyrl.control.node_daemon.STRANDED_MS", 10),
+      patch.object(self.bus, "fail_stranded_commands", side_effect=blocked),
+    ):
       try:
+        self.node.notify()
         await asyncio.wait_for(entered.wait(), 5)
         desired = self.node.state.workers["wide"]
         desired.node, desired.gpus = None, ()
@@ -862,16 +870,11 @@ class TestTrainer(RedisTest):
     self.assertTrue(all([(await self.bus.wait_for_reply(request, 1)).ok for request in pipelined]))
     self.assertEqual((await self.bus.get_run(causal))["steps"], 2)
 
-  async def test_revocation_finishes_one_command_and_shutdown_drains_the_claimed_remainder(self):
+  async def test_revocation_finishes_one_command_and_stop_leaves_the_remainder_queued(self):
     self.node.gpus = 1
     self.node.state.nodes[self.node.id] = (1, 0)
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    ids = await self.submit(
-      run,
-      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(15)],
-    )
     running = await self.node.add("p")
     original = self.node.processes["p"].call
     calls = 0
@@ -887,8 +890,16 @@ class TestTrainer(RedisTest):
       return await original(method, *args)
 
     self.node.processes["p"].call = call
+    ids = await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(15)],
+    )
     try:
       await asyncio.wait_for(entered.wait(), 5)
+      queue = await self.bus.queued_and_in_flight(run)
+      self.assertEqual(queue["queued"], len(ids) - 1)
+      self.assertEqual([cmd["request_id"] for cmd in queue["in_flight"]], [ids[0]])
       other_run = new_id()
       await self.bus.create_run(Run(other_run, "other", "tiny", 4, lora=LORA))
       other = await self.node.add("other")
@@ -915,20 +926,18 @@ class TestTrainer(RedisTest):
       self.node.notify()
       other_finish.set()
       await self.finish_worker("p")
-      self.assertEqual(calls, 16)
-      self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)).ok for request in ids]))
+      self.assertEqual(calls, 1)
+      self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)) is None for request in ids[1:]]))
+      queue = await self.bus.queued_and_in_flight(run)
+      self.assertEqual((queue["queued"], queue["in_flight"]), (len(ids) - 1, []))
+      self.assertIsNotNone(await self.bus.parked_checkpoint(run))
     finally:
       finish.set()
       other_finish.set()
 
-  async def test_shutdown_does_not_fetch_another_batch(self):
+  async def test_shutdown_does_not_claim_another_batch(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    ids = await self.submit(
-      run,
-      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(17)],
-    )
     await self.node.add("p")
     original = self.node.processes["p"].call
 
@@ -938,40 +947,39 @@ class TestTrainer(RedisTest):
       return await original(method, *args)
 
     self.node.processes["p"].call = call
-    await self.finish_worker("p")
-    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
-    self.assertTrue((await self.bus.wait_for_reply(ids[15], 0)).ok)
-    self.assertIsNone(await self.bus.wait_for_reply(ids[16], 0))
-    self.assertEqual((await self.bus.queued_and_in_flight(run))["queued"], 2)
-
-  async def test_shutdown_waits_for_the_claimed_reader_and_saves_its_completed_work(self):
-    run = new_id()
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
     ids = await self.submit(
       run,
       (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
-      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(30)],
-      (Op.FORWARD_BACKWARD, proto_body(run)),
-      (Op.OPTIM_STEP, {"adam_params": {}}),
-      (Op.OPTIM_STEP, {"adam_params": {}}),
+      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(17)],
     )
-    hooked, entered, finish, claimed, prepared = (asyncio.Event() for _ in range(5))
-    take = self.bus.take_commands
+    await self.finish_worker("p")
+    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
+    self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)) is None for request in ids[1:]]))
+    self.assertEqual((await self.bus.queued_and_in_flight(run))["queued"], len(ids) - 1)
+
+  async def test_shutdown_cancels_unclaimed_preparation_and_saves_completed_gradients(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    await self.node.drain(run)
+    entered, finish, preparing, release_prepare, cancelled = (asyncio.Event() for _ in range(5))
+    get_run = self.bus.get_run
     reads = calls = 0
 
     async def read(*args, **kwargs):
       nonlocal reads
       reads += 1
-      commands = await take(*args, **kwargs)
-      if reads == 1:
-        await hooked.wait()
-      elif reads == 2:
-        claimed.set()
-        await prepared.wait()
-      return commands
+      if reads == 2:  # the next head prepares while forward/backward is still executing
+        preparing.set()
+        try:
+          await release_prepare.wait()
+        except asyncio.CancelledError:
+          cancelled.set()
+          raise
+      return await get_run(*args, **kwargs)
 
-    with patch.object(self.bus, "take_commands", side_effect=read):
-      await self.node.add("p")
+    with patch.object(self.bus, "get_run", side_effect=read):
       child = self.node.processes["p"]
       original = child.call
 
@@ -979,32 +987,37 @@ class TestTrainer(RedisTest):
         nonlocal calls
         if method == "execute":
           calls += 1
-          if calls == 2:
-            entered.set()
-            await finish.wait()
+          entered.set()
+          await finish.wait()
         return await original(method, *args)
 
       child.call = call
-      hooked.set()
+      ids = await self.submit(
+        run,
+        (Op.FORWARD_BACKWARD, proto_body(run)),
+        (Op.OPTIM_STEP, {"adam_params": {}}),
+        (Op.OPTIM_STEP, {"adam_params": {}}),
+      )
       try:
-        await asyncio.wait_for(asyncio.gather(entered.wait(), claimed.wait()), 5)
-        self.assertEqual(len((await self.bus.queued_and_in_flight(run))["in_flight"]), 31)
+        await asyncio.wait_for(asyncio.gather(entered.wait(), preparing.wait()), 5)
+        queue = await self.bus.queued_and_in_flight(run)
+        self.assertEqual(queue["queued"], 2)
+        self.assertEqual([cmd["request_id"] for cmd in queue["in_flight"]], [ids[0]])
         self.node.draining = True
         self.node.notify()
-        finish.set()
-        self.assertTrue((await self.bus.wait_for_reply(ids[1], 5)).ok)
         self.assertFalse(child.closed)
         self.assertIsNone(await self.bus.parked_checkpoint(run))
-        self.assertEqual(reads, 2)
-        prepared.set()
+        finish.set()
+        self.assertTrue((await self.bus.wait_for_reply(ids[0], 5)).ok)
         await self.finish_worker("p")
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(child.closed)
       finally:
         finish.set()
-        prepared.set()
+        release_prepare.set()
 
-    self.assertEqual((reads, calls), (2, 32))
-    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)).ok for request in ids[:32]]))
-    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)) is None for request in ids[32:]]))
+    self.assertEqual((reads, calls), (2, 1))
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)) is None for request in ids[1:]]))
     self.assertEqual((await self.bus.queued_and_in_flight(run))["queued"], 2)
     self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
     tensors, _ = self.store.get(await self.bus.parked_checkpoint(run))

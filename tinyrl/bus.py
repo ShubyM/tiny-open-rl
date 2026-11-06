@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -271,25 +270,41 @@ class Bus:
       await self.r.set(key("seq", run_id, str(seq_id)), request_id, ex=SESSION_TTL)
     return request_id
 
-  async def take_commands(self, runs: list[str], owner: str, count: int = 16, block_ms: int = 1000) -> list[Cmd]:
-    """Read up to count commands per run. The node already knows its worker's membership from assignments."""
-    if not runs:
+  async def peek_commands(self, runs: list[str], block_ms: int = 0) -> list[Cmd]:
+    """Unclaimed heads, in arrival order. Looking and preparing never change stream ownership."""
+    p = self.r.pipeline(transaction=False)
+    for run in runs:
+      p.xinfo_groups(key("q", run))
+    cursors = {}
+    for run, groups in zip(runs, await p.execute(raise_on_error=False)):
+      if isinstance(groups, Exception):
+        if "no such key" not in str(groups):
+          raise groups
+        continue
+      if group := next((g for g in groups if g["name"] == GROUP.encode()), None):
+        cursors[key("q", run)] = group["last-delivered-id"]
+    if not cursors:
       await asyncio.sleep(block_ms / 1000)
       return []
+    got = await self.r.xread(cursors, count=1, block=block_ms or None)
+    cmds = [parse_cmd(stream.decode().removeprefix(key("q", "")), *entries[0]) for stream, entries in got]
+    return sorted(cmds, key=lambda c: (*map(int, c.entry_id.split("-")), c.run))
 
-    runs = random.sample(runs, len(runs))  # so no run always goes first, without changing the caller's list
-    streams = {key("q", run_id): ">" for run_id in runs}
-    try:
-      got = await self.r.xreadgroup(GROUP, owner, streams, count=count, block=block_ms or None)
-    except redis.ResponseError as e:
-      if "NOGROUP" not in str(e):
-        raise
-      return []  # a run was deleted after the node read its assignments
-
+  async def take_commands(self, runs: list[str], owner: str, count: int = 16, block_ms: int = 0) -> list[Cmd]:
+    """Claim only the selected work. A stream deleted during admission cannot hide another run."""
+    p = self.r.pipeline(transaction=False)
+    for run in runs:
+      p.xreadgroup(GROUP, owner, {key("q", run): ">"}, count=count)
     cmds = []
-    for stream, entries in got:
-      run_id = stream.decode().removeprefix(key("q", ""))
-      cmds += [parse_cmd(run_id, entry_id, fields) for entry_id, fields in entries]
+    for run, got in zip(runs, await p.execute(raise_on_error=False)):
+      if isinstance(got, Exception):
+        if "NOGROUP" not in str(got):
+          raise got
+        continue
+      cmds += [parse_cmd(run, entry_id, fields) for _, entries in got for entry_id, fields in entries]
+    if not cmds and block_ms:
+      await self.peek_commands(runs, block_ms)
+      return await self.take_commands(runs, owner, count)
     return cmds
 
   async def write_reply(self, cmd: Cmd, reply: Reply, worker: str, owner: str, started: float | None = None) -> bool:
@@ -303,14 +318,15 @@ class Bus:
         "busy_ms": int((time.time() - started) * 1000),
       }
 
-    k = key("owner", worker)
+    k, deleting = key("owner", worker), cmd.op == Op.DELETE_MODEL and reply.ok
     while True:
       try:
         async with self.r.pipeline(transaction=True) as p:
-          await p.watch(k)
+          await p.watch(k, *([key("ckpt", cmd.run)] if deleting else []))
           if await p.get(k) != owner.encode():
             await p.unwatch()
             return False
+          checkpoints = await p.hgetall(key("ckpt", cmd.run)) if deleting else {}
           p.multi()
           fields = {"ok": int(reply.ok), "content_type": reply.content_type, "body": reply.body}
           p.xadd(key("f", cmd.request_id), fields, maxlen=1, approximate=False)
@@ -319,6 +335,22 @@ class Bus:
           p.xdel(key("q", cmd.run), cmd.entry_id)
           for name, n in counts.items():
             p.hincrby(key("run", cmd.run), name, n)
+          if deleting:
+            # Completion includes deletion; a client observing its reply sees no owned checkpoint or live queue.
+            for cid, data in checkpoints.items():
+              if json.loads(data)["owned"]:
+                uri = f"tinker://{cmd.run}/{cid.decode()}"
+                p.hdel(key("ckpt", cmd.run), cid)
+                p.zrem(key("ckpts"), uri)
+                p.zrem(key("expiry"), uri)
+            p.srem(key("runs"), cmd.run)
+            p.delete(key("q", cmd.run), key("parked", cmd.run))
+            p.xadd(
+              key("events"),
+              {"kind": Ev.RUN_DELETED, "body": json.dumps({"run": cmd.run, "worker": worker})},
+              maxlen=1_000_000,
+              approximate=True,
+            )
           await p.execute()
           return True
       except redis.WatchError:

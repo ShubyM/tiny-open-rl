@@ -168,6 +168,30 @@ class TestUnixProcess(unittest.IsolatedAsyncioTestCase):
 
 
 class TestProcessOwnership(unittest.TestCase):
+  def test_only_a_checkpointable_target_omits_its_parent_death_signal(self):
+    cmd = """
+import ctypes, time
+sig = ctypes.c_int()
+if ctypes.CDLL(None).prctl(2, ctypes.byref(sig)) != 0: raise OSError('PR_GET_PDEATHSIG failed')
+print(sig.value, flush=True)
+time.sleep(60)
+"""
+    for checkpointable in (False, True):
+      with self.subTest(checkpointable=checkpointable):
+        proc = launch(
+          [sys.executable, "-c", cmd],
+          dict(os.environ),
+          checkpointable=checkpointable,
+          stdout=subprocess.PIPE,
+          bufsize=0,
+        )
+        try:
+          self.assertEqual(int(read_line(proc)), 0 if checkpointable else signal.SIGKILL)
+        finally:
+          reap(proc)
+          proc.wait()
+          proc.stdout.close()
+
   def test_a_container_init_can_be_the_explicit_parent(self):
     with (
       patch.dict(os.environ, {"TINYRL_PARENT_PID": "1"}, clear=True),
@@ -234,8 +258,13 @@ time.sleep(60)
       proc.stdout.close()
 
   def test_parent_death_cleans_the_group_and_detached_ranks(self):
-    for detached, delayed in ((False, False), (True, False), (True, True)):
-      with self.subTest(detached=detached, delayed=delayed):
+    cases = [
+      (checkpointable, detached, delayed)
+      for checkpointable in (False, True)
+      for detached, delayed in ((False, False), (True, False), (True, True))
+    ]
+    for checkpointable, detached, delayed in cases:
+      with self.subTest(checkpointable=checkpointable, detached=detached, delayed=delayed):
         rank_code = f"""
 import os, time
 if {delayed!r}:
@@ -255,7 +284,7 @@ time.sleep(60)
         owner_code = f"""
 import os, sys, time
 from tinyrl.control.process import launch
-proc = launch([sys.executable,'-c',{target_code!r}], dict(os.environ))
+proc = launch([sys.executable,'-c',{target_code!r}], dict(os.environ), checkpointable={checkpointable!r})
 print('owner',proc.pid,flush=True)
 time.sleep(60)
 """

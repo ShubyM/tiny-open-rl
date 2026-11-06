@@ -12,6 +12,7 @@ dependencies = ["fastapi", "uvicorn", "redis>=7.1", "protobuf>=5", "numpy", "tor
 
 [project.optional-dependencies]
 gcs = ["gcsfs"]
+profiling = ["nvtx>=0.2.16"]
 testing = ["httpx", "ruff", "tabulate"]
 
 [tool.setuptools.packages.find]

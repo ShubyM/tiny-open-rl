@@ -9,9 +9,33 @@ import json
 import time
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus, Ev, Event, Role, key
+from tinyrl.bus import Bus, Cmd, Ev, Event, Op, Role, key
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
+
+
+def select_runs(heads: list[Cmd], service: dict[str, float], width: int, prefer: str | None = None) -> list[str]:
+  """Choose ready heads by measured node execution seconds per run, not a global tenant share.
+  The caller bounds preferred continuations. New runs join the active service floor.
+  """
+  if width < 1:
+    raise ValueError("batch width must be positive")
+  ready = {}
+  for cmd in heads:
+    ready.setdefault(cmd.run, cmd)
+  floor = min((service[run] for run in ready if run in service), default=0.0)
+  ordered = sorted(
+    ready.values(),
+    key=lambda cmd: (
+      cmd.run != prefer,
+      service.get(cmd.run, floor),
+      cmd.op != Op.SAVE_WEIGHTS_FOR_SAMPLER,
+      tuple(map(int, cmd.entry_id.split("-"))),
+      cmd.run,
+    ),
+  )
+  return [cmd.run for cmd in ordered[:width]]
+
 
 # ***** workers *****
 
