@@ -19,6 +19,7 @@ import httpx
 
 from tinyrl.helpers import getenv
 from tinyrl.storage import models
+from tinyrl.trace import span
 from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
 
@@ -173,7 +174,8 @@ class VLLM:
   async def post(self, path: str, **kwargs) -> httpx.Response:
     for attempt in range(3):
       try:
-        res = await self.http.post(path, **kwargs)
+        with span(f"vllm{path}"):
+          res = await self.http.post(path, **kwargs)
         res.raise_for_status()
         return res
       except httpx.TransportError:
