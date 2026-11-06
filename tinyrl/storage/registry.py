@@ -10,11 +10,7 @@ from tinyrl.bus import Bus, key
 
 class Registry:
   def __init__(self, bus: Bus):
-    self.bus = bus
-
-  @property
-  def r(self):
-    return self.bus.r  # read when used, so a worker made without a bus, as tests do, still starts
+    self.r = bus.r
 
   async def register_checkpoint(
     self, uri: str, size: int, ttl: int | None = None, owned: bool = False, version: str | None = None

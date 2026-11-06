@@ -1,22 +1,21 @@
 import asyncio
 import json
-from unittest.mock import patch
+import tempfile
 
-from test.helpers import RedisTest, new_id, tiny
-from test.test_scheduler import check
-from tinyrl.bus import Op, Run
+from test.execution import TestNode
+from test.helpers import RedisTest
+from tinyrl.bus import Ev, Op, Run
 from tinyrl.control import scheduler
-from tinyrl.workers.sampler import Sampler
-from tinyrl.workers.trainer import Trainer
+from tinyrl.storage.store import Store
 
 
 class TestEvents(RedisTest):
   async def test_round_trip(self):
-    first = await self.bus.append_event("started", worker="p", node="n", gpus=[0], memory=0)
-    second = await self.bus.append_event("exited", worker="p")
+    first = await self.bus.append_event("node_up", node="n", gpus=2, memory=0)
+    second = await self.bus.append_event("node_lost", node="n")
     events = await self.bus.read_events()
-    self.assertEqual([(e.id, e.kind) for e in events], [(first, "started"), (second, "exited")])
-    self.assertEqual(events[0].body, {"worker": "p", "node": "n", "gpus": [0], "memory": 0})
+    self.assertEqual([(e.id, e.kind) for e in events], [(first, "node_up"), (second, "node_lost")])
+    self.assertEqual(events[0].body, {"node": "n", "gpus": 2, "memory": 0})
     self.assertLessEqual(events[0].t, events[1].t)
     self.assertEqual([e.id for e in await self.bus.read_events(first)], [second])
 
@@ -25,7 +24,7 @@ class TestEvents(RedisTest):
       await self.bus.append_event("grantd", worker="p")
     self.assertEqual(await self.bus.read_events(), [])
 
-  async def test_the_scheduler_assigns_new_runs_and_workers_find_them_in_redis(self):
+  async def test_the_scheduler_assigns_new_runs_and_the_log_has_the_worker_membership(self):
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     for run in ("a", "b"):
       await self.bus.create_run(Run(run, "", "tiny", 4))
@@ -37,50 +36,41 @@ class TestEvents(RedisTest):
       await asyncio.sleep(0.02)
     self.assertEqual(runs["a"], runs["b"])
     self.assertNotEqual(runs["a"], runs["f"])
-    self.assertEqual(sorted(await self.bus.runs_in_worker(runs["a"])), ["a", "b"])
-    self.assertEqual(await self.bus.runs_in_worker(runs["f"]), ["f"])
+    state = scheduler.State()
+    for event in await self.bus.read_events():
+      state = scheduler.fold(state, event)
+    self.assertEqual(sorted(scheduler.members(state, runs["a"])), ["a", "b"])
+    self.assertEqual(scheduler.members(state, runs["f"]), ["f"])
 
-  async def test_each_worker_appends_its_facts_in_order_and_the_log_folds_soundly(self):
-    run_id = new_id()
-    await self.run_scheduler({"lora:tiny:1": [0], "sampler:tiny": [1]})
-    await self.bus.create_run(Run(run_id, "lora:tiny:1", "tiny", 4, exclusive=False))
-
-    with patch("tinyrl.workers.model.load", side_effect=tiny), patch("tinyrl.workers.trainer.GPU", "0"):
-      trainer = Trainer(self.bus, "lora:tiny:1", owner="tw1")
-      await self.own(trainer)
-
-      await self.bus.submit_command(
-        run_id, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": {}}).encode()
+  async def test_gpu_reservations_and_accounting_stay_with_the_node_that_executes_them(self):
+    node = TestNode(self.bus, store=Store(tempfile.mkdtemp()), gpus=1)
+    try:
+      await self.bus.create_run(Run("r", "p", "tiny", 4))
+      await node.add("p", gpus=[0])
+      request = await self.bus.submit_command(
+        "r", Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": {}}).encode()
       )
+      self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
+      worker = node.running["p"]
+      self.assertEqual(worker.gpus, (0,))
+      self.assertIsNotNone(worker.since)
+      self.assertEqual(await self.bus.queued_and_in_flight("r"), {"live": True, "queued": 0, "in_flight": []})
+      self.assertGreater(worker.busy, 0)
+      local = {"started", "exited", "wants_gpu", "granted", "revoked", "released", "batch_done", "idle"}
+      self.assertFalse([e for e in await self.bus.read_events() if e.kind in local])
+    finally:
+      await node.aclose()
 
-      await trainer.step()
-
-      await trainer.step()
-
-    with patch("tinyrl.workers.sampler.ENGINE", "test.helpers:FakeEngine"), patch("tinyrl.workers.sampler.GPU", "1"):
-      sampler = Sampler(self.bus, "sampler:tiny", owner="sw1")
-      run_id2 = new_id()
-      await self.bus.create_run(Run(run_id2, "sampler:tiny", "tiny", 0))
-      req = {
-        "prompt": [1],
-        "max_tokens": 1,
-        "num_samples": 1,
-        "prompt_logprobs": False,
-        "prompt_logprobs_last_n": 0,
-        "topk_sample": 1,
-        "topk_prompt": 0,
-      }
-      await self.bus.submit_command(run_id2, Op.SAMPLE, json.dumps(req).encode())
-      await self.own(sampler)
-
-      await sampler.step()
-      await sampler.step()
-
-    events = await self.bus.read_events()
-    turns = ("wants_gpu", "granted", "batch_done", "idle")
-    for worker in ("lora:tiny:1", "sampler:tiny"):
-      self.assertEqual([e.kind for e in events if e.body.get("worker") == worker and e.kind in turns], list(turns))
-    s = scheduler.State()
-    for e in events:
-      s = scheduler.fold(s, e)
-    self.assertEqual(check(s), [])
+  async def test_cluster_placement_names_the_node_and_leaves_gpu_selection_to_it(self):
+    await self.bus.node_heartbeat("n", 2)
+    await self.bus.append_event(Ev.NODE_UP, node="n", gpus=2, memory=0)
+    await self.bus.create_run(Run("r", "p", "tiny", 4))
+    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    for _ in range(100):
+      placed = [e for e in await self.bus.read_events() if e.kind == Ev.PLACED]
+      if placed:
+        break
+      await asyncio.sleep(0.02)
+    self.assertEqual(len(placed), 1)
+    self.assertEqual((placed[0].body["worker"], placed[0].body["node"]), ("p", "n"))
+    self.assertNotIn("gpus", placed[0].body)

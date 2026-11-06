@@ -1,126 +1,257 @@
 import asyncio
 import json
 import unittest
-from unittest.mock import patch
 
 import torch
 
+from test.execution import TestNode
 from test.helpers import RedisTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl.api import wire
 from tinyrl.bus import Op, Run
-from tinyrl.control.turns import GpuTurn
-from tinyrl.workers import trainer
 from tinyrl.workers.model import Model
-from tinyrl.workers.trainer import Trainer
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
 class TestTakingTurns(RedisTest):
-  """Two trainers whose workers the node daemon put on one GPU: the scheduler decides whose turn it is."""
+  async def asyncSetUp(self):
+    await super().asyncSetUp()
+    self.node = TestNode(self.bus, gpus=1, node="n")
 
-  async def trainer(self, worker: str) -> tuple[Trainer, str]:
-    t = Trainer(self.bus, worker, Model(tiny), owner=worker)
-    await t.wait_for_lease()
+  async def asyncTearDown(self):
+    await self.node.aclose()
+    await super().asyncTearDown()
+
+  async def until(self, done):
+    async with asyncio.timeout(5):
+      while not done():
+        await self.node.tick()
+        await asyncio.sleep(0.01)
+
+  async def trainer(self, worker, gpus=None):
     run = new_id()
-    await self.bus.create_run(Run(run, worker, "tiny", 4))
-    await self.submit(run, Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA})
-    return t, run
+    await self.bus.create_run(Run(run, worker, "tiny", 4, lora=LORA, gpus=len(gpus or [0])))
+    await self.node.add(worker, gpus=gpus)
+    request = await self.submit(run, Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA})
+    return run, request
 
-  async def submit(self, run: str, op: Op, body: dict) -> str:
+  async def submit(self, run, op, body):
     return await self.bus.submit_command(run, op, json.dumps(body).encode())
 
-  async def until_it_yields(self, t: Trainer) -> None:
-    for _ in range(100):
-      await t.step(block_ms=10)
-      if not t.turn.held:
-        return
-    self.fail(f"{t.worker} kept its GPU")
+  async def reply(self, request):
+    reply = await self.bus.wait_for_reply(request, 5)
+    self.assertIsNotNone(reply)
+    self.assertTrue(reply.ok, reply.body)
+    return reply
 
-  async def test_an_idle_trainer_yields_its_gpu_to_one_that_waits(self):
-    with patch.object(trainer, "GPU", "node-a:0"):
-      await self.run_scheduler({"a": [0], "b": [0]})
-      a, _ = await self.trainer("a")
-      await a.step(block_ms=10)
-      b, run_b = await self.trainer("b")
-      waiting = asyncio.create_task(b.step(block_ms=10))
-      await asyncio.sleep(0.3)
-      self.assertFalse(waiting.done())  # b took its command, but a holds the GPU
-      self.assertEqual(len((await self.bus.queued_and_in_flight(run_b))["in_flight"]), 1)
+  async def test_an_idle_trainer_stays_resident_until_another_worker_waits(self):
+    _, request = await self.trainer("a")
+    await self.reply(request)
+    await asyncio.sleep(0.2)  # an empty read must not evict a resident model
+    a, child = self.node.running["a"], self.node.processes["a"]
+    self.assertIsNotNone(a.since)
+    self.assertFalse(child.trainer.model.parked)
+    _, request = await self.trainer("b")
+    await self.reply(request)
+    self.assertTrue(child.trainer.model.parked)
+    self.assertIsNone(a.since)
+    self.assertIsNotNone(self.node.running["b"].since)
+    local = {"granted", "revoked", "wants_gpu", "released", "batch_done"}
+    self.assertFalse(any(e.kind in local for e in await self.bus.read_events()))
 
-      await self.until_it_yields(a)
-      self.assertEqual(await asyncio.wait_for(waiting, 5), 1)
-      self.assertTrue(a.model.parked)
-      self.assertEqual((a.turn.held, b.turn.held), (False, True))
+  async def test_a_busy_trainer_yields_after_its_current_command_when_its_quantum_expires(self):
+    self.node.state.quantum = 0.3
+    run, request = await self.trainer("a")
+    await self.reply(request)
+    first, finish, order = asyncio.Event(), asyncio.Event(), []
+    child = self.node.processes["a"]
+    original = child.call
 
-  async def test_a_busy_trainer_keeps_its_gpu_for_its_quantum(self):
-    with patch.object(trainer, "GPU", "node-a:0"):
-      await self.run_scheduler({"a": [0], "b": [0]}, quantum=1.0)
-      a, run_a = await self.trainer("a")
-      await a.step(block_ms=10)
-      b, _ = await self.trainer("b")
-      waiting = asyncio.create_task(b.step(block_ms=10))
+    async def held(method, *args):
+      result = await original(method, *args)
+      if method == "execute":
+        order.append("a")
+        if len(order) == 1:
+          first.set()
+          await finish.wait()
+      return result
 
-      for _ in range(3):  # busy for well under its quantum
-        await self.submit(run_a, Op.OPTIM_STEP, {"adam_params": {}})
-        await a.step(block_ms=10)
-        await asyncio.sleep(0.1)
-      self.assertFalse(waiting.done())
+    child.call = held
+    requests = [await self.submit(run, Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(2)]
+    try:
+      await self.until(first.is_set)
+      _, waiting = await self.trainer("b")
+      other = self.node.processes["b"]
+      execute = other.call
 
-      await asyncio.sleep(1.0)
-      await self.submit(run_a, Op.OPTIM_STEP, {"adam_params": {}})
-      await a.step(block_ms=10)  # its quantum ran out, so it yields after this batch
-      self.assertEqual(await asyncio.wait_for(waiting, 5), 1)
-      self.assertTrue(a.model.parked)
+      async def observed(method, *args):
+        if method == "execute":
+          order.append("b")
+        return await execute(method, *args)
 
-  async def test_a_stopping_trainer_parks_before_it_gives_its_gpu_back(self):
-    with patch.object(trainer, "GPU", "node-a:0"):
-      await self.run_scheduler({"a": [0], "b": [0]})
-      a, _ = await self.trainer("a")
-      await a.step(block_ms=10)
-      b = GpuTurn(self.bus, "b", shared=True)
-      waiting = asyncio.create_task(b.wait_for_turn(1))
-      await asyncio.sleep(0.3)
-      self.assertFalse(waiting.done())
-      a.stop()  # what SIGTERM calls, after which serve drains and leaves
-      await a.park_every_run()
-      await a.release_gpu_and_worker()
-      self.assertTrue(await asyncio.wait_for(waiting, 5))
-      self.assertTrue(a.model.parked)
+      other.call = observed
+      await self.until(lambda: self.node.running["b"].ticket > 0)
+      await asyncio.sleep(0.35)
+      self.assertIsNone(await self.bus.wait_for_reply(waiting, 0))
+      self.assertIsNotNone(self.node.running["a"].since)
+      finish.set()
+      await asyncio.gather(*(self.reply(r) for r in [*requests, waiting]))
+      self.assertEqual(order, ["a", "b", "a"])
+    finally:
+      finish.set()
 
-  async def test_a_trainer_that_exits_gives_its_turn_to_the_next(self):
-    with patch.object(trainer, "GPU", "node-a:0"):
-      await self.run_scheduler({"a": [0], "b": [0]})
-      t = Trainer(self.bus, "a", Model(tiny), owner="a")
-      run = new_id()
-      await self.bus.create_run(Run(run, "a", "tiny", 0))
-      await self.submit(run, Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}})
-      await self.submit(run, Op.DELETE_MODEL, {})
-      b, _ = await self.trainer("b")
+  async def test_parking_must_acknowledge_before_another_worker_is_granted(self):
+    _, request = await self.trainer("a")
+    await self.reply(request)
+    parked, finish = asyncio.Event(), asyncio.Event()
+    child = self.node.processes["a"]
+    original = child.call
 
-      await t.serve()
-      self.assertEqual(await asyncio.wait_for(b.step(block_ms=10), 5), 1)
+    async def delayed(method, *args):
+      if method == "park":
+        parked.set()
+        await finish.wait()
+      return await original(method, *args)
 
-  @patch("tinyrl.control.turns.NODE", "n")
-  async def test_a_trainer_moved_on_its_node_revokes_itself_and_asks_on_its_new_gpu(self):
-    await self.run_scheduler({"a": [0], "b": [0], "c": [1]})
-    turn, turn2 = GpuTurn(self.bus, "a", shared=True), GpuTurn(self.bus, "b", shared=True)
-    await turn.wait_for_turn(1)
+    child.call = delayed
+    try:
+      _, waiting = await self.trainer("b")
+      await self.until(parked.is_set)
+      self.assertIsNone(await self.bus.wait_for_reply(waiting, 0))
+      self.assertIsNotNone(self.node.running["a"].since)
+      self.assertIsNone(self.node.running["b"].since)
+      finish.set()
+      await self.reply(waiting)
+      self.assertIsNone(self.node.running["a"].since)
+    finally:
+      finish.set()
 
-    waiting = asyncio.create_task(turn2.wait_for_turn(1))
-    while not any(e.kind == "wants_gpu" and e.body["worker"] == "b" for e in await self.bus.read_events()):
-      await asyncio.sleep(0.01)
-    await self.bus.append_event("placed", worker="b", node="n", gpus=[1], rule="test")
-    self.assertTrue(await asyncio.wait_for(waiting, 5))
-    self.assertEqual(turn2.gpu, 1)
+  async def test_process_exit_must_acknowledge_before_the_gpu_is_released(self):
+    _, request = await self.trainer("a")
+    await self.reply(request)
+    closing, finish = asyncio.Event(), asyncio.Event()
+    child = self.node.processes["a"]
+    original = child.close
 
-    await self.bus.append_event("placed", worker="a", node="n", gpus=[1], rule="test")
-    self.assertTrue(await turn.was_revoked())
-    await turn.give_turn_back()
-    self.assertEqual(turn.gpu, 1)
-    self.assertFalse(turn.moved)
-    await turn2.give_turn_back()
+    async def delayed():
+      closing.set()
+      await finish.wait()
+      await original()
+
+    child.close = delayed
+    self.node.tasks["a"].cancel()
+    try:
+      _, waiting = await self.trainer("b")
+      await self.until(closing.is_set)
+      self.assertIsNotNone(self.node.running["a"].since)
+      self.assertIsNone(self.node.running["b"].since)
+      self.assertIsNone(await self.bus.wait_for_reply(waiting, 0))
+      finish.set()
+      await self.reply(waiting)
+      self.assertTrue(child.closed)
+    finally:
+      finish.set()
+
+  async def test_a_waiting_lora_trainer_moves_before_its_next_reservation_without_restarting(self):
+    self.node.gpus = 2
+    self.node.state.nodes["n"] = (2, 0)
+    await self.bus.create_run(Run("reserved", "s", "tiny", 4, role="sampler"))
+    await self.node.add("s", gpus=[1])
+    run, request = await self.trainer("a", [0])
+    await self.reply(request)
+    entered, finish = asyncio.Event(), asyncio.Event()
+    original = self.node.processes["a"].call
+
+    async def held(method, *args):
+      if method == "execute":
+        entered.set()
+        await finish.wait()
+      return await original(method, *args)
+
+    self.node.processes["a"].call = held
+    work = await self.submit(run, Op.OPTIM_STEP, {"adam_params": {}})
+    try:
+      await self.until(entered.is_set)
+      _, waiting = await self.trainer("b", [0])
+      child = self.node.processes["b"]
+      await self.until(lambda: self.node.running["b"].ticket > 0)
+      self.assertIsNone(await self.bus.wait_for_reply(waiting, 0))
+      self.node.state.workers["b"].gpus = (1,)
+      self.node.notify()
+      await self.reply(waiting)
+      self.assertIs(self.node.processes["b"], child)
+      self.assertEqual(self.node.running["b"].gpus, (1,))
+      self.assertIsNotNone(self.node.running["a"].since)
+      self.assertIsNotNone(self.node.running["b"].since)
+    finally:
+      finish.set()
+      await self.reply(work)
+
+  async def test_a_multi_gpu_worker_waits_for_all_its_gpus_at_once(self):
+    self.node.gpus = 2
+    self.node.state.nodes["n"] = (2, 0)
+    _, request = await self.trainer("a", [1])
+    await self.reply(request)
+    entered, finish = asyncio.Event(), asyncio.Event()
+    original = self.node.processes["a"].call
+
+    async def held(method, *args):
+      if method == "park":
+        entered.set()
+        await finish.wait()
+      return await original(method, *args)
+
+    self.node.processes["a"].call = held
+    try:
+      _, waiting = await self.trainer("wide", [0, 1])
+      await self.until(entered.is_set)
+      self.assertIsNone(await self.bus.wait_for_reply(waiting, 0))
+      self.assertIsNone(self.node.running["wide"].since)
+      self.assertEqual([r.gpus for r in self.node.running.values() if r.since is not None], [(1,)])
+      finish.set()
+      await self.reply(waiting)
+      self.assertEqual(self.node.running["wide"].gpus, (0, 1))
+      self.assertIsNotNone(self.node.running["wide"].since)
+    finally:
+      finish.set()
+
+  async def test_an_idle_holder_that_resumes_keeps_its_quantum_for_queued_work(self):
+    run, request = await self.trainer("a")
+    await self.reply(request)
+    await asyncio.sleep(0.2)
+    entered, finish, order = asyncio.Event(), asyncio.Event(), []
+    original = self.node.processes["a"].call
+
+    async def held(method, *args):
+      result = await original(method, *args)
+      if method == "execute":
+        order.append("a")
+        if len(order) == 1:
+          entered.set()
+          await finish.wait()
+      return result
+
+    self.node.processes["a"].call = held
+    requests = [await self.submit(run, Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(2)]
+    try:
+      await self.until(entered.is_set)
+      _, waiting = await self.trainer("b")
+      original_b = self.node.processes["b"].call
+
+      async def observed(method, *args):
+        if method == "execute":
+          order.append("b")
+        return await original_b(method, *args)
+
+      self.node.processes["b"].call = observed
+      await self.until(lambda: self.node.running["b"].ticket > 0)
+      self.assertIsNone(await self.bus.wait_for_reply(waiting, 0))
+      finish.set()
+      await asyncio.gather(*(self.reply(r) for r in [*requests, waiting]))
+      self.assertEqual(order, ["a", "a", "b"])
+    finally:
+      finish.set()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")

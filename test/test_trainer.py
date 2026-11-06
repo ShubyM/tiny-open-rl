@@ -14,13 +14,14 @@ from peft import PeftModel
 from transformers import LlamaConfig, LlamaForCausalLM
 
 import tinyrl.workers.model
+from test.execution import TestNode
 from test.helpers import RedisTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl.api import wire
-from tinyrl.bus import Cmd, Ev, Op, Run
+from tinyrl.bus import Cmd, Op, Run
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import LOSSES, Model, batches, target_logprobs, token_budget
-from tinyrl.workers.trainer import Stop, Trainer
+from tinyrl.workers.trainer import Trainer
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -521,33 +522,34 @@ class TestModel(unittest.TestCase):
 
 
 class TestTrainer(RedisTest):
-  async def test_a3_restore_missing_run_skip(self):
-    run_id = new_id()
-    await self.bus.create_run(Run(run_id, "p", "tiny", 0))
-    t = Trainer(self.bus, "p", Model(tiny))
-    await self.own(t)
+  async def asyncSetUp(self):
+    await super().asyncSetUp()
+    self.store = Store(root=tempfile.mkdtemp())
+    self.node = TestNode(self.bus, store=self.store)
 
-    await self.bus.set_parked_checkpoint(run_id, "tinker://p/bad", "p", t.owner)
-    cmd = Cmd(
-      run=run_id,
-      entry_id="r1",
-      op=Op.OPTIM_STEP,
-      body=b"{}",
-    )
-    reply = await t.answer_command(cmd)
-    self.assertFalse(reply.ok)
-
-    self.assertNotIn(run_id, t.model.params)
+  async def asyncTearDown(self):
+    await self.node.aclose()
+    await super().asyncTearDown()
 
   async def submit(self, run: str, *cmds: tuple[Op, dict | bytes]) -> list[str]:
-    request_ids = []
-    for op, body in cmds:
-      request_ids.append(
-        await self.bus.submit_command(run, op, body if isinstance(body, bytes) else json.dumps(body).encode())
-      )
-    return request_ids
+    return [
+      await self.bus.submit_command(run, op, body if isinstance(body, bytes) else json.dumps(body).encode())
+      for op, body in cmds
+    ]
 
-  async def test_commands_flow_through_and_delete_drops_the_run(self):
+  def model(self, worker):
+    return self.node.processes[worker].trainer.model
+
+  async def until(self, predicate):
+    async with asyncio.timeout(10):
+      while not predicate():
+        self.node.dispatch()
+        await asyncio.sleep(0.01)
+
+  async def finish_worker(self, worker):
+    await self.until(lambda: worker not in self.node.running)
+
+  async def test_commands_flow_through_the_node_and_delete_drops_the_run(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4))
     request_ids = await self.submit(
@@ -557,186 +559,256 @@ class TestTrainer(RedisTest):
       (Op.OPTIM_STEP, {"adam_params": {}}),
       (Op.DELETE_MODEL, {}),
     )
-
-    t = Trainer(self.bus, "p", Model(tiny))
-    await self.own(t)
-    while await t.step(block_ms=10):
-      pass
-
+    await self.node.drain(run)
     replies = [await self.bus.wait_for_reply(request_id, 0) for request_id in request_ids]
     bodies = [json.loads(reply.body) for reply in replies]
     self.assertEqual([reply.ok for reply in replies], [True, False, True, True])
     self.assertEqual([body.get("type") for body in bodies], ["create_model", None, "optim_step", "delete_model"])
     self.assertEqual(bodies[1]["category"], "user")
-
     self.assertEqual((await self.bus.get_run(run))["steps"], 1)
-    self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))  # deleted
-    self.assertIsNone(t.stopping)  # a LoRA trainer keeps serving its worker
+    self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))
 
-  async def test_a_trainer_told_to_stop_during_a_batch_that_deletes_a_run_still_stops(self):
+  async def test_a_node_told_to_stop_during_a_batch_finishes_claimed_work_and_closes(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.DELETE_MODEL, {}))
-    t = Trainer(self.bus, "p", Model(tiny))
-    await self.own(t)
-    answer = t.answer_command
+    ids = await self.submit(
+      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.DELETE_MODEL, {})
+    )
+    await self.node.add("p")
+    child = self.node.processes["p"]
+    original = child.call
 
-    async def sigterm_then_answer(cmd):
-      t.stop()  # SIGTERM lands while the batch runs
-      return await answer(cmd)
+    async def call(method, *args):
+      if method == "execute":
+        self.node.draining = True  # graceful shutdown arrives while the first command executes
+      return await original(method, *args)
 
-    t.answer_command = sigterm_then_answer
-    await t.step(block_ms=10)
-    self.assertEqual(t.stopping, Stop.PARK)
+    child.call = call
+    await self.finish_worker("p")
+    self.assertTrue(child.closed)
+    self.assertTrue(all([(await self.bus.wait_for_reply(request_id, 1)).ok for request_id in ids]))
 
-  async def test_a_new_trainer_fails_what_a_dead_one_left_in_flight(self):
+  async def test_a_new_node_owner_fails_what_a_dead_one_left_in_flight(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4))
     [request_id] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {}}))
-    await self.bus.take_commands("p", "dead", block_ms=10)  # taken, and never answered
-
-    t = Trainer(self.bus, "p", Model(tiny), owner="new")
-    t.stopping = Stop.EXIT  # so serve() stops right after reclaiming
-    await t.serve()
-
+    await self.bus.take_commands([run], "dead", block_ms=10)
+    await self.node.add("p")
+    self.node.draining = True  # startup reconciliation still runs even if the node immediately drains
+    self.node.notify()
+    await self.finish_worker("p")
     reply = await self.bus.wait_for_reply(request_id, 1)
     self.assertFalse(reply.ok)
     self.assertEqual(json.loads(reply.body)["category"], "server")
     self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
 
-  async def test_a_full_fine_tune_trainer_exits_with_its_run(self):
+  async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
     await self.bus.create_run(Run(run, run, "tiny", 0))
     await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
+    await self.node.add(run)
+    child = self.node.processes[run]
+    await self.finish_worker(run)
+    self.assertTrue(child.closed)
+    self.assertIsNone(await self.bus.lease_owner(run))
 
-    t = Trainer(self.bus, run, Model(tiny))
-    await asyncio.wait_for(t.serve(), 60)
-    self.assertEqual(t.stopping, Stop.EXIT)
-    self.assertEqual(await self.bus.runs_in_worker(run), [])
-
-  async def test_a_run_moves_between_trainers_through_the_store(self):
-    store = Store(root=tempfile.mkdtemp())
+  async def test_a_run_moves_between_node_owned_models_through_the_store(self):
     for rank, lora in ((4, LORA), (0, {})):
       ctrl, r1, r2 = new_id(), new_id(), new_id()
       for r, worker in ((ctrl, f"ctrl-{rank}"), (r1, f"p1-{rank}"), (r2, f"p2-{rank}")):
-        await self.bus.create_run(Run(r, worker, "tiny", rank))
-
-      tc = Trainer(self.bus, f"ctrl-{rank}", Model(tiny), store=store)
-      t1 = Trainer(self.bus, f"p1-{rank}", Model(tiny), store=store)
-      t2 = Trainer(self.bus, f"p2-{rank}", Model(tiny), store=store)
-      await asyncio.gather(self.own(tc), self.own(t1), self.own(t2))
-
+        await self.bus.create_run(Run(r, worker, "tiny", rank, lora=lora))
       for r in (ctrl, r1):
         await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))
 
-      async def step_run(tr: Trainer, r: str) -> float:
+      async def step_run(r: str) -> float:
         fb, _ = await self.submit(
           r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})
         )
-        while await tr.step(block_ms=10):
-          pass
+        await self.node.drain(r)
         return wire.output_json((await self.bus.wait_for_reply(fb, 1)).body)["metrics"]["loss:sum"]
 
-      losses_ctrl = [await step_run(tc, ctrl) for _ in range(2)]
-      losses_moved = [await step_run(t1, r1) for _ in range(2)]
-
-      # save + delete on trainer 1, then create + load(optimizer=True) on trainer 2
+      losses_ctrl = [await step_run(ctrl) for _ in range(2)]
+      losses_moved = [await step_run(r1) for _ in range(2)]
       uri = f"tinker://{r1}/weights/handoff"
       await self.submit(r1, (Op.SAVE_WEIGHTS, {"uri": uri}), (Op.DELETE_MODEL, {}))
-      while await t1.step(block_ms=10):
-        pass
+      await self.node.drain(r1)
+      registered = await self.registry.get_checkpoint(uri)
+      self.assertEqual(registered["tinker_path"], uri)
+      self.assertGreater(registered["size_bytes"], 0)
       await self.submit(
         r2,
         (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}),
         (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": True}),
       )
-      while await t2.step(block_ms=10):
-        pass
-
+      await self.node.drain(r2)
       for _ in range(3):
-        losses_ctrl.append(await step_run(tc, ctrl))
-        losses_moved.append(await step_run(t2, r2))
-
+        losses_ctrl.append(await step_run(ctrl))
+        losses_moved.append(await step_run(r2))
       self.assertEqual(losses_moved, losses_ctrl, f"rank {rank}")
-      self.assertTrue(same(tc.model.params[ctrl], t2.model.params[r2]), f"rank {rank}")
+      self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p2-{rank}").params[r2]))
 
-  async def test_a_stopped_trainer_saves_its_runs_and_the_next_one_trains_on_exactly(self):
-    store = Store(root=tempfile.mkdtemp())
+  async def test_graceful_replacement_registers_and_restores_weights_optimizer_and_pending_gradients(self):
     for rank, lora in ((4, LORA), (0, {})):
       ctrl, run = new_id(), new_id()
-      await self.bus.create_run(Run(ctrl, f"ctrl-{rank}", "tiny", rank, lora=lora))
-      await self.bus.create_run(Run(run, f"p-{rank}", "tiny", rank, lora=lora))
-      tc, first = (Trainer(self.bus, worker, Model(tiny), store=store) for worker in (f"ctrl-{rank}", f"p-{rank}"))
-      serving = [asyncio.create_task(tc.serve()), asyncio.create_task(first.serve())]
-
-      async def call(r: str, op: Op, body: dict | bytes):
-        [request_id] = await self.submit(r, (op, body))
-        return await self.bus.wait_for_reply(request_id, 60)
-
-      async def step(r: str) -> float:
-        fb = await call(r, Op.FORWARD_BACKWARD, proto_body(r))
-        self.assertTrue((await call(r, Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})).ok)
-        return wire.output_json(fb.body)["metrics"]["loss:sum"]
-
+      for r, worker in ((ctrl, f"ctrl-{rank}"), (run, f"p-{rank}")):
+        await self.bus.create_run(Run(r, worker, "tiny", rank, lora=lora))
+        await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))
+        for _ in range(2):
+          await self.submit(
+            r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})
+          )
+        await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
+        await self.node.drain(r)
+      self.node.state.workers[f"p-{rank}"].node = None
+      self.node.notify()
+      await self.finish_worker(f"p-{rank}")
+      parked = await self.bus.parked_checkpoint(run)
+      self.assertIsNotNone(parked)
+      self.assertIsNotNone(await self.registry.get_checkpoint(parked))
       for r in (ctrl, run):
-        self.assertTrue((await call(r, Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora})).ok)
-      losses_ctrl = [await step(ctrl) for _ in range(2)]
-      losses = [await step(run) for _ in range(2)]
-
-      first.stop()  # what SIGTERM does
-      await serving.pop()
-      self.assertIsNotNone(await self.bus.parked_checkpoint(run))
-
-      second = Trainer(self.bus, f"p-{rank}", Model(tiny), store=store)
-      serving.append(asyncio.create_task(second.serve()))
-      for _ in range(3):
-        losses_ctrl.append(await step(ctrl))
-        losses.append(await step(run))
-      self.assertEqual(losses, losses_ctrl, f"rank {rank}")
-      # restored once, so a later crash can't bring back old state
+        [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
+        await self.node.drain(r)
+        self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
+      self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
       self.assertIsNone(await self.bus.parked_checkpoint(run))
+      self.assertIsNone(await self.registry.get_checkpoint(parked))  # recovery cannot replay old state after a crash
 
-      tc.stopping = second.stopping = Stop.EXIT
-      await asyncio.gather(*serving)
+  async def test_a_wide_checkpoint_keeps_its_ticket_until_all_gpus_are_available(self):
+    self.node.gpus = 2
+    self.node.state.nodes[self.node.id] = (2, 0)
+    wide_run, holder_run, later_run = new_id(), new_id(), new_id()
+    for run, worker in ((wide_run, "wide"), (holder_run, "holder")):
+      await self.bus.create_run(Run(run, worker, "tiny", 4, lora=LORA, gpus=2))
+      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+      await self.node.drain(run)
 
-  @patch("tinyrl.workers.trainer.LEASE_MS", 200)
-  async def test_a_trainer_takes_its_lease_again_when_redis_loses_it(self):
-    t = Trainer(self.bus, "p", Model(tiny))
-    await self.own(t)
-    await self.bus.r.delete("tinyrl:owner:p")  # what a Redis restart longer than the lease does
-    await asyncio.sleep(0.2)
-    self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (t.owner, None))
+    wide = self.node.running["wide"]
+    entered, finish = asyncio.Event(), asyncio.Event()
+    holder_call = self.node.processes["holder"].call
 
+    async def blocked(method, *args):
+      if method == "execute":
+        entered.set()
+        await finish.wait()
+      return await holder_call(method, *args)
+
+    self.node.processes["holder"].call = blocked
+    await self.submit(holder_run, (Op.OPTIM_STEP, {"adam_params": {}}))
+
+    await asyncio.wait_for(entered.wait(), 5)
+
+    waking, checkpoint = asyncio.Event(), asyncio.Event()
+    wide_call = self.node.processes["wide"].call
+
+    async def checkpoint_wake(method, *args):
+      if method == "resume":
+        waking.set()
+        await checkpoint.wait()
+      return await wide_call(method, *args)
+
+    self.node.processes["wide"].call = checkpoint_wake
+    self.node.state.workers["wide"].node = None
+    self.node.notify()
+    await self.until(lambda: wide.ticket > 0)
+    ticket = wide.ticket
+    await self.bus.create_run(Run(later_run, "later", "tiny", 4, lora=LORA))
+    [later_reply] = await self.submit(later_run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    later = await self.node.add("later")
+    await self.until(lambda: later.ticket > 0)
+    for _ in range(10):
+      self.node.dispatch()
+      await asyncio.sleep(0)
+      self.assertEqual(wide.ticket, ticket)
+      self.assertIsNone(wide.since)
+    self.assertGreater(later.ticket, ticket)
+
+    finish.set()
+    await self.until(waking.is_set)
+    self.assertIsNotNone(wide.since)
+    self.assertEqual(wide.gpus, (0, 1))
+    self.assertEqual(wide.ticket, 0)
+    self.assertIsNone(later.since)
+    checkpoint.set()
+    await self.finish_worker("wide")
+    self.assertIsNotNone(await self.bus.parked_checkpoint(wide_run))
+    self.assertTrue((await self.bus.wait_for_reply(later_reply, 5)).ok)
+
+  async def test_unplacement_during_stranded_cleanup_preserves_the_wide_checkpoint_gpus(self):
+    self.node.gpus = 2
+    self.node.state.nodes[self.node.id] = (2, 0)
+    run = new_id()
+    await self.bus.create_run(Run(run, "wide", "tiny", 4, lora=LORA, gpus=2))
+    await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      (Op.FORWARD_BACKWARD, proto_body(run)),
+    )
+    await self.node.drain(run)
+    actual = self.node.running["wide"]
+    entered, finish = asyncio.Event(), asyncio.Event()
+    cleanup, child_call = self.bus.fail_stranded_commands, self.node.processes["wide"].call
+    checkpoint_gpus = []
+
+    async def blocked(*args, **kwargs):
+      if args[-1] > 0:
+        entered.set()
+        await finish.wait()
+      return await cleanup(*args, **kwargs)
+
+    async def call(method, *args):
+      if method == "park_all":
+        checkpoint_gpus.append((actual.gpus, actual.since is not None))
+      return await child_call(method, *args)
+
+    self.node.processes["wide"].call = call
+    with patch.object(self.bus, "fail_stranded_commands", side_effect=blocked):
+      try:
+        await asyncio.wait_for(entered.wait(), 5)
+        desired = self.node.state.workers["wide"]
+        desired.node, desired.gpus = None, ()
+        self.node.notify()
+        finish.set()
+        await self.finish_worker("wide")
+      finally:
+        finish.set()
+    self.assertEqual(checkpoint_gpus, [((0, 1), True)])
+    tensors, _ = self.store.get(await self.bus.parked_checkpoint(run))
+    self.assertTrue(any(torch.count_nonzero(tensor) for name, tensor in tensors.items() if name.endswith(".grad")))
+
+  @patch("tinyrl.control.node_daemon.LEASE_MS", 100)
+  async def test_the_node_recovers_an_uncontested_lease_but_rejects_an_intervening_owner(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "p", "tiny", 4))
+    await self.node.add("p")
+    owner = await self.bus.lease_owner("p")
+    await self.bus.r.delete("tinyrl:owner:p")
+    async with asyncio.timeout(5):
+      while await self.bus.lease_owner("p") != owner:
+        await asyncio.sleep(0.01)
+    self.assertFalse(self.node.tasks["p"].done())
     await self.bus.r.set("tinyrl:last_owner:p", "another")
     await self.bus.r.delete("tinyrl:owner:p")
-    await asyncio.sleep(0.2)
-    self.assertEqual((await self.bus.lease_owner("p"), t.stopping), (None, Stop.EXIT))
+    child = self.node.processes["p"]
+    await self.finish_worker("p")
+    self.assertTrue(child.closed)
+    self.assertIsNone(await self.bus.lease_owner("p"))
 
-  async def test_a_run_whose_trainer_died_unsaved_fails_until_it_loads_a_checkpoint(self):
-    store = Store(root=tempfile.mkdtemp())
+  async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     run, uri = new_id(), "tinker://saved/weights/step-1"
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
     await self.submit(
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
     )
-    first = Trainer(self.bus, "p", Model(tiny), store=store)
-    await self.own(first)
-    while await first.step(block_ms=10):
-      pass
-    for task in self.renewal_tasks:  # it dies without saving
-      task.cancel()
-    await self.bus.release_lease("p", first.owner)
-
-    second = Trainer(self.bus, "p", Model(tiny), store=store)
-    await self.own(second)
+    await self.node.drain(run)
+    self.node.tasks["p"].cancel()  # a lost process has no park checkpoint
+    await self.finish_worker("p")
     ids = await self.submit(
       run,
       (Op.OPTIM_STEP, {"adam_params": {}}),
       (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": True}),
       (Op.OPTIM_STEP, {"adam_params": {}}),
     )
-    while await second.step(block_ms=10):
-      pass
+    await self.node.drain(run)
     replies = [await self.bus.wait_for_reply(request_id, 1) for request_id in ids]
     self.assertEqual([reply.ok for reply in replies], [False, True, True])
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
@@ -744,58 +816,42 @@ class TestTrainer(RedisTest):
   async def test_a_run_whose_parked_state_is_gone_still_deletes(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    await self.bus.r.set(f"tinyrl:parked:{run}", "tinker://gone/parked/1")  # its node lost the files
+    await self.bus.r.set(f"tinyrl:parked:{run}", "tinker://gone/parked/1")
     [request_id] = await self.submit(run, (Op.DELETE_MODEL, {}))
-    t = Trainer(self.bus, "p", Model(tiny), store=Store(root=tempfile.mkdtemp()))
-    await self.own(t)
-    while await t.step(block_ms=10):
-      pass
+    await self.node.drain(run)
     self.assertTrue((await self.bus.wait_for_reply(request_id, 1)).ok)
-    self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))  # deleted
+    self.assertIsNone(await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}"))
 
-  async def test_sampler_save_is_processed_before_other_runs_finish(self):
-    store = Store(root=tempfile.mkdtemp())
-    t = Trainer(self.bus, "p", Model(tiny), store=store)
-    await self.own(t)
-
+  async def test_sampler_save_is_processed_before_other_runs_finish_without_overtaking_its_own_updates(self):
     runs = [new_id() for _ in range(3)]
-    for r in runs:
-      await self.bus.create_run(Run(r, "p", "tiny", 4, lora=LORA))
-      await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-    await t.step(count=16, block_ms=10)
-
+    for run in runs:
+      await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    await self.node.drain(runs[0])
     opt_ids = {}
-    for r in runs:
-      ids = await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {}}))
-      opt_ids[r] = ids[-1]
+    for run in runs:
+      ids = await self.submit(run, (Op.FORWARD_BACKWARD, proto_body(run)), (Op.OPTIM_STEP, {"adam_params": {}}))
+      opt_ids[run] = ids[-1]
+    done_at = {}
 
-    done_at: dict[str, float] = {}
-
-    async def watch(name: str, req_id: str):
-      reply = await self.bus.wait_for_reply(req_id, 5)
+    async def watch(name, request_id):
+      reply = await self.bus.wait_for_reply(request_id, 5)
       done_at[name] = time.monotonic()
       return reply
 
-    opt_tasks = {r: asyncio.create_task(watch(r, req_id)) for r, req_id in opt_ids.items()}
+    opt_tasks = {run: asyncio.create_task(watch(run, request_id)) for run, request_id in opt_ids.items()}
 
-    async def submit_first_save():
+    async def first_save():
       finished, _ = await asyncio.wait(opt_tasks.values(), return_when=asyncio.FIRST_COMPLETED)
-      first_run = next(r for r, task in opt_tasks.items() if task in finished)
-      [save_id] = await self.submit(first_run, (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": "tinker://r/sampler_weights/s0"}))
-      reply = await watch("save", save_id)
-      return first_run, reply
+      first = next(run for run, task in opt_tasks.items() if task in finished)
+      [request_id] = await self.submit(first, (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": "tinker://r/sampler_weights/s0"}))
+      return first, await watch("save", request_id)
 
-    save_task = asyncio.create_task(submit_first_save())
-    n = await t.step(count=16, block_ms=10)
-    first_run, save_reply = await save_task
-    for task in opt_tasks.values():
-      await task
-
-    self.assertEqual(n, 7)
-    self.assertTrue(save_reply.ok)
-    other_times = [ts for name, ts in done_at.items() if name not in (first_run, "save")]
-    self.assertLess(done_at["save"], max(other_times))
-
+    save = asyncio.create_task(first_save())
+    first, reply = await save
+    await asyncio.gather(*opt_tasks.values())
+    self.assertTrue(reply.ok)
+    self.assertLess(done_at["save"], max(t for name, t in done_at.items() if name not in (first, "save")))
     causal = runs[0]
     pipelined = await self.submit(
       causal,
@@ -803,172 +859,195 @@ class TestTrainer(RedisTest):
       (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 0.1}}),
       (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{causal}/sampler_weights/s1"}),
     )
-    self.assertEqual(await t.step(count=16, block_ms=10), 3)
-    self.assertTrue(all([(await self.bus.wait_for_reply(rid, 1)).ok for rid in pipelined]))
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 1)).ok for request in pipelined]))
     self.assertEqual((await self.bus.get_run(causal))["steps"], 2)
 
-  async def test_step_returns_after_current_command_when_turn_revoked(self):
+  async def test_revocation_finishes_one_command_and_shutdown_drains_the_claimed_remainder(self):
+    self.node.gpus = 1
+    self.node.state.nodes[self.node.id] = (1, 0)
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    t = Trainer(self.bus, "p", Model(tiny))
-    await self.own(t)
-
-    for _ in range(10):
-      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
-
-    t.turn.held = True
-    t.turn.shared = True
+    ids = await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(15)],
+    )
+    running = await self.node.add("p")
+    original = self.node.processes["p"].call
     calls = 0
+    entered, finish, other_entered, other_finish = (asyncio.Event() for _ in range(4))
 
-    async def mock_next_decision(block_ms):
+    async def call(method, *args):
       nonlocal calls
-      calls += 1
-      if calls == 2:
-        return Ev.REVOKED
-      return None
+      if method == "execute":
+        calls += 1
+        if calls == 1:
+          entered.set()
+          await finish.wait()
+      return await original(method, *args)
 
-    t.turn.next_decision = mock_next_decision
+    self.node.processes["p"].call = call
+    try:
+      await asyncio.wait_for(entered.wait(), 5)
+      other_run = new_id()
+      await self.bus.create_run(Run(other_run, "other", "tiny", 4, lora=LORA))
+      other = await self.node.add("other")
+      other_call = self.node.processes["other"].call
 
-    processed = await t.step(count=10, block_ms=10)
-    self.assertEqual(processed, 1)
+      async def blocked_other(method, *args):
+        if method == "execute":
+          other_entered.set()
+          await other_finish.wait()
+        return await other_call(method, *args)
 
-  async def test_step_returns_after_current_command_when_stopping(self):
+      self.node.processes["other"].call = blocked_other
+      await self.submit(other_run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+      await self.until(lambda: other.ticket > 0)
+      running.since = time.time() - self.node.state.quantum - 1
+      self.assertIsNone(await self.bus.wait_for_reply(ids[0], 0))
+      finish.set()
+      await asyncio.wait_for(other_entered.wait(), 5)
+      self.assertIsNone(running.since)
+      self.assertTrue((await self.bus.wait_for_reply(ids[0], 0)).ok)
+      self.assertIsNone(await self.bus.wait_for_reply(ids[1], 0))
+      self.assertEqual(calls, 1)
+      self.node.state.workers["p"].node = None
+      self.node.notify()
+      other_finish.set()
+      await self.finish_worker("p")
+      self.assertEqual(calls, 16)
+      self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)).ok for request in ids]))
+    finally:
+      finish.set()
+      other_finish.set()
+
+  async def test_shutdown_does_not_fetch_another_batch(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    t = Trainer(self.bus, "p", Model(tiny))
-    await self.own(t)
+    ids = await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(17)],
+    )
+    await self.node.add("p")
+    original = self.node.processes["p"].call
 
-    for _ in range(10):
-      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    async def call(method, *args):
+      if method == "execute":
+        self.node.draining = True
+      return await original(method, *args)
 
-    orig_answer = t.answer_command
+    self.node.processes["p"].call = call
+    await self.finish_worker("p")
+    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
+    self.assertTrue((await self.bus.wait_for_reply(ids[15], 0)).ok)
+    self.assertIsNone(await self.bus.wait_for_reply(ids[16], 0))
+    self.assertEqual((await self.bus.queued_and_in_flight(run))["queued"], 2)
 
-    async def answer(cmd):
-      t.stop()
-      return await orig_answer(cmd)
-
-    t.answer_command = answer
-
-    orig_take = t.bus.take_commands
-    take_calls = 0
-
-    async def mock_take(*args, **kwargs):
-      nonlocal take_calls
-      take_calls += 1
-      return await orig_take(*args, **kwargs)
-
-    t.bus.take_commands = mock_take
-
-    processed = await t.step(count=10, block_ms=10)
-    self.assertEqual(processed, 10)
-    self.assertEqual(take_calls, 1)
-
-  async def test_step_runs_claimed_commands_if_stopping_after_revocation(self):
+  async def test_shutdown_waits_for_the_claimed_reader_and_saves_its_completed_work(self):
     run = new_id()
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
-    t = Trainer(self.bus, "p", Model(tiny))
-    await self.own(t)
+    ids = await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      *[(Op.OPTIM_STEP, {"adam_params": {}}) for _ in range(30)],
+      (Op.FORWARD_BACKWARD, proto_body(run)),
+      (Op.OPTIM_STEP, {"adam_params": {}}),
+      (Op.OPTIM_STEP, {"adam_params": {}}),
+    )
+    hooked, entered, finish, claimed, prepared = (asyncio.Event() for _ in range(5))
+    take = self.bus.take_commands
+    reads = calls = 0
 
-    for _ in range(10):
-      await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}))
+    async def read(*args, **kwargs):
+      nonlocal reads
+      reads += 1
+      commands = await take(*args, **kwargs)
+      if reads == 1:
+        await hooked.wait()
+      elif reads == 2:
+        claimed.set()
+        await prepared.wait()
+      return commands
 
-    t.turn.held = True
-    t.turn.shared = True
+    with patch.object(self.bus, "take_commands", side_effect=read):
+      await self.node.add("p")
+      child = self.node.processes["p"]
+      original = child.call
 
-    calls = 0
+      async def call(method, *args):
+        nonlocal calls
+        if method == "execute":
+          calls += 1
+          if calls == 2:
+            entered.set()
+            await finish.wait()
+        return await original(method, *args)
 
-    async def mock_next_decision(block_ms):
-      nonlocal calls
-      calls += 1
-      if calls == 2:
-        return Ev.REVOKED
-      if not t.turn.held:
-        return Ev.GRANTED
-      return None
+      child.call = call
+      hooked.set()
+      try:
+        await asyncio.wait_for(asyncio.gather(entered.wait(), claimed.wait()), 5)
+        self.assertEqual(len((await self.bus.queued_and_in_flight(run))["in_flight"]), 31)
+        self.node.draining = True
+        self.node.notify()
+        finish.set()
+        self.assertTrue((await self.bus.wait_for_reply(ids[1], 5)).ok)
+        self.assertFalse(child.closed)
+        self.assertIsNone(await self.bus.parked_checkpoint(run))
+        self.assertEqual(reads, 2)
+        prepared.set()
+        await self.finish_worker("p")
+      finally:
+        finish.set()
+        prepared.set()
 
-    t.turn.next_decision = mock_next_decision
+    self.assertEqual((reads, calls), (2, 32))
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)).ok for request in ids[:32]]))
+    self.assertTrue(all([(await self.bus.wait_for_reply(request, 0)) is None for request in ids[32:]]))
+    self.assertEqual((await self.bus.queued_and_in_flight(run))["queued"], 2)
+    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
+    tensors, _ = self.store.get(await self.bus.parked_checkpoint(run))
+    self.assertTrue(any(torch.count_nonzero(tensor) for name, tensor in tensors.items() if name.endswith(".grad")))
 
-    processed1 = await t.step(count=10, block_ms=10)
-    self.assertEqual(processed1, 1)
 
-    t.stop()
-
-    processed2 = await t.step(count=10, block_ms=10)
-    self.assertEqual(processed2, 9)
-
-    processed3 = await t.step(count=10, block_ms=10)
-    self.assertEqual(processed3, 0)
-
-  async def test_a_multi_rank_trainer_exits_on_a_server_error_but_answers_a_user_error(self):
-    t = Trainer(self.bus, "p", Model(tiny))
-    t.world_size = 2
-    with patch("torch.distributed.broadcast_object_list"), patch("os._exit", side_effect=SystemExit(1)) as exit_:
-      with self.assertRaises(KeyError):
-        t.call_model("optim_step", new_id(), {})
-      exit_.assert_not_called()
-      with patch.object(t.model, "optim_step", side_effect=RuntimeError("CUDA out of memory")):
-        with self.assertRaises(SystemExit):
-          t.call_model("optim_step", new_id(), {})
-      exit_.assert_called_once_with(1)
-
-  async def test_a_multi_rank_fsdp2_trainer_matches_a_single_rank_trainer(self):
+class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
+  async def test_two_rank_fsdp_matches_a_single_model_process(self):
     import sys
 
-    base_dir = tempfile.mkdtemp()
-    tiny().save_pretrained(base_dir)
+    from test.test_process import require_unix
+    from tinyrl.control.process import Process
+
+    require_unix()
+    base = tempfile.mkdtemp()
+    tiny().save_pretrained(base)
     for rank, lora in ((0, {"seed": 0}), (4, LORA)):
-      ckpt_dir, r1, r2 = tempfile.mkdtemp(), new_id(), new_id()
-      store = Store(root=ckpt_dir)
-      await self.bus.create_run(Run(r1, f"w1-{rank}", base_dir, rank, lora=lora))
-      await self.bus.create_run(Run(r2, f"w2-{rank}", base_dir, rank, lora=lora, gpus=2))
-      t1 = Trainer(self.bus, f"w1-{rank}", store=store)
-      await self.own(t1)
-      env = {**os.environ, "REDIS_URL": self.url, "CKPT": ckpt_dir, "CUDA_VISIBLE_DEVICES": ""}
-      cmd = ["-m", "torch.distributed.run", "--standalone", "--nproc-per-node=2", "-m", "tinyrl.workers.trainer"]
-      proc = await asyncio.create_subprocess_exec(sys.executable, *cmd, f"w2-{rank}", env=env)
+      ckpt, r1, r2 = tempfile.mkdtemp(), new_id(), new_id()
+      store = Store(root=ckpt)
+      single = Trainer(store=store)
+      env = {**os.environ, "CKPT": ckpt, "CUDA_VISIBLE_DEVICES": ""}
+      args = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=2"]
+      multi = Process([*args, "-m", "tinyrl.workers.trainer"], env)
       try:
-        ids = []
-        for r in (r1, r2):
-          ids += await self.submit(
-            r,
-            (Op.CREATE_MODEL, {"base_model": base_dir, "rank": rank, "lora": lora}),
-            (Op.FORWARD_BACKWARD, proto_body(r)),
+        for run in (r1, r2):
+          commands = [
+            (Op.CREATE_MODEL, {"base_model": base, "rank": rank, "lora": lora}),
+            (Op.FORWARD_BACKWARD, proto_body(run)),
             (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
-            (Op.FORWARD_BACKWARD, proto_body(r)),
+            (Op.FORWARD_BACKWARD, proto_body(run)),
             (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
-            (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{r}/sampler_weights/s1"}),
-          )
-        while await t1.step(block_ms=10):
-          pass
-        for request_id in ids:
-          reply = await self.bus.wait_for_reply(request_id, 60)
-          self.assertTrue(reply and reply.ok, reply and reply.body)
-
-        single, multi = (store.get(f"tinker://{r}/sampler_weights/s1")[0] for r in (r1, r2))
-        self.assertEqual(single.keys(), multi.keys(), f"rank {rank}")
-        for name in single:
-          torch.testing.assert_close(multi[name], single[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")
+            (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{run}/sampler_weights/s1"}),
+          ]
+          for i, (op, body) in enumerate(commands):
+            cmd = Cmd(run, str(i), op, body if isinstance(body, bytes) else json.dumps(body).encode())
+            reply, _ = single.execute(cmd) if run == r1 else await asyncio.wait_for(multi.call("execute", cmd), 90)
+            self.assertTrue(reply.ok, reply.body)
+        expected, actual = (store.get(f"tinker://{run}/sampler_weights/s1")[0] for run in (r1, r2))
+        self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")
+        for name in expected:
+          torch.testing.assert_close(actual[name], expected[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")
       finally:
-        proc.kill()
-        await proc.wait()
-
-  async def test_a_user_load_clears_the_gradients_its_checkpoint_was_saved_with(self):
-    run_id = new_id()
-    uri = f"tinker://{run_id}/weights/mid-step"
-    await self.bus.create_run(Run(run_id, "p", "tiny", 0))
-    t = Trainer(self.bus, "p", Model(tiny), store=Store(root=tempfile.mkdtemp()))
-    await self.own(t)
-    await self.submit(run_id, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}))
-    await t.step(block_ms=10)
-    for p in t.model.params[run_id].values():
-      p.grad = torch.ones_like(p.data)
-    [save, load] = await self.submit(
-      run_id, (Op.SAVE_WEIGHTS, {"uri": uri}), (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": False})
-    )
-    while await t.step(block_ms=10):
-      pass
-    self.assertTrue(all([(await self.bus.wait_for_reply(r, 1)).ok for r in (save, load)]))
-    self.assertTrue(all(p.grad is None for p in t.model.params[run_id].values()))
+        await multi.close()
 
 
 class TestCheckpointNames(unittest.TestCase):
