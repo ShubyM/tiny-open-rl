@@ -45,6 +45,20 @@ def unix_client(sock: str) -> aiohttp.ClientSession:
   return session("http://vllm", aiohttp.UnixConnector(path=sock, limit=0, keepalive_timeout=2))
 
 
+def parse(body: bytes) -> Out:
+  choices = sorted(json.loads(body)["choices"], key=lambda c: c["index"])
+  seqs = [
+    Seq(
+      c["token_ids"],
+      c["logprobs"]["token_logprobs"],
+      [by_id(d) for d in c["logprobs"]["top_logprobs"]],
+      c["finish_reason"] == "stop",
+    )
+    for c in choices
+  ]
+  return Out(seqs, [by_id(d) if d else None for d in choices[0].get("prompt_logprobs") or []])
+
+
 class VLLM:
   def __init__(
     self,
@@ -242,14 +256,5 @@ class VLLM:
       "return_token_ids": True,
       "return_tokens_as_token_ids": True,  # so logprobs are keyed "token_id:<id>", not by text two tokens can share
     }
-    choices = sorted(json.loads(await self.post("/v1/completions", json=req))["choices"], key=lambda c: c["index"])
-    seqs = [
-      Seq(
-        c["token_ids"],
-        c["logprobs"]["token_logprobs"],
-        [by_id(d) for d in c["logprobs"]["top_logprobs"]],
-        c["finish_reason"] == "stop",
-      )
-      for c in choices
-    ]
-    return Out(seqs, [by_id(d) if d else None for d in choices[0].get("prompt_logprobs") or []])
+    # off the event loop, which every worker on the node shares: a wave's replies are seconds of parsing
+    return await asyncio.to_thread(parse, await self.post("/v1/completions", json=req))

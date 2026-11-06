@@ -88,7 +88,7 @@ class Sampler:
           path, version = checkpoint
           name = hashlib.sha256(f"{uri}\0{version}".encode()).hexdigest()
           await self.running.load_checkpoint(name, path)
-      return Reply(True, wire.PROTO, encode(job, await self.running.sample(job, name)))
+      return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, await self.running.sample(job, name)))
     except Exception as e:
       return Reply.error(e)
 
