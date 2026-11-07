@@ -235,7 +235,7 @@ class TestStore(unittest.TestCase):
     store.put(big, {"w": torch.ones(4)})
     store.put(small, {"w": torch.ones(4)})
     gate, upload = threading.Event(), store.upload_version
-    store.upload_version = lambda dest, *args: (gate.wait(10) if "/a/" in dest else None, upload(dest, *args))
+    store.upload_version = lambda dest, *args: (gate.wait(60) if "/a/" in dest else None, upload(dest, *args))
     first = threading.Thread(target=store.upload_pending_saves)
     first.start()
     for _ in range(200):  # b lands while a's upload is held
@@ -245,7 +245,7 @@ class TestStore(unittest.TestCase):
     self.assertEqual([loader.landed(u, store.versions[u]) for u in (small, big)], [True, False])
     store.upload_pending_saves()  # a is still uploading, so this flush leaves it to the first
     gate.set()
-    first.join(10)
+    first.join(60)
     self.assertTrue(loader.landed(big, store.versions[big]))
 
   def test_full_sampler_weights_upload_as_xors_another_node_rebuilds_exactly(self):

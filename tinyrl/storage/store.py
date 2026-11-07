@@ -392,14 +392,15 @@ class Store:
 
   def upload_pending_saves(self) -> None:
     """Upload this node's saves, each run's in the order they were made and runs side by side, so a small save never waits behind another run's big one. A failed upload stops its run's for this flush, so _latest never goes backward. A run another flush is uploading is left to it."""
-    runs: dict[str, list] = {}
     with self.uploading:
+      jobs, runs = [], {}
       found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
-      for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
-        with open(e.path) as f:
-          job = json.load(f)
-        runs.setdefault(job["uri"].removeprefix("tinker://").split("/")[0], []).append((e.path, job))
-      runs = {r: jobs for r, jobs in runs.items() if r not in self.busy}
+      for e in found:
+        with contextlib.suppress(FileNotFoundError), open(e.path) as f:  # a sweep may have deleted it
+          jobs.append((e.stat().st_mtime_ns, e.path, e.name.removesuffix(".upload"), json.load(f)))
+      for _, path, version, job in sorted(jobs):
+        runs.setdefault(job["uri"].removeprefix("tinker://").split("/")[0], []).append((path, version, job))
+      runs = {r: saves for r, saves in runs.items() if r not in self.busy}
       self.busy |= runs.keys()
     try:
       parallel(self.upload_run, list(runs.values()))
@@ -408,15 +409,14 @@ class Store:
         self.busy -= runs.keys()
 
   def upload_run(self, jobs: list) -> None:
-    for path, job in jobs:
-      version = os.path.basename(path).removesuffix(".upload")
+    for path, version, job in jobs:
       if os.path.isdir(f"{self.cache}/{version}"):
         try:
           self.upload_version(self.path(job["uri"]), version, job["names"])
         except Exception as exc:
           print(f"upload failed for {version}, trying again: {exc!r}", file=sys.stderr, flush=True)
           return
-      with self.uploading:  # not while a flush lists them
+      with self.uploading, contextlib.suppress(FileNotFoundError):  # not while a flush lists them, and a sweep may have
         os.unlink(path)
 
   # ***** get *****

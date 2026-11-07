@@ -60,7 +60,7 @@ class NodeDaemon:
     self.state, self.after, self.serial = scheduler.State(), "0-0", 0
     self.changed, self.draining = asyncio.Event(), False
     self.heartbeat = time.monotonic()
-    self.swept, self.uploading, self.sweeping = 0.0, None, None
+    self.swept, self.uploading, self.sweeping, self.uploads = 0.0, None, None, set()
     self.turns: asyncio.Queue | None = None
     self.logging: asyncio.Task | None = None
 
@@ -493,6 +493,7 @@ class NodeDaemon:
       self.sweeping = asyncio.create_task(self.registry.sweep(self.store, SWEEP_GRACE_S))
     # a flush every tick: each takes the runs no other flush is uploading, so one run's big upload holds up no other run
     self.uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
+    self.uploads = {t for t in self.uploads if not t.done()} | {self.uploading}  # asyncio holds tasks weakly
     if self.after != after:
       self.notify()
 
@@ -513,7 +514,7 @@ class NodeDaemon:
     while self.store.busy or not uploading.done():
       with contextlib.suppress(Exception):  # the uploads matter more than the heartbeat
         await self.bus.node_heartbeat(self.id, self.gpus)
-      await asyncio.wait({uploading}, timeout=TICK)
+      await asyncio.sleep(TICK)
     await uploading
     await asyncio.to_thread(self.store.upload_pending_saves)  # what a run saved after an earlier flush listed its saves
 
