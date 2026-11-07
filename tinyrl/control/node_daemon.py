@@ -100,15 +100,15 @@ class NodeDaemon:
 
   async def landed(self, uri: str) -> str | None:
     """The registered version of a checkpoint, once this node can read it. It waits while the node that saved it is live, since that node is still uploading it, and fails once that node is gone."""
-    gone = False
+    gone = set()
     while True:
       info = await self.registry.get_checkpoint(uri) or {}
       if not (version := info.get("version")) or await asyncio.to_thread(self.store.landed, uri, version):
         return version
-      if gone:
-        raise ValueError(f"version {version} of {uri} was lost with node {info.get('node')} before it uploaded")
-      # after it leaves, one more look, in case it landed just before
-      gone = info.get("node") not in await self.bus.live_nodes()
+      if (node := info.get("node")) in gone:
+        raise ValueError(f"version {version} of {uri} was lost with node {node} before it uploaded")
+      if node not in await self.bus.live_nodes():
+        gone.add(node)  # one more look, in case it landed just before the node left
       await asyncio.sleep(0.5)
 
   async def announce_node(self) -> None:
