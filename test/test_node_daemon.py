@@ -71,6 +71,12 @@ class TestNodeDaemon(RedisTest):
     )
     await self.reply(request, node)
 
+  async def test_a_node_makes_its_checkpoint_folders_before_any_sampler_restores(self):
+    with tempfile.TemporaryDirectory() as folder:
+      self.node(store=Store(f"file://{folder}/bucket", cache=f"{folder}/cache"))
+      self.node(store=Store(f"{folder}/local"))
+      self.assertTrue(os.path.isdir(f"{folder}/cache") and os.path.isdir(f"{folder}/local"))
+
   async def test_a_backlogged_run_yields_to_a_ready_sibling(self):
     node, a, b = self.node(), new_id(), new_id()
     creates = {}
