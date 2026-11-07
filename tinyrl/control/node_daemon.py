@@ -50,6 +50,9 @@ class NodeDaemon:
   ):
     self.bus, self.registry = bus, Registry(bus)
     self.store = store if store is not None else Store()
+    # a sampler restored from a snapshot sees only the folders under /tmp and /dev/shm that exist when it restores
+    for folder in [self.store.cache] + ([] if self.store.remote else [self.store.base]):
+      os.makedirs(folder, exist_ok=True)
     self.gpus, self.id = gpus, node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.running: dict[str, scheduler.Worker] = {}
