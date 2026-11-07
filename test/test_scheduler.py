@@ -141,8 +141,9 @@ class TestCluster(unittest.TestCase):
     t = c.run("t")
     others = [c.run(f"r{i}", rank=4, base=f"m{i}") for i in range(5)]
     self.assertEqual([c.s.workers[w].node for w in [t, *others]], ["b", "a", "c", "c", "c", "c"])
+    lora = c.run("q", role="sampler", rank=4, base="m0")
     sampler = c.run("sample", role="sampler", train_run="t")
-    self.assertEqual(c.s.workers[sampler].node, "b")
+    self.assertEqual([c.s.workers[w].node for w in (lora, sampler)], ["c", "b"])  # the GPU t kept went to its sampler
 
   def test_samplers_packed_by_memory_leave_room_near_their_trainer(self):
     c = Cluster()
