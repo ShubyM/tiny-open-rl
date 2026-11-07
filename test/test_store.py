@@ -213,20 +213,20 @@ class TestStore(unittest.TestCase):
     store.delete("tinker://r/weights/final")
     self.assertEqual(store.list_checkpoints(), [])
 
-  def test_a_remote_save_returns_before_its_upload_and_other_nodes_wait_for_it(self):
+  def test_a_remote_save_returns_before_its_upload_and_other_nodes_read_it_once_it_lands(self):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     uri = "tinker://r/weights/final"
     saver.put(uri, {"w": torch.ones(4)})  # returns before anything uploads it
+    version = saver.versions[uri]
+    self.assertTrue(saver.landed(uri, version))
     self.assertTrue(torch.equal(saver.get(uri)[0]["w"], torch.ones(4)))  # this node reads it at once
-    got = {}
-    reader = threading.Thread(target=lambda: got.update(w=loader.get(uri, saver.versions[uri])[0]["w"]))
-    reader.start()
-    reader.join(0.5)
-    self.assertTrue(reader.is_alive())  # another node waits for the version
+    self.assertFalse(loader.landed(uri, version))
+    with self.assertRaisesRegex(ValueError, "has not landed"):
+      loader.get(uri, version)
     saver.upload_pending_saves()
-    reader.join(10)
-    self.assertTrue(torch.equal(got["w"], torch.ones(4)))
+    self.assertTrue(loader.landed(uri, version))
+    self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))
 
   def test_full_sampler_weights_upload_as_xors_another_node_rebuilds_exactly(self):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"

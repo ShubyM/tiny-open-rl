@@ -50,6 +50,9 @@ class NodeDaemon:
   ):
     self.bus, self.registry = bus, Registry(bus)
     self.store = store if store is not None else Store()
+    # a sampler restored from a snapshot sees only the folders under /tmp and /dev/shm that exist when it restores
+    for folder in [self.store.cache] + ([] if self.store.remote else [self.store.base]):
+      os.makedirs(folder, exist_ok=True)
     self.gpus, self.id = gpus, node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.running: dict[str, scheduler.Worker] = {}
@@ -97,6 +100,19 @@ class NodeDaemon:
       self.notify()
       return True
     return False
+
+  async def landed(self, uri: str) -> str | None:
+    """The registered version of a checkpoint, once this node can read it. It waits while the node that saved it is live, since that node is still uploading it, and fails once that node is gone."""
+    gone = set()
+    while True:
+      info = await self.registry.get_checkpoint(uri) or {}
+      if not (version := info.get("version")) or await asyncio.to_thread(self.store.landed, uri, version):
+        return version
+      if (node := info.get("node")) in gone:
+        raise ValueError(f"version {version} of {uri} was lost with node {node} before it uploaded")
+      if node not in await self.bus.live_nodes():
+        gone.add(node)  # one more look, in case it landed just before the node left
+      await asyncio.sleep(0.5)
 
   async def announce_node(self) -> None:
     await self.bus.node_heartbeat(self.id, self.gpus)
@@ -162,8 +178,7 @@ class NodeDaemon:
             if run is None:
               raise ValueError(f"no sampling session {cmd.run}")
             if uri := run.get("model_path"):
-              version = (await self.registry.get_checkpoint(uri) or {}).get("version")
-              checkpoint = await asyncio.to_thread(self.store.local_folder, uri, version)
+              checkpoint = await asyncio.to_thread(self.store.local_folder, uri, await self.landed(uri))
           return run, checkpoint
         except Exception as e:
           return e
@@ -206,13 +221,13 @@ class NodeDaemon:
           else:
             parked, version = await self.bus.parked_checkpoint(cmd.run), None
             if cmd.op == Op.LOAD_WEIGHTS:
-              version = (await self.registry.get_checkpoint(json.loads(cmd.body)["uri"]) or {}).get("version")
-            saved = (parked, (await self.registry.get_checkpoint(parked) or {}).get("version")) if parked else None
+              version = await self.landed(json.loads(cmd.body)["uri"])
+            saved = (parked, await self.landed(parked)) if parked else None
             await owned()  # metadata awaits may have outlived our ownership
             reply, effects = await model.call("execute", cmd, run, saved, version)
             await owned()
             if checkpoint := effects.get("saved"):
-              await self.registry.register_checkpoint(**checkpoint)
+              await self.registry.register_checkpoint(**checkpoint, node=self.id)
             if restored := effects.get("restored"):
               if not await self.bus.set_parked_checkpoint(cmd.run, None, worker, owner):
                 raise RuntimeError(f"lost worker {worker}")
@@ -496,7 +511,12 @@ class NodeDaemon:
       self.dispatch()
     if self.logging:
       self.logging.cancel()
-    await asyncio.to_thread(self.store.upload_pending_saves)
+    uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
+    while not uploading.done():  # live until its saves land, so other nodes wait for them instead of failing
+      with contextlib.suppress(Exception):  # the uploads matter more than the heartbeat
+        await self.bus.node_heartbeat(self.id, self.gpus)
+      await asyncio.wait({uploading}, timeout=TICK)
+    await uploading
 
   async def serve(self) -> None:
     await self.announce_node()
