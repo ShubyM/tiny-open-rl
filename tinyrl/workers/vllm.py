@@ -148,7 +148,7 @@ class VLLM:
     engine = await cls("http://vllm", base, lora, server, unix_client(f"{name}.sock")).ready()
     try:
       await engine.post("/sleep", params={"level": 2})
-      await engine.http.aclose()  # a connection into the server would reach outside the snapshot
+      await engine.http.close()  # a connection into the server would reach outside the snapshot
       await asyncio.to_thread(snapshot.save, await asyncio.to_thread(target_pid, server), folder, name, visible)
       await asyncio.to_thread(server.wait)
       return await cls.restore(folder, base, lora, env)
