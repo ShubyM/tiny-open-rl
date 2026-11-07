@@ -110,7 +110,7 @@ class TestCluster(unittest.TestCase):
     c = Cluster()
     c.node("a", 1)
     c.node("b", 2)
-    workers = [c.run(name) for name in ("r1", "r2", "r3")]
+    workers = [c.run(name, rank=4, base=name) for name in ("r1", "r2", "r3")]
     self.assertEqual([c.s.workers[w].node for w in workers], ["a", "b", "b"])
 
   def test_full_fine_tune_sampler_stays_near_its_training_run(self):
@@ -127,20 +127,22 @@ class TestCluster(unittest.TestCase):
     c.node("a", 2)
     c.node("b", 8)
     x = c.run("x", exclusive=True)
-    others = [c.run(f"r{i}") for i in range(5)]
-    self.assertEqual([c.s.workers[w].node for w in [x, *others]], ["a", "b", "b", "b", "b", "a"])
+    other = c.run("r", rank=4)
+    self.assertEqual([c.s.workers[w].node for w in (x, other)], ["a", "b"])
+    c.append(Ev.PLACED, worker=other, node="a")  # it took the GPU x keeps for its sampler
     sampler = c.run("sample", role="sampler", train_run="x", exclusive=True)
     self.assertEqual(c.s.workers[sampler].node, "b")
 
   def test_a_full_fine_tunes_trainer_keeps_room_beside_it_for_its_sampler(self):
     c = Cluster()
-    c.node("a", 2)
-    c.node("b", 8)
+    c.node("a", 1)
+    c.node("b", 2)
+    c.node("c", 8)
     t = c.run("t")
     others = [c.run(f"r{i}", rank=4, base=f"m{i}") for i in range(5)]
-    self.assertEqual([c.s.workers[w].node for w in [t, *others]], ["a", "b", "b", "b", "b", "b"])
+    self.assertEqual([c.s.workers[w].node for w in [t, *others]], ["b", "a", "c", "c", "c", "c"])
     sampler = c.run("sample", role="sampler", train_run="t")
-    self.assertEqual(c.s.workers[sampler].node, "a")
+    self.assertEqual(c.s.workers[sampler].node, "b")
 
   def test_samplers_packed_by_memory_leave_room_near_their_trainer(self):
     c = Cluster()

@@ -199,8 +199,8 @@ def place_next(s: State, now: float) -> tuple[Ev, dict] | None:
     return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
 
 
-def room(s: State, node: str, me: Kind) -> bool:
-  """Whether a worker of this kind could start on the node now: on an empty GPU, or packed by memory next to others."""
+def room(s: State, node: str, *new: Kind) -> bool:
+  """Whether workers of these kinds could start on the node now: on empty GPUs, or packed by memory next to others."""
   gpus, gpu_bytes = s.nodes[node]
   held: list[list[Kind]] = []  # what each GPU holds, packed first-fit the way choose() packs
 
@@ -221,13 +221,15 @@ def room(s: State, node: str, me: Kind) -> bool:
   for w in s.workers.values():
     for _ in range(w.kind.gpus if w.node == node else 0):
       put(w.kind)  # past the GPUs, trainers take turns
-  return all(put(me) for _ in range(me.gpus))
+  return all(put(k) for k in new for _ in range(k.gpus))
 
 
 def place(s: State, name: str) -> dict:
   """Choose a node with room, keeping a full fine-tune's sampler near its checkpoint files."""
   me = s.workers[name]
-  # a full fine-tune's trainer counts twice, keeping room beside it for its sampler: its weights crossing nodes cost seconds a step
+  # a full fine-tune's trainer goes where its sampler fits beside it, and counts twice to keep that room: weights crossing nodes cost seconds a step
+  full = me.kind.role == Role.TRAINER and not me.kind.lora
+  pair = (me.kind, dataclasses.replace(me.kind, role=Role.SAMPLER)) if full else (me.kind,)
   size = {x: 1 + (w.kind.role == Role.TRAINER and not w.kind.lora) for x, w in s.workers.items()}
   load = {
     n: sum(size[x] for x, w in s.workers.items() if w.node == n) / g
@@ -238,7 +240,7 @@ def place(s: State, name: str) -> dict:
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
   near = near if me.kind.role == Role.SAMPLER and not me.kind.lora else set()  # a LoRA adapter is small to fetch
   # near only with room: waiting there for a sampler to finish costs minutes, fetching the checkpoint seconds
-  node = min(sorted(load), key=lambda n: (not room(s, n, me.kind), n not in near, load[n]))
+  node = min(sorted(load), key=lambda n: (not room(s, n, *pair), not room(s, n, me.kind), n not in near, load[n]))
   rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
   return {"worker": name, "node": node, "rule": rule}
 
