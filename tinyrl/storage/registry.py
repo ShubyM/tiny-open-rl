@@ -21,7 +21,13 @@ class Registry:
     self.r = bus.r
 
   async def register_checkpoint(
-    self, uri: str, size: int, ttl: int | None = None, owned: bool = False, version: str | None = None
+    self,
+    uri: str,
+    size: int,
+    ttl: int | None = None,
+    owned: bool = False,
+    version: str | None = None,
+    node: str | None = None,
   ) -> None:
     """Record a checkpoint the store now holds. One the run owns, like a sampling session's weights or the state a stopping trainer parked, goes when the run is deleted. The rest stay until deleted, or their TTL runs out."""
     run, cid = uri.removeprefix("tinker://").split("/", 1)
@@ -32,7 +38,7 @@ class Registry:
       "time": now,
     }
     info |= {"tinker_path": uri, "size_bytes": size, "expires_at": now + ttl if ttl else None, "owned": owned}
-    info["version"] = version  # which version to wait for, when another node is still uploading it
+    info["version"], info["node"] = version, node  # the version to read, and the node uploading it
     p = self.r.pipeline(transaction=True)
     p.setnx(key("ckpt_since"), now)
     p.hset(key("ckpt", run), cid, json.dumps(info))
