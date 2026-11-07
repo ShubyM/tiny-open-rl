@@ -16,6 +16,8 @@ spec:
       - {key: tinyrl-gpu, operator: Exists, effect: NoSchedule}
       # a Spot node gets 30 s of notice: the node daemon gives its trainers DRAIN_S (20 s) to save their runs
       terminationGracePeriodSeconds: 25
+      # the pause process becomes PID 1 and reaps orphans: a killed worker's group leaves children to PID 1, which the daemon never waits for
+      shareProcessNamespace: true
       containers:
       - name: node-daemon
         image: tinyrl
