@@ -59,7 +59,7 @@ class NodeDaemon:
     self.tasks: dict[str, asyncio.Task] = {}
     self.state, self.after, self.serial = scheduler.State(), "0-0", 0
     self.changed, self.draining = asyncio.Event(), False
-    self.heartbeat = time.monotonic()
+    self.heartbeat, self.lag = time.monotonic(), 0.0
     self.swept, self.uploading, self.sweeping = 0.0, None, None
     self.turns: asyncio.Queue | None = None
     self.logging: asyncio.Task | None = None
@@ -206,6 +206,8 @@ class NodeDaemon:
     def ready():
       return [c for c in heads if c.request_id in prepared and prepared[c.request_id].done()]
 
+    took = {}  # request -> ms it took, for the batch_done trace event
+
     async def answer(cmd, inputs):
       before = time.time()
       with span("node.execute"):
@@ -233,8 +235,9 @@ class NodeDaemon:
       with span("node.publish"):
         if not await self.bus.write_reply(cmd, reply, worker, owner, started=before):
           raise RuntimeError(f"lost worker {worker}")
+      took[cmd.request_id] = (time.time() - before) * 1000
       if DEBUG:
-        print(f"{worker} {cmd.request_id} {cmd.op:24s} {(time.time() - before) * 1000:9.2f} ms")
+        print(f"{worker} {cmd.request_id} {cmd.op:24s} {took[cmd.request_id]:9.2f} ms")
       return reply
 
     def wanted():
@@ -338,7 +341,7 @@ class NodeDaemon:
         worker,
         seconds=seconds,
         queued=len(heads),
-        ops=[[c.op, seconds * 1000 / len(cmds)] for c in cmds],
+        ops=[[c.op, took.pop(c.request_id, 0.0)] for c in cmds],  # a wave's overlap, so traces draw requests in flight
       )
       for cmd in cmds:
         service[cmd.run] = service.get(cmd.run, 0.0) + seconds * len(r.gpus) / len(cmds)
@@ -470,7 +473,7 @@ class NodeDaemon:
       n: dataclasses.asdict(r) | {"asked": r.ticket, "on": [(self.id, g) for g in r.gpus]}
       for n, r in self.running.items()
     }
-    await self.bus.node_heartbeat(self.id, self.gpus, workers)
+    await self.bus.node_heartbeat(self.id, self.gpus, workers, self.lag)
     self.heartbeat = time.monotonic()
     if await self.bus.event_log_size() < self.state.n:
       for task in self.tasks.values():
@@ -520,7 +523,10 @@ class NodeDaemon:
     try:
       while True:
         await self.tick()
+        before = time.monotonic()
         await asyncio.sleep(TICK)
+        # how late the loop woke: every worker on the node shares it, so a stall here delays all their commands
+        self.lag = time.monotonic() - before - TICK
     finally:
       await self.close()
 

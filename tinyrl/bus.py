@@ -434,10 +434,9 @@ class Bus:
 
   # ***** nodes *****
 
-  async def node_heartbeat(self, node: str, gpus: int, workers: dict | None = None) -> None:
-    await self.r.hset(
-      key("nodes"), node, json.dumps({"gpus": gpus, "until": time.time() + NODE_MS / 1000, "workers": workers or {}})
-    )
+  async def node_heartbeat(self, node: str, gpus: int, workers: dict | None = None, lag: float = 0.0) -> None:
+    beat = {"gpus": gpus, "until": time.time() + NODE_MS / 1000, "workers": workers or {}, "lag": lag}
+    await self.r.hset(key("nodes"), node, json.dumps(beat))
 
   async def live_nodes(self, details: bool = False) -> dict:
     """The GPU count of every live node daemon, by id."""

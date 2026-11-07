@@ -94,6 +94,7 @@ class TestAPI(RedisTest):
     metrics, worker = (await self.http.get("/metrics")).text, run["worker"]
     self.assertIn(f'tinyrl_steps_total{{worker="{worker}",run="{run_id}"}} 8\n', metrics)
     self.assertIn(f'tinyrl_busy_seconds_total{{worker="{worker}",run="{run_id}"}} {run["busy_ms"] / 1000}\n', metrics)
+    self.assertIn("tinyrl_node_loop_lag_seconds{node=", metrics)
 
     session = (await self.http.get(f"/api/v1/sessions/{session_id}")).json()
     self.assertEqual((session["runs"], session["live"]), ([run_id], True))
