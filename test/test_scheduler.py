@@ -132,6 +132,16 @@ class TestCluster(unittest.TestCase):
     sampler = c.run("sample", role="sampler", train_run="x", exclusive=True)
     self.assertEqual(c.s.workers[sampler].node, "b")
 
+  def test_a_full_fine_tunes_trainer_keeps_room_beside_it_for_its_sampler(self):
+    c = Cluster()
+    c.node("a", 2)
+    c.node("b", 8)
+    t = c.run("t")
+    others = [c.run(f"r{i}", rank=4, base=f"m{i}") for i in range(5)]
+    self.assertEqual([c.s.workers[w].node for w in [t, *others]], ["a", "b", "b", "b", "b", "b"])
+    sampler = c.run("sample", role="sampler", train_run="t")
+    self.assertEqual(c.s.workers[sampler].node, "a")
+
   def test_samplers_packed_by_memory_leave_room_near_their_trainer(self):
     c = Cluster()
     c.append(Ev.NODE_UP, node="a", gpus=2, memory=81559 * MIB)

@@ -227,7 +227,13 @@ def room(s: State, node: str, me: Kind) -> bool:
 def place(s: State, name: str) -> dict:
   """Choose a node with room, keeping a full fine-tune's sampler near its checkpoint files."""
   me = s.workers[name]
-  load = {n: sum(w.node == n for w in s.workers.values()) / g for n, (g, _) in s.nodes.items() if g >= me.kind.gpus}
+  # a full fine-tune's trainer counts twice, keeping room beside it for its sampler: its weights crossing nodes cost seconds a step
+  size = {x: 1 + (w.kind.role == Role.TRAINER and not w.kind.lora) for x, w in s.workers.items()}
+  load = {
+    n: sum(size[x] for x, w in s.workers.items() if w.node == n) / g
+    for n, (g, _) in s.nodes.items()
+    if g >= me.kind.gpus
+  }
   trainers = [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
   near = near if me.kind.role == Role.SAMPLER and not me.kind.lora else set()  # a LoRA adapter is small to fetch
