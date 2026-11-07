@@ -199,8 +199,13 @@ def place_next(s: State, now: float) -> tuple[Ev, dict] | None:
     return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
 
 
-def room(s: State, node: str, me: Kind) -> bool:
-  """Whether a worker of this kind could start on the node now: on an empty GPU, or packed by memory next to others."""
+def sampler_of(k: Kind) -> Kind | None:
+  """The sampler a full fine-tune's trainer will have. Its weights are big, so it should start beside the trainer."""
+  return dataclasses.replace(k, role=Role.SAMPLER) if k.role == Role.TRAINER and not k.lora else None
+
+
+def room(s: State, node: str, *new: Kind, waiting: set[str] = frozenset()) -> bool:
+  """Whether workers of these kinds could start on the node now: on empty GPUs, or packed by memory next to others. A waiting trainer keeps a GPU for its sampler."""
   gpus, gpu_bytes = s.nodes[node]
   held: list[list[Kind]] = []  # what each GPU holds, packed first-fit the way choose() packs
 
@@ -218,10 +223,11 @@ def room(s: State, node: str, me: Kind) -> bool:
       return True
     return False
 
-  for w in s.workers.values():
-    for _ in range(w.kind.gpus if w.node == node else 0):
-      put(w.kind)  # past the GPUs, trainers take turns
-  return all(put(me) for _ in range(me.gpus))
+  for name, w in s.workers.items():
+    for k in [w.kind, sampler_of(w.kind)] if name in waiting else [w.kind]:
+      for _ in range(k.gpus if w.node == node else 0):
+        put(k)  # past the GPUs, trainers take turns
+  return all(put(k) for k in new for _ in range(k.gpus))
 
 
 def place(s: State, name: str) -> dict:
@@ -231,8 +237,19 @@ def place(s: State, name: str) -> dict:
   trainers = [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
   near = near if me.kind.role == Role.SAMPLER and not me.kind.lora else set()  # a LoRA adapter is small to fetch
-  # near only with room: waiting there for a sampler to finish costs minutes, fetching the checkpoint seconds
-  node = min(sorted(load), key=lambda n: (not room(s, n, me.kind), n not in near, load[n]))
+  # a full fine-tune's trainer goes where its sampler fits beside it, and keeps that GPU until the sampler comes
+  pair = [k for k in (me.kind, sampler_of(me.kind)) if k]
+  sampled = {
+    s.runs[r].train_run for x, w in s.workers.items() if w.node and w.kind.role == Role.SAMPLER for r in members(s, x)
+  }
+  waiting = {x for x, w in s.workers.items() if sampler_of(w.kind) and not sampled & set(members(s, x))}
+  waiting -= {t.worker for t in trainers if t}  # the GPU kept for this sampler is its own
+
+  # near only with room: waiting there for a sampler costs minutes, fetching weights seconds
+  def score(n: str) -> tuple:
+    return not room(s, n, *pair, waiting=waiting), not room(s, n, me.kind, waiting=waiting), n not in near, load[n]
+
+  node = min(sorted(load), key=score)
   rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
   return {"worker": name, "node": node, "rule": rule}
 
