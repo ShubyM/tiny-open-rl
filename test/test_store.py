@@ -228,6 +228,26 @@ class TestStore(unittest.TestCase):
     self.assertTrue(loader.landed(uri, version))
     self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))
 
+  def test_one_runs_upload_does_not_hold_up_anothers(self):
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    store, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
+    big, small = "tinker://a/weights/big", "tinker://b/weights/small"
+    store.put(big, {"w": torch.ones(4)})
+    store.put(small, {"w": torch.ones(4)})
+    gate, upload = threading.Event(), store.upload_version
+    store.upload_version = lambda dest, *args: (gate.wait(10) if "/a/" in dest else None, upload(dest, *args))
+    first = threading.Thread(target=store.upload_pending_saves)
+    first.start()
+    for _ in range(200):  # b lands while a's upload is held
+      if loader.landed(small, store.versions[small]):
+        break
+      time.sleep(0.05)
+    self.assertEqual([loader.landed(u, store.versions[u]) for u in (small, big)], [True, False])
+    store.upload_pending_saves()  # a is still uploading, so this flush leaves it to the first
+    gate.set()
+    first.join(10)
+    self.assertTrue(loader.landed(big, store.versions[big]))
+
   def test_full_sampler_weights_upload_as_xors_another_node_rebuilds_exactly(self):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())

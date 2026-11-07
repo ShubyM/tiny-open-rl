@@ -491,8 +491,8 @@ class NodeDaemon:
     if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
       self.swept = time.time()
       self.sweeping = asyncio.create_task(self.registry.sweep(self.store, SWEEP_GRACE_S))
-    if self.uploading is None or self.uploading.done():
-      self.uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
+    # a flush every tick: each takes the runs no other flush is uploading, so one run's big upload holds up no other run
+    self.uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
     if self.after != after:
       self.notify()
 
@@ -509,11 +509,13 @@ class NodeDaemon:
     if self.logging:
       self.logging.cancel()
     uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
-    while not uploading.done():  # live until its saves land, so other nodes wait for them instead of failing
+    # live until its saves land, so other nodes wait for them instead of failing
+    while self.store.busy or not uploading.done():
       with contextlib.suppress(Exception):  # the uploads matter more than the heartbeat
         await self.bus.node_heartbeat(self.id, self.gpus)
       await asyncio.wait({uploading}, timeout=TICK)
     await uploading
+    await asyncio.to_thread(self.store.upload_pending_saves)  # what a run saved after an earlier flush listed its saves
 
   async def serve(self) -> None:
     await self.announce_node()

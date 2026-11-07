@@ -2,7 +2,7 @@
 
 Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors + config.json, sharded with a model.safetensors.index.json when large).
 
-CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. upload_pending_saves() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node's daemon waits for the version it wants to land while the node that saved it is live, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
+CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. upload_pending_saves() uploads the node's saves behind, each run's in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node's daemon waits for the version it wants to land while the node that saved it is live, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
 
 A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named <keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0 goes up as the bytes that changed from the base model if this node has it, else whole, and every link whose parent didn't upload goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC per chunk, and a node rebuilds a link from the newest one it has. delete_unused_chain_links() deletes the links nothing is built from.
 """
@@ -183,7 +183,7 @@ class Store:
     self.cache = CKPT_CACHE if cache is None else cache
     self.buffers: dict[int, list[torch.Tensor]] = {}  # shard -> pinned buffers its writer keeps, since pinning is slow
     self.lock = threading.RLock()  # one save at a time, since saves share self.buffers
-    self.uploading = threading.Lock()
+    self.uploading, self.busy = threading.Lock(), set()  # the runs a flush is uploading
     self.versions: dict[str, str] = {}  # uri -> the version this process last saved
     self.chains: dict[str, str] = {}  # run -> the last link of its chain this process saved
 
@@ -391,27 +391,33 @@ class Store:
     return [f"{n}.xor" for n in shards]
 
   def upload_pending_saves(self) -> None:
-    """Upload this node's saves in the order they were made. A failed upload skips the rest for that URI or chain, so _latest never goes backward, and the next flush tries again."""
-    with self.uploading:  # the node daemon's last call at shutdown waits for the one running behind
+    """Upload this node's saves, each run's in the order they were made and runs side by side, so a small save never waits behind another run's big one. A failed upload stops its run's for this flush, so _latest never goes backward. A run another flush is uploading is left to it."""
+    runs: dict[str, list] = {}
+    with self.uploading:
       found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
-      failed = set()
       for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
-        version = e.name.removesuffix(".upload")
-        k = version.rpartition(".")[0] if "." in version else None
         with open(e.path) as f:
           job = json.load(f)
-        if (k and k in failed) or job["uri"] in failed:
-          continue
-        if os.path.isdir(f"{self.cache}/{version}"):
-          try:
-            self.upload_version(self.path(job["uri"]), version, job["names"])
-          except Exception as exc:
-            if k:
-              failed.add(k)
-            failed.add(job["uri"])
-            print(f"upload failed for {version}, trying again: {exc!r}", file=sys.stderr, flush=True)
-            continue
-        os.unlink(e.path)
+        runs.setdefault(job["uri"].removeprefix("tinker://").split("/")[0], []).append((e.path, job))
+      runs = {r: jobs for r, jobs in runs.items() if r not in self.busy}
+      self.busy |= runs.keys()
+    try:
+      parallel(self.upload_run, list(runs.values()))
+    finally:
+      with self.uploading:
+        self.busy -= runs.keys()
+
+  def upload_run(self, jobs: list) -> None:
+    for path, job in jobs:
+      version = os.path.basename(path).removesuffix(".upload")
+      if os.path.isdir(f"{self.cache}/{version}"):
+        try:
+          self.upload_version(self.path(job["uri"]), version, job["names"])
+        except Exception as exc:
+          print(f"upload failed for {version}, trying again: {exc!r}", file=sys.stderr, flush=True)
+          return
+      with self.uploading:  # not while a flush lists them
+        os.unlink(path)
 
   # ***** get *****
 
