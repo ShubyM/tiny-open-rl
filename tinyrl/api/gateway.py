@@ -417,6 +417,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       for name, n in counters.items():
         name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
         lines.append(f'tinyrl_{name}_total{{worker="{worker}",run="{run}"}} {n}')
+    for node, beat in (await bus.live_nodes(details=True)).items():
+      lines.append(f'tinyrl_node_loop_lag_seconds{{node="{node}"}} {beat.get("lag", 0.0)}')
     return PlainTextResponse("\n".join(lines) + "\n")
 
   return api
