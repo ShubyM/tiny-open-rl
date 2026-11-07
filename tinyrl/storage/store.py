@@ -2,7 +2,7 @@
 
 Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors + config.json, sharded with a model.safetensors.index.json when large).
 
-CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. upload_pending_saves() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node waits for the version it wants to land, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
+CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. upload_pending_saves() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node's daemon waits for the version it wants to land while the node that saved it is live, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
 
 A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named <keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0 goes up as the bytes that changed from the base model if this node has it, else whole, and every link whose parent didn't upload goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC per chunk, and a node rebuilds a link from the newest one it has. delete_unused_chain_links() deletes the links nothing is built from.
 """
@@ -21,7 +21,6 @@ import shutil
 import sys
 import tempfile
 import threading
-import time
 import uuid
 import weakref
 import zlib
@@ -42,7 +41,6 @@ SHARD_BYTES = getenv("SHARD_BYTES", 256 * 1024 * 1024)  # a full checkpoint this
 MAX_SHARDS = 16
 # a save copies GPU tensors off in pieces this big, through two pinned buffers per file
 STREAM_CHUNK = 256 * 1024 * 1024
-UPLOAD_WAIT_S = getenv("UPLOAD_WAIT_S", 900.0)  # how long a node waits for a version another node is uploading
 # trim_cache() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
 CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)
 KEYFRAME_EVERY = getenv("KEYFRAME_EVERY", 8)  # the most links in a chain of full sampler weights
@@ -357,7 +355,7 @@ class Store:
     finally:
       shutil.rmtree(f"{folder}.xor", ignore_errors=True)
       shutil.rmtree(f"{folder}.base", ignore_errors=True)
-    old = json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
+    old = self.latest(dest)
     self.fs.pipe_file(f"{dest}/_latest", json.dumps(info).encode())
     if "." not in version:
       keep = {"_latest", version, old.get("version")}
@@ -417,8 +415,19 @@ class Store:
 
   # ***** get *****
 
+  def landed(self, uri: str, version: str) -> bool:
+    """Whether this node can read the version now: it saved it, or the bucket has it."""
+    return (
+      not self.remote
+      or os.path.isdir(f"{self.cache}/{version}")
+      or self.latest(self.path(uri)).get("version") == version
+    )
+
+  def latest(self, dest: str) -> dict:
+    return json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
+
   def local_folder(self, uri: str, version: str | None = None) -> tuple[str, str]:
-    """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again. With a version, from a store on another node, it waits for that version to land."""
+    """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again. With a version, from a store on another node, that version has to have landed."""
     dest = self.path(uri)
     if not self.remote:
       real = os.path.join(os.path.dirname(dest), os.readlink(dest)) if os.path.islink(dest) else dest
@@ -434,14 +443,9 @@ class Store:
     if want and os.path.isdir(f"{self.cache}/{want}"):
       os.utime(f"{self.cache}/{want}")  # so trim_cache() takes the ones nobody read for longest
       return f"{self.cache}/{want}", want
-    deadline = time.time() + UPLOAD_WAIT_S
-    while True:
-      info = json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
-      if not version or info.get("version") == version:
-        break
-      if time.time() > deadline:
-        raise ValueError(f"version {version} of {uri} never landed")
-      time.sleep(0.5)  # another node is still uploading it
+    info = self.latest(dest)
+    if version and info.get("version") != version:
+      raise ValueError(f"version {version} of {uri} has not landed")
     if not info:
       raise ValueError(f"no checkpoint at {uri}")
     version, names = info["version"], info["files"]

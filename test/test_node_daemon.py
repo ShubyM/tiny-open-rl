@@ -102,7 +102,7 @@ class TestNodeDaemon(RedisTest):
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       uri = "tinker://training/sampler_weights/slow"
       writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
-      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri])
+      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri], node=node.id)  # live, so it waits
       await self.bus.create_run(Run("slow", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       await self.bus.create_run(Run("ready", "sampler", "tiny", 4, role=Role.SAMPLER))
       resident = await node.add("sampler")
@@ -121,6 +121,38 @@ class TestNodeDaemon(RedisTest):
       finally:
         await asyncio.to_thread(writer.upload_pending_saves)
       await self.reply(slow, node)
+
+  async def test_a_checkpoint_whose_node_left_before_it_uploaded_fails_fast(self):
+    with tempfile.TemporaryDirectory() as folder:
+      writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
+      node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
+      uri = "tinker://training/sampler_weights/lost"
+      writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
+      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri], node="gone")
+      await self.bus.create_run(Run("lost", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
+      await node.add("sampler")
+      request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
+      waiting = self.background(self.bus.wait_for_reply(request, 10))
+      await self.until(waiting.done, node)
+      self.assertFalse(waiting.result().ok)
+      self.assertIn("was lost with node gone", waiting.result().body.decode())
+
+  async def test_a_newer_save_from_a_live_node_is_waited_for_even_after_an_older_saver_left(self):
+    with tempfile.TemporaryDirectory() as folder:
+      writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
+      node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
+      uri, meta = "tinker://training/sampler_weights/w", {"base": "tiny", "lora": True, "config": {}}
+      writer.put(uri, {}, meta)
+      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri], node="gone")
+      reading = self.background(node.landed(uri))
+      await asyncio.sleep(0.2)  # it has seen "gone" leave
+      writer.put(uri, {}, meta)
+      await self.bus.node_heartbeat("live", 1)
+      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri], node="live")
+      await asyncio.sleep(1)
+      self.assertFalse(reading.done())
+      await asyncio.to_thread(writer.upload_pending_saves)
+      self.assertEqual(await asyncio.wait_for(reading, 5), writer.versions[uri])
 
   async def test_admission_waits_for_the_previous_model_process_to_park(self):
     require_unix()
