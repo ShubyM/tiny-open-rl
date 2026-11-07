@@ -122,6 +122,16 @@ class TestCluster(unittest.TestCase):
     sampler = c.run("sample", role="sampler", train_run="b")
     self.assertEqual(c.s.workers[sampler].node, "b")
 
+  def test_full_fine_tune_sampler_goes_elsewhere_when_its_trainers_node_is_full(self):
+    c = Cluster()
+    c.node("a", 2)
+    c.node("b", 8)
+    x = c.run("x", exclusive=True)
+    others = [c.run(f"r{i}") for i in range(5)]
+    self.assertEqual([c.s.workers[w].node for w in [x, *others]], ["a", "b", "b", "b", "b", "a"])
+    sampler = c.run("sample", role="sampler", train_run="x", exclusive=True)
+    self.assertEqual(c.s.workers[sampler].node, "b")
+
   def test_lost_node_workers_are_reassigned_and_forget_their_desired_gpus(self):
     c = Cluster()
     c.node("a", 1)

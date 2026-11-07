@@ -206,7 +206,9 @@ def place(s: State, name: str) -> dict:
   trainers = [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
   near = near if me.kind.role == Role.SAMPLER and not me.kind.lora else set()  # a LoRA adapter is small to fetch
-  node = min(sorted(load), key=lambda n: (n not in near, load[n]))
+  # near only with a free GPU: waiting there for a sampler to finish costs minutes, fetching the checkpoint seconds
+  used = {n: sum(w.kind.gpus for w in s.workers.values() if w.node == n) for n in load}
+  node = min(sorted(load), key=lambda n: (used[n] + me.kind.gpus > s.nodes[n][0], n not in near, load[n]))
   rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
   return {"worker": name, "node": node, "rule": rule}
 
