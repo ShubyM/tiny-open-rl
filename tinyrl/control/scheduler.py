@@ -199,6 +199,31 @@ def place_next(s: State, now: float) -> tuple[Ev, dict] | None:
     return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
 
 
+def room(s: State, node: str, me: Kind) -> bool:
+  """Whether a worker of this kind could start on the node now: on an empty GPU, or packed by memory next to others."""
+  gpus, gpu_bytes = s.nodes[node]
+  held: list[list[Kind]] = []  # what each GPU holds, packed first-fit the way choose() packs
+
+  def put(k: Kind) -> bool:
+    for kinds in held:
+      if (
+        not k.exclusive
+        and not any(x.exclusive for x in kinds)
+        and fit([budget(s, x, node) for x in [*kinds, k]], gpu_bytes)
+      ):
+        kinds.append(k)
+        return True
+    if len(held) < gpus:
+      held.append([k])
+      return True
+    return False
+
+  for w in s.workers.values():
+    for _ in range(w.kind.gpus if w.node == node else 0):
+      put(w.kind)  # past the GPUs, trainers take turns
+  return all(put(me) for _ in range(me.gpus))
+
+
 def place(s: State, name: str) -> dict:
   """Choose a node with room, keeping a full fine-tune's sampler near its checkpoint files."""
   me = s.workers[name]
@@ -206,9 +231,8 @@ def place(s: State, name: str) -> dict:
   trainers = [s.runs.get(s.runs[r].train_run or "") for r in members(s, name)]
   near = {s.workers[t.worker].node for t in trainers if t and t.worker in s.workers}
   near = near if me.kind.role == Role.SAMPLER and not me.kind.lora else set()  # a LoRA adapter is small to fetch
-  # near only with a free GPU: waiting there for a sampler to finish costs minutes, fetching the checkpoint seconds
-  used = {n: sum(w.kind.gpus for w in s.workers.values() if w.node == n) for n in load}
-  node = min(sorted(load), key=lambda n: (used[n] + me.kind.gpus > s.nodes[n][0], n not in near, load[n]))
+  # near only with room: waiting there for a sampler to finish costs minutes, fetching the checkpoint seconds
+  node = min(sorted(load), key=lambda n: (not room(s, n, me.kind), n not in near, load[n]))
   rule = "place.near_its_trainer" if node in near else "place.least_loaded_node"
   return {"worker": name, "node": node, "rule": rule}
 
