@@ -115,6 +115,12 @@ class TestCluster(unittest.TestCase):
     self.assertEqual(c.settle(), [(Ev.UNPLACED, {"worker": a, "rule": "place.emptied"})])
     self.assertNotIn(a, c.s.workers)
 
+  def test_a_new_worker_never_takes_a_name_in_use(self):
+    c = Cluster()
+    c.node("n", 1)
+    c.s.workers["w1"] = Worker(Kind(lora=True), "n")  # a worker the counter doesn't know about, as after a lost counter
+    self.assertNotEqual(c.run("f"), "w1")
+
   def test_workers_go_to_the_node_with_the_fewest_workers_per_gpu(self):
     c = Cluster()
     c.node("a", 1)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import itertools
 import json
 from dataclasses import dataclass, field
 
@@ -172,7 +173,7 @@ def decide(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
   for run, r in sorted(s.runs.items()):
     if not r.worker:
       if not (worker := choose_worker(s, r)):
-        s.made += 1
+        s.made = next(n for n in itertools.count(s.made + 1) if f"w{n}" not in s.workers)  # never a name in use
         worker = f"w{s.made}"
       join(s, run, worker)
       out.append((Ev.ASSIGNED, {"run": run, "worker": worker}))
@@ -350,12 +351,12 @@ async def run(bus: Bus, quantum: float = QUANTUM) -> None:
     s = state_from(await bus.read_table())
     s.quantum = quantum
     new, changes = decide(s)
+    await bus.r.set(key("state"), json.dumps(dataclasses.asdict(new), sort_keys=True))  # what the gateway shows
     if not changes:
       continue
     assigned = {r: x.worker for r, x in new.runs.items() if x.worker != s.runs[r].worker}
     workers = {n: {"kind": dataclasses.asdict(w.kind), "node": w.node} for n, w in new.workers.items()}
     await bus.write_table(assigned, workers, sorted(s.workers.keys() - new.workers.keys()), new.made, changes)
-    await bus.r.set(key("state"), json.dumps(dataclasses.asdict(new), sort_keys=True))
 
 
 if __name__ == "__main__":
