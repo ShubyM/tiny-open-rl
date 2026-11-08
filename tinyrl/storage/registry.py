@@ -1,4 +1,4 @@
-"""The checkpoint registry, on Redis: every checkpoint the store holds, who owns it, when it expires, and the version another node waits for. The node daemons' sweeps delete what it lets go."""
+"""The checkpoint registry, on Redis: every checkpoint the store holds, who owns it, when it expires, and the version a node reads it by. The node daemons' sweeps delete what it lets go."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ class Registry:
     ttl: int | None = None,
     owned: bool = False,
     version: str | None = None,
-    node: str | None = None,
   ) -> None:
     """Record a checkpoint the store now holds. One the run owns, like a sampling session's weights or the state a stopping trainer parked, goes when the run is deleted. The rest stay until deleted, or their TTL runs out."""
     run, cid = uri.removeprefix("tinker://").split("/", 1)
@@ -34,7 +33,7 @@ class Registry:
       "time": now,
     }
     info |= {"tinker_path": uri, "size_bytes": size, "expires_at": now + ttl if ttl else None, "owned": owned}
-    info["version"], info["node"] = version, node  # the version to read, and the node uploading it
+    info["version"] = version  # what a node reads it by
     p = self.r.pipeline(transaction=True)
     p.setnx(key("ckpt_since"), now)
     p.hset(key("ckpt", run), cid, json.dumps(info))
@@ -47,6 +46,10 @@ class Registry:
     run, cid = uri.removeprefix("tinker://").split("/", 1)
     info = await self.r.hget(key("ckpt", run), cid)
     return json.loads(info) if info else None
+
+  async def version(self, uri: str) -> str | None:
+    """The version to read a checkpoint by."""
+    return (await self.get_checkpoint(uri) or {}).get("version")
 
   async def checkpoints_of_run(self, run: str) -> list[dict]:
     found = [json.loads(v) for v in (await self.r.hgetall(key("ckpt", run))).values()]
@@ -98,10 +101,9 @@ class Registry:
     """Every checkpoint in the registry, parked ones too, and their versions."""
     uris, versions = set(), set()
     async for k in self.r.scan_iter(match=key("ckpt", "*")):
-      run = k.decode().removeprefix(key("ckpt", ""))
-      for cid, info in (await self.r.hgetall(k)).items():
-        uris.add(f"tinker://{run}/{cid.decode()}")
-        versions.add(json.loads(info).get("version"))
+      for info in map(json.loads, await self.r.hvals(k)):
+        uris.add(info["tinker_path"])
+        versions.add(info.get("version"))
     return uris, versions - {None}
 
   async def sweep(self, store: Store, grace: float) -> None:
