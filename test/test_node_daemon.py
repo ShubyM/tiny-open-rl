@@ -45,10 +45,9 @@ class TestNodeDaemon(RedisTest):
     await asyncio.gather(*self.tasks, return_exceptions=True)
     for node in self.nodes:
       await node.close(graceful=False)
-      for task in (node.uploading, node.sweeping):
-        if task:
-          task.cancel()
-          await asyncio.gather(task, return_exceptions=True)
+      if task := node.sweeping:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     await super().asyncTearDown()
 
   async def until(self, done, node):
@@ -101,8 +100,8 @@ class TestNodeDaemon(RedisTest):
       writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       uri = "tinker://training/sampler_weights/slow"
-      writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
-      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri], node=node.id)  # live, so it waits
+      version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
+      await self.registry.register_checkpoint(uri, 0, version=version, node=node.id)  # live, so it waits
       await self.bus.create_run(Run("slow", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       await self.bus.create_run(Run("ready", "sampler", "tiny", 4, role=Role.SAMPLER))
       resident = await node.add("sampler")
@@ -127,8 +126,8 @@ class TestNodeDaemon(RedisTest):
       writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       uri = "tinker://training/sampler_weights/lost"
-      writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
-      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri], node="gone")
+      version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
+      await self.registry.register_checkpoint(uri, 0, version=version, node="gone")
       await self.bus.create_run(Run("lost", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       await node.add("sampler")
       request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
@@ -142,17 +141,17 @@ class TestNodeDaemon(RedisTest):
       writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       uri, meta = "tinker://training/sampler_weights/w", {"base": "tiny", "lora": True, "config": {}}
-      writer.put(uri, {}, meta)
-      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri], node="gone")
+      version = writer.put(uri, {}, meta)
+      await self.registry.register_checkpoint(uri, 0, version=version, node="gone")
       reading = self.background(node.landed(uri))
       await asyncio.sleep(0.2)  # it has seen "gone" leave
-      writer.put(uri, {}, meta)
+      version = writer.put(uri, {}, meta)
       await self.bus.node_heartbeat("live", 1)
-      await self.registry.register_checkpoint(uri, 0, version=writer.versions[uri], node="live")
+      await self.registry.register_checkpoint(uri, 0, version=version, node="live")
       await asyncio.sleep(1)
       self.assertFalse(reading.done())
       await asyncio.to_thread(writer.upload_pending_saves)
-      self.assertEqual(await asyncio.wait_for(reading, 5), writer.versions[uri])
+      self.assertEqual(await asyncio.wait_for(reading, 5), version)
 
   async def test_admission_waits_for_the_previous_model_process_to_park(self):
     require_unix()
@@ -209,9 +208,7 @@ class TestNodeDaemon(RedisTest):
       store = Store(f"file://{folder}/bucket", cache=f"{folder}/cache")
       store.put("tinker://r/weights/w", {"w": torch.ones(2)})
       node = self.node(store=store)
-      await node.tick()
-      await node.uploading
-      self.assertEqual(store.list_checkpoints(), ["tinker://r/weights/w"])
+      await self.until(lambda: store.list_checkpoints() == ["tinker://r/weights/w"], node)
 
 
 if __name__ == "__main__":

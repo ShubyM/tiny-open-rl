@@ -254,7 +254,8 @@ class TestModel(unittest.TestCase):
 
     model, (lora_run,) = lora_runs()
     train(model, lora_run, steps=3)
-    lora_dir = store.put(f"tinker://{lora_run}/sampler_weights/final", *model.sampler_weights(lora_run))
+    store.put(f"tinker://{lora_run}/sampler_weights/final", *model.sampler_weights(lora_run))
+    lora_dir = store.path(f"tinker://{lora_run}/sampler_weights/final")
     with torch.no_grad():
       torch.testing.assert_close(
         PeftModel.from_pretrained(tiny(), lora_dir).eval()(ids).logits,
@@ -264,7 +265,8 @@ class TestModel(unittest.TestCase):
     fft, fft_run = Model(tiny), new_id()
     fft.create_run(fft_run, "tiny", 0, {})
     train(fft, fft_run, steps=3)
-    fft_dir = store.put(f"tinker://{fft_run}/sampler_weights/final", *fft.sampler_weights(fft_run))
+    store.put(f"tinker://{fft_run}/sampler_weights/final", *fft.sampler_weights(fft_run))
+    fft_dir = store.path(f"tinker://{fft_run}/sampler_weights/final")
     with torch.no_grad():
       torch.testing.assert_close(
         LlamaForCausalLM.from_pretrained(fft_dir).eval()(ids).logits,

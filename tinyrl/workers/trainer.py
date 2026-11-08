@@ -54,13 +54,13 @@ class Trainer:
     self, run: str, uri: str, sampler: bool = False, ttl_seconds: int | None = None, owned: bool = False
   ) -> dict:
     tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
-    self.store.put(uri, tensors, meta)
+    version = self.store.put(uri, tensors, meta)
     return {
       "uri": uri,
       "size": sum(map(nbytes, tensors.values())),
       "ttl": ttl_seconds,
       "owned": owned,
-      "version": self.store.versions.get(uri),
+      "version": version,
     }
 
   def load_run(self, run: str, uri: str, version: str | None, optimizer: bool, gradients: bool) -> None:

@@ -102,7 +102,6 @@ class TestNode(NodeDaemon):
 
   async def aclose(self):
     await self.close(graceful=False)
-    for task in (self.uploading, self.sweeping):
-      if task:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+    if task := self.sweeping:
+      task.cancel()
+      await asyncio.gather(task, return_exceptions=True)
