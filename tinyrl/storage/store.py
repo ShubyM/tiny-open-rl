@@ -228,7 +228,7 @@ class Store:
 
   def keep_uploading(self) -> None:
     while not self.stopping.wait(0.25):  # seconds between looks for new saves
-      with contextlib.suppress(Exception):  # it logs each failed upload, and the next pass tries again
+      with contextlib.suppress(Exception):  # it logs a failed upload. On any failure the next pass retries
         self.upload_pending_saves()
 
   def close(self) -> None:
@@ -488,7 +488,7 @@ class Store:
       return folder, version
     info = self.latest(dest)
     if version and info.get("version") != version:
-      raise ValueError(f"version {version} of {uri} has not landed" + (f", and {peer} didn't answer" if peer else ""))
+      raise ValueError(f"version {version} of {uri} has not landed" + (f", and {peer} failed to copy" if peer else ""))
     if not info:
       raise ValueError(f"no checkpoint at {uri}")
     version, names = info["version"], info["files"]
@@ -502,12 +502,12 @@ class Store:
     ), version
 
   def copy_from(self, peer: str, version: str) -> str | None:
-    """A version copied from the node that saved it, which keeps it until it has uploaded. None if that node doesn't answer."""
+    """A version copied from the node that saved it, which keeps it until it has uploaded. None if the copy fails: that node is gone, or no longer has it."""
     url = f"http://{peer}/{version}"
     try:
       names = json.load(urllib.request.urlopen(f"{url}/", timeout=10))
       return self.cached_folder(version, lambda tmp: parallel(lambda n: fetch(f"{url}/{n}", f"{tmp}/{n}"), names))
-    except Exception:  # gone, or no longer has it: the bucket does
+    except Exception:  # the bucket has it, or it's lost
       return None
 
   def cached_folder(self, version: str, fill) -> str:

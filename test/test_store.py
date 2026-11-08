@@ -253,7 +253,7 @@ class TestStore(unittest.TestCase):
     saver.peer = "127.0.0.1:9"  # a node that no longer answers
     uri = "tinker://r/weights/final"
     version = saver.put(uri, {"w": torch.ones(4)})
-    with self.assertRaisesRegex(ValueError, "has not landed, and 127.0.0.1:9 didn't answer"):
+    with self.assertRaisesRegex(ValueError, "has not landed, and 127.0.0.1:9 failed to copy"):
       loader.get(uri, version)
     saver.upload_pending_saves()
     self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))

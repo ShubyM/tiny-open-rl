@@ -144,7 +144,7 @@ class TestNodeDaemon(RedisTest):
       waiting = self.background(self.bus.wait_for_reply(request, 10))
       await self.until(waiting.done, node)
       self.assertFalse(waiting.result().ok)
-      self.assertIn("has not landed, and 127.0.0.1:9 didn't answer", waiting.result().body.decode())
+      self.assertIn("has not landed, and 127.0.0.1:9 failed to copy", waiting.result().body.decode())
 
   async def test_admission_waits_for_the_previous_model_process_to_park(self):
     require_unix()
