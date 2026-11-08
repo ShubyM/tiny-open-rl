@@ -9,12 +9,12 @@ from tinyrl.control.scheduler import (
   Run,
   State,
   Worker,
-  budget,
   can_run,
   decide,
+  from_table,
+  memory_budget,
   place_gpus,
   select_runs,
-  state_from,
 )
 
 GIB, MIB = 2**30, 2**20
@@ -31,11 +31,11 @@ class Cluster:
       "nodes": self.nodes,
       "runs": {r: (rec, self.s.runs[r].worker if r in self.s.runs else "") for r, rec in self.records.items()},
       "workers": {n: {"kind": dataclasses.asdict(w.kind), "node": w.node} for n, w in self.s.workers.items()},
-      "made": self.s.made,
+      "workers_made": self.s.workers_made,
     }
 
   def settle(self):
-    self.s, decisions = decide(state_from(self.table()))
+    self.s, decisions = decide(from_table(self.table()))
     return decisions
 
   def node(self, name, gpus, memory=80 * GIB):
@@ -94,7 +94,7 @@ class Local:
     for gpu in range(self.s.nodes["n"][0]):
       held = [r for r in self.running.values() if r.since is not None and gpu in r.gpus]
       if len(held) > 1:
-        sizes = [budget(self.s, r.kind, "n") for r in held]
+        sizes = [memory_budget(self.s, r.kind, "n") for r in held]
         self.test.assertTrue(all(sizes))
         self.test.assertLessEqual(sum(sizes), self.s.nodes["n"][1])
     for r in self.running.values():
@@ -225,7 +225,7 @@ class TestCluster(unittest.TestCase):
         c.settle()
         self.assertEqual(decide(c.s)[1], [])
         self.assertTrue(all(w.node is None or w.node in c.s.nodes for w in c.s.workers.values()))
-        self.assertEqual(state_from(c.table()), c.s)
+        self.assertEqual(from_table(c.table()), c.s)
         self.assertTrue(all(w.gpus == () for w in c.s.workers.values()))
 
 

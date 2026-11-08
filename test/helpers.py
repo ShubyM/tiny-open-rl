@@ -84,13 +84,13 @@ async def assign_new_runs(bus) -> None:
   """Assign new runs the way the scheduler would, without placing anything."""
   from tinyrl.control import scheduler
 
-  s = scheduler.state_from(await bus.read_table())
+  s = scheduler.from_table(await bus.read_table())
   new, changes = scheduler.decide(s)
   runs = {body["run"]: body["worker"] for kind, body in changes if kind == "assigned"}
-  made = {
+  new_workers = {
     w: {"kind": dataclasses.asdict(new.workers[w].kind), "node": None} for w in set(runs.values()) - s.workers.keys()
   }
-  await bus.write_table(runs, made, [], new.made, [])
+  await bus.write_table(runs, new_workers, [], new.workers_made, [])
 
 
 class FakeEngine:

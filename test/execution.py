@@ -51,11 +51,11 @@ class TestNode(NodeDaemon):
 
   async def read_state(self):
     """The table, with the workers a test placed here itself, since no scheduler places them."""
-    state = scheduler.state_from(await self.bus.read_table())
+    state = scheduler.from_table(await self.bus.read_table())
     state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))  # live before its first heartbeat
     for worker in self.pinned & state.workers.keys():
       state.workers[worker].node = self.id
-    return scheduler.keep_gpus(state, self.state)
+    return scheduler.keep_chosen_gpus(state, self.state)
 
   async def sync(self):
     self.state = await self.read_state()
@@ -93,7 +93,7 @@ class TestNode(NodeDaemon):
       while True:
         await self.tick()
         queues = await asyncio.gather(
-          *(self.bus.queued_and_in_flight(r) for r in scheduler.members(self.state, worker))
+          *(self.bus.queued_and_in_flight(r) for r in scheduler.runs_of(self.state, worker))
         )
         if not any(q.get("queued") or q.get("in_flight") for q in queues):
           break

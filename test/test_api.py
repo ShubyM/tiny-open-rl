@@ -213,7 +213,7 @@ class TestAPI(RedisTest):
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
     await self.node.sync()
-    self.assertEqual(scheduler.members(self.node.state, await self.worker(full)), [full])
+    self.assertEqual(scheduler.runs_of(self.node.state, await self.worker(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()

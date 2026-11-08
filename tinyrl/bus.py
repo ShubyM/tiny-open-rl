@@ -227,17 +227,17 @@ class Bus:
     for run in runs:
       p.hmget(key("run", run), "record", "worker")
     p.hgetall(key("workers"))
-    p.get(key("made"))
-    *records, workers, made = await p.execute()
+    p.get(key("workers_made"))
+    *records, workers, workers_made = await p.execute()
     return {
       "nodes": nodes,
       "runs": {r: (json.loads(rec), w and w.decode()) for r, (rec, w) in zip(runs, records) if rec},
       "workers": {k.decode(): json.loads(v) for k, v in workers.items()},
-      "made": int(made or 0),
+      "workers_made": int(workers_made or 0),
     }
 
   async def write_table(
-    self, assigned: dict[str, str], workers: dict[str, dict], gone: list[str], made: int, changes: list
+    self, assigned: dict[str, str], workers: dict[str, dict], gone: list[str], workers_made: int, changes: list
   ) -> None:
     """The scheduler's new assignment, and a trace entry for each change, at once. Only the scheduler writes it."""
     p = self.r.pipeline(transaction=True)
@@ -247,7 +247,7 @@ class Bus:
       p.hset(key("workers"), mapping={n: json.dumps(w) for n, w in workers.items()})
     if gone:
       p.hdel(key("workers"), *gone)
-    p.set(key("made"), made)
+    p.set(key("workers_made"), workers_made)
     for kind, body in changes:
       p.xadd(key("events"), {"kind": kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True)
     await p.execute()

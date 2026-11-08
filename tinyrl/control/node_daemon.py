@@ -40,7 +40,7 @@ def gpu_memory_mib() -> int:
     return 0
 
 
-def layout(s: scheduler.State) -> tuple:
+def assignment(s: scheduler.State) -> tuple:
   return {n: w.node for n, w in s.workers.items()}, {r: x.worker for r, x in s.runs.items()}
 
 
@@ -119,7 +119,7 @@ class NodeDaemon:
       await asyncio.sleep(0.5)
 
   async def read_state(self) -> scheduler.State:
-    return scheduler.keep_gpus(scheduler.state_from(await self.bus.read_table()), self.state)
+    return scheduler.keep_chosen_gpus(scheduler.from_table(await self.bus.read_table()), self.state)
 
   async def announce_node(self) -> None:
     await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20)
@@ -192,7 +192,7 @@ class NodeDaemon:
 
     async def read(delay=0):
       await asyncio.sleep(delay)
-      commands = await self.bus.peek_commands(scheduler.members(self.state, worker), IDLE_MS)
+      commands = await self.bus.peek_commands(scheduler.runs_of(self.state, worker), IDLE_MS)
       for cmd in commands:
         if cmd.request_id not in prepared:
           preparing = prepared[cmd.request_id] = asyncio.create_task(prepare(cmd))
@@ -253,7 +253,7 @@ class NodeDaemon:
         not self.draining
         and w
         and w.node == self.id
-        and scheduler.members(self.state, worker)
+        and scheduler.runs_of(self.state, worker)
         and (w.gpus == r.gpus or movable(r, self.gpus))
       )
 
@@ -280,7 +280,7 @@ class NodeDaemon:
       except Exception as e:
         # A boot failure still answers waiting clients. Keep its reservation until close acknowledges.
         await owned()
-        for cmd in await self.bus.take_commands(scheduler.members(self.state, worker), owner, 1):
+        for cmd in await self.bus.take_commands(scheduler.runs_of(self.state, worker), owner, 1):
           if not await self.bus.write_reply(cmd, Reply.error(e), worker, owner):
             raise RuntimeError(f"lost worker {worker}") from e
         raise
@@ -288,7 +288,7 @@ class NodeDaemon:
     async def turn(gpus, runnable):
       if (p := model.proc) and p.poll() is not None:
         raise RuntimeError(f"worker {worker} exited")
-      waiting = scheduler.has_waiter(self.running, r.gpus)
+      waiting = scheduler.someone_waits(self.running, r.gpus)
       if r.since is not None and (
         gpus != r.gpus or (waiting and (not runnable or time.time() >= r.since + self.state.quantum))
       ):
@@ -382,14 +382,14 @@ class NodeDaemon:
         await asyncio.gather(guard, return_exceptions=True)
       if await self.bus.lease_owner(worker) == owner:
         if died:
-          await self.bus.take_commands(scheduler.members(self.state, worker), owner, 1)
-        await self.bus.fail_stranded_commands(scheduler.members(self.state, worker), worker, owner, 0)
+          await self.bus.take_commands(scheduler.runs_of(self.state, worker), owner, 1)
+        await self.bus.fail_stranded_commands(scheduler.runs_of(self.state, worker), worker, owner, 0)
       await self.bus.release_lease(worker, owner)
 
     try:
       if not await self.bus.take_lease(worker, owner):
         return
-      await self.bus.fail_stranded_commands(scheduler.members(self.state, worker), worker, owner, 0)
+      await self.bus.fail_stranded_commands(scheduler.runs_of(self.state, worker), worker, owner, 0)
       if not await self.bus.renew_lease(worker, owner) or self.draining:
         return
       self.running[worker] = r
@@ -431,7 +431,7 @@ class NodeDaemon:
         if time.monotonic() - swept >= STRANDED_MS / 1000:
           swept = time.monotonic()
           await owned()
-          await self.bus.fail_stranded_commands(scheduler.members(self.state, worker), worker, owner, 0)
+          await self.bus.fail_stranded_commands(scheduler.runs_of(self.state, worker), worker, owner, 0)
 
       # No drain: preparation never claimed work. Only the completed batch belonged to this process.
       if not sampling:
@@ -483,7 +483,7 @@ class NodeDaemon:
     self.heartbeat = time.monotonic()
     old, self.state = self.state, await self.read_state()
     self.dispatch()
-    mine = {n for n, w in self.state.workers.items() if w.node == self.id and scheduler.members(self.state, n)}
+    mine = {n for n, w in self.state.workers.items() if w.node == self.id and scheduler.runs_of(self.state, n)}
     if not self.draining:
       for worker in sorted(mine - self.tasks.keys()):
         self.start(worker)
@@ -492,7 +492,7 @@ class NodeDaemon:
       self.sweeping = asyncio.create_task(self.registry.sweep(self.store, SWEEP_GRACE_S))
     if self.uploading is None or self.uploading.done():
       self.uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
-    if layout(old) != layout(self.state):
+    if assignment(old) != assignment(self.state):
       self.notify()
 
   async def close(self, graceful: bool = True) -> None:
