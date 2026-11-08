@@ -27,8 +27,6 @@ class TestEvents(RedisTest):
       await asyncio.sleep(0.02)
     self.assertEqual(runs["a"], runs["b"])
     self.assertNotEqual(runs["a"], runs["f"])
-    state = scheduler.State()
-    for event in await self.bus.read_events():
-      state = scheduler.fold(state, event)
+    state = scheduler.state_from(await self.bus.read_table())
     self.assertEqual(sorted(scheduler.members(state, runs["a"])), ["a", "b"])
     self.assertEqual(scheduler.members(state, runs["f"]), ["f"])

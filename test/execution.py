@@ -1,10 +1,8 @@
 """Real node control with a synchronous CPU model in place of the local socket process."""
 
 import asyncio
-import time
 
-from test.helpers import FakeEngine, tiny
-from tinyrl.bus import Ev
+from test.helpers import FakeEngine, assign_new_runs, tiny
 from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.workers.model import Model
@@ -37,7 +35,7 @@ class TestNode(NodeDaemon):
   def __init__(self, bus, store=None, gpus=8, node="test-node", model=tiny, engine=FakeEngine, gpu_mib=0):
     super().__init__(bus, gpus=gpus, node=node, gpu_mib=gpu_mib, store=store)
     self.default_model, self.engine_type = model, engine
-    self.processes, self.samplers = {}, {}
+    self.processes, self.samplers, self.pinned = {}, {}, set()
     self.state.nodes[self.id] = (gpus, gpu_mib * 2**20)
 
   def open_trainer(self, worker, env):
@@ -51,17 +49,22 @@ class TestNode(NodeDaemon):
     self.samplers[worker] = sampler
     return sampler
 
+  async def read_state(self):
+    """The table, with the workers a test placed here itself, since no scheduler places them."""
+    state = scheduler.state_from(await self.bus.read_table())
+    state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))  # live before its first heartbeat
+    for worker in self.pinned & state.workers.keys():
+      state.workers[worker].node = self.id
+    return scheduler.keep_gpus(state, self.state)
+
   async def sync(self):
-    while events := await self.bus.read_events(self.after):
-      for event in events:
-        self.state = scheduler.fold(self.state, event)
-      self.after = events[-1].id
+    self.state = await self.read_state()
 
   async def add(self, worker, gpus=None):
+    self.pinned.add(worker)
     await self.sync()
     self.dispatch()
     desired = self.state.workers[worker]
-    desired.node = self.id
     if gpus is not None:
       desired.gpus = tuple(gpus)
     scheduler.place_gpus(self.state, self.id, self.running)
@@ -77,10 +80,7 @@ class TestNode(NodeDaemon):
     return self.running[worker]
 
   async def worker_for(self, run):
-    await self.sync()
-    for kind, body in scheduler.decide(self.state, time.time()):
-      if kind == Ev.ASSIGNED:
-        await self.bus.assign_run_to_worker(body["run"], body["worker"])
+    await assign_new_runs(self.bus)
     await self.sync()
     return r.worker if (r := self.state.runs.get(run)) else None
 

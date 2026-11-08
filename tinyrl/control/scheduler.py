@@ -1,4 +1,4 @@
-"""The cluster assigns runs to workers and workers to nodes. A node chooses GPUs directly from its own running processes. Run one cluster scheduler; restarting it replays assignments without restarting models."""
+"""The cluster assigns runs to workers and workers to nodes. Its current assignment is a table in Redis: each run's worker, and each worker's kind and node. The scheduler reads it, fixes what's wrong and writes it back; events only trace what changed. A node chooses GPUs directly from its own running processes. Run one cluster scheduler."""
 
 from __future__ import annotations
 
@@ -6,10 +6,9 @@ import asyncio
 import copy
 import dataclasses
 import json
-import time
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus, Cmd, Ev, Event, Op, Role, key
+from tinyrl.bus import Bus, Cmd, Ev, Op, Role, key
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 
@@ -112,10 +111,42 @@ class Worker:
 @dataclass
 class State:
   quantum: float = QUANTUM
-  n: int = 0  # entries folded
-  nodes: dict[str, tuple[int, int]] = field(default_factory=dict)  # node -> (GPUs, bytes per GPU)
+  made: int = 0  # workers made so far, so the next is w<made + 1>
+  nodes: dict[str, tuple[int, int]] = field(default_factory=dict)  # live node -> (GPUs, bytes per GPU)
   workers: dict[str, Worker] = field(default_factory=dict)
   runs: dict[str, Run] = field(default_factory=dict)
+
+
+def state_from(table: dict) -> State:
+  """The cluster as Redis holds it: live nodes, each run's kind and worker, and each worker's kind and node."""
+  s = State(made=table["made"], nodes={n: (v["gpus"], v.get("memory", 0)) for n, v in table["nodes"].items()})
+  for run, (rec, worker) in table["runs"].items():
+    ex, tr = rec.get("exclusive", False), rec.get("train_run")
+    k = Kind(
+      Role(rec.get("role", "trainer")),
+      rec.get("base", ""),
+      rec.get("rank", 0) > 0,
+      ex,
+      ex and tr or None,
+      rec.get("gpus", 1),
+    )
+    s.runs[run] = Run(k, worker or "", tr)
+  # an exclusive run's sampling sessions end with it
+  s.runs = {r: x for r, x in s.runs.items() if not x.kind.train_run or x.kind.train_run in s.runs}
+  for name, w in table["workers"].items():
+    s.workers[name] = Worker(Kind(**w["kind"] | {"role": Role(w["kind"]["role"])}), w["node"])
+  for x in s.runs.values():
+    if x.worker:  # created in a worker already, as tests do
+      s.workers.setdefault(x.worker, Worker(x.kind))
+  return s
+
+
+def keep_gpus(new: State, old: State) -> State:
+  """A node keeps the GPUs it chose for each worker that stays where it was."""
+  for name, w in new.workers.items():
+    if (was := old.workers.get(name)) and was.node == w.node:
+      w.gpus = was.gpus
+  return new
 
 
 def join(s: State, run: str, worker: str) -> None:
@@ -131,72 +162,34 @@ def members(s: State, worker: str) -> list[str]:
 # ***** fold *****
 
 
-def fold(state: State, e: Event) -> State:
-  """The state after entry e. Changes and returns the state it is given, and ignores entries it doesn't know."""
-  s = state
-  s.n += 1
-  b = e.body
-  w = s.workers.get(b.get("worker", ""))
-  match e.kind:
-    case Ev.RUN_CREATED:
-      ex, tr = b.get("exclusive", False), b.get("train_run")
-      k = Kind(
-        Role(b.get("role", "trainer")), b.get("base", ""), b.get("rank", 0) > 0, ex, ex and tr or None, b.get("gpus", 1)
-      )
-      s.runs[b["run"]] = Run(k, train_run=b.get("train_run"))
-      if b.get("worker"):  # created in a worker already, as tests do
-        join(s, b["run"], b["worker"])
-    case Ev.ASSIGNED if b["run"] in s.runs:
-      join(s, b["run"], b["worker"])
-    case Ev.RUN_DELETED:  # an exclusive run's sampling sessions end with it
-      s.runs = {r: x for r, x in s.runs.items() if r != b["run"] and x.kind.train_run != b["run"]}
-    case Ev.NODE_UP:
-      s.nodes[b["node"]] = (b["gpus"], b.get("memory", 0))
-    case Ev.NODE_LOST:
-      s.nodes.pop(b["node"], None)
-      for x in s.workers.values():
-        if x.node == b["node"]:
-          x.node, x.gpus = None, ()
-    case Ev.PLACED if w:
-      if w.node != b["node"]:
-        w.gpus = ()
-      w.node = b["node"]
-    case Ev.UNPLACED if w:
-      w.node, w.gpus = None, ()
-  s.workers = {name: x for name, x in s.workers.items() if x.node or members(s, name)}
-  return s
-
-
 # ***** decide *****
 
 
-def decide(state: State, now: float) -> list[tuple[Ev, dict]]:
-  """Fold cluster assignments into a copy before choosing the next, so placements see one another."""
+def decide(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
+  """The cluster after fixing what's wrong, and what changed, in order. Each change lands in the copy before the next is chosen, so placements see one another."""
   s, out = copy.deepcopy(state), []
-  while d := next((d for step in (assign, unplace, place_next) if (d := step(s, now))), None):
-    s = fold(s, Event("", now, *d))
-    out.append(d)
-  return out
-
-
-def assign(s: State, now: float) -> tuple[Ev, dict] | None:
-  for run_id, r in sorted(s.runs.items()):
-    if not r.worker:
-      return Ev.ASSIGNED, {"run": run_id, "worker": choose_worker(s, r) or f"w{s.n + 1}"}
-
-
-def unplace(s: State, now: float) -> tuple[Ev, dict] | None:
   for name, w in sorted(s.workers.items()):
-    if w.node and not members(s, name):
-      return Ev.UNPLACED, {"worker": name, "rule": "place.emptied"}
-
-
-def place_next(s: State, now: float) -> tuple[Ev, dict] | None:
-  """Place one worker that has runs and no GPU, exclusive ones first."""
+    if w.node and w.node not in s.nodes:  # its node's heartbeat ran out
+      w.node, w.gpus = None, ()
+      out.append((Ev.UNPLACED, {"worker": name, "rule": "place.node_lost"}))
+  for run, r in sorted(s.runs.items()):
+    if not r.worker:
+      if not (worker := choose_worker(s, r)):
+        s.made += 1
+        worker = f"w{s.made}"
+      join(s, run, worker)
+      out.append((Ev.ASSIGNED, {"run": run, "worker": worker}))
+  for name, w in sorted(s.workers.items()):
+    if not members(s, name):
+      if w.node:
+        out.append((Ev.UNPLACED, {"worker": name, "rule": "place.emptied"}))
+      del s.workers[name]
   cap = max((g for g, _ in s.nodes.values()), default=0)
-  unplaced = [name for name, w in s.workers.items() if w.node is None and members(s, name) and w.kind.gpus <= cap]
-  if unplaced:
-    return Ev.PLACED, place(s, min(unplaced, key=lambda name: (not s.workers[name].kind.exclusive, name)))
+  waiting = [n for n, w in s.workers.items() if w.node is None and w.kind.gpus <= cap]
+  for name in sorted(waiting, key=lambda name: (not s.workers[name].kind.exclusive, name)):
+    out.append((Ev.PLACED, placed := place(s, name)))
+    s.workers[name].node = placed["node"]
+  return s, out
 
 
 def sampler_of(k: Kind) -> Kind | None:
@@ -343,36 +336,26 @@ def choose(s: State, node: str, running, name: str, avoid: tuple[int, ...] = ())
 
 # ***** the loop *****
 
-TICK_MS = getenv("TICK_MS", 100)  # how long it waits for an entry before it checks quanta and heartbeats again
-BATCH = 10_000  # entries read at once. It decides only once a read comes back short, so never from half the log
+TICK_MS = getenv("TICK_MS", 100)  # how long it waits for an entry before it looks at the table again
 
 
 async def run(bus: Bus, quantum: float = QUANTUM) -> None:
-  state, after, registry = State(quantum=quantum), "0-0", Registry(bus)
+  registry = Registry(bus)
   while True:
-    if await bus.event_log_size() < state.n:  # the log shrank, so Redis was flushed
-      state, after = State(quantum=quantum), "0-0"
-    events = await bus.read_events(after, count=BATCH, block_ms=TICK_MS)
-    for e in events:
-      state = fold(state, e)
-    after = events[-1].id if events else after
-    if len(events) == BATCH:
-      continue
-    if lost := sorted(set(state.nodes) - set(await bus.live_nodes())):  # their heartbeats ran out
-      for node in lost:
-        await bus.append_event(Ev.NODE_LOST, node=node)
-      continue  # decide once they are folded, so nothing is placed on them
+    await bus.read_events("$", count=1, block_ms=TICK_MS)  # wake on anything new, or each tick
     for session in await bus.expired_sessions():  # their clients stopped heartbeating
       await bus.end_session(session)
     # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
     await registry.unregister_checkpoints(*await registry.expired_checkpoints())
-    for decision, body in decide(state, time.time()):  # folded when it is read back on the next pass
-      if decision == Ev.ASSIGNED:
-        await bus.assign_run_to_worker(body["run"], body["worker"])
-      else:
-        await bus.append_event(decision, **body)
-    if events:
-      await bus.r.set(key("state"), json.dumps(dataclasses.asdict(state), sort_keys=True))
+    s = state_from(await bus.read_table())
+    s.quantum = quantum
+    new, changes = decide(s)
+    if not changes:
+      continue
+    assigned = {r: x.worker for r, x in new.runs.items() if x.worker != s.runs[r].worker}
+    workers = {n: {"kind": dataclasses.asdict(w.kind), "node": w.node} for n, w in new.workers.items()}
+    await bus.write_table(assigned, workers, sorted(s.workers.keys() - new.workers.keys()), new.made, changes)
+    await bus.r.set(key("state"), json.dumps(dataclasses.asdict(new), sort_keys=True))
 
 
 if __name__ == "__main__":

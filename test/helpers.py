@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import os
 import subprocess
 import tempfile
@@ -69,14 +70,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
   async def worker(self, run: str) -> str:
     """The run's worker, once every new run is assigned the way the scheduler assigns it."""
-    from tinyrl.control import scheduler
-
-    s = scheduler.State()
-    for e in await self.bus.read_events():
-      s = scheduler.fold(s, e)
-    for kind, body in scheduler.decide(s, 0.0):
-      if kind == "assigned":
-        await self.bus.assign_run_to_worker(body["run"], body["worker"])
+    await assign_new_runs(self.bus)
     return (await self.bus.get_run(run))["worker"]
 
   async def asyncTearDown(self):
@@ -84,6 +78,19 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
       task.cancel()
     await asyncio.gather(*self.renewal_tasks, return_exceptions=True)
     await self.bus.r.aclose()
+
+
+async def assign_new_runs(bus) -> None:
+  """Assign new runs the way the scheduler would, without placing anything."""
+  from tinyrl.control import scheduler
+
+  s = scheduler.state_from(await bus.read_table())
+  new, changes = scheduler.decide(s)
+  runs = {body["run"]: body["worker"] for kind, body in changes if kind == "assigned"}
+  made = {
+    w: {"kind": dataclasses.asdict(new.workers[w].kind), "node": None} for w in set(runs.values()) - s.workers.keys()
+  }
+  await bus.write_table(runs, made, [], new.made, [])
 
 
 class FakeEngine:

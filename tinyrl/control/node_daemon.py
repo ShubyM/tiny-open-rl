@@ -40,6 +40,10 @@ def gpu_memory_mib() -> int:
     return 0
 
 
+def layout(s: scheduler.State) -> tuple:
+  return {n: w.node for n, w in s.workers.items()}, {r: x.worker for r, x in s.runs.items()}
+
+
 def movable(w, gpus: int) -> bool:
   return w.kind.role == Role.TRAINER and w.kind.lora and len(w.gpus) == 1 and gpus > 1
 
@@ -57,7 +61,7 @@ class NodeDaemon:
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.running: dict[str, scheduler.Worker] = {}
     self.tasks: dict[str, asyncio.Task] = {}
-    self.state, self.after, self.serial = scheduler.State(), "0-0", 0
+    self.state, self.serial = scheduler.State(), 0
     self.changed, self.draining = asyncio.Event(), False
     self.heartbeat, self.lag = time.monotonic(), 0.0
     self.swept, self.uploading, self.sweeping = 0.0, None, None
@@ -114,10 +118,13 @@ class NodeDaemon:
         gone.add(node)  # one more look, in case it landed just before the node left
       await asyncio.sleep(0.5)
 
+  async def read_state(self) -> scheduler.State:
+    return scheduler.keep_gpus(scheduler.state_from(await self.bus.read_table()), self.state)
+
   async def announce_node(self) -> None:
-    await self.bus.node_heartbeat(self.id, self.gpus)
+    await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20)
     self.heartbeat = time.monotonic()
-    await self.bus.append_event(Ev.NODE_UP, node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)
+    await self.bus.append_event(Ev.NODE_UP, node=self.id, gpus=self.gpus, memory=self.gpu_mib * 2**20)  # for traces
 
   def open_trainer(self, worker: str, env: dict[str, str]) -> Process:
     width, cmd = len(self.running[worker].gpus), [sys.executable]
@@ -468,35 +475,24 @@ class NodeDaemon:
       self.notify()
 
   async def tick(self) -> None:
-    after = self.after
     workers = {
       n: dataclasses.asdict(r) | {"asked": r.ticket, "on": [(self.id, g) for g in r.gpus]}
       for n, r in self.running.items()
     }
-    await self.bus.node_heartbeat(self.id, self.gpus, workers, self.lag)
+    await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20, workers, self.lag)
     self.heartbeat = time.monotonic()
-    if await self.bus.event_log_size() < self.state.n:
-      for task in self.tasks.values():
-        if not task.cancelling():
-          task.cancel()
-      self.state, self.after = scheduler.State(), "0-0"
-    while events := await self.bus.read_events(self.after):
-      for e in events:
-        scheduler.fold(self.state, e)
-      self.after = events[-1].id
+    old, self.state = self.state, await self.read_state()
     self.dispatch()
     mine = {n for n, w in self.state.workers.items() if w.node == self.id and scheduler.members(self.state, n)}
     if not self.draining:
       for worker in sorted(mine - self.tasks.keys()):
         self.start(worker)
-    if self.id not in self.state.nodes and not self.tasks:
-      await self.announce_node()
     if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
       self.swept = time.time()
       self.sweeping = asyncio.create_task(self.registry.sweep(self.store, SWEEP_GRACE_S))
     if self.uploading is None or self.uploading.done():
       self.uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
-    if self.after != after:
+    if layout(old) != layout(self.state):
       self.notify()
 
   async def close(self, graceful: bool = True) -> None:
@@ -514,7 +510,7 @@ class NodeDaemon:
     uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
     while not uploading.done():  # live until its saves land, so other nodes wait for them instead of failing
       with contextlib.suppress(Exception):  # the uploads matter more than the heartbeat
-        await self.bus.node_heartbeat(self.id, self.gpus)
+        await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20)
       await asyncio.wait({uploading}, timeout=TICK)
     await uploading
 

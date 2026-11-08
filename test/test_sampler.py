@@ -269,9 +269,10 @@ class TestSampler(RedisTest):
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
 
   async def test_invalid_backlog_does_not_starve_a_ready_sibling(self):
-    for run in ("broken", "ready"):
-      await self.bus.create_run(Run(run, "sampler", "base", 4, role=Role.SAMPLER))
-    await self.bus.r.delete(key("run", "broken"))
+    await self.bus.create_run(
+      Run("broken", "sampler", "base", 4, role=Role.SAMPLER, model_path="tinker://x/sampler_weights/gone")
+    )
+    await self.bus.create_run(Run("ready", "sampler", "base", 4, role=Role.SAMPLER))
     requests = [await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(32)]
     ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
     bus, queued = self.bus, []
