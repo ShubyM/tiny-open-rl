@@ -28,5 +28,5 @@ class TestEvents(RedisTest):
     self.assertEqual(runs["a"], runs["b"])
     self.assertNotEqual(runs["a"], runs["f"])
     state = scheduler.from_table(await self.bus.read_table())
-    self.assertEqual(sorted(scheduler.runs_of(state, runs["a"])), ["a", "b"])
-    self.assertEqual(scheduler.runs_of(state, runs["f"]), ["f"])
+    self.assertEqual(sorted(scheduler.jobs_of(state, runs["a"])), ["a", "b"])
+    self.assertEqual(scheduler.jobs_of(state, runs["f"]), ["f"])

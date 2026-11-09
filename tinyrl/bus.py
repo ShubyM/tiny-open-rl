@@ -221,7 +221,7 @@ class Bus:
   # ***** the cluster's assignment *****
 
   async def read_table(self) -> dict:
-    """What the scheduler places from, read together: live nodes, each run's record and worker, and each worker's kind and node."""
+    """What the scheduler places from, read together: live nodes, each job's record and worker, and each worker's spec and node."""
     nodes, runs = await self.live_nodes(details=True), sorted(r.decode() for r in await self.r.smembers(key("runs")))
     p = self.r.pipeline(transaction=True)
     for run in runs:

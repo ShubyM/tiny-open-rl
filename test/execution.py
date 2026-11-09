@@ -82,7 +82,7 @@ class TestNode(NodeDaemon):
   async def worker_for(self, run):
     await assign_new_runs(self.bus)
     await self.sync()
-    return r.worker if (r := self.state.runs.get(run)) else None
+    return r.worker if (r := self.state.jobs.get(run)) else None
 
   async def drain(self, run):
     """Let the real worker coroutines finish the commands visible in their Redis streams."""
@@ -93,7 +93,7 @@ class TestNode(NodeDaemon):
       while True:
         await self.tick()
         queues = await asyncio.gather(
-          *(self.bus.queued_and_in_flight(r) for r in scheduler.runs_of(self.state, worker))
+          *(self.bus.queued_and_in_flight(r) for r in scheduler.jobs_of(self.state, worker))
         )
         if not any(q.get("queued") or q.get("in_flight") for q in queues):
           break

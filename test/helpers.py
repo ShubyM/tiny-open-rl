@@ -88,7 +88,7 @@ async def assign_new_runs(bus) -> None:
   new, changes = scheduler.decide(s)
   runs = {body["run"]: body["worker"] for kind, body in changes if kind == "assigned"}
   new_workers = {
-    w: {"kind": dataclasses.asdict(new.workers[w].kind), "node": None} for w in set(runs.values()) - s.workers.keys()
+    w: {"spec": dataclasses.asdict(new.workers[w].spec), "node": None} for w in set(runs.values()) - s.workers.keys()
   }
   await bus.write_table(runs, new_workers, [], new.workers_made, [])
 

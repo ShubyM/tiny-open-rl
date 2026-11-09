@@ -5,10 +5,10 @@ import unittest
 
 from tinyrl.bus import Cmd, Ev, Op, Role
 from tinyrl.control.scheduler import (
-  Kind,
-  Run,
-  State,
+  Assignment,
+  Job,
   Worker,
+  WorkerSpec,
   can_run,
   decide,
   from_table,
@@ -24,13 +24,13 @@ class Cluster:
   """The table the scheduler reads, kept here as it would be in Redis: node heartbeats, run records and the workers it wrote."""
 
   def __init__(self):
-    self.nodes, self.records, self.s = {}, {}, State()
+    self.nodes, self.records, self.s = {}, {}, Assignment()
 
   def table(self):
     return {
       "nodes": self.nodes,
-      "runs": {r: (rec, self.s.runs[r].worker if r in self.s.runs else "") for r, rec in self.records.items()},
-      "workers": {n: {"kind": dataclasses.asdict(w.kind), "node": w.node} for n, w in self.s.workers.items()},
+      "runs": {r: (rec, self.s.jobs[r].worker if r in self.s.jobs else "") for r, rec in self.records.items()},
+      "workers": {n: {"spec": dataclasses.asdict(w.spec), "node": w.node} for n, w in self.s.workers.items()},
       "workers_made": self.s.workers_made,
     }
 
@@ -48,7 +48,7 @@ class Cluster:
   def run(self, name, **body):
     self.records[name] = {"role": "trainer", "base": "a", "rank": 0} | body
     self.settle()
-    return self.s.runs[name].worker
+    return self.s.jobs[name].worker
 
   def delete(self, run):
     self.records.pop(run, None)
@@ -58,22 +58,22 @@ class Local:
   """Direct placement and reservations, with the same small runtime fields the node owns."""
 
   def __init__(self, test, gpus=1, memory=80 * GIB):
-    self.test, self.s, self.running, self.ticket = test, State(nodes={"n": (gpus, memory)}), {}, 0
+    self.test, self.s, self.running, self.ticket = test, Assignment(nodes={"n": (gpus, memory)}), {}, 0
 
   def add(self, name, *, at=None, sampler=False, lora=False, exclusive=False, width=1, busy=0.0):
-    kind = Kind(Role.SAMPLER if sampler else Role.TRAINER, name, lora, exclusive, gpus=width)
-    self.s.workers[name] = Worker(kind, "n", () if at is None else tuple(at))
-    self.s.runs[name] = Run(kind, name)
+    spec = WorkerSpec(Role.SAMPLER if sampler else Role.TRAINER, name, lora, exclusive, gpus=width)
+    self.s.workers[name] = Worker(spec, "n", () if at is None else tuple(at))
+    self.s.jobs[name] = Job(spec, name)
     if at is None:
       self.place()
-    self.running[name] = Worker(kind, "n", self.s.workers[name].gpus, busy=busy)
+    self.running[name] = Worker(spec, "n", self.s.workers[name].gpus, busy=busy)
     return self.running[name]
 
   def place(self):
     place_gpus(self.s, "n", self.running)
 
   def drop(self, name):
-    self.s.runs.pop(name)
+    self.s.jobs.pop(name)
     self.s.workers.pop(name)
     self.place()
 
@@ -94,7 +94,7 @@ class Local:
     for gpu in range(self.s.nodes["n"][0]):
       held = [r for r in self.running.values() if r.since is not None and gpu in r.gpus]
       if len(held) > 1:
-        sizes = [memory_budget(self.s, r.kind, "n") for r in held]
+        sizes = [memory_budget(self.s, r.spec, "n") for r in held]
         self.test.assertTrue(all(sizes))
         self.test.assertLessEqual(sum(sizes), self.s.nodes["n"][1])
     for r in self.running.values():
@@ -118,7 +118,9 @@ class TestCluster(unittest.TestCase):
   def test_a_new_worker_never_takes_a_name_in_use(self):
     c = Cluster()
     c.node("n", 1)
-    c.s.workers["w1"] = Worker(Kind(lora=True), "n")  # a worker the counter doesn't know about, as after a lost counter
+    c.s.workers["w1"] = Worker(
+      WorkerSpec(lora=True), "n"
+    )  # a worker the counter doesn't know about, as after a lost counter
     self.assertNotEqual(c.run("f"), "w1")
 
   def test_workers_go_to_the_node_with_the_fewest_workers_per_gpu(self):
@@ -218,7 +220,7 @@ class TestCluster(unittest.TestCase):
           c.node(name, rng.choice([1, 2, 4]))
         elif roll < 0.25:
           c.lose(name)
-        elif roll < 0.8 and name not in c.s.runs:
+        elif roll < 0.8 and name not in c.s.jobs:
           c.run(name, rank=rng.choice([0, 8]), base=str(rng.randrange(3)), gpus=rng.choice([1, 2]))
         else:
           c.delete(name)
