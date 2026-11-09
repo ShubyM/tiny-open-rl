@@ -219,10 +219,10 @@ counters:
 
 A run's wait includes waiting on its own earlier calls, since a run's calls run in order.
 
-`GET /api/v1/scheduling` combines cluster assignments with the latest live-node heartbeat: actual GPUs, waiting workers,
-reservations, accumulated busy time, and the owned process PID (or `null` before a sampling engine starts). These local
-snapshots are diagnostic; the node's live GPU state governs admission. Per-command timing is available with `DEBUG=1`.
-The Redis event log contains cluster assignments, and each node's GPU turns for traces.
+`GET /api/v1/scheduling` reads the cluster's assignment table and adds, from each node's latest heartbeat, its workers'
+actual GPUs and process PID (`null` before a sampling engine starts). GPU turns are the node's own; they are not in
+Redis. Per-command timing is available with `DEBUG=1`. The Redis event log traces runs and nodes coming and going, and
+the scheduler's decisions.
 
 Every model call (`model.<method>`), vLLM request (`vllm/<path>`) and checkpoint `store.put` or `store.get` is an NVTX range
 in the `tinyrl` domain. Without a profiler attached a range costs about a microsecond. To see where a node's time goes, run
