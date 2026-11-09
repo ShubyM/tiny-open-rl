@@ -99,8 +99,7 @@ change without touching scheduling. What's new, and who writes it:
 | `tinyrl:loc:<ref>` | string with TTL: peer address of a node daemon holding `<ref>` in `/dev/shm` | the node daemon that staged `<ref>` | any trainer or sampler calling `store.get` |
 | `tinyrl:owner:<worker>` | string with a 10 s TTL: the lease | the trainer that holds it | trainers, scheduler, gateway |
 | `tinyrl:node:<id>` | hash `{gpus, gpu_bytes, host_bytes, gpu_model, tier, addr, draining}` with a 30 s TTL; `tier` is `reserved` or `burst`, from a node label | that node daemon | scheduler, store |
-| `tinyrl:events` | stream: the log placement and GPU turns are decided from. Facts like `run_created`, `node_up` and `wants_gpu`, and the scheduler's decisions, `placed`, `unplaced`, `granted` and `revoked` | the gateway, node daemons, trainers and samplers append facts; the scheduler appends decisions | the scheduler, node daemons, trainers, samplers |
-| `tinyrl:state` | JSON: the scheduler's current state, placements and turns | the scheduler | gateway |
+| `tinyrl:events` | stream: a trace of runs and nodes coming and going, `run_created`, `run_deleted`, `node_up`, and the scheduler's decisions, `assigned`, `placed`, `unplaced`. Nothing is decided from it | the gateway and node daemons append facts; the scheduler appends decisions | traces; the scheduler wakes on it |
 | `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | counters (built): calls run, time queued, time running | `Bus.write_reply`, under the worker's lease | scheduler, `GET /metrics` |
 | `gpu_bytes`, `host_bytes` in `tinyrl:run:<run>` | measured state size, so a move's cost is known | the run's trainer | scheduler |
 

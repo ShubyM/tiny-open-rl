@@ -6,10 +6,9 @@ import asyncio
 import copy
 import dataclasses
 import itertools
-import json
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus, Cmd, Ev, Op, Role, key
+from tinyrl.bus import Bus, Cmd, Ev, Op, Role
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 
@@ -361,7 +360,6 @@ async def run(bus: Bus, quantum: float = QUANTUM) -> None:
     s = from_table(await bus.read_table())
     s.quantum = quantum
     new, changes = decide(s)
-    await bus.r.set(key("state"), json.dumps(dataclasses.asdict(new), sort_keys=True))  # what the gateway shows
     if not changes:
       continue
     assigned = {r: x.worker for r, x in new.jobs.items() if x.worker != s.jobs[r].worker}
