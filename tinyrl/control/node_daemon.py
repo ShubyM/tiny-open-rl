@@ -65,22 +65,6 @@ class NodeDaemon:
     self.changed, self.draining = asyncio.Event(), False
     self.heartbeat, self.lag = time.monotonic(), 0.0
     self.swept, self.uploading, self.sweeping = 0.0, None, None
-    self.turns: asyncio.Queue | None = None
-    self.logging: asyncio.Task | None = None
-
-  def log(self, kind: Ev, worker: str, **body) -> None:
-    """Append a turn to the event log, in order and without waiting, for traces and the dashboard. No scheduler folds it."""
-    if self.logging is None:
-      self.turns, self.logging = asyncio.Queue(), asyncio.create_task(self.append_turns())
-    self.turns.put_nowait((kind, {"worker": worker, **body}))
-
-  async def append_turns(self) -> None:
-    while True:
-      kind, body = await self.turns.get()
-      try:
-        await self.bus.append_event(kind, **body)
-      except Exception as e:  # a trace that misses a turn is better than a worker that stops
-        print(f"could not log {kind}: {e!r}", file=sys.stderr, flush=True)
 
   def notify(self) -> None:
     changed, self.changed = self.changed, asyncio.Event()
@@ -95,12 +79,10 @@ class NodeDaemon:
       with span("node.request_gpu"):
         self.serial += 1
         r.ticket = self.serial
-      self.log(Ev.WANTS_GPU, worker)
       self.notify()
     if scheduler.can_run(self.state, self.id, self.running, worker):
       with span("node.grant_gpu"):
         r.since, r.ticket = time.time(), 0
-      self.log(Ev.GRANTED, worker)
       self.notify()
       return True
     return False
@@ -213,8 +195,6 @@ class NodeDaemon:
     def ready():
       return [c for c in heads if c.request_id in prepared and prepared[c.request_id].done()]
 
-    took = {}  # request -> ms it took, for the batch_done trace event
-
     async def answer(cmd, inputs):
       before = time.time()
       with span("node.execute"):
@@ -242,9 +222,8 @@ class NodeDaemon:
       with span("node.publish"):
         if not await self.bus.write_reply(cmd, reply, worker, owner, started=before):
           raise RuntimeError(f"lost worker {worker}")
-      took[cmd.request_id] = (time.time() - before) * 1000
       if DEBUG:
-        print(f"{worker} {cmd.request_id} {cmd.op:24s} {took[cmd.request_id]:9.2f} ms")
+        print(f"{worker} {cmd.request_id} {cmd.op:24s} {(time.time() - before) * 1000:9.2f} ms")
       return reply
 
     def wanted():
@@ -295,7 +274,6 @@ class NodeDaemon:
         with span("node.park"):
           await model.park() if sampling else await model.call("park")
         r.since = None
-        self.log(Ev.RELEASED, worker)
         self.notify()
       if r.gpus != gpus:
         r.gpus = gpus
@@ -343,13 +321,6 @@ class NodeDaemon:
         reply = await answer(cmd, inputs[cmd.run])
       seconds = time.monotonic() - before
       r.busy += seconds
-      self.log(
-        Ev.BATCH_DONE,
-        worker,
-        seconds=seconds,
-        queued=len(heads),
-        ops=[[c.op, took.pop(c.request_id, 0.0)] for c in cmds],  # a wave's overlap, so traces draw requests in flight
-      )
       for cmd in cmds:
         service[cmd.run] = service.get(cmd.run, 0.0) + seconds * len(r.gpus) / len(cmds)
       active = {c.run for c in [*ready(), *cmds]}
@@ -372,10 +343,7 @@ class NodeDaemon:
           except (Exception, asyncio.CancelledError) as e:
             print(f"{worker} could not close, retrying: {e!r}", file=sys.stderr, flush=True)
             await asyncio.sleep(TICK)
-      if r.since is not None:
-        self.log(Ev.RELEASED, worker)
       r.since = None  # release only after the child has acknowledged park or close
-      self.log(Ev.EXITED, worker)
       self.notify()
       if guard:
         guard.cancel()
@@ -400,7 +368,6 @@ class NodeDaemon:
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
       model = self.open_sampler(worker, env) if sampling else self.open_trainer(worker, env)
       r.pid = model.proc.pid if model.proc else None
-      self.log(Ev.STARTED, worker, node=self.id)
       guard = asyncio.create_task(keepalive())
       reader = asyncio.create_task(read())
       reader.add_done_callback(lambda _: self.notify())
@@ -475,10 +442,7 @@ class NodeDaemon:
       self.notify()
 
   async def tick(self) -> None:
-    workers = {
-      n: dataclasses.asdict(r) | {"asked": r.ticket, "on": [(self.id, g) for g in r.gpus]}
-      for n, r in self.running.items()
-    }
+    workers = {n: {"gpus": r.gpus, "pid": r.pid} for n, r in self.running.items()}  # where its processes are
     await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20, workers, self.lag)
     self.heartbeat = time.monotonic()
     old, self.state = self.state, await self.read_state()
@@ -505,8 +469,6 @@ class NodeDaemon:
           task.cancel()
       await asyncio.gather(*self.tasks.values(), return_exceptions=True)
       self.dispatch()
-    if self.logging:
-      self.logging.cancel()
     uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
     while not uploading.done():  # live until its saves land, so other nodes wait for them instead of failing
       with contextlib.suppress(Exception):  # the uploads matter more than the heartbeat
