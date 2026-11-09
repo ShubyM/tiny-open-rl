@@ -3,11 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
-import os
-import shutil
-import sys
 import time
 
 from redis.exceptions import WatchError
@@ -98,47 +94,17 @@ class Registry:
     """The checkpoints whose TTL has run out."""
     return [u.decode() for u in await self.r.zrangebyscore(key("expiry"), 0, time.time())]
 
-  async def registered_versions(self) -> set[str]:
-    """The version of every checkpoint in the registry, parked ones too."""
-    found = set()
+  async def registered(self) -> tuple[set[str], set[str]]:
+    """Every checkpoint in the registry, parked ones too, and their versions."""
+    uris, versions = set(), set()
     async for k in self.r.scan_iter(match=key("ckpt", "*")):
-      found |= {json.loads(v).get("version") for v in await self.r.hvals(k)}
-    return found - {None}
-
-  async def first_registered_at(self) -> float | None:
-    """When the first checkpoint was registered. A sweep leaves files older than that alone."""
-    since = await self.r.get(key("ckpt_since"))
-    return float(since) if since else None
+      run = k.decode().removeprefix(key("ckpt", ""))
+      for cid, info in (await self.r.hgetall(k)).items():
+        uris.add(f"tinker://{run}/{cid.decode()}")
+        versions.add(json.loads(info).get("version"))
+    return uris, versions - {None}
 
   async def sweep(self, store: Store, grace: float) -> None:
-    """Delete the checkpoints in this node's store that the registry doesn't have: deleted, expired, or their run's. Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before. Then the links of full sampler weight chains no registered checkpoint is built from. It also keeps the node's cache of a bucket store under CKPT_CACHE_BYTES."""
-    await asyncio.to_thread(store.trim_cache)
-    if (since := await self.first_registered_at()) is None:
-      return
-    for uri in await asyncio.to_thread(store.list_checkpoints):
-      try:
-        if await self.get_checkpoint(uri) is None:
-          saved = await asyncio.to_thread(store.saved_at, uri)
-          if since < saved < time.time() - grace:
-            await asyncio.to_thread(store.delete, uri)
-      except Exception as e:  # one checkpoint it can't read or delete mustn't stop the rest of the sweep
-        print(f"sweep could not delete {uri}, trying again next sweep: {e!r}", file=sys.stderr, flush=True)
-    await asyncio.to_thread(
-      store.delete_unused_chain_links,
-      await self.registered_versions(),
-      since,
-      time.time() - grace,
-    )
-    if os.path.isdir(store.cache):
-      for e in list(os.scandir(store.cache)):
-        if e.name.endswith(".upload") and since < e.stat().st_mtime < time.time() - grace:
-          try:
-            with open(e.path) as f:
-              uri = json.load(f)["uri"]
-          except Exception:
-            continue
-          if await self.get_checkpoint(uri) is None:
-            version = e.name.removesuffix(".upload")
-            await asyncio.to_thread(shutil.rmtree, f"{store.cache}/{version}", ignore_errors=True)
-            with contextlib.suppress(OSError):
-              await asyncio.to_thread(os.unlink, e.path)
+    """Let the node's store delete what the registry doesn't have. Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before."""
+    since = await self.r.get(key("ckpt_since"))  # when the first checkpoint was registered
+    await asyncio.to_thread(store.sweep, *await self.registered(), float(since) if since else None, grace)

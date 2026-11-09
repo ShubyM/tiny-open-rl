@@ -26,7 +26,8 @@ class TestStore(unittest.TestCase):
       "b": torch.randn(8, dtype=torch.bfloat16),
       "w.step": torch.tensor(3.0),
     }
-    folder = store.put(uri, want, {"optimizer": True})
+    store.put(uri, want, {"optimizer": True})
+    folder = store.path(uri)
     self.assertEqual(os.listdir(folder), ["state.safetensors"])
 
     got, meta = store.get(uri)
@@ -42,10 +43,10 @@ class TestStore(unittest.TestCase):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     uri = "tinker://run-1/sampler_weights/step-1"
-    saver.put(uri, {"w": torch.ones(4)}, {"lora": True, "config": {"r": 4}})
-    saver.upload_pending_saves()  # the node daemon's job
+    saved = saver.put(uri, {"w": torch.ones(4)}, {"lora": True, "config": {"r": 4}})
+    saver.upload_pending_saves()  # what start() does in the background
 
-    folder, version = loader.local_folder(uri, saver.versions[uri])
+    folder, version = loader.local_folder(uri, saved)
     self.assertEqual(sorted(os.listdir(folder)), ["adapter_config.json", "adapter_model.safetensors"])
     self.assertTrue(torch.equal(loader.get(uri)[0]["w"], torch.ones(4)))
     self.assertEqual(loader.local_folder(uri), (folder, version))  # downloaded once
@@ -85,7 +86,8 @@ class TestStore(unittest.TestCase):
       "w2": torch.randn(8, dtype=torch.bfloat16),
       "w3": torch.tensor(3.0),
     }
-    folder = store.put(uri, want, {"optimizer": True, "lora": False})
+    store.put(uri, want, {"optimizer": True, "lora": False})
+    folder = store.path(uri)
     files = sorted(os.listdir(folder))
     self.assertTrue(any("state-00001-of-" in f for f in files))
 
@@ -99,7 +101,8 @@ class TestStore(unittest.TestCase):
     _, v2 = store.local_folder(uri)
     self.assertNotEqual(v1, v2)
 
-    sampler_folder = store.put(uri + "-sampler", want, {"lora": False, "config": {"test": True}})
+    store.put(uri + "-sampler", want, {"lora": False, "config": {"test": True}})
+    sampler_folder = store.path(uri + "-sampler")
     sampler_files = sorted(os.listdir(sampler_folder))
     self.assertIn("config.json", sampler_files)
     self.assertIn("model.safetensors.index.json", sampler_files)
@@ -110,7 +113,8 @@ class TestStore(unittest.TestCase):
       "t3": torch.ones(8, dtype=torch.uint8),
       "t4": torch.ones(8, dtype=torch.uint8),
     }
-    huge_folder = store.put(uri + "-huge", want_huge, {"lora": False, "config": {"test": True}})
+    store.put(uri + "-huge", want_huge, {"lora": False, "config": {"test": True}})
+    huge_folder = store.path(uri + "-huge")
     st_file = next(f for f in sorted(os.listdir(huge_folder)) if f.endswith(".safetensors"))
     import safetensors
 
@@ -217,8 +221,7 @@ class TestStore(unittest.TestCase):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     uri = "tinker://r/weights/final"
-    saver.put(uri, {"w": torch.ones(4)})  # returns before anything uploads it
-    version = saver.versions[uri]
+    version = saver.put(uri, {"w": torch.ones(4)})  # returns before anything uploads it
     self.assertTrue(saver.landed(uri, version))
     self.assertTrue(torch.equal(saver.get(uri)[0]["w"], torch.ones(4)))  # this node reads it at once
     self.assertFalse(loader.landed(uri, version))
@@ -232,13 +235,13 @@ class TestStore(unittest.TestCase):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     w, meta, uris = torch.randn(128, 128).to(torch.bfloat16), {"lora": False, "config": {"model_type": "x"}}, []
+    versions = []
     # two files, many chunks
     for step in range(3):
       w.view(-1)[step::101] *= 2  # a step changes a few values
       uris.append(f"tinker://r/sampler_weights/{step}")
-      saver.put(uris[-1], {"w": w.clone(), "b": torch.ones(8)}, meta)
+      versions.append(saver.put(uris[-1], {"w": w.clone(), "b": torch.ones(8)}, meta))
     saver.upload_pending_saves()
-    versions = [saver.versions[u] for u in uris]
     self.assertEqual([v.rpartition(".")[2] for v in versions], ["0", "1", "2"])
     self.assertEqual(len({v.rpartition(".")[0] for v in versions}), 1)
     links = f"{saver.base}/r/_versions"
@@ -259,8 +262,7 @@ class TestStore(unittest.TestCase):
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     meta, v = {"config": {"model_type": "x"}}, []
     for step in range(KEYFRAME_EVERY + 2):
-      saver.put(f"tinker://r/sampler_weights/{step}", {"w": torch.full((64,), float(step))}, meta)
-      v.append(saver.versions[f"tinker://r/sampler_weights/{step}"])
+      v.append(saver.put(f"tinker://r/sampler_weights/{step}", {"w": torch.full((64,), float(step))}, meta))
       saver.upload_pending_saves()
       if step == KEYFRAME_EVERY:
         os.unlink(f"{saver.cache}/{v[-1]}.uploaded")  # as if its upload failed
@@ -286,14 +288,13 @@ class TestStore(unittest.TestCase):
     w = torch.randn(128, 128).to(torch.bfloat16)
     safetensors.torch.save_file({"w": w.clone(), "b": torch.ones(8)}, f"{base}/model.safetensors")
     saver = Store(root, cache=tempfile.mkdtemp())
-    meta, uris = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{base}"}, []
+    meta, uris, versions = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{base}"}, [], []
     for step in range(2):
       w.view(-1)[step::101] *= 2  # a step changes a few values
       uris.append(f"tinker://r/sampler_weights/{step}")
       # "new" isn't in the base, so it goes up as all its bytes
-      saver.put(uris[-1], {"w": w.clone(), "b": torch.ones(8), "new": torch.randn(8)}, meta)
+      versions.append(saver.put(uris[-1], {"w": w.clone(), "b": torch.ones(8), "new": torch.randn(8)}, meta))
     saver.upload_pending_saves()
-    versions = [saver.versions[u] for u in uris]
     self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/0/_latest"))["from"], "base")
     self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/1/_latest"))["from"], "base")
     whole = sum(os.path.getsize(f) for f in glob.glob(f"{saver.cache}/{versions[0]}/*.safetensors"))
@@ -310,9 +311,8 @@ class TestStore(unittest.TestCase):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     meta = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{tempfile.mkdtemp()}/missing"}
-    saver.put("tinker://r/sampler_weights/0", {"w": torch.randn(64)}, meta)
+    version = saver.put("tinker://r/sampler_weights/0", {"w": torch.randn(64)}, meta)
     saver.upload_pending_saves()
-    version = saver.versions["tinker://r/sampler_weights/0"]
     self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/0/_latest"))["from"], version)
     got = loader.get("tinker://r/sampler_weights/0")[0]["w"]
     self.assertTrue(torch.equal(got, saver.get("tinker://r/sampler_weights/0")[0]["w"]))
@@ -326,9 +326,8 @@ class TestStore(unittest.TestCase):
     saver = Store(root=root, cache=tempfile.mkdtemp())
     uri_0, uri_1 = "tinker://r/sampler_weights/0", "tinker://r/sampler_weights/1"
     meta = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{base_model_dir}"}
-    saver.put(uri_0, {"w": torch.ones(8)}, meta)
+    v0 = saver.put(uri_0, {"w": torch.ones(8)}, meta)
     saver.upload_pending_saves()
-    v0 = saver.versions[uri_0]
     saver.fs.rm(f"{saver.base}/r/_versions/{v0}", recursive=True)
     saver.put(uri_1, {"w": torch.ones(8) * 2}, meta)
     saver.upload_pending_saves()
@@ -387,6 +386,20 @@ class TestRegistry(RedisTest):
     await self.bus.r.set(key("ckpt_since"), time.time() - 1200)
     await self.registry.sweep(store, 600)
     self.assertEqual(set(store.list_checkpoints()), {before, kept, young})
+
+  async def test_sweep_deletes_an_unregistered_save_still_waiting_to_upload(self):
+    store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
+    kept, dropped = "tinker://r/weights/kept", "tinker://r/weights/dropped"
+    versions = [store.put(uri, {"w": torch.ones(1)}) for uri in (kept, dropped)]
+    for version in versions:
+      os.utime(f"{store.cache}/{version}.upload", (time.time() - 900, time.time() - 900))
+    await self.registry.register_checkpoint(kept, 1, version=versions[0])
+    await self.bus.r.set(key("ckpt_since"), time.time() - 1200)
+    await self.registry.sweep(store, 600)
+    self.assertTrue(os.path.isdir(f"{store.cache}/{versions[0]}"))
+    self.assertTrue(os.path.exists(f"{store.cache}/{versions[0]}.upload"))
+    self.assertFalse(os.path.isdir(f"{store.cache}/{versions[1]}"))
+    self.assertFalse(os.path.exists(f"{store.cache}/{versions[1]}.upload"))
 
 
 if __name__ == "__main__":

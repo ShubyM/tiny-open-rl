@@ -54,9 +54,7 @@ class NodeDaemon:
   ):
     self.bus, self.registry = bus, Registry(bus)
     self.store = store if store is not None else Store()
-    # a sampler restored from a snapshot sees only the folders under /tmp and /dev/shm that exist when it restores
-    for folder in [self.store.cache] + ([] if self.store.remote else [self.store.base]):
-      os.makedirs(folder, exist_ok=True)
+    self.store.start()
     self.gpus, self.id = gpus, node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.running: dict[str, scheduler.Worker] = {}
@@ -64,7 +62,7 @@ class NodeDaemon:
     self.state, self.serial = scheduler.Assignment(), 0
     self.changed, self.draining = asyncio.Event(), False
     self.heartbeat, self.lag = time.monotonic(), 0.0
-    self.swept, self.uploading, self.sweeping = 0.0, None, None
+    self.swept, self.sweeping = 0.0, None
 
   def notify(self) -> None:
     changed, self.changed = self.changed, asyncio.Event()
@@ -363,7 +361,7 @@ class NodeDaemon:
       self.running[worker] = r
       env = {**scheduler.settings(r.spec, self.gpus, self.gpu_mib * 2**20), **os.environ}
       env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(self.gpus) if movable(r, self.gpus) else r.gpus))
-      env["CKPT"], env["CKPT_CACHE"] = self.store.root, self.store.cache
+      env.update(self.store.env())
       if not sampling:
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
       model = self.open_sampler(worker, env) if sampling else self.open_trainer(worker, env)
@@ -454,8 +452,6 @@ class NodeDaemon:
     if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
       self.swept = time.time()
       self.sweeping = asyncio.create_task(self.registry.sweep(self.store, SWEEP_GRACE_S))
-    if self.uploading is None or self.uploading.done():
-      self.uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
     if assignment(old) != assignment(self.state):
       self.notify()
 
@@ -469,12 +465,12 @@ class NodeDaemon:
           task.cancel()
       await asyncio.gather(*self.tasks.values(), return_exceptions=True)
       self.dispatch()
-    uploading = asyncio.create_task(asyncio.to_thread(self.store.upload_pending_saves))
-    while not uploading.done():  # live until its saves land, so other nodes wait for them instead of failing
+    closing = asyncio.create_task(asyncio.to_thread(self.store.close))
+    while not closing.done():  # live until its saves land, so other nodes wait for them instead of failing
       with contextlib.suppress(Exception):  # the uploads matter more than the heartbeat
         await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20)
-      await asyncio.wait({uploading}, timeout=TICK)
-    await uploading
+      await asyncio.wait({closing}, timeout=TICK)
+    await closing
 
   async def serve(self) -> None:
     await self.announce_node()

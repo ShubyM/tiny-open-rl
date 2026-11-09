@@ -2,9 +2,9 @@
 
 Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors + config.json, sharded with a model.safetensors.index.json when large).
 
-CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. upload_pending_saves() uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon runs it, so a trainer exits, and gives its GPUs back, right after its last save. Another node's daemon waits for the version it wants to land while the node that saved it is live, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
+CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. After start(), a background thread uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon starts it, so a trainer exits, and gives its GPUs back, right after its last save. Another node's daemon waits for the version it wants to land while the node that saved it is live, then downloads it once into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
 
-A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named <keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0 goes up as the bytes that changed from the base model if this node has it, else whole, and every link whose parent didn't upload goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC per chunk, and a node rebuilds a link from the newest one it has. delete_unused_chain_links() deletes the links nothing is built from.
+A full fine-tune's sampler weights change in few bf16 values a step, so its saves form a chain per run, named <keyframe>.<n>, kept under <run>/_versions/ while any checkpoint is built from them. Link 0 goes up as the bytes that changed from the base model if this node has it, else whole, and every link whose parent didn't upload goes up whole. The rest go up as the bytes that changed from the link before, zlib compressed, with a CRC per chunk, and a node rebuilds a link from the newest one it has. sweep() deletes the links nothing is built from.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import weakref
 import zlib
@@ -45,6 +46,7 @@ STREAM_CHUNK = 256 * 1024 * 1024
 CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)
 KEYFRAME_EVERY = getenv("KEYFRAME_EVERY", 8)  # the most links in a chain of full sampler weights
 XOR_CHUNK = 16 * 1024 * 1024
+UPLOAD_EVERY = 0.25  # seconds between looks for new saves to upload
 
 
 def pinned_bytes(size: int) -> torch.Tensor:
@@ -183,12 +185,37 @@ class Store:
     self.cache = CKPT_CACHE if cache is None else cache
     self.buffers: dict[int, list[torch.Tensor]] = {}  # shard -> pinned buffers its writer keeps, since pinning is slow
     self.lock = threading.RLock()  # one save at a time, since saves share self.buffers
-    self.uploading = threading.Lock()
-    self.versions: dict[str, str] = {}  # uri -> the version this process last saved
+    self.uploading, self.stopping, self.uploader = threading.Lock(), threading.Event(), None
     self.chains: dict[str, str] = {}  # run -> the last link of its chain this process saved
 
   def path(self, uri: str) -> str:
     return f"{self.base}/{uri.removeprefix('tinker://')}"
+
+  def env(self) -> dict[str, str]:
+    """What a worker process on this node needs to open the same store."""
+    return {"CKPT": self.root, "CKPT_CACHE": self.cache}
+
+  def start(self) -> None:
+    """Make this node's folders, and upload its saves behind from now on. The node daemon calls it once."""
+    # a sampler restored from a snapshot sees only the folders under /tmp and /dev/shm that exist when it restores
+    for folder in [self.cache] + ([] if self.remote else [self.base]):
+      os.makedirs(folder, exist_ok=True)
+    self.uploader = threading.Thread(target=self.keep_uploading, daemon=True)
+    self.uploader.start()
+
+  def keep_uploading(self) -> None:
+    while not self.stopping.wait(UPLOAD_EVERY):
+      try:
+        self.upload_pending_saves()
+      except Exception as e:  # the next pass tries again
+        print(f"upload pass failed: {e!r}", file=sys.stderr, flush=True)
+
+  def close(self) -> None:
+    """Return once every save this node made has uploaded."""
+    self.stopping.set()
+    if self.uploader:
+      self.uploader.join()
+    self.upload_pending_saves()
 
   # ***** put *****
 
@@ -265,7 +292,8 @@ class Store:
     return [*files, *weights]
 
   @span("store.put")
-  def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str:
+  def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str | None:
+    """Save a checkpoint, and return the version to read it by on another node. A local store has no versions: None."""
     dest = self.path(uri)
     if self.remote:
       os.makedirs(self.cache, exist_ok=True)
@@ -281,12 +309,11 @@ class Store:
       finally:
         shutil.rmtree(folder, ignore_errors=True)
       self.record_latest_version(uri, version)
-      self.versions[uri] = version
       with open(f"{self.cache}/{version}.upload.tmp", "w") as f:
         json.dump({"uri": uri, "names": names}, f)
       # upload_pending_saves() takes it from here
       os.replace(f"{self.cache}/{version}.upload.tmp", f"{self.cache}/{version}.upload")
-      return dest
+      return version
     parent, base = os.path.dirname(dest), os.path.basename(dest)
     os.makedirs(parent, exist_ok=True)
     folder = tempfile.mkdtemp(dir=parent, prefix=f".{base}.")
@@ -314,7 +341,7 @@ class Store:
         shutil.rmtree(folder, ignore_errors=True)
       if os.path.lexists(link):  # left only if the swap failed
         os.unlink(link)
-    return dest
+    return None
 
   def record_latest_version(self, uri: str, version: str) -> None:
     """Record on this node which version of a checkpoint it saved last, for this node's other processes."""
@@ -579,13 +606,29 @@ class Store:
       return max((self.fs.modified(f).timestamp() for f in self.fs.find(self.path(uri))), default=0.0)
     return os.lstat(self.path(uri)).st_mtime
 
-  def delete_unused_chain_links(self, live: set[str], since: float, before: float) -> None:
-    """Delete the links of chains that none of the live versions is built from, uploaded between since and before."""
-    keep = {f"{k}.{i}" for v in live if "." in v for k, _, n in [v.rpartition(".")] for i in range(int(n) + 1)}
+  def sweep(self, registered: set[str], versions: set[str], since: float | None, grace: float) -> None:
+    """Delete what the registry doesn't have, saved after since, when it began, and more than grace seconds ago: checkpoints deleted, expired or their run's, the links of chains none of the versions is built from, and saves of those checkpoints still waiting to upload. Then keep the cache under CKPT_CACHE_BYTES."""
+    self.trim_cache()
+    if since is None:  # so turning the registry on never deletes what came before
+      return
+    before = time.time() - grace
+    for uri in set(self.list_checkpoints()) - registered:
+      try:
+        if since < self.saved_at(uri) < before:
+          self.delete(uri)
+      except Exception as e:  # one checkpoint it can't read or delete mustn't stop the rest of the sweep
+        print(f"sweep could not delete {uri}, trying again next sweep: {e!r}", file=sys.stderr, flush=True)
+    keep = {f"{k}.{i}" for v in versions if "." in v for k, _, n in [v.rpartition(".")] for i in range(int(n) + 1)}
     for links in self.fs.glob(f"{self.base}/*/_versions/*") if self.remote else []:
       if links.rsplit("/", 1)[1] not in keep and (files := self.fs.ls(links, detail=False)):
         if since < self.fs.modified(files[0]).timestamp() < before:
           self.fs.rm(links, recursive=True)
+    for e in list(os.scandir(self.cache)) if os.path.isdir(self.cache) else []:
+      if e.name.endswith(".upload") and since < e.stat().st_mtime < before:
+        with contextlib.suppress(OSError, ValueError), open(e.path) as f:  # it may have uploaded meanwhile
+          if json.load(f)["uri"] not in registered:
+            shutil.rmtree(f"{self.cache}/{e.name.removesuffix('.upload')}", ignore_errors=True)
+            os.unlink(e.path)
 
   def trim_cache(self) -> None:
     """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the bucket has: a version still uploading stays."""
