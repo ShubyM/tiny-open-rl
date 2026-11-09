@@ -218,11 +218,38 @@ class Bus:
     p.xadd(key("events"), {"kind": Ev.RUN_CREATED, "body": json.dumps(body)})
     await p.execute()
 
-  async def assign_run_to_worker(self, run: str, worker: str) -> None:
-    """The scheduler's assignment of a run to a worker, with its log entry, at once. Only the scheduler writes it."""
+  # ***** the cluster's assignment *****
+
+  async def read_table(self) -> dict:
+    """What the scheduler places from, read together: live nodes, each job's record and worker, and each worker's spec and node."""
+    nodes, runs = await self.live_nodes(details=True), sorted(r.decode() for r in await self.r.smembers(key("runs")))
     p = self.r.pipeline(transaction=True)
-    p.hset(key("run", run), "worker", worker)
-    p.xadd(key("events"), {"kind": Ev.ASSIGNED, "body": json.dumps({"run": run, "worker": worker})})
+    for run in runs:
+      p.hmget(key("run", run), "record", "worker")
+    p.hgetall(key("workers"))
+    p.get(key("workers_made"))
+    *records, workers, workers_made = await p.execute()
+    return {
+      "nodes": nodes,
+      "runs": {r: (json.loads(rec), w and w.decode()) for r, (rec, w) in zip(runs, records) if rec},
+      "workers": {k.decode(): json.loads(v) for k, v in workers.items()},
+      "workers_made": int(workers_made or 0),
+    }
+
+  async def write_table(
+    self, assigned: dict[str, str], workers: dict[str, dict], gone: list[str], workers_made: int, changes: list
+  ) -> None:
+    """The scheduler's new assignment, and a trace entry for each change, at once. Only the scheduler writes it."""
+    p = self.r.pipeline(transaction=True)
+    for run, worker in assigned.items():
+      p.hset(key("run", run), "worker", worker)
+    if workers:
+      p.hset(key("workers"), mapping={n: json.dumps(w) for n, w in workers.items()})
+    if gone:
+      p.hdel(key("workers"), *gone)
+    p.set(key("workers_made"), workers_made)
+    for kind, body in changes:
+      p.xadd(key("events"), {"kind": kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True)
     await p.execute()
 
   async def get_run(self, run_id: str) -> dict | None:
@@ -434,8 +461,10 @@ class Bus:
 
   # ***** nodes *****
 
-  async def node_heartbeat(self, node: str, gpus: int, workers: dict | None = None, lag: float = 0.0) -> None:
-    beat = {"gpus": gpus, "until": time.time() + NODE_MS / 1000, "workers": workers or {}, "lag": lag}
+  async def node_heartbeat(
+    self, node: str, gpus: int, memory: int = 0, workers: dict | None = None, lag: float = 0.0
+  ) -> None:
+    beat = {"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, "workers": workers or {}, "lag": lag}
     await self.r.hset(key("nodes"), node, json.dumps(beat))
 
   async def live_nodes(self, details: bool = False) -> dict:
@@ -485,13 +514,6 @@ class Bus:
       key("events"), {"kind": Ev(_kind), "body": json.dumps(body)}, maxlen=1_000_000, approximate=True
     )
     return entry_id.decode()
-
-  async def event_log_size(self) -> int:
-    """How many entries were ever appended to the log. It drops below what a reader folded only if Redis was flushed."""
-    try:
-      return (await self.r.xinfo_stream(key("events")))["entries-added"]
-    except redis.ResponseError:  # no log yet
-      return 0
 
   async def read_events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[Event]:
     """The entries after stream id `after`, waiting up to block_ms for one, or not at all if it is 0."""

@@ -1,17 +1,18 @@
 import copy
+import dataclasses
 import random
 import unittest
 
-from tinyrl.bus import Cmd, Ev, Event, Op, Role
+from tinyrl.bus import Cmd, Ev, Op, Role
 from tinyrl.control.scheduler import (
-  Kind,
-  Run,
-  State,
+  Assignment,
+  Job,
   Worker,
-  budget,
+  WorkerSpec,
   can_run,
   decide,
-  fold,
+  from_table,
+  memory_budget,
   place_gpus,
   select_runs,
 )
@@ -20,51 +21,59 @@ GIB, MIB = 2**30, 2**20
 
 
 class Cluster:
-  """Only cluster assignments are logged. Local GPU placement and reservations never enter this log."""
+  """The table the scheduler reads, kept here as it would be in Redis: node heartbeats, run records and the workers it wrote."""
 
   def __init__(self):
-    self.s, self.entries = State(), []
+    self.nodes, self.records, self.s = {}, {}, Assignment()
 
-  def append(self, kind, **body):
-    self.entries.append(Event(str(len(self.entries)), 0.0, kind, body))
-    fold(self.s, self.entries[-1])
+  def table(self):
+    return {
+      "nodes": self.nodes,
+      "runs": {r: (rec, self.s.jobs[r].worker if r in self.s.jobs else "") for r, rec in self.records.items()},
+      "workers": {n: {"spec": dataclasses.asdict(w.spec), "node": w.node} for n, w in self.s.workers.items()},
+      "workers_made": self.s.workers_made,
+    }
 
   def settle(self):
-    decisions = decide(self.s, 0.0)
-    for kind, body in decisions:
-      self.append(kind, **body)
+    self.s, decisions = decide(from_table(self.table()))
     return decisions
 
-  def node(self, name, gpus):
-    self.append(Ev.NODE_UP, node=name, gpus=gpus, memory=80 * GIB)
+  def node(self, name, gpus, memory=80 * GIB):
+    self.nodes[name] = {"gpus": gpus, "memory": memory}
     self.settle()
 
+  def lose(self, node):
+    self.nodes.pop(node, None)
+
   def run(self, name, **body):
-    self.append(Ev.RUN_CREATED, **({"run": name, "role": "trainer", "base": "a", "rank": 0} | body))
+    self.records[name] = {"role": "trainer", "base": "a", "rank": 0} | body
     self.settle()
-    return self.s.runs[name].worker
+    return self.s.jobs[name].worker
+
+  def delete(self, run):
+    self.records.pop(run, None)
 
 
 class Local:
   """Direct placement and reservations, with the same small runtime fields the node owns."""
 
   def __init__(self, test, gpus=1, memory=80 * GIB):
-    self.test, self.s, self.running, self.ticket = test, State(nodes={"n": (gpus, memory)}), {}, 0
+    self.test, self.s, self.running, self.ticket = test, Assignment(nodes={"n": (gpus, memory)}), {}, 0
 
   def add(self, name, *, at=None, sampler=False, lora=False, exclusive=False, width=1, busy=0.0):
-    kind = Kind(Role.SAMPLER if sampler else Role.TRAINER, name, lora, exclusive, gpus=width)
-    self.s.workers[name] = Worker(kind, "n", () if at is None else tuple(at))
-    self.s.runs[name] = Run(kind, name)
+    spec = WorkerSpec(Role.SAMPLER if sampler else Role.TRAINER, name, lora, exclusive, gpus=width)
+    self.s.workers[name] = Worker(spec, "n", () if at is None else tuple(at))
+    self.s.jobs[name] = Job(spec, name)
     if at is None:
       self.place()
-    self.running[name] = Worker(kind, "n", self.s.workers[name].gpus, busy=busy)
+    self.running[name] = Worker(spec, "n", self.s.workers[name].gpus, busy=busy)
     return self.running[name]
 
   def place(self):
     place_gpus(self.s, "n", self.running)
 
   def drop(self, name):
-    self.s.runs.pop(name)
+    self.s.jobs.pop(name)
     self.s.workers.pop(name)
     self.place()
 
@@ -85,7 +94,7 @@ class Local:
     for gpu in range(self.s.nodes["n"][0]):
       held = [r for r in self.running.values() if r.since is not None and gpu in r.gpus]
       if len(held) > 1:
-        sizes = [budget(self.s, r.kind, "n") for r in held]
+        sizes = [memory_budget(self.s, r.spec, "n") for r in held]
         self.test.assertTrue(all(sizes))
         self.test.assertLessEqual(sum(sizes), self.s.nodes["n"][1])
     for r in self.running.values():
@@ -100,11 +109,19 @@ class TestCluster(unittest.TestCase):
     self.assertEqual(c.run("b", rank=8), a)
     self.assertEqual(c.s.workers[a].node, "n")
     self.assertEqual(c.s.workers[a].gpus, ())  # the cluster never chooses local GPUs
-    c.append(Ev.RUN_DELETED, run="a")
+    c.delete("a")
     self.assertEqual(c.settle(), [])
-    c.append(Ev.RUN_DELETED, run="b")
+    c.delete("b")
     self.assertEqual(c.settle(), [(Ev.UNPLACED, {"worker": a, "rule": "place.emptied"})])
     self.assertNotIn(a, c.s.workers)
+
+  def test_a_new_worker_never_takes_a_name_in_use(self):
+    c = Cluster()
+    c.node("n", 1)
+    c.s.workers["w1"] = Worker(
+      WorkerSpec(lora=True), "n"
+    )  # a worker the counter doesn't know about, as after a lost counter
+    self.assertNotEqual(c.run("f"), "w1")
 
   def test_workers_go_to_the_node_with_the_fewest_workers_per_gpu(self):
     c = Cluster()
@@ -129,7 +146,7 @@ class TestCluster(unittest.TestCase):
     x = c.run("x", exclusive=True)
     other = c.run("r", rank=4)
     self.assertEqual([c.s.workers[w].node for w in (x, other)], ["a", "b"])
-    c.append(Ev.PLACED, worker=other, node="a")  # it took the GPU x keeps for its sampler
+    c.s.workers[other].node = "a"  # it took the GPU x keeps for its sampler
     sampler = c.run("sample", role="sampler", train_run="x", exclusive=True)
     self.assertEqual(c.s.workers[sampler].node, "b")
 
@@ -147,7 +164,7 @@ class TestCluster(unittest.TestCase):
 
   def test_samplers_packed_by_memory_leave_room_near_their_trainer(self):
     c = Cluster()
-    c.append(Ev.NODE_UP, node="a", gpus=2, memory=81559 * MIB)
+    c.node("a", 2, memory=81559 * MIB)
     c.node("b", 8)
     t = c.run("t")
     others = [c.run(f"r{i}") for i in range(4)]
@@ -160,11 +177,9 @@ class TestCluster(unittest.TestCase):
     c = Cluster()
     c.node("a", 1)
     w = c.run("r")
-    c.s.workers[w].gpus = (0,)
     c.node("b", 1)
-    c.append(Ev.NODE_LOST, node="a")
-    self.assertEqual(c.s.workers[w].gpus, ())
-    c.settle()
+    c.lose("a")
+    self.assertEqual(c.settle()[0], (Ev.UNPLACED, {"worker": w, "rule": "place.node_lost"}))
     self.assertEqual((c.s.workers[w].node, c.s.workers[w].gpus), ("b", ()))
 
   def test_multi_gpu_worker_waits_for_a_node_that_has_enough_gpus(self):
@@ -184,6 +199,8 @@ class TestCluster(unittest.TestCase):
 
   def test_sampling_sessions_share_only_their_kind_and_exclusive_training_run(self):
     c = Cluster()
+    c.run("X", rank=8, exclusive=True)  # an exclusive run's sessions end with it, so it has to exist
+    c.run("Z", rank=8, exclusive=True)
     a = c.run("a", role="sampler", rank=8, train_run="A")
     b = c.run("b", role="sampler", rank=8, train_run="B")
     fft = c.run("f", role="sampler", train_run="A")
@@ -194,7 +211,7 @@ class TestCluster(unittest.TestCase):
     self.assertEqual(x, y)
     self.assertEqual(len({a, b, fft, x, y, z}), 4)
 
-  def test_random_cluster_logs_replay_without_local_execution_state(self):
+  def test_random_clusters_settle_and_survive_the_table(self):
     for seed in range(100):
       rng, c = random.Random(seed), Cluster()
       for _ in range(100):
@@ -202,19 +219,16 @@ class TestCluster(unittest.TestCase):
         if roll < 0.15:
           c.node(name, rng.choice([1, 2, 4]))
         elif roll < 0.25:
-          c.append(Ev.NODE_LOST, node=name)
-        elif roll < 0.8 and name not in c.s.runs:
+          c.lose(name)
+        elif roll < 0.8 and name not in c.s.jobs:
           c.run(name, rank=rng.choice([0, 8]), base=str(rng.randrange(3)), gpus=rng.choice([1, 2]))
         else:
-          c.append(Ev.RUN_DELETED, run=name)
+          c.delete(name)
         c.settle()
-        self.assertEqual(decide(c.s, 0.0), [])
+        self.assertEqual(decide(c.s)[1], [])
         self.assertTrue(all(w.node is None or w.node in c.s.nodes for w in c.s.workers.values()))
-      replay = State()
-      for event in c.entries:
-        fold(replay, event)
-      self.assertEqual(replay, c.s)
-      self.assertTrue(all(w.gpus == () for w in replay.workers.values()))
+        self.assertEqual(from_table(c.table()), c.s)
+        self.assertTrue(all(w.gpus == () for w in c.s.workers.values()))
 
 
 class TestPlacement(unittest.TestCase):
