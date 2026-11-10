@@ -349,7 +349,7 @@ def choose_gpus(
 TICK_MS = getenv("TICK_MS", 100)  # how long it waits for an entry before it looks at the table again
 
 
-async def run(bus: Bus, quantum: float = QUANTUM) -> None:
+async def run(bus: Bus) -> None:
   registry = Registry(bus)
   while True:
     await bus.read_events("$", count=1, block_ms=TICK_MS)  # wake on anything new, or each tick
@@ -358,7 +358,6 @@ async def run(bus: Bus, quantum: float = QUANTUM) -> None:
     # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
     await registry.unregister_checkpoints(*await registry.expired_checkpoints())
     s = from_table(await bus.read_table())
-    s.quantum = quantum
     new, changes = decide(s)
     if not changes:
       continue
