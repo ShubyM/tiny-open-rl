@@ -97,16 +97,15 @@ class Registry:
     """The checkpoints whose TTL has run out."""
     return [u.decode() for u in await self.r.zrangebyscore(key("expiry"), 0, time.time())]
 
-  async def registered(self) -> tuple[set[str], set[str]]:
-    """Every checkpoint in the registry, parked ones too, and their versions."""
-    uris, versions = set(), set()
+  async def registered(self) -> set[str]:
+    """Every checkpoint in the registry, parked ones too."""
+    uris = set()
     async for k in self.r.scan_iter(match=key("ckpt", "*")):
       for info in map(json.loads, await self.r.hvals(k)):
         uris.add(info["tinker_path"])
-        versions.add(info.get("version"))
-    return uris, versions - {None}
+    return uris
 
   async def sweep(self, store: Store, grace: float) -> None:
     """Let the node's store delete what the registry doesn't have. Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before."""
     since = await self.r.get(key("ckpt_since"))  # when the first checkpoint was registered
-    await asyncio.to_thread(store.sweep, *await self.registered(), float(since) if since else None, grace)
+    await asyncio.to_thread(store.sweep, await self.registered(), float(since) if since else None, grace)

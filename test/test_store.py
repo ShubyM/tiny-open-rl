@@ -1,6 +1,4 @@
 import asyncio
-import glob
-import json
 import os
 import subprocess
 import sys
@@ -14,7 +12,7 @@ import torch
 
 from test.helpers import RedisTest, new_id
 from tinyrl.bus import Op, Reply, Run, key
-from tinyrl.storage.store import KEYFRAME_EVERY, SHARD_BYTES, Store
+from tinyrl.storage.store import SHARD_BYTES, Store
 
 
 class TestStore(unittest.TestCase):
@@ -237,7 +235,7 @@ class TestStore(unittest.TestCase):
     meta, w = {"lora": False, "config": {"model_type": "x"}}, torch.randn(64, 64).to(torch.bfloat16)
     versions = [saver.put(f"tinker://r/sampler_weights/{step}", {"w": w * step}, meta) for step in range(2)]
     self.assertFalse(saver.fs.exists(f"{saver.base}/r"))
-    folder, version = loader.local_folder("tinker://r/sampler_weights/1", versions[1])  # a link of a chain
+    folder, version = loader.local_folder("tinker://r/sampler_weights/1", versions[1])
     self.assertEqual(version, versions[1].partition("@")[0])
     for name in os.listdir(f"{saver.cache}/{version}"):
       with open(f"{saver.cache}/{version}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
@@ -257,110 +255,6 @@ class TestStore(unittest.TestCase):
       loader.get(uri, version)
     saver.upload_pending_saves()
     self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))
-
-  def test_full_sampler_weights_upload_as_xors_another_node_rebuilds_exactly(self):
-    root = f"memory://tinyrl-test/{uuid.uuid4()}"
-    saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
-    w, meta, uris = torch.randn(128, 128).to(torch.bfloat16), {"lora": False, "config": {"model_type": "x"}}, []
-    versions = []
-    # two files, many chunks
-    for step in range(3):
-      w.view(-1)[step::101] *= 2  # a step changes a few values
-      uris.append(f"tinker://r/sampler_weights/{step}")
-      versions.append(saver.put(uris[-1], {"w": w.clone(), "b": torch.ones(8)}, meta))
-    saver.upload_pending_saves()
-    self.assertEqual([v.rpartition(".")[2] for v in versions], ["0", "1", "2"])
-    self.assertEqual(len({v.rpartition(".")[0] for v in versions}), 1)
-    links = f"{saver.base}/r/_versions"
-    whole, xor = (saver.fs.du(f"{links}/{v}") for v in versions[:2])
-    self.assertLess(xor, whole / 4)
-    self.assertTrue(all(not n.endswith(".safetensors") for n in saver.fs.ls(f"{links}/{versions[1]}", detail=False)))
-
-    folder = loader.local_folder(uris[1], versions[1])[0]  # link 0 whole, then link 1's XOR
-    saver.fs.rm(f"{links}/{versions[0]}", recursive=True)
-    folder = loader.local_folder(uris[2], versions[2])[0]  # from link 1 here, so link 0 is never read again
-    for name in os.listdir(f"{saver.cache}/{versions[2]}"):
-      with open(f"{saver.cache}/{versions[2]}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
-        self.assertEqual(a.read(), b.read())
-    self.assertTrue(torch.equal(loader.get(uris[2])[0]["w"], w))
-
-  def test_chains_restart_at_keyframe_every_and_a_link_whose_parent_never_landed_goes_whole(self):
-    root = f"memory://tinyrl-test/{uuid.uuid4()}"
-    saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
-    meta, v = {"config": {"model_type": "x"}}, []
-    for step in range(KEYFRAME_EVERY + 2):
-      v.append(saver.put(f"tinker://r/sampler_weights/{step}", {"w": torch.full((64,), float(step))}, meta))
-      saver.upload_pending_saves()
-      if step == KEYFRAME_EVERY:
-        os.unlink(f"{saver.cache}/{v[-1]}.uploaded")  # as if its upload failed
-    self.assertEqual([x.rpartition(".")[2] for x in v[-2:]], ["0", "1"])
-    self.assertNotEqual(v[0].rpartition(".")[0], v[-2].rpartition(".")[0])
-    names = saver.fs.ls(f"{saver.base}/r/_versions/{v[-1]}", detail=False)
-    self.assertTrue(any(n.endswith(".safetensors") for n in names))
-    self.assertEqual(
-      json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/{KEYFRAME_EVERY + 1}/_latest"))["from"], v[-1]
-    )
-    self.assertTrue(
-      torch.equal(
-        loader.get(f"tinker://r/sampler_weights/{KEYFRAME_EVERY + 1}")[0]["w"],
-        torch.full((64,), float(KEYFRAME_EVERY + 1)),
-      )
-    )
-    self.assertTrue(torch.equal(loader.get("tinker://r/sampler_weights/1")[0]["w"], torch.full((64,), 1.0)))
-
-  def test_link_0_goes_up_as_its_changes_from_the_base_model_and_another_node_rebuilds_exactly(self):
-    import safetensors.torch
-
-    root, base = f"memory://tinyrl-test/{uuid.uuid4()}", tempfile.mkdtemp()
-    w = torch.randn(128, 128).to(torch.bfloat16)
-    safetensors.torch.save_file({"w": w.clone(), "b": torch.ones(8)}, f"{base}/model.safetensors")
-    saver = Store(root, cache=tempfile.mkdtemp())
-    meta, uris, versions = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{base}"}, [], []
-    for step in range(2):
-      w.view(-1)[step::101] *= 2  # a step changes a few values
-      uris.append(f"tinker://r/sampler_weights/{step}")
-      # "new" isn't in the base, so it goes up as all its bytes
-      versions.append(saver.put(uris[-1], {"w": w.clone(), "b": torch.ones(8), "new": torch.randn(8)}, meta))
-    saver.upload_pending_saves()
-    self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/0/_latest"))["from"], "base")
-    self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/1/_latest"))["from"], "base")
-    whole = sum(os.path.getsize(f) for f in glob.glob(f"{saver.cache}/{versions[0]}/*.safetensors"))
-    self.assertLess(saver.fs.du(f"{saver.base}/r/_versions/{versions[0]}"), whole / 4)
-
-    for uri, version in zip(uris, versions):  # each on a node that has nothing cached
-      folder = Store(root, cache=tempfile.mkdtemp()).local_folder(uri, version)[0]
-      for name in os.listdir(f"{saver.cache}/{version}"):
-        with open(f"{saver.cache}/{version}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
-          self.assertEqual(a.read(), b.read())
-      self.assertEqual(glob.glob(f"{os.path.dirname(folder)}/*.base"), [])
-
-  def test_link_0_goes_up_whole_without_the_base_model_on_the_node(self):
-    root = f"memory://tinyrl-test/{uuid.uuid4()}"
-    saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
-    meta = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{tempfile.mkdtemp()}/missing"}
-    version = saver.put("tinker://r/sampler_weights/0", {"w": torch.randn(64)}, meta)
-    saver.upload_pending_saves()
-    self.assertEqual(json.loads(saver.fs.cat_file(f"{saver.base}/r/sampler_weights/0/_latest"))["from"], version)
-    got = loader.get("tinker://r/sampler_weights/0")[0]["w"]
-    self.assertTrue(torch.equal(got, saver.get("tinker://r/sampler_weights/0")[0]["w"]))
-
-  def test_d5_delta_cleanup_breaks_future_save(self):
-    root = f"memory://tinyrl-test-d5-{uuid.uuid4()}"
-    base_model_dir = tempfile.mkdtemp()
-    import safetensors.torch
-
-    safetensors.torch.save_file({"w": torch.randn(8)}, f"{base_model_dir}/model.safetensors")
-    saver = Store(root=root, cache=tempfile.mkdtemp())
-    uri_0, uri_1 = "tinker://r/sampler_weights/0", "tinker://r/sampler_weights/1"
-    meta = {"lora": False, "config": {"model_type": "x"}, "base": f"file://{base_model_dir}"}
-    v0 = saver.put(uri_0, {"w": torch.ones(8)}, meta)
-    saver.upload_pending_saves()
-    saver.fs.rm(f"{saver.base}/r/_versions/{v0}", recursive=True)
-    saver.put(uri_1, {"w": torch.ones(8) * 2}, meta)
-    saver.upload_pending_saves()
-    reader = Store(root=root, cache=tempfile.mkdtemp())
-    got, _ = reader.get(uri_1)
-    self.assertTrue(torch.equal(got["w"], torch.ones(8) * 2))
 
   def test_three_saves_leave_exactly_two_versions(self):
     root = f"memory://tinyrl-test-d4-count-{uuid.uuid4()}"
