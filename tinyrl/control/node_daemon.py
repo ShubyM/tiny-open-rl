@@ -24,7 +24,7 @@ from tinyrl.workers.sampler import Sampler
 
 GPUS, DRAIN_S, TICK = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK", 0.25)
 IDLE_MS, STRANDED_MS = getenv("IDLE_MS", 150), 5000
-RUN_COMMANDS, RUN_QUANTUM = getenv("RUN_COMMANDS", 4), getenv("RUN_QUANTUM", 1.0)
+RUN_COMMANDS = getenv("RUN_COMMANDS", 4)  # a trainer stays with a run this long while its next command is queued
 SAMPLE_RUNS, SAMPLE_COMMANDS = getenv("SAMPLE_RUNS", 3), getenv("SAMPLE_COMMANDS", 128)
 SAVE_WAIT_S, SAMPLE_WAIT_S = getenv("SAVE_WAIT_S", 0.015), getenv("SAMPLE_WAIT_S", 0.02)
 SWEEP_S, SWEEP_GRACE_S = getenv("SWEEP_S", 60.0), 600
@@ -113,8 +113,8 @@ class NodeDaemon:
     sampling = r.spec.role == Role.SAMPLER
     heads, prepared, service = [], {}, {}
     reader = guard = model = closing = None
-    renewed, swept, virtual = time.monotonic(), 0.0, 0.0
-    last_run, turn_started, turn_commands = None, 0.0, 0
+    renewed, swept, virtual = time.monotonic(), 0.0, 0
+    last_run, turn_commands = None, 0
 
     async def owned():
       nonlocal renewed
@@ -270,11 +270,10 @@ class NodeDaemon:
         await activate()
 
     async def execute(candidates):
-      nonlocal reader, last_run, turn_started, turn_commands, heads, virtual
-      now = time.monotonic()
+      nonlocal reader, last_run, turn_commands, heads, virtual
       for cmd in candidates:
         service[cmd.run] = max(service.get(cmd.run, virtual), virtual)
-      prefer = last_run if turn_commands < RUN_COMMANDS and now < turn_started + RUN_QUANTUM else None
+      prefer = last_run if turn_commands < RUN_COMMANDS else None
       runs = scheduler.select_runs(
         candidates, service, SAMPLE_RUNS if sampling and r.spec.lora else 1, prefer if not sampling else None
       )
@@ -301,13 +300,12 @@ class NodeDaemon:
       else:
         cmd = cmds[0]
         if cmd.run != last_run or prefer is None:
-          last_run, turn_started, turn_commands = cmd.run, before, 0
+          last_run, turn_commands = cmd.run, 0
         turn_commands += 1
         reply = await answer(cmd, inputs[cmd.run])
-      seconds = time.monotonic() - before
-      r.busy += seconds
+      r.busy += time.monotonic() - before
       for cmd in cmds:
-        service[cmd.run] = service.get(cmd.run, 0.0) + seconds * len(r.gpus) / len(cmds)
+        service[cmd.run] = service.get(cmd.run, 0) + cmd.cost
       active = {c.run for c in [*ready(), *cmds]}
       virtual = max(virtual, min(service[run] for run in active))
       if not sampling and cmds[-1].op == Op.OPTIM_STEP and r.spec.lora:

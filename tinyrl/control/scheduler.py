@@ -14,7 +14,7 @@ from tinyrl.storage.registry import Registry
 
 
 def select_runs(heads: list[Cmd], service: dict[str, float], width: int, prefer: str | None = None) -> list[str]:
-  """Choose ready heads by measured node execution seconds per run, not a global tenant share.
+  """Choose ready heads by the tokens each run has been served, not a global tenant share.
   The caller bounds preferred continuations. New runs join the active service floor.
   """
   if width < 1:
