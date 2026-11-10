@@ -70,7 +70,7 @@ class NodeDaemon:
   def reserve(self, worker: str) -> bool:
     """Try admission without blocking observation of newly ready work or preparation errors."""
     r = self.running[worker]
-    if r.since is not None:
+    if r.served is not None:
       return True
     if not r.ticket:
       with span("node.request_gpu"):
@@ -79,7 +79,7 @@ class NodeDaemon:
       self.notify()
     if scheduler.can_run(self.state, self.id, self.running, worker):
       with span("node.grant_gpu"):
-        r.since, r.ticket = time.time(), 0
+        r.served, r.ticket = 0, 0
       self.notify()
       return True
     return False
@@ -221,7 +221,7 @@ class NodeDaemon:
       )
 
     async def activate():
-      if r.since is None:
+      if r.served is None:
         with span("node.wait_gpu"):
           while True:  # only final checkpointing waits here; ordinary admission never blocks the ready loop
             changed = self.changed
@@ -238,7 +238,6 @@ class NodeDaemon:
             if model.running is None:
               await model.start()
               r.pid = model.proc.pid if model.proc else None
-              r.since = time.time()  # cold boot is outside the first GPU quantum
       except Exception as e:
         # A boot failure still answers waiting clients. Keep its reservation until close acknowledges.
         await owned()
@@ -251,12 +250,10 @@ class NodeDaemon:
       if (p := model.proc) and p.poll() is not None:
         raise RuntimeError(f"worker {worker} exited")
       waiting = scheduler.someone_waits(self.running, r.gpus)
-      if r.since is not None and (
-        gpus != r.gpus or (waiting and (not runnable or time.time() >= r.since + self.state.quantum))
-      ):
+      if r.served is not None and (gpus != r.gpus or (waiting and (not runnable or r.served >= scheduler.TURN))):
         with span("node.park"):
           await model.park() if sampling else await model.call("park")
-        r.since = None
+        r.served = None
         self.notify()
       if r.gpus != gpus:
         r.gpus = gpus
@@ -264,7 +261,7 @@ class NodeDaemon:
       if not runnable and r.ticket:
         r.ticket = 0
         self.notify()
-      if runnable and r.since is None and self.reserve(worker):
+      if runnable and r.served is None and self.reserve(worker):
         await activate()
 
     async def execute(candidates):
@@ -290,7 +287,6 @@ class NodeDaemon:
       await owned()
       if not cmds:
         return
-      before = time.monotonic()
       if sampling:
         async with asyncio.TaskGroup() as group:
           for cmd in cmds:
@@ -301,9 +297,10 @@ class NodeDaemon:
           last_run, turn_commands = cmd.run, 0
         turn_commands += 1
         reply = await answer(cmd, inputs[cmd.run])
-      r.busy += time.monotonic() - before
       for cmd in cmds:
         service[cmd.run] = service.get(cmd.run, 0) + cmd.cost
+      if r.served is not None:  # a head that failed to prepare is answered without the GPUs
+        r.served += sum(cmd.cost for cmd in cmds)
       active = {c.run for c in [*ready(), *cmds]}
       virtual = max(virtual, min(service[run] for run in active))
       return cmds[0] if not sampling and reply.ok else None
@@ -322,7 +319,7 @@ class NodeDaemon:
           except (Exception, asyncio.CancelledError) as e:
             print(f"{worker} could not close, retrying: {e!r}", file=sys.stderr, flush=True)
             await asyncio.sleep(TICK)
-      r.since = None  # release only after the child has acknowledged park or close
+      r.served = None  # release only after the child has acknowledged park or close
       self.notify()
       if guard:
         guard.cancel()
@@ -366,7 +363,7 @@ class NodeDaemon:
         await turn(self.state.workers[worker].gpus, bool(runnable) or warm)
         if not wanted():
           break
-        if runnable and r.since is not None:
+        if runnable and r.served is not None:
           if (cmd := await execute(runnable)) and cmd.op == Op.DELETE_MODEL and not r.spec.lora:
             break
         else:
@@ -381,7 +378,7 @@ class NodeDaemon:
 
       # No drain: preparation never claimed work. Only the completed batch belonged to this process.
       if not sampling:
-        if len(r.gpus) > 1 and r.since is None:
+        if len(r.gpus) > 1 and r.served is None:
           await activate()
         await owned()
         for saved in await model.call("park_all"):

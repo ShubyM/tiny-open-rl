@@ -366,7 +366,7 @@ above `TARGET_UTIL` for a while, before work queues.
 ## Taking turns on a node daemon's GPUs
 
 **Current local policy.** Workers with known memory budgets may hold a GPU together when they fit. Otherwise the node
-uses the order workers become ready and a 30-second quantum, starting after cold engine startup completes. The node
+uses the order workers become ready and a turn of `TURN` tokens served (200,000). The node
 coordinates GPU reservations directly; each worker coroutine owns its execution state, and the cluster scheduler
 handles run and node assignment.
 
@@ -377,7 +377,7 @@ handles run and node assignment.
 2. The worker reserves all its GPUs before waking the model. If admission is blocked, it waits on the node's change
    event and checks again when notified. Preparation completion uses that same event. Independent workers continue
    on their own GPUs; node heartbeats and worker lease renewal continue while model operations run.
-3. An idle holder yields to a waiter, and a busy holder yields at a command or sampling-wave boundary after its quantum.
+3. An idle holder yields to a waiter, and a busy holder yields at a command or sampling-wave boundary once its turn of tokens is served.
    A wave has up to three sessions for a LoRA engine or one session for a full fine-tune engine.
 4. The node orders a trainer to park its tensors on pinned host memory, or an engine to sleep. The reservation remains
    held until that operation acknowledges, or until the whole process group has exited during cleanup. A failed wake

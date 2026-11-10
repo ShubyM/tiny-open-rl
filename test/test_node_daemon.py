@@ -121,8 +121,8 @@ class TestNodeDaemon(RedisTest):
         contender = await node.add("other", gpus=[0])
         request = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(request, node)
-        self.assertIsNone(resident.since)
-        self.assertIsNotNone(contender.since)
+        self.assertIsNone(resident.served)
+        self.assertIsNotNone(contender.served)
         self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
         self.assertEqual(await self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
       finally:
@@ -164,8 +164,8 @@ class TestNodeDaemon(RedisTest):
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
       )
       await self.until(lambda: "b" in node.running and node.running["b"].ticket > 0, node)
-      self.assertIsNotNone(holder.since)
-      self.assertIsNone(node.running["b"].since)
+      self.assertIsNotNone(holder.served)
+      self.assertIsNone(node.running["b"].served)
       self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})
       heartbeat = (await self.bus.live_nodes(details=True))[node.id]["until"]
       await node.tick()
@@ -174,7 +174,7 @@ class TestNodeDaemon(RedisTest):
       with contextlib.suppress(ProcessLookupError):
         os.killpg(holder.pid, signal.SIGCONT)
     await self.reply(request, node)
-    self.assertIsNone(holder.since)
+    self.assertIsNone(holder.served)
 
   async def test_real_model_process_serves_moves_and_restarts(self):
     require_unix()
