@@ -6,6 +6,7 @@ Every training call becomes a command on its run's stream, and retrieve_future w
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime
 import json
 import time
@@ -19,7 +20,7 @@ from pydantic import BaseModel
 
 from tinyrl.api import wire
 from tinyrl.bus import Bus, Op, Role, Run, key
-from tinyrl.control import estimator
+from tinyrl.control import estimator, scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
@@ -151,12 +152,14 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.get("/api/v1/scheduling")
   async def scheduling():
-    nodes, state = await bus.live_nodes(details=True), json.loads(await bus.r.get(key("state")) or "{}")
-    for node, info in nodes.items():
+    """The cluster's assignment, with each worker's GPUs and process from its node's last heartbeat."""
+    table = await bus.read_table()
+    state = dataclasses.asdict(scheduler.from_table(table))
+    for node, info in table["nodes"].items():
       for worker, local in info.get("workers", {}).items():
-        if state.get("workers", {}).get(worker, {}).get("node") == node:
-          state["workers"][worker] = local
-    return {"nodes": {n: v["gpus"] for n, v in nodes.items()}, "state": state}
+        if state["workers"].get(worker, {}).get("node") == node:
+          state["workers"][worker] |= local
+    return {"nodes": {n: v["gpus"] for n, v in table["nodes"].items()}, "state": state}
 
   @api.get("/api/v1/healthz")
   async def healthz():

@@ -10,7 +10,7 @@ import unittest
 
 from test.helpers import RedisTest, new_id, tiny
 from test.test_process import require_unix
-from tinyrl.bus import GROUP, Ev, Op, Reply, Run, key
+from tinyrl.bus import GROUP, Op, Reply, Run, key
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 
@@ -107,7 +107,7 @@ class TestLease(RedisTest):
       await self.until(pending)
       first.send_signal(signal.SIGSTOP)
       os.killpg(model_pid, signal.SIGCONT)  # the child may run while its parent cannot publish a result
-      await self.bus.append_event(Ev.NODE_LOST, node=first_node)
+      await self.bus.r.hdel(key("nodes"), first_node)  # its heartbeat ran out
       expected = await self.bus.wait_for_reply(request, 30)
       self.assertFalse(expected.ok)
       self.assertIn("lost the worker", json.loads(expected.body)["error"])
