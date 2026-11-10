@@ -222,13 +222,40 @@ class TestStore(unittest.TestCase):
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     uri = "tinker://r/weights/final"
     version = saver.put(uri, {"w": torch.ones(4)})  # returns before anything uploads it
-    self.assertTrue(saver.landed(uri, version))
-    self.assertTrue(torch.equal(saver.get(uri)[0]["w"], torch.ones(4)))  # this node reads it at once
-    self.assertFalse(loader.landed(uri, version))
+    self.assertTrue(torch.equal(saver.get(uri, version)[0]["w"], torch.ones(4)))  # this node reads it at once
     with self.assertRaisesRegex(ValueError, "has not landed"):
       loader.get(uri, version)
     saver.upload_pending_saves()
-    self.assertTrue(loader.landed(uri, version))
+    self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))
+
+  def test_another_node_copies_a_save_from_the_node_that_made_it_before_it_uploads(self):
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
+    saver.start()
+    saver.stopping.set()  # no uploads, so the copy can only come from the saver
+    saver.uploader.join()
+    meta, w = {"lora": False, "config": {"model_type": "x"}}, torch.randn(64, 64).to(torch.bfloat16)
+    versions = [saver.put(f"tinker://r/sampler_weights/{step}", {"w": w * step}, meta) for step in range(2)]
+    self.assertFalse(saver.fs.exists(f"{saver.base}/r"))
+    folder, version = loader.local_folder("tinker://r/sampler_weights/1", versions[1])  # a link of a chain
+    self.assertEqual(version, versions[1].partition("@")[0])
+    for name in os.listdir(f"{saver.cache}/{version}"):
+      with open(f"{saver.cache}/{version}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
+        self.assertEqual(a.read(), b.read())
+    self.assertTrue(torch.equal(loader.get("tinker://r/sampler_weights/0", versions[0])[0]["w"], w * 0))
+    saver.close()  # its saves upload, then it stops serving them
+    later = Store(root, cache=tempfile.mkdtemp())
+    self.assertTrue(torch.equal(later.get("tinker://r/sampler_weights/1", versions[1])[0]["w"], w))
+
+  def test_a_save_whose_node_is_gone_comes_from_the_bucket_or_fails(self):
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
+    saver.peer = "127.0.0.1:9"  # a node that no longer answers
+    uri = "tinker://r/weights/final"
+    version = saver.put(uri, {"w": torch.ones(4)})
+    with self.assertRaisesRegex(ValueError, "has not landed, and 127.0.0.1:9 failed to copy"):
+      loader.get(uri, version)
+    saver.upload_pending_saves()
     self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))
 
   def test_full_sampler_weights_upload_as_xors_another_node_rebuilds_exactly(self):

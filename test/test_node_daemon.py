@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import tempfile
+import threading
 import unittest
 
 import torch
@@ -95,13 +96,20 @@ class TestNodeDaemon(RedisTest):
     self.assertEqual((await self.bus.get_run(a))["steps"], 12)
     self.assertIs(node.processes["worker"], child)
 
-  async def test_an_unpublished_checkpoint_does_not_block_ready_work_or_gpu_handoff(self):
+  async def test_a_slow_checkpoint_read_does_not_block_ready_work_or_gpu_handoff(self):
     with tempfile.TemporaryDirectory() as folder:
       writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
+      release, read = threading.Event(), node.store.local_folder
+
+      def slow_read(*args):  # a big copy still running
+        release.wait()
+        return read(*args)
+
+      node.store.local_folder = slow_read
       uri = "tinker://training/sampler_weights/slow"
       version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
-      await self.registry.register_checkpoint(uri, 0, version=version, node=node.id)  # live, so it waits
+      await self.registry.register_checkpoint(uri, 0, version=version)
       await self.bus.create_run(Run("slow", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       await self.bus.create_run(Run("ready", "sampler", "tiny", 4, role=Role.SAMPLER))
       resident = await node.add("sampler")
@@ -119,39 +127,24 @@ class TestNodeDaemon(RedisTest):
         self.assertEqual(await self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
       finally:
         await asyncio.to_thread(writer.upload_pending_saves)
+        release.set()
       await self.reply(slow, node)
 
   async def test_a_checkpoint_whose_node_left_before_it_uploaded_fails_fast(self):
     with tempfile.TemporaryDirectory() as folder:
       writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
+      writer.peer = "127.0.0.1:9"  # a node that no longer answers
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       uri = "tinker://training/sampler_weights/lost"
       version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
-      await self.registry.register_checkpoint(uri, 0, version=version, node="gone")
+      await self.registry.register_checkpoint(uri, 0, version=version)
       await self.bus.create_run(Run("lost", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       await node.add("sampler")
       request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
       waiting = self.background(self.bus.wait_for_reply(request, 10))
       await self.until(waiting.done, node)
       self.assertFalse(waiting.result().ok)
-      self.assertIn("was lost with node gone", waiting.result().body.decode())
-
-  async def test_a_newer_save_from_a_live_node_is_waited_for_even_after_an_older_saver_left(self):
-    with tempfile.TemporaryDirectory() as folder:
-      writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
-      node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
-      uri, meta = "tinker://training/sampler_weights/w", {"base": "tiny", "lora": True, "config": {}}
-      version = writer.put(uri, {}, meta)
-      await self.registry.register_checkpoint(uri, 0, version=version, node="gone")
-      reading = self.background(node.landed(uri))
-      await asyncio.sleep(0.2)  # it has seen "gone" leave
-      version = writer.put(uri, {}, meta)
-      await self.bus.node_heartbeat("live", 1)
-      await self.registry.register_checkpoint(uri, 0, version=version, node="live")
-      await asyncio.sleep(1)
-      self.assertFalse(reading.done())
-      await asyncio.to_thread(writer.upload_pending_saves)
-      self.assertEqual(await asyncio.wait_for(reading, 5), version)
+      self.assertIn("has not landed, and 127.0.0.1:9 failed to copy", waiting.result().body.decode())
 
   async def test_admission_waits_for_the_previous_model_process_to_park(self):
     require_unix()
