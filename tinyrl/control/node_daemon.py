@@ -26,7 +26,6 @@ GPUS, DRAIN_S, TICK = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK",
 IDLE_MS, STRANDED_MS = getenv("IDLE_MS", 150), 5000
 RUN_COMMANDS = getenv("RUN_COMMANDS", 4)  # a trainer stays with a run this long while its next command is queued
 SAMPLE_RUNS, SAMPLE_COMMANDS = getenv("SAMPLE_RUNS", 3), getenv("SAMPLE_COMMANDS", 128)
-SAVE_WAIT_S, SAMPLE_WAIT_S = getenv("SAVE_WAIT_S", 0.015), getenv("SAMPLE_WAIT_S", 0.02)
 SWEEP_S, SWEEP_GRACE_S = getenv("SWEEP_S", 60.0), 600
 
 
@@ -240,7 +239,6 @@ class NodeDaemon:
               await model.start()
               r.pid = model.proc.pid if model.proc else None
               r.since = time.time()  # cold boot is outside the first GPU quantum
-              await asyncio.sleep(SAMPLE_WAIT_S)
       except Exception as e:
         # A boot failure still answers waiting clients. Keep its reservation until close acknowledges.
         await owned()
@@ -308,8 +306,6 @@ class NodeDaemon:
         service[cmd.run] = service.get(cmd.run, 0) + cmd.cost
       active = {c.run for c in [*ready(), *cmds]}
       virtual = max(virtual, min(service[run] for run in active))
-      if not sampling and cmds[-1].op == Op.OPTIM_STEP and r.spec.lora:
-        await asyncio.sleep(SAVE_WAIT_S)  # bounded grace for the client's following sampler save
       return cmds[0] if not sampling and reply.ok else None
 
     async def cleanup():

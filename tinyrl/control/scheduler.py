@@ -27,8 +27,8 @@ def select_runs(heads: list[Cmd], service: dict[str, float], width: int, prefer:
     ready.values(),
     key=lambda cmd: (
       cmd.run != prefer,
+      cmd.op != Op.SAVE_WEIGHTS_FOR_SAMPLER,  # first, since a sampler waits on it, and it arrives after its run's turn
       service.get(cmd.run, floor),
-      cmd.op != Op.SAVE_WEIGHTS_FOR_SAMPLER,
       tuple(map(int, cmd.entry_id.split("-"))),
       cmd.run,
     ),
