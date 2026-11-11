@@ -44,14 +44,13 @@ the event loop and overlaps startup and execution. A slow download does not bloc
 otherwise idle worker from yielding its GPU. Executable commands are claimed only after GPU admission, one bounded batch
 at a time. A preparation error claims and answers its failed head without waiting for a GPU.
 
-Within a shared engine, `scheduler.select_runs` chooses ready runs with the least measured service; sampler saves break
-ties. A trainer may continue its current run for up to `RUN_COMMANDS` commands or `RUN_QUANTUM` seconds before choosing
-by service again. These limits are checked between commands, so a single command can exceed the time limit. The same
-model process stays resident when switching runs. This is fairness between ready runs in one engine; GPU admission
-uses its own waiting order and does not establish a global per-user share.
-Service charges the batch's elapsed time times its GPU count; sampling divides that charge among its commands. This is
-an accounting estimate, not a measurement of each request's kernel time. A newly ready run joins the active service floor,
-so waiting on input preparation does not accumulate catch-up credit.
+Within a shared engine, `scheduler.select_runs` chooses the ready runs served the fewest tokens; sampler saves break
+ties. A trainer may continue its current run for up to `RUN_COMMANDS` commands while its next command is queued, before
+choosing by service again. The same model process stays resident when switching runs. This is fairness between ready
+runs in one engine; GPU admission uses its own waiting order and does not establish a global per-user share.
+Each command carries its cost, set when it is queued: the tokens a `forward_backward` trains on, a sample's prompt plus
+the most tokens it may generate, and 1 for anything else. A newly ready run joins the active service floor, so waiting
+on input preparation does not accumulate catch-up credit.
 
 The node keeps actual process placements, waiting order and GPU reservations outside the replayed cluster assignment
 log. Preparation completion and scheduling changes wake workers through the same node change event. Workers on
@@ -89,7 +88,6 @@ services, stop the nodes gracefully and restart the scheduler and node daemons t
 | Variable | Default | Controls |
 |---|---|---|
 | `RUN_COMMANDS` | 4 | Commands in a preferred trainer continuation |
-| `RUN_QUANTUM` | 1 s | Time in that continuation, checked between commands |
 | `QUANTUM` | 30 s | GPU turn while another worker waits, checked between commands or waves |
 | `SAMPLE_RUNS` | 3 | LoRA sessions in a sampling wave; full fine-tunes use one |
 | `SAMPLE_COMMANDS` | 128 | Commands from each session in a wave |
@@ -193,7 +191,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM`,
-`RUN_COMMANDS`, `RUN_QUANTUM`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `SAVE_WAIT_S`, `SAMPLE_WAIT_S`, `IDLE_MS`, `DRAIN_S`,
+`RUN_COMMANDS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `SAVE_WAIT_S`, `SAMPLE_WAIT_S`, `IDLE_MS`, `DRAIN_S`,
 `ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted), `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 
 ## Telemetry

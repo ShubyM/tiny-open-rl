@@ -88,6 +88,7 @@ class Cmd:
   entry_id: str
   op: Op
   body: bytes
+  cost: int = 1  # the tokens it works on, which is what the node charges its run
 
   @property
   def request_id(self) -> str:
@@ -110,7 +111,7 @@ class Reply:
 
 
 def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
-  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"])
+  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"], int(fields.get(b"cost", 1)))
 
 
 def connect(url: str) -> redis.Redis:
@@ -282,13 +283,15 @@ class Bus:
 
   # ***** commands *****
 
-  async def submit_command(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
+  async def submit_command(
+    self, run_id: str, op: Op, body: bytes, seq_id: int | None = None, cost: int = 1
+  ) -> str | None:
     """Queue a command on a run's stream. Returns its request id, or None if there is no such run. A call retried with the same seq_id gets the first call's request id and is queued once."""
     if seq_id is not None and (first := await self.r.get(key("seq", run_id, str(seq_id)))):
       return first.decode()  # a retry, even of a deleted run's command, a pre-IDMP one, or one older than IDMP's window
     seq = [] if seq_id is None else ["IDMP", run_id, seq_id]  # and two racing retries still queue once
     # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
-    fields = ["op", op, "body", body, *(["seq", seq_id] if seq else [])]
+    fields = ["op", op, "body", body, "cost", cost, *(["seq", seq_id] if seq else [])]
     entry_id = await self.r.execute_command("XADD", key("q", run_id), "NOMKSTREAM", *seq, "*", *fields)
     if entry_id is None:
       return None

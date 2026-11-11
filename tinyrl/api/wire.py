@@ -39,6 +39,11 @@ def parse(raw: bytes) -> pb.ForwardBackwardRequest:
     raise ValueError(f"bad ForwardBackwardRequest: {e}") from e
 
 
+def cost(req: pb.ForwardBackwardRequest) -> int:
+  """The tokens a request trains on."""
+  return sum(len(chunk.encoded_text.tokens) // 4 for d in req.data for chunk in d.model_input)
+
+
 def datums(req: pb.ForwardBackwardRequest) -> list[Datum]:
   out = []
   for d in req.data:
