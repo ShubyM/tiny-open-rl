@@ -72,7 +72,7 @@ class Sampler:
     return getattr(self.running, "server", None)
 
   async def start(self) -> None:
-    """Start once; the node excludes this boot time from the worker's first quantum."""
+    """Start the engine, once."""
     async with self.loading:
       if self.running is None:
         self.running = await self.engine_type.start(self.base, self.lora, self.env)

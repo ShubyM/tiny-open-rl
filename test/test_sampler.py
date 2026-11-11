@@ -2,6 +2,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from unittest import mock
 
 import httpx
 
@@ -10,6 +11,7 @@ from test.helpers import FakeEngine, RedisTest, tiny
 from tinyrl.api import wire
 from tinyrl.api.gateway import app
 from tinyrl.bus import Op, Role, Run, key
+from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 from tinyrl.workers.sampler import Out, Seq, encode
 
@@ -189,7 +191,7 @@ class TestSampler(RedisTest):
       [error] = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
       self.assertIsInstance(error, RuntimeError)
       self.assertIsNone(sampler.running)
-      self.assertIsNone(reservation.since)
+      self.assertIsNone(reservation.served)
       self.assertIsNone(await self.bus.lease_owner("sampler"))
       self.assertIsNone(await self.bus.wait_for_reply(future, 0))
       self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
@@ -247,7 +249,6 @@ class TestSampler(RedisTest):
         return await super().sample(job, name)
 
     node = self.node(store, gpus=1, engine=Occupied)
-    node.state.quantum = 0.01
     await node.add("busy", gpus=[0])
     waiting = await node.add("waiting", gpus=[0])
     self.pump(node)
@@ -267,6 +268,35 @@ class TestSampler(RedisTest):
       finish.set()
     self.assertTrue((await self.bus.wait_for_reply(holding, 5)).ok)
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
+
+  async def test_a_busy_holder_yields_its_gpu_after_its_turn_of_tokens(self):
+    for run, worker in (("busy", "busy"), ("ready", "waiting")):
+      await self.bus.create_run(Run(run, worker, "base", 4, role=Role.SAMPLER))
+    order, sampling, finish = [], asyncio.Event(), asyncio.Event()
+
+    class Recording(FakeEngine):
+      async def sample(self, job, name):
+        order.append(job["prompt"])
+        if job["prompt"] == [11]:
+          sampling.set()
+          await finish.wait()
+        return await super().sample(job, name)
+
+    node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
+    await node.add("busy", gpus=[0])
+    waiting = await node.add("waiting", gpus=[0])
+    self.pump(node)
+    with mock.patch.object(scheduler, "TURN", 1):
+      first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
+      await asyncio.wait_for(sampling.wait(), 5)
+      ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode())
+      await self.until(lambda: bool(waiting.ticket))
+      more = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [33]}).encode())
+      await asyncio.sleep(0.5)  # so the holder has its next command ready when the first one ends
+      finish.set()
+      for request in (first, ready, more):
+        self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
+    self.assertEqual(order, [[11], [22], [33]])
 
   async def test_invalid_backlog_does_not_starve_a_ready_sibling(self):
     await self.bus.create_run(

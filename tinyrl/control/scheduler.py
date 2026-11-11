@@ -74,7 +74,7 @@ def fits(memory: list[int], gpu_bytes: int) -> bool:
 
 # ***** the assignment *****
 
-QUANTUM = getenv("QUANTUM", 30.0)  # seconds a busy holder keeps its GPUs while others wait, engine boot aside
+TURN = getenv("TURN", 200_000)  # tokens a busy holder serves on its GPUs while others wait
 
 
 @dataclass(frozen=True)
@@ -107,8 +107,7 @@ class Worker:
   gpus: tuple[int, ...] = ()  # desired GPUs, chosen by the node; a running process may still be on its old ones
   # The node's local copy records actual GPUs and reservations; cluster assignments leave these fields empty.
   ticket: int = 0
-  since: float | None = None
-  busy: float = 0.0
+  served: int | None = None  # tokens it has served on its GPUs this turn, None while it is parked
   pid: int | None = None
 
 
@@ -116,7 +115,6 @@ class Worker:
 class Assignment:
   """The cluster's current assignment: the live nodes, each job's worker, and each worker's node. A node's own copy also holds its workers' GPUs and turns."""
 
-  quantum: float = QUANTUM
   workers_made: int = 0  # so the next new worker is w<workers_made + 1>
   nodes: dict[str, tuple[int, int]] = field(default_factory=dict)  # live node -> (GPUs, bytes per GPU)
   workers: dict[str, Worker] = field(default_factory=dict)
@@ -263,9 +261,9 @@ def place_gpus(s: Assignment, node: str, running) -> None:
     if w.node != node or not jobs_of(s, name):
       continue
     while not w.gpus:
-      gpus, aside = choose_gpus(s, node, running, name)
+      gpus, aside = choose_gpus(s, node, name)
       if aside:
-        s.workers[aside[0]].gpus = choose_gpus(s, node, running, aside[0], avoid=gpus)[0]
+        s.workers[aside[0]].gpus = choose_gpus(s, node, aside[0], avoid=gpus)[0]
       else:
         w.gpus = gpus
   # Spread trainers after departures. A GPU is empty only after its old process has left it.
@@ -282,7 +280,9 @@ def place_gpus(s: Assignment, node: str, running) -> None:
     if not empty or not (crowded := [g for g, names in movable.items() if names]):
       return
     g = max(crowded, key=lambda g: (len(there[g]), -g))
-    name = min(movable[g], key=lambda n: (not s.workers[n].spec.lora, n in running and running[n].since is not None, n))
+    name = min(
+      movable[g], key=lambda n: (not s.workers[n].spec.lora, n in running and running[n].served is not None, n)
+    )
     s.workers[name].gpus = (empty[0],)
 
 
@@ -293,12 +293,12 @@ def someone_waits(running, gpus: tuple[int, ...]) -> bool:
 def can_run(s: Assignment, node: str, running, name: str) -> bool:
   """Reserve all actual GPUs together, in ticket order on each GPU, including processes still draining after unplacement."""
   r = running[name]
-  if r.ticket <= 0 or r.since is not None or not r.gpus or node not in s.nodes:
+  if r.ticket <= 0 or r.served is not None or not r.gpus or node not in s.nodes:
     return False
   for gpu in r.gpus:
     if any(x.ticket > 0 and (x.ticket, n) < (r.ticket, name) and gpu in x.gpus for n, x in running.items()):
       return False
-    memory = [memory_budget(s, x.spec, node) for x in running.values() if x.since is not None and gpu in x.gpus]
+    memory = [memory_budget(s, x.spec, node) for x in running.values() if x.served is not None and gpu in x.gpus]
     if not fits([*memory, memory_budget(s, r.spec, node)], s.nodes[node][1]):
       return False
   return True
@@ -309,10 +309,8 @@ def takes_turns(w: Worker) -> bool:
   return w.spec.role == Role.TRAINER and not w.spec.exclusive
 
 
-def choose_gpus(
-  s: Assignment, node: str, running, name: str, avoid: tuple[int, ...] = ()
-) -> tuple[tuple[int, ...], list[str]]:
-  """Choose GPUs and trainers to move aside. Pack known memory budgets, keep exclusive workers alone, and otherwise take turns with the least busy trainers. A sampler moves trainers rather than sharing with them when there is room."""
+def choose_gpus(s: Assignment, node: str, name: str, avoid: tuple[int, ...] = ()) -> tuple[tuple[int, ...], list[str]]:
+  """Choose GPUs and trainers to move aside. Pack known memory budgets, keep exclusive workers alone, and otherwise take turns on the GPUs with the fewest workers. A sampler moves trainers rather than sharing with them when there is room."""
   gpus, gpu_bytes = s.nodes[node]
   me, width, memory = s.workers[name], s.workers[name].spec.gpus, memory_budget(s, s.workers[name].spec, node)
   there = {
@@ -333,13 +331,12 @@ def choose_gpus(
   options = [g for g in range(gpus) if g not in avoid]
   if len(fitting := [g for g in options if fits_on(g)]) >= width:
     return tuple(sorted(fitting, key=lambda g: (bool(there[g]) != bool(memory), g))[:width]), []
-  busy = {g: sum(running[n].busy for n, _ in there[g] if n in running) for g in options}
   if takes_turns(me) or len(options) <= width:  # with no spare GPUs there is nowhere to move to
-    return tuple(sorted(options, key=lambda g: (not clear(g), busy[g], g))[:width]), []
+    return tuple(sorted(options, key=lambda g: (not clear(g), len(there[g]), g))[:width]), []
   # as few moves as it can, LoRA trainers first, since a full fine-tune saves its weights and AdamW state far slower
   lora = {g: all(w.spec.lora for _, w in there[g]) for g in options}
   moves = {g: 0 if fits_on(g) else sum(w.spec.gpus for _, w in there[g]) for g in options}
-  chosen = tuple(sorted(options, key=lambda g: (not clear(g), moves[g], not lora[g], busy[g], g))[:width])
+  chosen = tuple(sorted(options, key=lambda g: (not clear(g), moves[g], not lora[g], g))[:width])
   aside = sorted({n for g in chosen if not fits_on(g) for n, _ in there[g]})
   return chosen, aside if all(map(clear, chosen)) else []
 
@@ -349,7 +346,7 @@ def choose_gpus(
 TICK_MS = getenv("TICK_MS", 100)  # how long it waits for an entry before it looks at the table again
 
 
-async def run(bus: Bus, quantum: float = QUANTUM) -> None:
+async def run(bus: Bus) -> None:
   registry = Registry(bus)
   while True:
     await bus.read_events("$", count=1, block_ms=TICK_MS)  # wake on anything new, or each tick
@@ -358,7 +355,6 @@ async def run(bus: Bus, quantum: float = QUANTUM) -> None:
     # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
     await registry.unregister_checkpoints(*await registry.expired_checkpoints())
     s = from_table(await bus.read_table())
-    s.quantum = quantum
     new, changes = decide(s)
     if not changes:
       continue

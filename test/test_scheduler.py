@@ -60,13 +60,13 @@ class Local:
   def __init__(self, test, gpus=1, memory=80 * GIB):
     self.test, self.s, self.running, self.ticket = test, Assignment(nodes={"n": (gpus, memory)}), {}, 0
 
-  def add(self, name, *, at=None, sampler=False, lora=False, exclusive=False, width=1, busy=0.0):
+  def add(self, name, *, at=None, sampler=False, lora=False, exclusive=False, width=1):
     spec = WorkerSpec(Role.SAMPLER if sampler else Role.TRAINER, name, lora, exclusive, gpus=width)
     self.s.workers[name] = Worker(spec, "n", () if at is None else tuple(at))
     self.s.jobs[name] = Job(spec, name)
     if at is None:
       self.place()
-    self.running[name] = Worker(spec, "n", self.s.workers[name].gpus, busy=busy)
+    self.running[name] = Worker(spec, "n", self.s.workers[name].gpus)
     return self.running[name]
 
   def place(self):
@@ -81,24 +81,24 @@ class Local:
     self.ticket += 1
     self.running[name].ticket = self.ticket
 
-  def grants(self, now=0.0):
+  def grants(self):
     granted = []
     for name in sorted(self.running, key=lambda n: (self.running[n].ticket, n)):
       if can_run(self.s, "n", self.running, name):
-        self.running[name].since, self.running[name].ticket = now, 0
+        self.running[name].served, self.running[name].ticket = 0, 0
         granted.append(name)
     self.check()
     return granted
 
   def check(self):
     for gpu in range(self.s.nodes["n"][0]):
-      held = [r for r in self.running.values() if r.since is not None and gpu in r.gpus]
+      held = [r for r in self.running.values() if r.served is not None and gpu in r.gpus]
       if len(held) > 1:
         sizes = [memory_budget(self.s, r.spec, "n") for r in held]
         self.test.assertTrue(all(sizes))
         self.test.assertLessEqual(sum(sizes), self.s.nodes["n"][1])
     for r in self.running.values():
-      self.test.assertFalse(r.ticket and r.since is not None)
+      self.test.assertFalse(r.ticket and r.served is not None)
 
 
 class TestCluster(unittest.TestCase):
@@ -301,7 +301,7 @@ class TestReservations(unittest.TestCase):
     for _ in range(3):
       [name] = p.grants()
       order.append(name)
-      p.running[name].since = None
+      p.running[name].served = None
     self.assertEqual(order, ["a", "c", "b"])
 
   def test_workers_with_known_budgets_share_but_unknown_budgets_wait(self):
@@ -312,11 +312,11 @@ class TestReservations(unittest.TestCase):
     p.add("trainer")
     p.request("trainer")
     self.assertEqual(p.grants(), ["a", "b"])
-    p.running["a"].since = None
+    p.running["a"].served = None
     self.assertEqual(p.grants(), ["c"])
-    p.running["b"].since = None
+    p.running["b"].served = None
     self.assertEqual(p.grants(), [])
-    p.running["c"].since = None
+    p.running["c"].served = None
     self.assertEqual(p.grants(), ["trainer"])
 
   def test_unknown_gpu_memory_never_allows_concurrent_reservations(self):
@@ -334,11 +334,11 @@ class TestReservations(unittest.TestCase):
     for name in ("holder", "wide", "later"):
       p.request(name)
     self.assertEqual(p.grants(), ["holder"])
-    self.assertIsNone(p.running["wide"].since)
-    self.assertIsNone(p.running["later"].since)
-    p.running["holder"].since = None
+    self.assertIsNone(p.running["wide"].served)
+    self.assertIsNone(p.running["later"].served)
+    p.running["holder"].served = None
     self.assertEqual(p.grants(), ["wide"])
-    p.running["wide"].since = None
+    p.running["wide"].served = None
     self.assertEqual(p.grants(), ["later"])
 
   def test_different_gpus_can_run_concurrently(self):
@@ -358,8 +358,8 @@ class TestReservations(unittest.TestCase):
       for _ in range(100):
         name = rng.choice(list(p.running))
         r = p.running[name]
-        if r.since is not None:
-          r.since = None  # parking or process exit has completed
+        if r.served is not None:
+          r.served = None  # parking or process exit has completed
         elif not r.ticket:
           p.request(name)
         p.grants()
