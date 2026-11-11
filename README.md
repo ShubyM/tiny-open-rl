@@ -44,10 +44,11 @@ the event loop and overlaps startup and execution. A slow download does not bloc
 otherwise idle worker from yielding its GPU. Executable commands are claimed only after GPU admission, one bounded batch
 at a time. A preparation error claims and answers its failed head without waiting for a GPU.
 
-Within a shared engine, `scheduler.select_runs` chooses the ready runs served the fewest tokens; sampler saves break
-ties. A trainer may continue its current run for up to `RUN_COMMANDS` commands while its next command is queued, before
-choosing by service again. The same model process stays resident when switching runs. This is fairness between ready
-runs in one engine; GPU admission uses its own waiting order and does not establish a global per-user share.
+Within a shared engine, `scheduler.select_runs` chooses the ready runs served the fewest tokens, after any sampler save,
+which a sampler is waiting on. A trainer may continue its current run for up to `RUN_COMMANDS` commands while its next
+command is queued, before choosing by service again. The same model process stays resident when switching runs. This is
+fairness between ready runs in one engine; GPU admission uses its own waiting order and does not establish a global
+per-user share.
 Each command carries its cost, set when it is queued: the tokens a `forward_backward` trains on, a sample's prompt plus
 the most tokens it may generate, and 1 for anything else. A newly ready run joins the active service floor, so waiting
 on input preparation does not accumulate catch-up credit.
@@ -91,8 +92,6 @@ services, stop the nodes gracefully and restart the scheduler and node daemons t
 | `QUANTUM` | 30 s | GPU turn while another worker waits, checked between commands or waves |
 | `SAMPLE_RUNS` | 3 | LoRA sessions in a sampling wave; full fine-tunes use one |
 | `SAMPLE_COMMANDS` | 128 | Commands from each session in a wave |
-| `SAVE_WAIT_S` | 0.015 s | Grace after a LoRA optimizer reply for its following sampler save |
-| `SAMPLE_WAIT_S` | 0.02 s | Gathering delay after cold sampler startup |
 
 When no other run is ready, the same run can be chosen again after its continuation ends.
 
@@ -191,7 +190,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM`,
-`RUN_COMMANDS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `SAVE_WAIT_S`, `SAMPLE_WAIT_S`, `IDLE_MS`, `DRAIN_S`,
+`RUN_COMMANDS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `IDLE_MS`, `DRAIN_S`,
 `ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted), `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 
 ## Telemetry
