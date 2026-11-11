@@ -384,9 +384,9 @@ handles run and node assignment.
    also keeps its reservation until cleanup finishes.
 
 A local LoRA move retains the model process. Its old allocation must park before the next reservation can use its new
-GPUs. A slow checkpoint download does not prevent an otherwise idle worker from yielding to ready work. Current local
-placement and reservations appear in node heartbeats and the scheduling endpoint as diagnostic snapshots. Redis retains
-cluster assignments; there is no local turn event protocol to replay.
+GPUs. A slow checkpoint download does not prevent an otherwise idle worker from yielding to ready work. Each worker's
+actual GPUs and process appear in its node's heartbeat and the scheduling endpoint; reservations stay in the node. Redis
+retains cluster assignments; there is no local turn event protocol to replay.
 
 Measured on an H100: parking 16 GB takes 0.60 s, resuming takes 0.64 s, and 725–781 MiB stay on the GPU (529 MiB of
 CUDA context, about 210 MiB of cuBLAS, and allocator slack). vLLM's level 1 sleep leaves 808 MiB on an L4. That leftover

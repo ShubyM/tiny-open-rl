@@ -59,10 +59,15 @@ def daemons() -> dict[str, str]:
   return {p["metadata"]["name"]: p["spec"].get("nodeName", "") for p in pods if p["status"].get("phase") == "Running"}
 
 
+def table() -> dict[str, dict]:
+  """Worker -> its spec and node, from the scheduler's assignment table."""
+  records = redis("HGETALL", "tinyrl:workers").splitlines()
+  return {worker: json.loads(raw) for worker, raw in zip(records[::2], records[1::2])}
+
+
 def placements() -> dict[str, str]:
   """Worker -> the node daemon pod the scheduler placed it on. A node daemon's id is its pod name and pid."""
-  workers = json.loads(redis("GET", "tinyrl:state") or "{}").get("workers", {})
-  return {worker: p["node"].rsplit("-", 1)[0] for worker, p in workers.items() if p["node"]}
+  return {worker: w["node"].rsplit("-", 1)[0] for worker, w in table().items() if w["node"]}
 
 
 def serving(worker: str) -> str | None:
@@ -70,7 +75,7 @@ def serving(worker: str) -> str | None:
 
 
 def live_workers() -> dict[tuple[str, str], dict]:
-  """Physical (pod, worker) -> live state, including its owned supervisor PID. Placement may already name another node."""
+  """Physical (pod, worker) -> its GPUs and owned supervisor PID, as its node reports. Placement may already name another node."""
   records = redis("HGETALL", "tinyrl:nodes").splitlines()
   workers = {}
   for node, raw in zip(records[::2], records[1::2]):
@@ -94,19 +99,18 @@ def processes(pod: str) -> dict[int, tuple[int, int, str]]:
 
 def trainer_process(worker: str) -> tuple[str, int]:
   pod = serving(worker)
-  state = live_workers()[(pod, worker)]
-  pid = state["pid"]
-  assert state["kind"]["role"] == "trainer" and isinstance(pid, int) and pid > 1, state
+  pid = live_workers()[(pod, worker)]["pid"]
+  assert table()[worker]["spec"]["role"] == "trainer" and isinstance(pid, int) and pid > 1, pid
   args = processes(pod)[pid][2]
   assert "-m tinyrl.control.process " in args and "-m tinyrl.workers.trainer " in args, args
   return pod, pid
 
 
-def check_processes(placed: dict, workers: dict, procs: dict, owners: list[str]) -> None:
+def check_processes(placed: dict, workers: dict, procs: dict, owners: list[str], trainers: set[str]) -> None:
   assert set(workers) == {(pod, worker) for worker, pod in placed.items()}, (placed, workers)
   for pod, ps in procs.items():
     local = {worker: state for (at, worker), state in workers.items() if at == pod}
-    missing = [worker for worker, s in local.items() if s["kind"]["role"] == "trainer" and s["pid"] is None]
+    missing = [worker for worker, s in local.items() if worker in trainers and s["pid"] is None]
     assert not missing, (pod, "trainers without a process", missing)
     expected = [s["pid"] for s in local.values() if s["pid"] is not None]
     supervisors = {pid for pid, (_, _, args) in ps.items() if "-m tinyrl.control.process " in args}
@@ -277,7 +281,8 @@ def main() -> None:
     workers = live_workers()
     procs = {pod: processes(pod) for pod in daemons()}
     owners = [k.removeprefix("tinyrl:owner:") for k in redis("KEYS", "tinyrl:owner:*").split()]
-    check_processes(placed, workers, procs, owners)
+    trainers = {worker for worker, w in table().items() if w["spec"]["role"] == "trainer"}
+    check_processes(placed, workers, procs, owners, trainers)
     engines = sum(s["pid"] is not None for s in workers.values())
     return f"{len(placed)} workers, {engines} owned process groups, and no stray processes or leases"
 
