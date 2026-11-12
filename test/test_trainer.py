@@ -72,7 +72,7 @@ class TestForwardPass(unittest.TestCase):
     mask[2, 7:] = 0
 
     with torch.no_grad():
-      got = target_logprobs(lm, ids, mask, targets)
+      got = target_logprobs(lm, ids, targets)  # which passes no mask: padding on the right changes no real position
       want = lm(ids, attention_mask=mask).logits.log_softmax(-1).gather(-1, targets[..., None])[..., 0]
     torch.testing.assert_close(got[mask.bool()], want[mask.bool()])
 

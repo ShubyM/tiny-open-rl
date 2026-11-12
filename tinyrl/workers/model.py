@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import logging
 import math
 import os
@@ -129,7 +130,6 @@ def batch_tensors(data: list[wire.Datum], lengths: list[int], device: torch.devi
 
   return {
     "ids": pad([d.tokens for d in data], lengths, np.int64, device),
-    "mask": pad([np.ones(n) for n in lengths], lengths, np.int64, device),
     "targets": column("target_tokens", 0, np.int64),
     "weights": column("weights", 1.0, np.float32),
     "sampler_logprobs": column("logprobs", 0.0, np.float32),
@@ -137,11 +137,13 @@ def batch_tensors(data: list[wire.Datum], lengths: list[int], device: torch.devi
   }
 
 
-def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
   """The logprob of each target token.
 
-  The model returns its hidden states instead of logits. The output head and the logsumexp then run CHUNK positions at a time under checkpointing, so the [tokens, vocab] logits never exist all at once."""
-  out = lm(ids, attention_mask=mask, use_cache=False, logits_to_keep=1, output_hidden_states=True)
+  The model returns its hidden states instead of logits. The output head and the logsumexp then run CHUNK positions at a time under checkpointing, so the [tokens, vocab] logits never exist all at once.
+
+  The model gets no padding mask. Rows are padded on the right and attention is causal, so no token sees the padding, and without a mask the model's attention can run on a kernel that takes none."""
+  out = lm(ids, use_cache=False, logits_to_keep=1, output_hidden_states=True)
   hidden = out.hidden_states[-1].flatten(0, 1)
   head = lm.get_output_embeddings()
   softcap = getattr(lm.config.get_text_config(), "final_logit_softcapping", None)  # gemma caps its logits
@@ -184,8 +186,19 @@ def load(name: str) -> PreTrainedModel:
   cls = getattr(transformers, arch, AutoModelForCausalLM)
   # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create_run
   if torch.cuda.is_available() and not dist.is_initialized():
-    return cls.from_pretrained(name, dtype=torch.bfloat16, device_map={"": torch.cuda.current_device()})
-  return cls.from_pretrained(name, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+    lm = cls.from_pretrained(name, dtype=torch.bfloat16, device_map={"": torch.cuda.current_device()})
+  else:
+    lm = cls.from_pretrained(name, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+  # FlashAttention 4 where transformers finds it installed, on a GPU it has kernels for, for a model that takes it: otherwise
+  # this raises and the model keeps PyTorch's attention. It takes a sliding layer's window, as Gemma has, where PyTorch's
+  # gets an [n, n] mask and computes every pair of a long row
+  with contextlib.suppress(ImportError, ValueError):
+    lm.set_attn_implementation("flash_attention_4")
+    # its kernels are for a head dimension up to 128, and for 256. A layer with another, as Gemma 4's full layers, stays
+    for layer in [m for m in lm.modules() if getattr(m, "head_dim", 0) > 128 and m.head_dim != 256]:
+      layer.config = copy.copy(layer.config)
+      layer.config._attn_implementation = "sdpa"
+  return lm
 
 
 def lora_targets(lm: PreTrainedModel, config: dict) -> list[str]:
@@ -223,7 +236,12 @@ class Model:
         self.lm.gradient_checkpointing_enable()
         if self.lora:
           self.lm.enable_input_require_grads()  # with the embeddings frozen, checkpointed layers need a gradient path
-      if dist.is_initialized():  # FSDP2 over its default unnamed mesh, which PEFT sizes adapters for at full width
+      if dist.is_initialized() and self.lora:
+        # a LoRA run's base model is frozen, so each rank keeps a whole copy: sharded, every pass would gather every layer's
+        # weights again, and the ranks would wait on each other layer by layer. Only the adapters' gradients cross ranks
+        if torch.cuda.is_available():
+          self.lm.to(torch.cuda.current_device())
+      elif dist.is_initialized():  # FSDP2 over its default unnamed mesh
         mp = MixedPrecisionPolicy(reduce_dtype=torch.float32)
         for layer in [m for m in self.lm.modules() if type(m).__name__ in (self.lm._no_split_modules or ())]:
           fully_shard(layer, mp_policy=mp)
@@ -287,7 +305,7 @@ class Model:
           seq = [data[i] for i in batch] or [wire.Datum(np.zeros(1, np.int32), {"weights": np.zeros(1, np.float32)})]
           x = batch_tensors(seq, [lengths[i] for i in batch] or [1], lm.device)
           with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
-            lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
+            lp = target_logprobs(lm, x["ids"], x["targets"])
           loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
           if not forward_only:
             accumulating = True
