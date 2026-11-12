@@ -24,11 +24,14 @@ from tinyrl.helpers import getenv
 from tinyrl.storage import models
 from tinyrl.storage.store import aligned, nbytes, pinned_bytes
 
-LigerFusedLinearCrossEntropyLoss = apply_liger = None
+LigerFusedLinearCrossEntropyLoss = apply_liger = flash_attn_func = None
 with contextlib.suppress(ImportError):
   logging.getLogger("liger_kernel").setLevel(logging.ERROR)
   from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
   from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance as apply_liger
+with contextlib.suppress(ImportError):
+  os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
+  from flash_attn.cute import flash_attn_func
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
@@ -167,12 +170,17 @@ def causal_attention(
 ):
   """Causal attention over right-padded rows, with no [n, n] mask.
 
-  A layer that sees everything before it runs PyTorch's flash kernel. A sliding layer sees its last sliding_window positions,
-  and under a mask it would still compute every pair. Here a block of queries meets only the keys in its reach, so the work
-  grows with n * sliding_window instead of n². Registered with transformers, which then builds no mask for the model."""
+  Runs FlashAttention 4 where its Hopper/Blackwell kernels take the head dimension (a full layer with head_dim 512 exceeds
+  SM100 TMEM), and otherwise runs PyTorch's flash kernel on full layers or window-sized blocks on sliding layers."""
+  d, n, w = query.shape[-1], query.shape[2], sliding_window
+  sm = torch.cuda.get_device_capability(query.device)[0] if flash_attn_func and query.is_cuda and not dropout else 0
+  if query.dtype in (torch.float16, torch.bfloat16) and d == value.shape[-1] and d % 8 == 0:
+    if (sm == 9 and d <= 256) or (sm == 10 and (d <= 128 or d == 256)):
+      q, k, v = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+      return flash_attn_func(q, k, v, softmax_scale=scaling, causal=True, window_size=(w - 1, 0) if w else (None, None))
   groups = getattr(module, "num_key_value_groups", 1)
   key, value = key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)
-  n, w, attend = query.shape[2], sliding_window, torch.nn.functional.scaled_dot_product_attention
+  attend = torch.nn.functional.scaled_dot_product_attention
   if w is None or n <= w:
     return attend(query, key, value, dropout_p=dropout, scale=scaling, is_causal=True).transpose(
       1, 2
