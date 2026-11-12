@@ -17,7 +17,7 @@ from test.test_api import proto_body
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Run
 from tinyrl.storage.store import Store
-from tinyrl.workers.model import LOSSES, Model, batches, target_logprobs
+from tinyrl.workers.model import LOSSES, Model, batches, causal_attention, target_logprobs
 from tinyrl.workers.trainer import Trainer
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
@@ -75,6 +75,20 @@ class TestForwardPass(unittest.TestCase):
       got = target_logprobs(lm, ids, mask, targets)
       want = lm(ids, attention_mask=mask).logits.log_softmax(-1).gather(-1, targets[..., None])[..., 0]
     torch.testing.assert_close(got[mask.bool()], want[mask.bool()])
+
+  def test_attention_without_a_mask_is_attention_under_the_causal_and_the_sliding_mask(self):
+    torch.manual_seed(0)
+    n, heads, kv_heads = 70, 4, 2
+    query, key, value = torch.randn(2, heads, n, 8), torch.randn(2, kv_heads, n, 8), torch.randn(2, kv_heads, n, 8)
+    module = type("Layer", (), {"num_key_value_groups": heads // kv_heads})()
+    q, k = torch.arange(n)[:, None], torch.arange(n)[None]
+    wide = lambda t: t.repeat_interleave(heads // kv_heads, dim=1)  # noqa: E731
+    # 16 and 31 put block edges inside the row, 70 and 200 reach every earlier position
+    for window in (None, 16, 31, 70, 200):
+      mask = (k <= q) & (k > q - window if window else True)
+      want = torch.nn.functional.scaled_dot_product_attention(query, wide(key), wide(value), attn_mask=mask, scale=0.3)
+      got, _ = causal_attention(module, query, key, value, None, scaling=0.3, sliding_window=window)
+      self.assertTrue(torch.allclose(got, want.transpose(1, 2), atol=1e-5), window)
 
   def test_losses_are_their_definitions(self):
     g = torch.Generator().manual_seed(0)

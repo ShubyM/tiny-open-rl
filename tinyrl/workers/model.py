@@ -17,7 +17,7 @@ from peft.helpers import disable_input_dtype_casting
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.utils.checkpoint import checkpoint
-from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
+from transformers import AttentionInterface, AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl.api import wire
 from tinyrl.helpers import getenv
@@ -162,6 +162,34 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
   return torch.cat([checkpoint(chunk_logprobs, h, t, use_reentrant=False) for h, t in chunks]).view(targets.shape)
 
 
+def causal_attention(
+  module, query, key, value, attention_mask, dropout=0.0, scaling=None, sliding_window=None, **kwargs
+):
+  """Causal attention over right-padded rows, with no [n, n] mask.
+
+  A layer that sees everything before it runs PyTorch's flash kernel. A sliding layer sees its last sliding_window positions,
+  and under a mask it would still compute every pair. Here a block of queries meets only the keys in its reach, so the work
+  grows with n * sliding_window instead of n². Registered with transformers, which then builds no mask for the model."""
+  groups = getattr(module, "num_key_value_groups", 1)
+  key, value = key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)
+  n, w, attend = query.shape[2], sliding_window, torch.nn.functional.scaled_dot_product_attention
+  if w is None or n <= w:
+    return attend(query, key, value, dropout_p=dropout, scale=scaling, is_causal=True).transpose(
+      1, 2
+    ).contiguous(), None
+  out = []
+  for start in range(0, n, w):
+    end, first = min(n, start + w), max(0, start - w + 1)
+    q, k = torch.arange(start, end, device=query.device)[:, None], torch.arange(first, end, device=query.device)[None]
+    reach = (k <= q) & (k > q - w)
+    keys, values = key[:, :, first:end], value[:, :, first:end]
+    out.append(attend(query[:, :, start:end], keys, values, attn_mask=reach, dropout_p=dropout, scale=scaling))
+  return torch.cat(out, dim=2).transpose(1, 2).contiguous(), None
+
+
+AttentionInterface.register("tinyrl_causal", causal_attention)
+
+
 # ***** model *****
 
 
@@ -180,12 +208,15 @@ def like_param(t: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
 def load(name: str) -> PreTrainedModel:
   """The class the checkpoint names in its config, which is the one vLLM serves, so the weights and adapters a trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and vLLM drops an adapter whose names it can't map, without an error."""
   name = models.local(name)
-  arch = (AutoConfig.from_pretrained(name).architectures or [""])[0]
-  cls = getattr(transformers, arch, AutoModelForCausalLM)
+  config = AutoConfig.from_pretrained(name)
+  cls = getattr(transformers, (config.architectures or [""])[0], AutoModelForCausalLM)
+  # a model with sliding layers, as Gemma has, would otherwise mask every pair of a long row
+  sliding = "sliding_attention" in (getattr(config.get_text_config(), "layer_types", None) or ())
+  kw = {"attn_implementation": "tinyrl_causal"} if sliding else {}
   # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create_run
   if torch.cuda.is_available() and not dist.is_initialized():
-    return cls.from_pretrained(name, dtype=torch.bfloat16, device_map={"": torch.cuda.current_device()})
-  return cls.from_pretrained(name, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+    return cls.from_pretrained(name, dtype=torch.bfloat16, device_map={"": torch.cuda.current_device()}, **kw)
+  return cls.from_pretrained(name, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32, **kw)
 
 
 def lora_targets(lm: PreTrainedModel, config: dict) -> list[str]:
