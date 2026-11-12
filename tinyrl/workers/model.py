@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import logging
 import math
 import os
@@ -17,21 +18,18 @@ from peft.helpers import disable_input_dtype_casting
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.utils.checkpoint import checkpoint
-from transformers import AttentionInterface, AutoConfig, AutoModelForCausalLM, PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
 from tinyrl.api import wire
 from tinyrl.helpers import getenv
 from tinyrl.storage import models
 from tinyrl.storage.store import aligned, nbytes, pinned_bytes
 
-LigerFusedLinearCrossEntropyLoss = apply_liger = flash_attn_func = None
+LigerFusedLinearCrossEntropyLoss = apply_liger = None
 with contextlib.suppress(ImportError):
   logging.getLogger("liger_kernel").setLevel(logging.ERROR)
   from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
   from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance as apply_liger
-with contextlib.suppress(ImportError):
-  os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
-  from flash_attn.cute import flash_attn_func
 
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
@@ -132,7 +130,6 @@ def batch_tensors(data: list[wire.Datum], lengths: list[int], device: torch.devi
 
   return {
     "ids": pad([d.tokens for d in data], lengths, np.int64, device),
-    "mask": pad([np.ones(n) for n in lengths], lengths, np.int64, device),
     "targets": column("target_tokens", 0, np.int64),
     "weights": column("weights", 1.0, np.float32),
     "sampler_logprobs": column("logprobs", 0.0, np.float32),
@@ -140,11 +137,13 @@ def batch_tensors(data: list[wire.Datum], lengths: list[int], device: torch.devi
   }
 
 
-def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
   """The logprob of each target token.
 
-  The model returns its hidden states instead of logits. The output head and the logsumexp then run CHUNK positions at a time under checkpointing, so the [tokens, vocab] logits never exist all at once."""
-  out = lm(ids, attention_mask=mask, use_cache=False, logits_to_keep=1, output_hidden_states=True)
+  The model returns its hidden states instead of logits. The output head and the logsumexp then run CHUNK positions at a time under checkpointing, so the [tokens, vocab] logits never exist all at once.
+
+  The model gets no padding mask. Rows are padded on the right and attention is causal, so no token sees the padding, and without a mask the model's attention can run on a kernel that takes none."""
+  out = lm(ids, use_cache=False, logits_to_keep=1, output_hidden_states=True)
   hidden = out.hidden_states[-1].flatten(0, 1)
   head = lm.get_output_embeddings()
   softcap = getattr(lm.config.get_text_config(), "final_logit_softcapping", None)  # gemma caps its logits
@@ -165,39 +164,6 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, mask: torch.Tensor, 
   return torch.cat([checkpoint(chunk_logprobs, h, t, use_reentrant=False) for h, t in chunks]).view(targets.shape)
 
 
-def causal_attention(
-  module, query, key, value, attention_mask, dropout=0.0, scaling=None, sliding_window=None, **kwargs
-):
-  """Causal attention over right-padded rows, with no [n, n] mask.
-
-  Runs FlashAttention 4 where its Hopper/Blackwell kernels take the head dimension (a full layer with head_dim 512 exceeds
-  SM100 TMEM), and otherwise runs PyTorch's flash kernel on full layers or window-sized blocks on sliding layers."""
-  d, n, w = query.shape[-1], query.shape[2], sliding_window
-  sm = torch.cuda.get_device_capability(query.device)[0] if flash_attn_func and query.is_cuda and not dropout else 0
-  if query.dtype in (torch.float16, torch.bfloat16) and d == value.shape[-1] and d % 8 == 0:
-    if (sm == 9 and d <= 256) or (sm == 10 and (d <= 128 or d == 256)):
-      q, k, v = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
-      return flash_attn_func(q, k, v, softmax_scale=scaling, causal=True, window_size=(w - 1, 0) if w else (None, None))
-  groups = getattr(module, "num_key_value_groups", 1)
-  key, value = key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)
-  attend = torch.nn.functional.scaled_dot_product_attention
-  if w is None or n <= w:
-    return attend(query, key, value, dropout_p=dropout, scale=scaling, is_causal=True).transpose(
-      1, 2
-    ).contiguous(), None
-  out = []
-  for start in range(0, n, w):
-    end, first = min(n, start + w), max(0, start - w + 1)
-    q, k = torch.arange(start, end, device=query.device)[:, None], torch.arange(first, end, device=query.device)[None]
-    reach = (k <= q) & (k > q - w)
-    keys, values = key[:, :, first:end], value[:, :, first:end]
-    out.append(attend(query[:, :, start:end], keys, values, attn_mask=reach, dropout_p=dropout, scale=scaling))
-  return torch.cat(out, dim=2).transpose(1, 2).contiguous(), None
-
-
-AttentionInterface.register("tinyrl_causal", causal_attention)
-
-
 # ***** model *****
 
 
@@ -216,15 +182,23 @@ def like_param(t: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
 def load(name: str) -> PreTrainedModel:
   """The class the checkpoint names in its config, which is the one vLLM serves, so the weights and adapters a trainer saves carry the checkpoint's parameter names and vLLM maps them like the checkpoint's own. A multimodal checkpoint's causal LM class names its layers differently (Qwen3.5: model.layers.* for model.language_model.*), and vLLM drops an adapter whose names it can't map, without an error."""
   name = models.local(name)
-  config = AutoConfig.from_pretrained(name)
-  cls = getattr(transformers, (config.architectures or [""])[0], AutoModelForCausalLM)
-  # a model with sliding layers, as Gemma has, would otherwise mask every pair of a long row
-  sliding = "sliding_attention" in (getattr(config.get_text_config(), "layer_types", None) or ())
-  kw = {"attn_implementation": "tinyrl_causal"} if sliding else {}
+  arch = (AutoConfig.from_pretrained(name).architectures or [""])[0]
+  cls = getattr(transformers, arch, AutoModelForCausalLM)
   # bf16 on the gpu, where a LoRA run's frozen base model stays. A full fine-tune upcasts to fp32 in Model.create_run
   if torch.cuda.is_available() and not dist.is_initialized():
-    return cls.from_pretrained(name, dtype=torch.bfloat16, device_map={"": torch.cuda.current_device()}, **kw)
-  return cls.from_pretrained(name, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32, **kw)
+    lm = cls.from_pretrained(name, dtype=torch.bfloat16, device_map={"": torch.cuda.current_device()})
+  else:
+    lm = cls.from_pretrained(name, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+  # FlashAttention 4 where transformers finds it installed, on a GPU it has kernels for, for a model that takes it: otherwise
+  # this raises and the model keeps PyTorch's attention. It takes a sliding layer's window, as Gemma has, where PyTorch's
+  # gets an [n, n] mask and computes every pair of a long row
+  with contextlib.suppress(ImportError, ValueError):
+    lm.set_attn_implementation("flash_attention_4")
+    # its kernels are for a head dimension up to 128, and for 256. A layer with another, as Gemma 4's full layers, stays
+    for layer in [m for m in lm.modules() if getattr(m, "head_dim", 0) > 128 and m.head_dim != 256]:
+      layer.config = copy.copy(layer.config)
+      layer.config._attn_implementation = "sdpa"
+  return lm
 
 
 def lora_targets(lm: PreTrainedModel, config: dict) -> list[str]:
@@ -331,7 +305,7 @@ class Model:
           seq = [data[i] for i in batch] or [wire.Datum(np.zeros(1, np.int32), {"weights": np.zeros(1, np.float32)})]
           x = batch_tensors(seq, [lengths[i] for i in batch] or [1], lm.device)
           with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
-            lp = target_logprobs(lm, x["ids"], x["mask"], x["targets"])
+            lp = target_logprobs(lm, x["ids"], x["targets"])
           loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
           if not forward_only:
             accumulating = True

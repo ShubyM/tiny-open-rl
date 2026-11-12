@@ -15,5 +15,8 @@ COPY pyproject.toml README.md ./
 COPY tinyrl tinyrl
 RUN pip install --no-cache-dir --no-deps .
 
+# FlashAttention 4 compiles a kernel the first time a process uses it, unless it finds it in this cache
+ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 FLASH_ATTENTION_CUTE_DSL_CACHE_DIR=/root/.cache/flash-attention-cute
+
 ENTRYPOINT []
 CMD ["python3", "-m", "tinyrl.control.node_daemon"]
