@@ -223,7 +223,12 @@ class Model:
         self.lm.gradient_checkpointing_enable()
         if self.lora:
           self.lm.enable_input_require_grads()  # with the embeddings frozen, checkpointed layers need a gradient path
-      if dist.is_initialized():  # FSDP2 over its default unnamed mesh, which PEFT sizes adapters for at full width
+      if dist.is_initialized() and self.lora:
+        # a LoRA run's base model is frozen, so each rank keeps a whole copy: sharded, every pass would gather every layer's
+        # weights again, and the ranks would wait on each other layer by layer. Only the adapters' gradients cross ranks
+        if torch.cuda.is_available():
+          self.lm.to(torch.cuda.current_device())
+      elif dist.is_initialized():  # FSDP2 over its default unnamed mesh
         mp = MixedPrecisionPolicy(reduce_dtype=torch.float32)
         for layer in [m for m in self.lm.modules() if type(m).__name__ in (self.lm._no_split_modules or ())]:
           fully_shard(layer, mp_policy=mp)
