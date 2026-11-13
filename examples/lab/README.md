@@ -81,10 +81,12 @@ Settings are `name=value` arguments, the fields of `Config` at the top of `lab_r
 Two things tinyrl takes from the session rather than from the recipe: the trainer's width, as `TINKER_TAGS=openrl.gpus=4` in
 the environment, and the API key, as `TINKER_API_KEY`.
 
-An episode leaves a folder under `$LAB_ROOT/results/tinyrl/<task>/<id>/`, which is where LAB's grader reads it: `output/` (what
-it wrote), `messages.jsonl` (the conversation, as cookbook messages), `metrics.json` (LAB's tool counts), and the grader's
-`scores.json` and `grading.log`. With `capture=true` the cookbook also keeps each call's prompt and sampled tokens; a prompt is
-the whole conversation so far, so that store grows with the square of an episode's turns.
+What an episode said and did is in the cookbook's own logs: `out/iteration_<n>/train_rollout_summaries.jsonl` and
+`eval_test_rollout_summaries.jsonl` hold, for every rollout, each turn's text, tool calls and tool replies, with its rewards and
+metrics. With `capture=true` the cookbook also keeps each call's prompt and sampled tokens, thinking included; a prompt is the
+whole conversation so far, so that store grows with the square of an episode's turns. What an episode wrote is where LAB's
+grader reads it, under `$LAB_ROOT/results/tinyrl/<task>/<id>/`: `output/`, `metrics.json` (LAB's tool counts), and the grader's
+`scores.json` and `grading.log`.
 
 What the cookbook's loop does not give: it samples through one sampling client, so a step's episodes share one sampler, and a
 run that is restarted resumes from the cookbook's checkpoint, which needs a gateway that answers `weights_info`.

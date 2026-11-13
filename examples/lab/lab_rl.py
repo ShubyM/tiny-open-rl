@@ -34,13 +34,13 @@ import tinker
 from gemma4 import SAMPLED, Gemma4
 from harness.tools import get_all_tool_definitions
 from tinker_cookbook import model_info, renderers
-from tinker_cookbook.renderers.base import Message, RenderedMessage, Renderer, message_to_jsonable
+from tinker_cookbook.renderers.base import Message, RenderedMessage, Renderer
 from tinker_cookbook.rl import train
 from tinker_cookbook.rl.rollout_limits import RolloutLimits
 from tinker_cookbook.rl.rollout_presets import RolloutConfig
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetBuilder, Trajectory
 from tinker_cookbook.tokenizer_utils import get_tokenizer
-from tinker_cookbook.tool_use import build_agent_tool_env
+from tinker_cookbook.tool_use import build_agent_tool_env, simple_tool_result
 from tinker_cookbook.tool_use.types import ToolInput, ToolResult
 
 LAB = Path(os.environ["LAB_ROOT"]).resolve()  # LAB's checkout, which is also on PYTHONPATH for its harness and sandbox
@@ -215,7 +215,7 @@ class LabTool:
 
   async def run(self, input: ToolInput) -> ToolResult:
     result = await self.rollout.execute(self.name, input.arguments)
-    return ToolResult(messages=[{"role": "tool", "content": result, "name": self.name, "tool_call_id": input.call_id}])
+    return simple_tool_result(result, call_id=input.call_id or "", name=self.name)
 
 
 class Rollout:
@@ -276,12 +276,10 @@ class Rollout:
   async def finish(self, messages: list[Message] | None = None) -> tuple[float, dict]:
     """The episode's grade, which the cookbook's environment asks for at an episode's end, and the group for the rest."""
     if self.graded is None:
-      self.graded = await self.end(messages or self.env.message_env.history)
+      self.graded = await self.end()
     return self.graded
 
-  async def end(self, messages: list[Message]) -> tuple[float, dict]:
-    self.run.mkdir(parents=True, exist_ok=True)
-    (self.run / "messages.jsonl").write_text("".join(json.dumps(message_to_jsonable(m)) + "\n" for m in messages))
+  async def end(self) -> tuple[float, dict]:
     if self.box:
       (self.run / "metrics.json").write_text(json.dumps(self.tools.get_metrics() | {"suspends": self.box.suspends}))
       try:
