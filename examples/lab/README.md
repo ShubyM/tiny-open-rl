@@ -19,14 +19,14 @@ turns or its room for tokens. What is here joins LAB to them:
 - **Tools.** Each of LAB's tools is a cookbook `Tool` that runs LAB's own code in the rollout's sandbox. A turn's calls run in the
   order the model made them.
 - **Sandboxes.** A rollout has a sandbox of its own, opened by its first tool call and closed when the episode ends.
-- **Grading.** When an episode ends, what it wrote comes home and LAB's judge grades it. The cookbook's environment asks for the
+- **Grading.** When an episode ends, what it wrote is copied back and LAB's judge grades it. The cookbook's environment asks for the
   grade when an episode stops by itself or runs out of turns. For the other endings (a turn that cannot be read, a turn cut off
   by its token limit, no room left) it does not, so the group grades those as their group reward: every episode that wrote
   something is graded, however it ended.
 - **Sampled turns stay as sampled.** The cookbook renders a conversation again from its parsed messages at every turn, and a
   turn written again differs from the sampled one in whitespace. The next prompt would then not extend the last, and an episode
   of 50 turns would train as 50 sequences instead of one. Both renderers here keep a sampled turn's tokens on its message and
-  write those: `gemma4.py`, and `as_sampled` in `lab_rl.py`, which does it to any cookbook renderer.
+  write those: `gemma4.py`, and `keep_sampled_tokens` in `lab_rl.py`, which does it to any cookbook renderer.
 
 The tasks, tools and grader are LAB's. The held-out tasks and the order of the training tasks are the same as in open-rl's
 `examples/harvey_labs` recipe, so a run here and a run there can be compared; no code is shared with it. First prompts are the
@@ -116,7 +116,7 @@ run that is restarted resumes from the cookbook's checkpoint, which needs a gate
   sampler has to return the stop token; tinyrl's does.
 - **Tasks against open-rl's recipe.** The 50 held-out tasks and the first 300 training tasks are the same, in the same order.
 - **`substrate.py` against open-rl's Substrate sandbox, before it was put behind the cookbook's interface.** 23 tool calls on
-  the same task: 22 gave the same result, with the same tool metrics and the same files brought home; the other was a grep
+  the same task: 22 gave the same result, with the same tool metrics and the same files copied back; the other was a grep
   count whose lines came in a different order, since LAB's grep runs on the host here and in the sandbox there. An output
   folder holding a link to `/etc/passwd` leaked nothing. Not rerun on this version.
 - **Before the cookbook's environment, the same episode logic as a plain script: 35 steps of 8 tasks × 6 on 4 B200s.**

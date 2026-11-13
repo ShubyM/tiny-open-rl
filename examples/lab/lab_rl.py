@@ -31,7 +31,7 @@ from pathlib import Path
 import chz
 import substrate
 import tinker
-from gemma4 import SAMPLED, Gemma4
+from gemma4 import SAMPLED_TOKENS, Gemma4Renderer
 from harness.tools import get_all_tool_definitions
 from tinker_cookbook import model_info, renderers
 from tinker_cookbook.renderers.base import Message, RenderedMessage, Renderer
@@ -43,8 +43,8 @@ from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.tool_use import build_agent_tool_env, simple_tool_result
 from tinker_cookbook.tool_use.types import ToolInput, ToolResult
 
-LAB = Path(os.environ["LAB_ROOT"]).resolve()  # LAB's checkout, which is also on PYTHONPATH for its harness and sandbox
-SKILLS = sorted(p.parent.name for p in (LAB / "harness" / "skills").glob("*/SKILL.md"))
+LAB_ROOT = Path(os.environ["LAB_ROOT"]).resolve()  # LAB's checkout, which is also on PYTHONPATH
+SKILLS = sorted(p.parent.name for p in (LAB_ROOT / "harness" / "skills").glob("*/SKILL.md"))
 
 
 @chz.chz
@@ -81,7 +81,7 @@ class Config:
 
 def load_task(name: str) -> dict | None:
   """A task that can run and be graded: instructions, criteria and documents."""
-  folder = LAB / "tasks" / name
+  folder = LAB_ROOT / "tasks" / name
   config = json.loads((folder / "task.json").read_text())
   documents = folder / "documents"
   if not (config.get("instructions") and config.get("criteria") and documents.is_dir() and any(documents.rglob("*"))):
@@ -92,7 +92,7 @@ def load_task(name: str) -> dict | None:
 def split() -> tuple[list[dict], list[dict]]:
   """open-rl's split: 50 held-out tasks from a seeded shuffle, and for training the rest that share no family with them."""
   # sorted as paths, folder by folder, which is the order open-rl shuffles: as strings, "a-b/c" would come before "a/c"
-  names = [p.parent.relative_to(LAB / "tasks").as_posix() for p in sorted((LAB / "tasks").rglob("task.json"))]
+  names = [p.parent.relative_to(LAB_ROOT / "tasks").as_posix() for p in sorted((LAB_ROOT / "tasks").rglob("task.json"))]
   tasks = {n: t for n in names if (t := load_task(n))}
   shuffled = list(tasks)
   random.Random(0).shuffle(shuffled)
@@ -107,9 +107,9 @@ def split() -> tuple[list[dict], list[dict]]:
 
 
 def system_prompt(task: dict) -> str:
-  prompt = (LAB / "harness" / "system_prompt.md").read_text()
+  prompt = (LAB_ROOT / "harness" / "system_prompt.md").read_text()
   for skill in SKILLS:
-    prompt += f"\n\n## Skill: {skill}\n\n{(LAB / 'harness' / 'skills' / skill / 'SKILL.md').read_text()}"
+    prompt += f"\n\n## Skill: {skill}\n\n{(LAB_ROOT / 'harness' / 'skills' / skill / 'SKILL.md').read_text()}"
   outputs = list(dict.fromkeys(re.findall(r"`([^`]+\.(?:docx|xlsx|pptx|pdf|md|txt))`", task["instructions"], re.I)))
   if not outputs:
     return prompt
@@ -133,40 +133,42 @@ def system_prompt(task: dict) -> str:
 # ***** the model's side: prompts and sampled turns *****
 
 
-def as_sampled(renderer: Renderer) -> Renderer:
+def keep_sampled_tokens(renderer: Renderer) -> Renderer:
   """A cookbook renderer made to keep a sampled turn in the conversation as the tokens that were sampled. The cookbook's write a
   past turn again from its parsed message, which for Qwen differs in whitespace from what was sampled: the next prompt would then
   not extend this one, and an episode would train as one sequence per turn instead of one. gemma4.py does the same for Gemma 4."""
 
-  class AsSampled(type(renderer)):
+  class KeepSampledTokens(type(renderer)):
     has_extension_property = True
 
     def parse_response(self, response: list[int]):
-      message, end = super().parse_response(response)
-      message[SAMPLED] = list(response)
-      return message, end
+      message, termination = super().parse_response(response)
+      message[SAMPLED_TOKENS] = list(response)
+      return message, termination
 
     def render_message(self, message: Message, ctx) -> RenderedMessage:
-      if SAMPLED not in message:
+      if SAMPLED_TOKENS not in message:
         return super().render_message(message, ctx)
       # the opening the turn was sampled after, and the turn, ended by the stop token whether or not sampling returned it
-      opening, tokens, stop = self._get_generation_suffix("assistant", ctx), message[SAMPLED], self._end_message_token
-      turn = tinker.EncodedTextChunk(tokens=tokens if tokens[-1] == stop else [*tokens, stop])
-      return RenderedMessage(header=tinker.EncodedTextChunk(tokens=opening), output=[turn])
+      header = self._get_generation_suffix("assistant", ctx)
+      tokens, stop = message[SAMPLED_TOKENS], self._end_message_token
+      output = tinker.EncodedTextChunk(tokens=tokens if tokens[-1] == stop else [*tokens, stop])
+      return RenderedMessage(header=tinker.EncodedTextChunk(tokens=header), output=[output])
 
-  renderer.__class__ = AsSampled  # the cookbook builds its renderers by name, so the built one is given the class
+  # the cookbook builds its renderers by name, so the built one is given the class
+  renderer.__class__ = KeepSampledTokens
   return renderer
 
 
-def renderer_for(cfg: Config) -> Renderer:
+def make_renderer(cfg: Config) -> Renderer:
   tokenizer = get_tokenizer(cfg.model)
   if "gemma-4" in cfg.model and not cfg.renderer:
-    return Gemma4(tokenizer, cfg.model, cfg.think)
+    return Gemma4Renderer(tokenizer, cfg.model, cfg.think)
   name = cfg.renderer or model_info.get_recommended_renderer_name(cfg.model)
-  return as_sampled(renderers.get_renderer(name, tokenizer, model_name=cfg.model))
+  return keep_sampled_tokens(renderers.get_renderer(name, tokenizer, model_name=cfg.model))
 
 
-def bounded(tokenizer, result: str, limit: int) -> str:
+def truncate_tool_result(tokenizer, result: str, limit: int) -> str:
   tokens = tokenizer.encode(result, add_special_tokens=False)
   if len(tokens) <= limit:
     return result
@@ -180,12 +182,12 @@ def bounded(tokenizer, result: str, limit: int) -> str:
 
 def grade(cfg: Config, run_id: str, task: str) -> tuple[float, dict]:
   """The fraction of the task's rubric that LAB's judge passes, 0 when the episode wrote nothing."""
-  run = LAB / "results" / run_id
+  run = LAB_ROOT / "results" / run_id
   if not any(p.is_file() and p.stat().st_size for p in (run / "output").rglob("*")):
     return 0.0, {"graded": "no output"}
-  python = LAB / ".venv" / "bin" / "python"
+  python = LAB_ROOT / ".venv" / "bin" / "python"
   flags = ["--run-id", run_id, "--task", task, "--judge-model", cfg.judge, "--parallel", str(cfg.judge_parallel)]
-  done = subprocess.run([python, "-m", "evaluation.run_eval", *flags], cwd=LAB, capture_output=True, text=True)
+  done = subprocess.run([python, "-m", "evaluation.run_eval", *flags], cwd=LAB_ROOT, capture_output=True, text=True)
   (run / "grading.log").write_text(done.stdout + done.stderr)
   scores = json.loads(scores_file.read_text()) if (scores_file := run / "scores.json").exists() else {}
   if done.returncode or not scores.get("n_criteria"):
@@ -210,67 +212,68 @@ class Rollout:
   """One episode: the cookbook's environment for it, a sandbox of its own, opened by its first tool call, and its end, where the
   sandbox is closed and what the episode wrote is graded, once."""
 
-  def __init__(self, group: "Group"):
+  def __init__(self, group: "LabEnvGroupBuilder"):
     self.group, self.cfg, self.task = group, group.cfg, group.task
     cfg, renderer, specs = self.cfg, group.renderer, get_all_tool_definitions()
     self.run_id = f"tinyrl/{self.task['name'].replace('/', '__')}/{uuid.uuid4().hex[:12]}"
-    self.run = LAB / "results" / self.run_id  # where LAB's grader looks for what an episode wrote
-    self.box = self.tools = self.graded = None
+    self.run = LAB_ROOT / "results" / self.run_id  # where LAB's grader looks for what an episode wrote
+    self.sandbox = self.tools = self.result = None
     tools, user = [LabTool(self, spec) for spec in specs], {"role": "user", "content": self.task["instructions"]}
-    first = [*renderer.create_conversation_prefix_with_tools(specs, system_prompt(self.task)), user]
+    messages = [*renderer.create_conversation_prefix_with_tools(specs, system_prompt(self.task)), user]
     # the cookbook's runner gives each call a turn's worth of tokens, or what room is left
     limits = RolloutLimits(max_turn_tokens=cfg.turn_tokens, max_trajectory_tokens=cfg.traj_tokens)
-    rollout = RolloutConfig(limits=limits, tool_execution="sequential")  # a turn's calls in the order it made them
+    config = RolloutConfig(limits=limits, tool_execution="sequential")  # a turn's calls run in order
     # an episode ends on its turns, and with less than 2048 tokens of room for its next turn
-    ends = dict(max_turns=cfg.max_turns, max_trajectory_tokens=cfg.traj_tokens, max_generation_tokens=2048)
+    options = dict(max_turns=cfg.max_turns, max_trajectory_tokens=cfg.traj_tokens, max_generation_tokens=2048)
     # and on a cut-off turn. The cookbook grades neither that ending nor a turn it cannot read, so their rewards
-    # stand for no grade: Group.compute_group_rewards grades those
-    ungraded = dict(terminate_on_length=True, failed_parse_reward=0.0, context_overflow_reward=0.0)
-    self.env = build_agent_tool_env(renderer, tools, first, self.finish, rollout_config=rollout, **ends, **ungraded)
+    # stand for no grade: LabEnvGroupBuilder.compute_group_rewards grades those
+    options |= dict(terminate_on_length=True, failed_parse_reward=0.0, context_overflow_reward=0.0)
+    self.env = build_agent_tool_env(renderer, tools, messages, self.final_reward, rollout_config=config, **options)
 
   async def execute(self, name: str, arguments: dict) -> str:
-    if self.box is None:
+    if self.sandbox is None:
       (self.run / "output").mkdir(parents=True)
       (self.run / "workspace").mkdir()
       for skill in SKILLS:
-        if (scripts := LAB / "harness" / "skills" / skill / "scripts").exists():
+        if (scripts := LAB_ROOT / "harness" / "skills" / skill / "scripts").exists():
           shutil.copytree(scripts, self.run / "workspace" / "skills" / skill / "scripts")
-      cfg, documents, workspace = self.cfg, self.task["documents"], self.run / "workspace"
-      where = cfg.substrate_endpoint, cfg.substrate_image, cfg.substrate_idle
-      box = await substrate.open_sandbox(*where, documents, workspace)
-      files = substrate.Files(box, asyncio.get_running_loop(), documents, workspace, self.run / "output", timeout=60)
-      self.box, self.tools = box, substrate.Tools(sandbox=files, shell_timeout=60)
+      cfg, documents = self.cfg, self.task["documents"]
+      workspace, output = self.run / "workspace", self.run / "output"
+      substrate_args = cfg.substrate_endpoint, cfg.substrate_image, cfg.substrate_idle
+      sandbox = await substrate.create_sandbox(*substrate_args, documents, workspace)
+      files = substrate.LabSandbox(sandbox, asyncio.get_running_loop(), documents, workspace, output, timeout=60)
+      self.sandbox, self.tools = sandbox, substrate.LabTools(sandbox=files, shell_timeout=60)
     result = await asyncio.to_thread(self.tools.execute, name, arguments)
-    if self.box.gone:  # which LAB's tools would have told the model as one more error
-      raise self.box.gone
-    return bounded(self.group.renderer.tokenizer, result, self.cfg.tool_tokens)
+    if self.sandbox.crashed:  # which LAB's tools would have told the model as one more error
+      raise self.sandbox.crashed
+    return truncate_tool_result(self.group.renderer.tokenizer, result, self.cfg.tool_tokens)
 
-  async def shut(self) -> None:
-    """Let the sandbox go, once: at the episode's end, or by its group when the episode failed."""
-    if box := self.box:
-      self.box = None
-      await box.cleanup()
+  async def close_sandbox(self) -> None:
+    """Delete the sandbox, once: at the episode's end, or by its group when the episode failed."""
+    if sandbox := self.sandbox:
+      self.sandbox = None
+      await sandbox.cleanup()
 
-  async def finish(self, messages: list[Message] | None = None) -> tuple[float, dict]:
+  async def final_reward(self, messages: list[Message] | None = None) -> tuple[float, dict]:
     """The episode's grade, which the cookbook's environment asks for at an episode's end, and the group for the rest."""
-    if self.graded is None:
-      self.graded = await self.end()
-    return self.graded
+    if self.result is None:
+      self.result = await self.close_and_grade()
+    return self.result
 
-  async def end(self) -> tuple[float, dict]:
-    if self.box:
-      (self.run / "metrics.json").write_text(json.dumps(self.tools.get_metrics() | {"suspends": self.box.suspends}))
+  async def close_and_grade(self) -> tuple[float, dict]:
+    if self.sandbox:
+      (self.run / "metrics.json").write_text(json.dumps(self.tools.get_metrics() | {"suspends": self.sandbox.suspends}))
       try:
-        await substrate.bring_home(self.box, self.run / "workspace", self.run / "output")
+        await substrate.copy_to_host(self.sandbox, self.run / "workspace", self.run / "output")
       finally:
-        await self.shut()
+        await self.close_sandbox()
     async with self.group.grading:
       reward, graded = await asyncio.to_thread(grade, self.cfg, self.run_id, self.task["name"])
     metrics = {"graded": float(graded["graded"] == "yes"), "wrote_nothing": float(graded["graded"] == "no output")}
     return reward, metrics | {k: graded[k] for k in ("criteria", "criteria_passed") if k in graded}
 
 
-class Group(EnvGroupBuilder):
+class LabEnvGroupBuilder(EnvGroupBuilder):
   """A task's episodes in one step."""
 
   def __init__(self, cfg: Config, renderer: Renderer, grading: asyncio.Semaphore, task: dict, size: int):
@@ -278,33 +281,33 @@ class Group(EnvGroupBuilder):
     self.rollouts: dict[int, Rollout] = {}
 
   async def make_envs(self) -> list[Env]:
-    made = [Rollout(self) for _ in range(self.size)]
-    self.rollouts |= {id(rollout.env): rollout for rollout in made}
-    return [rollout.env for rollout in made]
+    created = [Rollout(self) for _ in range(self.size)]
+    self.rollouts |= {id(rollout.env): rollout for rollout in created}
+    return [rollout.env for rollout in created]
 
   async def compute_group_rewards(self, trajectories: list[Trajectory], envs: list[Env]) -> list[tuple[float, dict]]:
     """The cookbook's environment has an episode graded when it ends by itself, or by its turns. One that ended on a turn that could
     not be read, on a turn's token limit or out of room was not, and still has its sandbox: it is graded here, as its group reward."""
 
-    async def late(env: Env) -> tuple[float, dict]:
+    async def grade_if_needed(env: Env) -> tuple[float, dict]:
       rollout = self.rollouts[id(env)]
-      return (0.0, {}) if rollout.graded else await rollout.finish()
+      return (0.0, {}) if rollout.result else await rollout.final_reward()
 
-    return await asyncio.gather(*map(late, envs))
+    return await asyncio.gather(*map(grade_if_needed, envs))
 
   async def cleanup(self) -> None:
-    await asyncio.gather(*(rollout.shut() for rollout in self.rollouts.values()), return_exceptions=True)
+    await asyncio.gather(*(rollout.close_sandbox() for rollout in self.rollouts.values()), return_exceptions=True)
     self.rollouts = {}
 
   def logging_tags(self) -> list[str]:
     return ["lab"]
 
 
-class Batches(RLDataset):
-  def __init__(self, groups: list[list[Group]]):
+class LabDataset(RLDataset):
+  def __init__(self, groups: list[list[LabEnvGroupBuilder]]):
     self.groups = groups
 
-  def get_batch(self, index: int) -> list[Group]:
+  def get_batch(self, index: int) -> list[LabEnvGroupBuilder]:
     return self.groups[index]
 
   def __len__(self) -> int:
@@ -312,19 +315,19 @@ class Batches(RLDataset):
 
 
 @chz.chz
-class Lab(RLDatasetBuilder):
+class LabDatasetBuilder(RLDatasetBuilder):
   cfg: Config
 
-  async def __call__(self) -> tuple[Batches, Batches | None]:
+  async def __call__(self) -> tuple[LabDataset, LabDataset | None]:
     cfg = self.cfg
     # the tools and the grader run in threads, a few for each episode of a step
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(4 * cfg.batch * cfg.group))
-    renderer, grading = renderer_for(cfg), asyncio.Semaphore(cfg.grading)
+    renderer, grading = make_renderer(cfg), asyncio.Semaphore(cfg.grading)
     tasks, held_out = ([load_task(cfg.task)] * (cfg.batch * cfg.steps), []) if cfg.task else split()
     steps = [tasks[i * cfg.batch : (i + 1) * cfg.batch] for i in range(len(tasks) // cfg.batch)]
-    batches = [[Group(cfg, renderer, grading, t, cfg.group) for t in batch] for batch in steps]
-    evals = [Group(cfg, renderer, grading, t, 1) for t in held_out[: cfg.eval_tasks]]
-    return Batches(batches), Batches([evals]) if evals and cfg.eval_every else None
+    batches = [[LabEnvGroupBuilder(cfg, renderer, grading, t, cfg.group) for t in batch] for batch in steps]
+    evals = [LabEnvGroupBuilder(cfg, renderer, grading, t, 1) for t in held_out[: cfg.eval_tasks]]
+    return LabDataset(batches), LabDataset([evals]) if evals and cfg.eval_every else None
 
 
 # ***** a run *****
@@ -336,7 +339,7 @@ async def main(cfg: Config) -> None:
     base_url=cfg.base_url,
     log_path=cfg.out,
     recipe_name="tinyrl_lab",
-    dataset_builder=Lab(cfg=cfg),
+    dataset_builder=LabDatasetBuilder(cfg=cfg),
     learning_rate=cfg.lr,
     lora_rank=cfg.rank,
     max_tokens=cfg.turn_tokens,
@@ -349,12 +352,12 @@ async def main(cfg: Config) -> None:
   )
   # the cookbook logs two groups of every step token by token, which for long episodes is megabytes a step
   logging.getLogger(train.__name__).addFilter(lambda record: record.funcName != "print_group")
-  captured = contextlib.nullcontext()
+  capture_scope = contextlib.nullcontext()
   if cfg.capture:
     from tinker_cookbook.capture.store import capture_to_store  # which starts a store daemon, so only when asked for
 
-    captured = capture_to_store("lab", data_dir=str(Path(cfg.out, "capture")))
-  with captured:
+    capture_scope = capture_to_store("lab", data_dir=str(Path(cfg.out, "capture")))
+  with capture_scope:
     await train.main(run)
 
 
