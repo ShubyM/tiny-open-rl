@@ -1,0 +1,7 @@
+# What lab_rl.py and substrate.py import, at the versions the runs in README.md used. The Substrate client is installed from a checkout.
+tinker==0.29.0
+transformers==5.16.1
+huggingface-hub==1.14.0
+jinja2==3.1.6
+grpcio==1.84.0
+protobuf==7.36.2

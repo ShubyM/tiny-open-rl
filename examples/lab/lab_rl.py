@@ -1,6 +1,6 @@
 """LAB legal-agent RL on tinyrl. LAB supplies the tasks, the tools and the grader; Gemma 4 or a Qwen 3.5 family model runs through
-the Tinker SDK. An episode's tools run in an Agent Substrate environment (SUBSTRATE_ENDPOINT), which is suspended while the model
-generates, in a sandbox from an Agent Sandbox warm pool (SANDBOX_WARMPOOL), or in LAB's own podman container.
+the Tinker SDK. An episode's tools run in an Agent Substrate environment (SUBSTRATE_ENDPOINT, substrate.py), which is suspended
+while the model generates, or in LAB's own podman container.
 
 One step samples GROUP episodes for each of BATCH tasks, grades them, and trains on each episode's sampled tokens with
 advantage = reward - its task's mean reward. Every step's episodes are saved, so replay.py can train on them again.
@@ -9,12 +9,11 @@ after each step and starts from it again, so a run that died is rerun with the s
 
   LAB_ROOT=/path/to/harvey-labs PYTHONPATH=$LAB_ROOT OPENAI_BASE_URL=http://judge/v1 OPENAI_API_KEY=unused python lab_rl.py
 
-The task split, the system prompt and the Gemma 4 turn handling follow open-rl's examples/harvey_labs, whose sandbox clients
-this uses. See README.md.
+The task split and the system prompt are those of open-rl's examples/harvey_labs, so the two train and evaluate on the same
+tasks. Nothing is imported from it. See README.md.
 """
 
 import asyncio
-import functools
 import json
 import os
 import pickle
@@ -67,8 +66,6 @@ THINK = env("THINK", 1)
 JUDGE = env("JUDGE", "gpt-gemma-4-31b-it")
 JUDGE_PARALLEL = env("JUDGE_PARALLEL", 16)
 GRADING = env("GRADING", 6)  # episodes graded at once
-WARMPOOL = env("SANDBOX_WARMPOOL", "")  # the Agent Sandbox warm pool to claim sandboxes from; local podman without one
-SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE", "lab-sandboxes")
 SUBSTRATE = env(
   "SUBSTRATE_ENDPOINT", ""
 )  # ate-env-api of an Agent Substrate cluster, whose sandboxes suspend while the model generates
@@ -103,7 +100,8 @@ def load_task(name: str) -> dict | None:
 
 def split() -> tuple[list[dict], list[dict]]:
   """open-rl's split: 50 held-out tasks from a seeded shuffle, and for training the rest that share no family with them."""
-  names = sorted(p.parent.relative_to(LAB / "tasks").as_posix() for p in (LAB / "tasks").rglob("task.json"))
+  # sorted as paths, folder by folder, which is the order open-rl shuffles: as strings, "a-b/c" would come before "a/c"
+  names = [p.parent.relative_to(LAB / "tasks").as_posix() for p in sorted((LAB / "tasks").rglob("task.json"))]
   tasks = {n: t for n in names if (t := load_task(n))}
   shuffled = list(tasks)
   random.Random(0).shuffle(shuffled)
@@ -195,33 +193,16 @@ def bounded(result: str) -> str:
 # ***** sandboxes *****
 
 
-@functools.cache
-def remote_sandboxes():
-  if SUBSTRATE:
-    from harvey_labs.substrate_sandbox import SubstrateSandboxFactory
-
-    return SubstrateSandboxFactory(SUBSTRATE, SUBSTRATE_IMAGE, "ate-env", SUBSTRATE_IDLE)
-  from harvey_labs.agent_sandbox import AgentSandboxFactory
-
-  return AgentSandboxFactory(WARMPOOL, SANDBOX_NAMESPACE)
-
-
 async def open_sandbox(task: dict, run_id: str):
-  """Where an episode's tools run: a sandbox claimed from an Agent Sandbox warm pool or an Agent Substrate environment, through open-rl's clients, or LAB's own podman container. Returns how to run a tool, the tools' metrics, and how to bring the outputs home and let the sandbox go."""
+  """Where an episode's tools run: an Agent Substrate environment, or LAB's own podman container. Returns how to run a tool, the tools' metrics, and how to bring the outputs home and let the sandbox go."""
   run = LAB / "results" / run_id
-  if SUBSTRATE or WARMPOOL:
-    from harvey_labs.sandbox import SandboxRequest
+  if SUBSTRATE:
+    import substrate  # which needs the Substrate client, and a local run does not
 
-    folders = {"documents_dir": task["documents"], "workspace_dir": run / "workspace", "output_dir": run / "output"}
-    box = await remote_sandboxes()(SandboxRequest(lab_root=LAB, run_id=run_id, command_timeout=60, **folders))
-
-    async def close():
-      try:
-        await box.collect_outputs(run / "output")
-      finally:
-        await box.cleanup()
-
-    return box.execute_tool, box.tool_metrics, close
+    box = await substrate.open_sandbox(
+      SUBSTRATE, SUBSTRATE_IMAGE, SUBSTRATE_IDLE, task["documents"], run / "workspace", run / "output"
+    )
+    return box.execute, box.metrics, lambda: box.close(run / "output")
 
   from sandbox.sandbox import Sandbox
 
