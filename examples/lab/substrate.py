@@ -20,7 +20,9 @@ from pathlib import Path
 from ate_env import Client, EnvError, NotFoundError
 from harness.tools import ToolExecutor
 from sandbox.sandbox import DOCUMENTS_PATH, OUTPUT_PATH, WORKSPACE_PATH, ExecResult
-from sandbox.sandbox import Sandbox as Podman
+from sandbox.sandbox import (
+  Sandbox as Paths,  # for LAB's rules on sandbox paths, which are static methods of its local sandbox
+)
 
 SPACE = "ate-env"
 LIVE: set[str] = set()  # environments not yet deleted
@@ -65,7 +67,7 @@ class Files:
     self, command: str, *, cwd: str = WORKSPACE_PATH, timeout: int | None = None, env: dict | None = None
   ) -> ExecResult:
     """A command as LAB's podman sandbox runs one: a login shell under coreutils timeout, with the folders' names in its environment."""
-    Podman.assert_sandbox_path(cwd)
+    Paths.assert_sandbox_path(cwd)
     timeout = timeout or self.timeout
     places = {"DOCUMENTS_DIR": DOCUMENTS_PATH, "OUTPUT_DIR": OUTPUT_PATH, "WORKSPACE_DIR": WORKSPACE_PATH}
     wrapped = f"timeout --kill-after=2 {timeout} bash -lc {shlex.quote(command)}"
@@ -79,7 +81,7 @@ class Files:
     return ExecResult(stdout=done.stdout, stderr=done.stderr, returncode=done.exit_code)
 
   def read_file(self, path: str) -> bytes:
-    Podman.assert_sandbox_path(path)
+    Paths.assert_sandbox_path(path)
     try:
       return self.wait(self.env.read_file_bytes(path), 240)
     except NotFoundError as e:
@@ -88,14 +90,14 @@ class Files:
       raise OSError(f"{path}: {e}") from e
 
   def write_file(self, path: str, content: bytes | str) -> None:
-    Podman.assert_sandbox_path(path)
-    if not Podman.is_writable(path):
+    Paths.assert_sandbox_path(path)
+    if not Paths.is_writable(path):
       raise PermissionError(f"write denied: {path} is not under a writable mount")
     self.wait(self.env.write_file(path, content.encode() if isinstance(content, str) else content), 240)
 
   def exists(self, path: str) -> bool:
     try:
-      Podman.assert_sandbox_path(path)
+      Paths.assert_sandbox_path(path)
     except ValueError:
       return False
     return self.exec(f"test -e {shlex.quote(path)}", timeout=30).returncode == 0
