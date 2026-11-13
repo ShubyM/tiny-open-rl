@@ -35,6 +35,7 @@ COPY examples/common ./common
 COPY examples/harvey_labs ./harvey_labs
 COPY tinyrl_lab ./tinyrl_lab
 
-ENV PYTHONPATH=/app LAB_ROOT=/app/harvey_labs/harvey-labs
+ENV LAB_ROOT=/app/harvey_labs/harvey-labs
+ENV PYTHONPATH=/app:$LAB_ROOT
 WORKDIR /app/tinyrl_lab
 ENTRYPOINT ["/app/.venv/bin/python", "lab_rl.py"]

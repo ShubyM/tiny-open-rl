@@ -1,4 +1,4 @@
-"""Trajectories as files a person or an agent can read, and the page that shows them.
+"""Trajectories as files a person or an agent can read.
 
   <root>/<run>/run.json                     name, model, facts, status
   <root>/<run>/steps.jsonl                  one line per step: {"step": 0, "metrics": {any numbers}}
@@ -11,7 +11,6 @@ An episode's first line is {"type": "episode", "metrics": {any numbers}, "tags":
 tokens and seconds, a tool's a name and error. A {"type": "list", "name": ..., "rows": [...]} is a table the client logged.
 
   traj.py export out/full4/step-0.pkl <root> <run> [name] [fact]...   a step lab_rl.py saved, into a run
-  traj.py build <root> [out.html] [bytes]                             the page with the runs inside it, under a size if given
   traj.py ls <root>/<run> [metric]                                    a run as text: a row per task, a number per episode
   traj.py show <episode.jsonl> [turn]                                 an episode in about a page, or one turn in full
 """
@@ -176,58 +175,6 @@ def load(root: str) -> dict:
   return {"runs": runs}
 
 
-def build(root: str, out: str = "", budget: str = "0") -> None:
-  """The page with its runs inside it: JSON, gzipped, in base64. Episodes of a task read the same documents, so a long text is
-  stored once. With a budget in bytes, the page keeps the conversations of as many steps as fit, each run's last step first,
-  then its first, then the rest from the latest back; the other episodes keep their numbers."""
-  import base64
-  import gzip
-  import hashlib
-
-  data, texts, template = load(root), {}, (Path(__file__).parent / "page.html").read_text()
-  for run in data["runs"]:
-    for episode in run["episodes"]:
-      for e in episode["events"]:
-        if e["type"] != "message" or len(e.get("text") or "") < 300:
-          continue
-        if len(e["text"]) > 6000:  # the page shows the start of a long text and says how much the file has
-          e["cut"], e["text"] = len(e["text"]), e["text"][:6000]
-        e["ref"] = hashlib.sha1(e["text"].encode()).hexdigest()[:12]
-        texts[e["ref"]] = e.pop("text")
-
-  def bare(episode: dict) -> dict:
-    files = [{k: v for k, v in f.items() if k != "text"} for f in episode["files"]]
-    return episode | {"events": [], "files": files, "absent": True}
-
-  def page(kept: set) -> str:
-    runs = [
-      r | {"episodes": [e if (r["id"], e["step"]) in kept else bare(e) for e in r["episodes"]]} for r in data["runs"]
-    ]
-    used = {e["ref"] for r in runs for episode in r["episodes"] for e in episode["events"] if "ref" in e}
-    packed = json.dumps({"runs": runs, "texts": {ref: texts[ref] for ref in used}}, separators=(",", ":"))
-    return template.replace("/*PACKED*/", base64.b64encode(gzip.compress(packed.encode(), 9)).decode())
-
-  orders = []
-  for run in data["runs"]:
-    steps = sorted({e["step"] for e in run["episodes"]})
-    orders.append([(run["id"], s) for s in dict.fromkeys([*steps[-1:], *steps[:1], *reversed(steps)])])
-  steps = [order[rank] for rank in range(max(map(len, orders), default=0)) for order in orders if rank < len(order)]
-  low, high = (0, len(steps)) if int(budget) else (len(steps), len(steps))
-  while low < high:
-    mid = (low + high + 1) // 2
-    low, high = (mid, high) if len(page(set(steps[:mid])).encode()) <= int(budget) else (low, mid - 1)
-  made = page(set(steps[:low]))
-  Path(out or Path(root, "index.html")).write_text(made)
-  episodes = [e for r in data["runs"] for e in r["episodes"]]
-  whole = sum((r["id"], e["step"]) in set(steps[:low]) for r in data["runs"] for e in r["episodes"])
-  print(
-    f"{len(data['runs'])} runs, {len(episodes)} episodes, {whole} with their conversation, {len(made.encode()):,} bytes"
-  )
-
-
-# ***** the same, as text *****
-
-
 def ls(run: str, metric: str = "reward") -> str:
   root, name = Path(run).parent, Path(run).name
   data = next(r for r in load(str(root))["runs"] if r["id"] == name)
@@ -298,8 +245,6 @@ if __name__ == "__main__":
   match sys.argv[1:]:
     case ["export", pkl, root, run, *rest]:
       export(pkl, root, run, *rest)
-    case ["build", root, *rest]:
-      build(root, *rest)
     case ["ls", run, *metric]:
       print(ls(run, *metric))
     case ["show", path]:

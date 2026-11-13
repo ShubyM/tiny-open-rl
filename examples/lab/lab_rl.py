@@ -7,7 +7,7 @@ advantage = reward - its task's mean reward. Every step's episodes are saved, so
 Every EVAL_EVERY steps, and after the last, the held-out tasks are run once each without training. The run saves its state
 after each step and starts from it again, so a run that died is rerun with the same command.
 
-  LAB_ROOT=/path/to/harvey-labs OPENAI_BASE_URL=http://judge/v1 OPENAI_API_KEY=unused python lab_rl.py
+  LAB_ROOT=/path/to/harvey-labs PYTHONPATH=$LAB_ROOT OPENAI_BASE_URL=http://judge/v1 OPENAI_API_KEY=unused python lab_rl.py
 
 The task split, the system prompt and the Gemma 4 turn handling follow open-rl's examples/harvey_labs, whose sandbox clients
 this uses. See README.md.
@@ -30,14 +30,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import tinker
+from harness.tools import ToolExecutor, get_all_tool_definitions
 from huggingface_hub import hf_hub_download
 from tinker import types
 from transformers import AutoTokenizer
 from transformers.utils.chat_parsing import parse_response
 
-LAB = Path(os.environ["LAB_ROOT"]).resolve()
-sys.path.insert(0, str(LAB))
-from harness.tools import ToolExecutor, get_all_tool_definitions  # noqa: E402
+LAB = Path(os.environ["LAB_ROOT"]).resolve()  # LAB's checkout, which is also on PYTHONPATH for its harness and sandbox
 
 
 def env(name: str, default):

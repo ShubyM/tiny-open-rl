@@ -8,7 +8,7 @@ matter's documents with tools, writes the deliverable, and a judge model grades 
 |---|---|
 | `lab_rl.py` | The run: episodes, grading, training, evals on held-out tasks, state to start again from. |
 | `replay.py` | Trains on saved episodes again, to time the trainer alone. |
-| `traj.py`, `page.html` | Episodes as files, and one page that shows runs, metrics and every trajectory. |
+| `traj.py` | Episodes as files a person or an agent can read: export, list, show. |
 | `Dockerfile` | The run as an image for the cluster. |
 
 It is a plain script on the Tinker SDK. The tasks, tools and grader are LAB's. The task split, the prompt and the sandbox
@@ -33,7 +33,7 @@ An episode's tools run in one of three places, chosen by the environment:
 Locally, against a tinyrl gateway, with podman and a judge that speaks the OpenAI API:
 
 ```bash
-LAB_ROOT=/path/to/harvey-labs BASE_URL=http://localhost:18000 \
+LAB_ROOT=/path/to/harvey-labs PYTHONPATH=$LAB_ROOT BASE_URL=http://localhost:18000 \
 OPENAI_BASE_URL=http://judge/v1 OPENAI_API_KEY=unused python lab_rl.py
 ```
 
@@ -57,7 +57,7 @@ The settings are the names at the top of `lab_rl.py`, read from the environment.
 | `BATCH`, `GROUP`, `STEPS` | 8, 6, 1 | Tasks per step, episodes per task, steps. |
 | `EVAL_EVERY`, `EVAL_TASKS` | 0, 50 | Held-out tasks run before every so many steps and after the last. |
 | `TRAJ_TOKENS`, `TURN_TOKENS`, `MAX_TURNS` | 32768, 8192, 40 | An episode's context, a turn's length, and its turns. |
-| `EXPORT` | | `"<run> <name> <fact>;<fact>"` writes each step as trajectory files under `OUT/trajectories`, for `traj.py build`. |
+| `EXPORT` | | `"<run> <name> <fact>;<fact>"` writes each step as trajectory files under `OUT/trajectories`. |
 
 ## What has been run
 
