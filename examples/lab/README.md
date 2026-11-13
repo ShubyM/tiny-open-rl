@@ -8,7 +8,6 @@ matter's documents with tools, writes the deliverable, and a judge model grades 
 |---|---|
 | `lab_rl.py` | The recipe: the config, the environment, and the call into tinker-cookbook's training loop. |
 | `substrate.py` | An episode's sandbox as an Agent Substrate environment. |
-| `traj.py` | Reads the episodes the run writes as files: list a run, show an episode. |
 | `Dockerfile`, `requirements.txt` | The run as an image for the cluster. |
 
 The loop is [tinker-cookbook](https://github.com/thinking-machines-lab/tinker-cookbook)'s `rl.train`: sampling, advantages, the

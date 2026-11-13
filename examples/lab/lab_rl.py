@@ -368,7 +368,7 @@ class Group(EnvGroupBuilder):
     return ["lab"]
 
   def write(self, episode: Episode, metrics: dict, tags: dict, criteria: list | None) -> None:
-    """The episode as files a person or an agent can read (traj.py), beside the run's others: its messages, and what it wrote."""
+    """The episode as files a person or an agent can read, beside the run's others: its messages as lines of JSON, and what it wrote."""
     run = Path(self.cfg.out, "trajectories", self.cfg.run + ("-eval" if self.held_out else ""))
     folder, n = run / str(self.step) / self.task["name"].replace("/", "__"), next(self.number)
     folder.mkdir(parents=True, exist_ok=True)

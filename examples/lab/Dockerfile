@@ -26,7 +26,7 @@ COPY ate-env-client /src/ate-env-client
 RUN --mount=type=cache,target=/root/.cache/uv uv venv .venv \
     && uv pip install --python .venv/bin/python --index-strategy unsafe-best-match -r requirements.txt \
     && uv pip install --python .venv/bin/python --no-deps /src/ate-env-client
-COPY lab_rl.py substrate.py traj.py ./
+COPY lab_rl.py substrate.py ./
 
 # LAB's harness and sandbox modules are imported from its checkout
 ENV LAB_ROOT=/lab PYTHONPATH=/lab PATH=/app/.venv/bin:$PATH
