@@ -63,9 +63,7 @@ class Config:
   batch: int = 8  # tasks per step
   group: int = 6  # episodes per task
   task: str = ""  # train on this one task instead of the split
-  eval_every: int = (
-    0  # run the held-out tasks before every so many steps, and the cookbook runs them after the last; 0 for never
-  )
+  eval_every: int = 0  # run the held-out tasks before every so many steps and after the last; 0 for never
   eval_tasks: int = 50
   save_every: int = 5
   max_turns: int = 40
@@ -75,9 +73,7 @@ class Config:
   judge: str = "gpt-gemma-4-31b-it"
   judge_parallel: int = 16
   grading: int = 6  # episodes graded at once
-  capture: bool = (
-    False  # keep every sampling and training call's tokens in the cookbook's capture store under out/capture
-  )
+  capture: bool = False  # keep every call's tokens in the cookbook's capture store, under out/capture
 
 
 # ***** tasks *****
@@ -194,11 +190,7 @@ def grade(cfg: Config, run_id: str, task: str) -> tuple[float, dict]:
   scores = json.loads(scores_file.read_text()) if (scores_file := run / "scores.json").exists() else {}
   if done.returncode or not scores.get("n_criteria"):
     return 0.0, {"graded": "judge failed"}
-  passed = {
-    "criteria": scores["n_criteria"],
-    "criteria_passed": scores["n_passed"],
-    "rows": scores.get("criteria_results"),
-  }
+  passed = {"criteria": scores["n_criteria"], "criteria_passed": scores["n_passed"]}
   return scores["n_passed"] / scores["n_criteria"], {"graded": "yes", **passed}
 
 
@@ -206,12 +198,8 @@ class LabTool:
   """One of LAB's tools as a cookbook tool, run in its rollout's sandbox."""
 
   def __init__(self, rollout: "Rollout", spec: dict):
-    self.rollout, self.name, self.description, self.parameters_schema = (
-      rollout,
-      spec["name"],
-      spec["description"],
-      spec["parameters"],
-    )
+    self.rollout, self.name = rollout, spec["name"]
+    self.description, self.parameters_schema = spec["description"], spec["parameters"]
 
   async def run(self, input: ToolInput) -> ToolResult:
     result = await self.rollout.execute(self.name, input.arguments)
@@ -228,24 +216,17 @@ class Rollout:
     self.run_id = f"tinyrl/{self.task['name'].replace('/', '__')}/{uuid.uuid4().hex[:12]}"
     self.run = LAB / "results" / self.run_id  # where LAB's grader looks for what an episode wrote
     self.box = self.tools = self.graded = None
-    prefix = renderer.create_conversation_prefix_with_tools(specs, system_prompt(self.task))
+    tools, user = [LabTool(self, spec) for spec in specs], {"role": "user", "content": self.task["instructions"]}
+    first = [*renderer.create_conversation_prefix_with_tools(specs, system_prompt(self.task)), user]
     # the cookbook's runner gives each call a turn's worth of tokens, or what room is left
     limits = RolloutLimits(max_turn_tokens=cfg.turn_tokens, max_trajectory_tokens=cfg.traj_tokens)
-    self.env = build_agent_tool_env(
-      renderer,
-      [LabTool(self, spec) for spec in specs],
-      [*prefix, {"role": "user", "content": self.task["instructions"]}],
-      self.finish,
-      rollout_config=RolloutConfig(
-        limits=limits, tool_execution="sequential"
-      ),  # a turn's calls in the order it made them
-      max_turns=cfg.max_turns,
-      max_trajectory_tokens=cfg.traj_tokens,
-      max_generation_tokens=2048,  # an episode with less room than this for its next turn ends
-      terminate_on_length=True,
-      failed_parse_reward=0.0,  # these two stand for no grade: Group.compute_group_rewards grades such an episode
-      context_overflow_reward=0.0,
-    )
+    rollout = RolloutConfig(limits=limits, tool_execution="sequential")  # a turn's calls in the order it made them
+    # an episode ends on its turns, and with less than 2048 tokens of room for its next turn
+    ends = dict(max_turns=cfg.max_turns, max_trajectory_tokens=cfg.traj_tokens, max_generation_tokens=2048)
+    # and on a cut-off turn. The cookbook grades neither that ending nor a turn it cannot read, so their rewards
+    # stand for no grade: Group.compute_group_rewards grades those
+    ungraded = dict(terminate_on_length=True, failed_parse_reward=0.0, context_overflow_reward=0.0)
+    self.env = build_agent_tool_env(renderer, tools, first, self.finish, rollout_config=rollout, **ends, **ungraded)
 
   async def execute(self, name: str, arguments: dict) -> str:
     if self.box is None:
@@ -254,13 +235,10 @@ class Rollout:
       for skill in SKILLS:
         if (scripts := LAB / "harness" / "skills" / skill / "scripts").exists():
           shutil.copytree(scripts, self.run / "workspace" / "skills" / skill / "scripts")
-      cfg, documents = self.cfg, self.task["documents"]
-      box = await substrate.open_sandbox(
-        cfg.substrate_endpoint, cfg.substrate_image, cfg.substrate_idle, documents, self.run / "workspace"
-      )
-      files = substrate.Files(
-        box, asyncio.get_running_loop(), documents, self.run / "workspace", self.run / "output", timeout=60
-      )
+      cfg, documents, workspace = self.cfg, self.task["documents"], self.run / "workspace"
+      where = cfg.substrate_endpoint, cfg.substrate_image, cfg.substrate_idle
+      box = await substrate.open_sandbox(*where, documents, workspace)
+      files = substrate.Files(box, asyncio.get_running_loop(), documents, workspace, self.run / "output", timeout=60)
       self.box, self.tools = box, substrate.Tools(sandbox=files, shell_timeout=60)
     result = await asyncio.to_thread(self.tools.execute, name, arguments)
     if self.box.gone:  # which LAB's tools would have told the model as one more error

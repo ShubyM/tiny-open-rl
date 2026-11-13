@@ -11,15 +11,7 @@ from pathlib import Path
 
 import tinker
 from huggingface_hub import hf_hub_download
-from tinker_cookbook.renderers.base import (
-  Message,
-  ParseTermination,
-  Renderer,
-  TextPart,
-  ThinkingPart,
-  ToolCall,
-  ToolSpec,
-)
+from tinker_cookbook.renderers.base import Message, ParseTermination, Renderer, ToolCall, ToolSpec
 from transformers.utils.chat_parsing import parse_response
 
 SAMPLED = "sampled_tokens"  # on a parsed turn: its tokens as they were sampled
@@ -28,7 +20,7 @@ SAMPLED = "sampled_tokens"  # on a parsed turn: its tokens as they were sampled
 class Gemma4(Renderer):
   def __init__(self, tokenizer, model: str, think: bool = True):
     super().__init__(tokenizer)
-    self.think = think
+    self.flags = {"tokenize": True, "return_dict": False, "enable_thinking": think, "preserve_thinking": True}
     self.response = json.loads(Path(hf_hub_download(model, "tokenizer_config.json")).read_text())["response_template"]
     self.stop = [tokenizer.convert_tokens_to_ids(t) for t in ("<turn|>", "<|tool_response>")]
     # what the template writes to open a model turn, which a sampled turn's text follows
@@ -50,9 +42,7 @@ class Gemma4(Renderer):
     return [{"role": "system", "content": system_prompt, "tools": tools}]
 
   def template(self, messages: list[dict], **kw) -> list[int]:
-    return self.tokenizer.apply_chat_template(
-      messages, tokenize=True, return_dict=False, enable_thinking=self.think, preserve_thinking=True, **kw
-    )
+    return self.tokenizer.apply_chat_template(messages, **self.flags, **kw)
 
   def to_openai_message(self, message: Message) -> dict:
     plain = super().to_openai_message(message)
@@ -95,12 +85,10 @@ class Gemma4(Renderer):
     if not calls and "<|tool_call>" in text:
       return message, ParseTermination.MALFORMED
     thinking = said.get("thinking") or said.get("reasoning_content") or ""
-    message["content"] = [ThinkingPart(type="thinking", thinking=thinking)] if thinking else []
-    message["content"].append(TextPart(type="text", text=said.get("content") or ""))
+    message["content"] = [{"type": "thinking", "thinking": thinking}] if thinking else []
+    message["content"].append({"type": "text", "text": said.get("content") or ""})
     if calls:
-      bodies = [
-        ToolCall.FunctionBody(name=c["function"]["name"], arguments=json.dumps(c["function"]["arguments"]))
-        for c in calls
-      ]
+      made = [c["function"] for c in calls]
+      bodies = [ToolCall.FunctionBody(name=f["name"], arguments=json.dumps(f["arguments"])) for f in made]
       message["tool_calls"] = [ToolCall(id=f"call_{n}", function=body) for n, body in enumerate(bodies)]
     return message, ParseTermination.STOP_SEQUENCE if response[-1] in self.stop else ParseTermination.EOS

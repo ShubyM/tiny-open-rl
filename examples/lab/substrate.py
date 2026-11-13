@@ -23,9 +23,7 @@ from ate_env import Client, EnvError, NotFoundError
 from ate_env.types import EnvironmentStatus
 from harness.tools import ToolExecutor
 from sandbox.sandbox import DOCUMENTS_PATH, OUTPUT_PATH, WORKSPACE_PATH, ExecResult
-from sandbox.sandbox import (
-  Sandbox as Paths,  # for LAB's rules on sandbox paths, which are static methods of its local sandbox
-)
+from sandbox.sandbox import Sandbox as Paths  # LAB's rules on sandbox paths, static methods of its local sandbox
 from tinker_cookbook.sandbox import SandboxResult, SandboxTerminatedError
 
 SPACE = "ate-env"
@@ -100,14 +98,11 @@ class Substrate:
         self.timers.add(timer := asyncio.create_task(self.rest(self.asked)))
         timer.add_done_callback(self.timers.discard)
 
-  async def run_command(
-    self, command: str, workdir: str | None = None, timeout: int = 60, max_output_bytes: int | None = None
-  ) -> SandboxResult:
+  async def run_command(self, command: str, workdir=None, timeout=60, max_output_bytes=None) -> SandboxResult:
     # past the command's own time there is a resume from a snapshot and the call's round trips to wait for
     done = await self.ask(self.env.shell(command, cwd=workdir or ""), timeout + 180)
-    return SandboxResult(
-      stdout=done.stdout[:max_output_bytes], stderr=done.stderr[:max_output_bytes], exit_code=done.exit_code
-    )
+    out, err = done.stdout[:max_output_bytes], done.stderr[:max_output_bytes]
+    return SandboxResult(stdout=out, stderr=err, exit_code=done.exit_code)
 
   async def read_bytes(self, path: str, timeout: int = 240) -> bytes:
     return await self.ask(self.env.read_file_bytes(path), timeout)
@@ -119,9 +114,7 @@ class Substrate:
       return SandboxResult(stdout="", stderr=str(e), exit_code=1)
     return SandboxResult(stdout=text, stderr="", exit_code=0)
 
-  async def write_file(
-    self, path: str, content: str | bytes, executable: bool = False, timeout: int = 60
-  ) -> SandboxResult:
+  async def write_file(self, path: str, content: str | bytes, executable=False, timeout=60) -> SandboxResult:
     data = content.encode() if isinstance(content, str) else content
     await self.ask(self.env.write_file(path, data, mode=0o755 if executable else 0o644), timeout)
     return SandboxResult(stdout="", stderr="", exit_code=0)
@@ -136,22 +129,15 @@ class Substrate:
 class Files:
   """What LAB's tools ask of a sandbox, answered by a Substrate. The tools run in a thread, and each call here runs on the event loop."""
 
-  def __init__(
-    self, box: Substrate, loop: asyncio.AbstractEventLoop, documents: Path, workspace: Path, output: Path, timeout: int
-  ):
+  def __init__(self, box: Substrate, loop, documents: Path, workspace: Path, output: Path, timeout: int):
     self.box, self.loop, self.timeout = box, loop, timeout
-    self.documents_dir, self.workspace_dir, self.output_dir = (
-      documents,
-      workspace,
-      output,
-    )  # the host's, which LAB counts documents in
+    # the host's folders, which LAB counts documents in
+    self.documents_dir, self.workspace_dir, self.output_dir = documents, workspace, output
 
   def wait(self, call):
     return asyncio.run_coroutine_threadsafe(call, self.loop).result()
 
-  def exec(
-    self, command: str, *, cwd: str = WORKSPACE_PATH, timeout: int | None = None, env: dict | None = None
-  ) -> ExecResult:
+  def exec(self, command: str, *, cwd=WORKSPACE_PATH, timeout=None, env=None) -> ExecResult:
     """A command as LAB's podman sandbox runs one: a login shell under coreutils timeout, with the folders' names in its environment."""
     Paths.assert_sandbox_path(cwd)
     timeout = timeout or self.timeout
@@ -246,9 +232,8 @@ async def open_sandbox(endpoint: str, image: str, idle: float, documents: Path, 
     box = Substrate(endpoint, env, idle)
     files = await asyncio.to_thread(packed, [(workspace, "."), (documents, "documents")])
     async with asyncio.timeout(300):
-      while (
-        True
-      ):  # a call to an environment that is still booting waits for it, or fails, and the client does not say which
+      # a call to an environment that is still booting waits for it, or fails, and the client does not say which
+      while True:
         with contextlib.suppress(EnvError):
           await box.write_file("/tmp/in.tar", files, timeout=240)
           break
