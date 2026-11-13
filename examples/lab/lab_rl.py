@@ -1,20 +1,22 @@
 """LAB legal-agent RL on tinyrl, as a tinker-cookbook recipe. LAB supplies the tasks, the tools and the grader; the cookbook supplies
-the loop: it samples GROUP episodes for each of BATCH tasks, trains on each episode's sampled tokens with advantage = reward - its
-task's mean reward, runs the held-out tasks every EVAL_EVERY steps, and keeps checkpoints to start again from.
+the rest: its tool-using environment (build_agent_tool_env) runs an episode, and its loop samples GROUP episodes for each of BATCH
+tasks, trains on each episode's sampled tokens with advantage = reward - its task's mean reward, runs the held-out tasks every
+EVAL_EVERY steps, and keeps checkpoints to start again from.
 
-What is here is the environment. An episode opens its own sandbox with its first prompt, reads each sampled turn's tool calls
-itself, runs them in that sandbox, and when it ends, closes the sandbox and has LAB's judge grade what was written. The sandbox
-is an Agent Substrate environment (substrate.py), which is suspended while the model generates, or LAB's own podman container.
+What is here is what joins them: LAB's tools as cookbook tools, each episode's sandbox, which is an Agent Substrate environment
+(substrate.py) opened by the episode's first tool call, and the episode's end, where the sandbox is closed and LAB's judge
+grades what was written.
 
   LAB_ROOT=/path/to/harvey-labs PYTHONPATH=$LAB_ROOT OPENAI_BASE_URL=http://judge/v1 OPENAI_API_KEY=unused \\
-    python lab_rl.py base_url=http://localhost:18000 steps=35 eval_every=5
+    python lab_rl.py base_url=http://localhost:18000 substrate_endpoint=ate-env-api.ate-env:7777 substrate_image=... steps=35
 
 The held-out tasks, the order of the training tasks and the system prompt are those of open-rl's examples/harvey_labs, so the two
-train and evaluate on the same tasks. Nothing is imported from it. Prompts are written by the model's chat template. See README.md.
+train and evaluate on the same tasks. Nothing is imported from it. Prompts are written by the cookbook's renderer for the model,
+or for Gemma 4, which it has none for, by gemma4.py. See README.md.
 """
 
 import asyncio
-import itertools
+import contextlib
 import json
 import logging
 import os
@@ -22,68 +24,60 @@ import random
 import re
 import shutil
 import subprocess
-import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import chz
+import substrate
 import tinker
-from harness.tools import ToolExecutor, get_all_tool_definitions
-from huggingface_hub import hf_hub_download
-from tinker_cookbook import checkpoint_utils
+from gemma4 import SAMPLED, Gemma4
+from harness.tools import get_all_tool_definitions
+from tinker_cookbook import model_info, renderers
+from tinker_cookbook.renderers.base import Message, RenderedMessage, Renderer, message_to_jsonable
 from tinker_cookbook.rl import train
-from tinker_cookbook.rl.metric_util import RLTestSetEvaluator
 from tinker_cookbook.rl.rollout_limits import RolloutLimits
-from tinker_cookbook.rl.types import (
-  Env,
-  EnvGroupBuilder,
-  InitialObservationOverflow,
-  RLDataset,
-  RLDatasetBuilder,
-  StepResult,
-)
-from transformers import AutoTokenizer
-from transformers.utils.chat_parsing import parse_response
+from tinker_cookbook.rl.rollout_presets import RolloutConfig
+from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetBuilder, Trajectory
+from tinker_cookbook.tokenizer_utils import get_tokenizer
+from tinker_cookbook.tool_use import build_agent_tool_env
+from tinker_cookbook.tool_use.types import ToolInput, ToolResult
 
 LAB = Path(os.environ["LAB_ROOT"]).resolve()  # LAB's checkout, which is also on PYTHONPATH for its harness and sandbox
 SKILLS = sorted(p.parent.name for p in (LAB / "harness" / "skills").glob("*/SKILL.md"))
-# how an episode ended, as the cookbook names it in a rollout's metrics
-STOPS = {
-  "done": "completed",
-  "turns": "max_turns",
-  "length": "max_tokens",
-  "context": "context_overflow",
-  "malformed": "parse_error",
-}
 
 
 @chz.chz
 class Config:
-  model: str = "google/gemma-4-E4B-it"  # Gemma 4, or a Qwen 3.5 family model
+  substrate_endpoint: str  # ate-env-api of an Agent Substrate cluster
+  substrate_image: str  # LAB's sandbox image, pinned by digest
+  substrate_idle: float = 30.0  # seconds without a call before a sandbox is suspended
+  model: str = "google/gemma-4-E4B-it"
+  renderer: str = ""  # a cookbook renderer by name; without one, the cookbook's choice for the model, or gemma4.py
+  think: bool = True  # Gemma 4's thinking; for other models the renderer's name says
   base_url: str = "http://localhost:18000"
-  out: str = "out"  # the cookbook's logs and checkpoints, and the episodes as files under trajectories/
-  run: str = "lab"  # the run's name among the trajectories
+  out: str = "out"  # the cookbook's logs and checkpoints
   rank: int = 32
   lr: float = 2e-4
   steps: int = 1
   batch: int = 8  # tasks per step
   group: int = 6  # episodes per task
   task: str = ""  # train on this one task instead of the split
-  eval_every: int = 0  # run the held-out tasks before every so many steps and after the last; 0 for never
+  eval_every: int = (
+    0  # run the held-out tasks before every so many steps, and the cookbook runs them after the last; 0 for never
+  )
   eval_tasks: int = 50
   save_every: int = 5
   max_turns: int = 40
   turn_tokens: int = 8192
   traj_tokens: int = 32768
   tool_tokens: int = 4096
-  think: bool = True
   judge: str = "gpt-gemma-4-31b-it"
   judge_parallel: int = 16
   grading: int = 6  # episodes graded at once
-  substrate_endpoint: str = ""  # ate-env-api of an Agent Substrate cluster; LAB's podman container without one
-  substrate_image: str = ""  # LAB's sandbox image, pinned by digest
-  substrate_idle: float = 30.0  # seconds without a tool call before a sandbox is suspended
+  capture: bool = (
+    False  # keep every sampling and training call's tokens in the cookbook's capture store under out/capture
+  )
 
 
 # ***** tasks *****
@@ -140,84 +134,52 @@ def system_prompt(task: dict) -> str:
   return prompt
 
 
-class Chat:
-  """A model's tokenizer and chat template: the tokens an episode is given, and its sampled turns read back as tool calls."""
+# ***** the model's side: prompts and sampled turns *****
 
-  def __init__(self, model: str, think: bool, tool_tokens: int):
-    self.tok, self.think, self.tool_tokens = AutoTokenizer.from_pretrained(model), think, tool_tokens
-    self.response = json.loads(Path(hf_hub_download(model, "tokenizer_config.json")).read_text())["response_template"]
-    ends = (
-      ("<|im_end|>",) if "<|im_end|>" in self.tok.get_vocab() else ("<turn|>", "<|tool_response>")
-    )  # Qwen's, or Gemma 4's
-    self.stop = [self.tok.convert_tokens_to_ids(t) for t in ends]
-    self.tools = [{"type": "function", "function": t} for t in get_all_tool_definitions()]
-    # what the template writes to open a model turn, which a sampled turn's text follows
-    user = [{"role": "user", "content": "-"}]
-    self.opening = self.tok.decode(self.render(user, add_generation_prompt=True)[len(self.render(user)) :])
 
-  def render(self, messages: list[dict], **kw) -> list[int]:
-    return self.tok.apply_chat_template(
-      messages, tokenize=True, return_dict=False, enable_thinking=self.think, preserve_thinking=True, **kw
-    )
+def as_sampled(renderer: Renderer) -> Renderer:
+  """A cookbook renderer made to keep a sampled turn in the conversation as the tokens that were sampled. The cookbook's write a
+  past turn again from its parsed message, which for Qwen differs in whitespace from what was sampled: the next prompt would then
+  not extend this one, and an episode would train as one sequence per turn instead of one. gemma4.py does the same for Gemma 4."""
 
-  def parse(self, text: str) -> dict:
-    """A sampled turn as a message with its thinking, text and tool calls."""
-    # after tool replies Gemma's template has already opened the thinking channel
-    opened = "<channel|>" in text and not text.startswith("<|channel>")
-    return parse_response(text, self.response, prefix=self.opening + ("<|channel>thought\n" if opened else ""))
+  class AsSampled(type(renderer)):
+    has_extension_property = True
 
-  def first_prompt(self, task: dict) -> list[int]:
-    messages = [{"role": "system", "content": system_prompt(task)}, {"role": "user", "content": task["instructions"]}]
-    return self.render(messages, tools=self.tools, add_generation_prompt=True)
+    def parse_response(self, response: list[int]):
+      message, end = super().parse_response(response)
+      message[SAMPLED] = list(response)
+      return message, end
 
-  def tool_turn(self, calls: list[dict], results: list[str], last: int) -> list[int]:
-    """The tokens that follow a sampled turn of tool calls: the tools' replies and the next turn's opening, as the template writes them. The sampled turn itself stays as sampled."""
-    # a user turn first, without which Qwen's template renders nothing
-    user, assistant = {"role": "user", "content": "-"}, {"role": "assistant", "content": "", "tool_calls": calls}
-    replies = [{"role": "tool", "name": c["function"]["name"], "content": r} for c, r in zip(calls, results)]
-    turn, after = (
-      self.render([user, assistant], add_generation_prompt=False),
-      self.render([user, assistant, *replies], add_generation_prompt=True),
-    )
-    if after[: len(turn)] != turn:
-      raise ValueError("the template rewrote a tool-calling turn when its replies were added")
-    # sampling stops at the stop token that ends the turn, with or without returning it
-    stop = max(i for i, t in enumerate(turn) if t in self.stop)
-    return ([] if last == turn[stop] else [turn[stop]]) + after[stop + 1 :]
+    def render_message(self, message: Message, ctx) -> RenderedMessage:
+      if SAMPLED not in message:
+        return super().render_message(message, ctx)
+      # the opening the turn was sampled after, and the turn, ended by the stop token whether or not sampling returned it
+      opening, tokens, stop = self._get_generation_suffix("assistant", ctx), message[SAMPLED], self._end_message_token
+      turn = tinker.EncodedTextChunk(tokens=tokens if tokens[-1] == stop else [*tokens, stop])
+      return RenderedMessage(header=tinker.EncodedTextChunk(tokens=opening), output=[turn])
 
-  def bounded(self, result: str) -> str:
-    tokens = self.tok.encode(result, add_special_tokens=False)
-    if len(tokens) <= self.tool_tokens:
-      return result
-    kept = self.tok.decode(tokens[: self.tool_tokens], skip_special_tokens=False)
-    kept = kept[: kept.rfind("\n") + 1] or kept
-    return f"{kept.rstrip()}\n\n[Observation truncated at {self.tool_tokens:,} tokens. Run a narrower command, or read with an offset and a limit, to get the rest.]"
+  renderer.__class__ = AsSampled  # the cookbook builds its renderers by name, so the built one is given the class
+  return renderer
+
+
+def renderer_for(cfg: Config) -> Renderer:
+  tokenizer = get_tokenizer(cfg.model)
+  if "gemma-4" in cfg.model and not cfg.renderer:
+    return Gemma4(tokenizer, cfg.model, cfg.think)
+  name = cfg.renderer or model_info.get_recommended_renderer_name(cfg.model)
+  return as_sampled(renderers.get_renderer(name, tokenizer, model_name=cfg.model))
+
+
+def bounded(tokenizer, result: str, limit: int) -> str:
+  tokens = tokenizer.encode(result, add_special_tokens=False)
+  if len(tokens) <= limit:
+    return result
+  kept = tokenizer.decode(tokens[:limit], skip_special_tokens=False)
+  kept = kept[: kept.rfind("\n") + 1] or kept
+  return f"{kept.rstrip()}\n\n[Observation truncated at {limit:,} tokens. Run a narrower command, or read with an offset and a limit, to get the rest.]"
 
 
 # ***** an episode *****
-
-
-async def open_sandbox(cfg: Config, task: dict, run: Path):
-  """Where an episode's tools run. Returns how to run a tool, the tools' metrics, and how to bring the outputs home and let the sandbox go."""
-  if cfg.substrate_endpoint:
-    import substrate  # which needs the Substrate client, and a local run does not
-
-    box = await substrate.open_sandbox(
-      cfg.substrate_endpoint,
-      cfg.substrate_image,
-      cfg.substrate_idle,
-      task["documents"],
-      run / "workspace",
-      run / "output",
-    )
-    return box.execute, box.metrics, box.close
-
-  from sandbox.sandbox import Sandbox
-
-  box = Sandbox(task["documents"], run / "output", run / "workspace", default_timeout=60)
-  await asyncio.to_thread(box.start)
-  tools = ToolExecutor(sandbox=box, shell_timeout=60)
-  return lambda *call: asyncio.to_thread(tools.execute, *call), tools.get_metrics, lambda: asyncio.to_thread(box.stop)
 
 
 def grade(cfg: Config, run_id: str, task: str) -> tuple[float, dict]:
@@ -240,145 +202,126 @@ def grade(cfg: Config, run_id: str, task: str) -> tuple[float, dict]:
   return scores["n_passed"] / scores["n_criteria"], {"graded": "yes", **passed}
 
 
-class Episode(Env):
-  """One rollout of a task, with a sandbox of its own from its first prompt to its end. It ends itself, by its turns and its room
-  for tokens, so that it is the one to close the sandbox and grade."""
+class LabTool:
+  """One of LAB's tools as a cookbook tool, run in its rollout's sandbox."""
+
+  def __init__(self, rollout: "Rollout", spec: dict):
+    self.rollout, self.name, self.description, self.parameters_schema = (
+      rollout,
+      spec["name"],
+      spec["description"],
+      spec["parameters"],
+    )
+
+  async def run(self, input: ToolInput) -> ToolResult:
+    result = await self.rollout.execute(self.name, input.arguments)
+    return ToolResult(messages=[{"role": "tool", "content": result, "name": self.name, "tool_call_id": input.call_id}])
+
+
+class Rollout:
+  """One episode: the cookbook's environment for it, a sandbox of its own, opened by its first tool call, and its end, where the
+  sandbox is closed and what the episode wrote is graded, once."""
 
   def __init__(self, group: "Group"):
-    self.group, self.cfg, self.chat, self.task = group, group.cfg, group.chat, group.task
-    # the cookbook's runner reads this: each call may sample a turn's worth of tokens, or what room is left
-    self.rollout_limits = RolloutLimits(
-      max_turn_tokens=self.cfg.turn_tokens, max_trajectory_tokens=self.cfg.traj_tokens
-    )
+    self.group, self.cfg, self.task = group, group.cfg, group.task
+    cfg, renderer, specs = self.cfg, group.renderer, get_all_tool_definitions()
     self.run_id = f"tinyrl/{self.task['name'].replace('/', '__')}/{uuid.uuid4().hex[:12]}"
-    self.run = LAB / "results" / self.run_id
-    self.tokens: list[int] = []
-    self.turns = self.sampled = 0
-    self.sampling = 0.0
-    self.close = None  # how to let the sandbox go, while there is one
-    # the episode as the trajectory files tell it: its messages in order
-    system = {"type": "message", "role": "system", "text": system_prompt(self.task)}
-    self.lines = [system, {"type": "message", "role": "user", "text": self.task["instructions"]}]
+    self.run = LAB / "results" / self.run_id  # where LAB's grader looks for what an episode wrote
+    self.box = self.tools = self.graded = None
+    prefix = renderer.create_conversation_prefix_with_tools(specs, system_prompt(self.task))
+    # the cookbook's runner gives each call a turn's worth of tokens, or what room is left
+    limits = RolloutLimits(max_turn_tokens=cfg.turn_tokens, max_trajectory_tokens=cfg.traj_tokens)
+    self.env = build_agent_tool_env(
+      renderer,
+      [LabTool(self, spec) for spec in specs],
+      [*prefix, {"role": "user", "content": self.task["instructions"]}],
+      self.finish,
+      rollout_config=RolloutConfig(
+        limits=limits, tool_execution="sequential"
+      ),  # a turn's calls in the order it made them
+      max_turns=cfg.max_turns,
+      max_trajectory_tokens=cfg.traj_tokens,
+      max_generation_tokens=2048,  # an episode with less room than this for its next turn ends
+      terminate_on_length=True,
+      failed_parse_reward=0.0,  # these two stand for no grade: Group.compute_group_rewards grades such an episode
+      context_overflow_reward=0.0,
+    )
 
-  def observation(self) -> tinker.ModelInput:
-    self.asked = time.time()
-    return tinker.ModelInput.from_ints(self.tokens)
-
-  async def initial_observation(self):
-    self.tokens = self.chat.first_prompt(self.task)
-    if self.cfg.traj_tokens - len(self.tokens) < 2048:
-      return InitialObservationOverflow(reward=0.0, metrics={"stop/context_overflow": 1.0})
-    (self.run / "output").mkdir(parents=True)
-    (self.run / "workspace").mkdir()
-    for skill in SKILLS:
-      if (scripts := LAB / "harness" / "skills" / skill / "scripts").exists():
-        shutil.copytree(scripts, self.run / "workspace" / "skills" / skill / "scripts")
-    self.started = time.time()
-    self.execute, self.metrics, self.close = await open_sandbox(self.cfg, self.task, self.run)
-    return self.observation(), self.chat.stop
-
-  async def step(self, action: list[int], *, extra=None) -> StepResult:
-    self.sampling += time.time() - self.asked
-    self.tokens += action
-    self.turns, self.sampled = self.turns + 1, self.sampled + len(action)
-    text, end, calls = self.chat.tok.decode(action, skip_special_tokens=False), None, None
-    line = {"type": "message", "role": "assistant", "turn": self.turns, "tokens": len(action)}
-    try:
-      said = self.chat.parse(text)
-      calls = said.get("tool_calls")
-      line |= {"thinking": said.get("thinking") or said.get("reasoning_content", ""), "text": said.get("content", "")}
-      line["calls"] = [c["function"] for c in calls or []]
-    except ValueError:
-      end = "malformed"
-      line |= {"text": text, "error": "this turn's tool call could not be parsed, which ended the episode"}
-    self.lines.append(line)
-    if end:
-      pass
-    elif (extra or {}).get("stop_reason") == "length":
-      end = "length"
-    elif not calls:
-      end = "malformed" if "tool_call>" in text else "done"  # <|tool_call> for Gemma, <tool_call> for Qwen
-    else:
-      results = [
-        self.chat.bounded(await self.execute(c["function"]["name"], c["function"]["arguments"])) for c in calls
-      ]
-      for call, result in zip(calls, results):
-        reply = {
-          "type": "message",
-          "role": "tool",
-          "turn": self.turns,
-          "name": call["function"]["name"],
-          "text": result,
-        }
-        self.lines.append(reply | {"error": result.startswith("Error")})  # how LAB's tools report one
-      self.tokens += self.chat.tool_turn(calls, results, self.tokens[-1])
-      if self.turns >= self.cfg.max_turns:
-        end = "turns"
-      elif self.cfg.traj_tokens - len(self.tokens) < 2048:
-        end = "context"
-    if not end:
-      return StepResult(0.0, False, self.observation(), self.chat.stop)
-    reward, metrics = await self.finish(end)
-    return StepResult(reward, True, self.observation(), self.chat.stop, metrics={f"stop/{STOPS[end]}": 1.0} | metrics)
+  async def execute(self, name: str, arguments: dict) -> str:
+    if self.box is None:
+      (self.run / "output").mkdir(parents=True)
+      (self.run / "workspace").mkdir()
+      for skill in SKILLS:
+        if (scripts := LAB / "harness" / "skills" / skill / "scripts").exists():
+          shutil.copytree(scripts, self.run / "workspace" / "skills" / skill / "scripts")
+      cfg, documents = self.cfg, self.task["documents"]
+      box = await substrate.open_sandbox(
+        cfg.substrate_endpoint, cfg.substrate_image, cfg.substrate_idle, documents, self.run / "workspace"
+      )
+      files = substrate.Files(
+        box, asyncio.get_running_loop(), documents, self.run / "workspace", self.run / "output", timeout=60
+      )
+      self.box, self.tools = box, substrate.Tools(sandbox=files, shell_timeout=60)
+    result = await asyncio.to_thread(self.tools.execute, name, arguments)
+    if self.box.gone:  # which LAB's tools would have told the model as one more error
+      raise self.box.gone
+    return bounded(self.group.renderer.tokenizer, result, self.cfg.tool_tokens)
 
   async def shut(self) -> None:
     """Let the sandbox go, once: at the episode's end, or by its group when the episode failed."""
-    if close := self.close:
-      self.close = None
-      await close()
+    if box := self.box:
+      self.box = None
+      await box.cleanup()
 
-  async def finish(self, end: str) -> tuple[float, dict]:
-    (self.run / "metrics.json").write_text(json.dumps(self.metrics()))
-    await self.shut()
-    rolled = time.time()
+  async def finish(self, messages: list[Message] | None = None) -> tuple[float, dict]:
+    """The episode's grade, which the cookbook's environment asks for at an episode's end, and the group for the rest."""
+    if self.graded is None:
+      self.graded = await self.end(messages or self.env.message_env.history)
+    return self.graded
+
+  async def end(self, messages: list[Message]) -> tuple[float, dict]:
+    self.run.mkdir(parents=True, exist_ok=True)
+    (self.run / "messages.jsonl").write_text("".join(json.dumps(message_to_jsonable(m)) + "\n" for m in messages))
+    if self.box:
+      (self.run / "metrics.json").write_text(json.dumps(self.tools.get_metrics() | {"suspends": self.box.suspends}))
+      try:
+        await substrate.bring_home(self.box, self.run / "workspace", self.run / "output")
+      finally:
+        await self.shut()
     async with self.group.grading:
       reward, graded = await asyncio.to_thread(grade, self.cfg, self.run_id, self.task["name"])
-    metrics = {"turns": self.turns, "tokens": len(self.tokens), "sampled_tokens": self.sampled}
-    metrics |= {"graded": float(graded["graded"] == "yes"), "wrote_nothing": float(graded["graded"] == "no output")}
-    metrics |= {k: graded[k] for k in ("criteria", "criteria_passed") if k in graded}
-    seconds = {"seconds": rolled - self.started, "sample_seconds": self.sampling, "grade_seconds": time.time() - rolled}
-    self.group.write(self, {"reward": reward} | metrics | seconds, {"end": end}, graded.get("rows"))
-    return reward, metrics
+    metrics = {"graded": float(graded["graded"] == "yes"), "wrote_nothing": float(graded["graded"] == "no output")}
+    return reward, metrics | {k: graded[k] for k in ("criteria", "criteria_passed") if k in graded}
 
 
 class Group(EnvGroupBuilder):
-  """A task's episodes in one step. The episodes own their sandboxes; the group only lets go of those an error left open."""
+  """A task's episodes in one step."""
 
-  def __init__(
-    self, cfg: Config, chat: Chat, grading: asyncio.Semaphore, task: dict, size: int, step: int, held_out: bool
-  ):
-    self.cfg, self.chat, self.grading, self.task, self.size = cfg, chat, grading, task, size
-    self.step, self.held_out = (
-      step,
-      held_out,
-    )  # a held-out task's group is rolled out again at each eval, a step further on
-    self.episodes: list[Episode] = []
-    self.number = itertools.count(1)
+  def __init__(self, cfg: Config, renderer: Renderer, grading: asyncio.Semaphore, task: dict, size: int):
+    self.cfg, self.renderer, self.grading, self.task, self.size = cfg, renderer, grading, task, size
+    self.rollouts: dict[int, Rollout] = {}
 
-  async def make_envs(self) -> list[Episode]:
-    self.episodes += (made := [Episode(self) for _ in range(self.size)])
-    return made
+  async def make_envs(self) -> list[Env]:
+    made = [Rollout(self) for _ in range(self.size)]
+    self.rollouts |= {id(rollout.env): rollout for rollout in made}
+    return [rollout.env for rollout in made]
+
+  async def compute_group_rewards(self, trajectories: list[Trajectory], envs: list[Env]) -> list[tuple[float, dict]]:
+    """The cookbook's environment has an episode graded when it ends by itself, or by its turns. One that ended on a turn that could
+    not be read, on a turn's token limit or out of room was not, and still has its sandbox: it is graded here, as its group reward."""
+
+    async def late(env: Env) -> tuple[float, dict]:
+      rollout = self.rollouts[id(env)]
+      return (0.0, {}) if rollout.graded else await rollout.finish()
+
+    return await asyncio.gather(*map(late, envs))
 
   async def cleanup(self) -> None:
-    await asyncio.gather(*(episode.shut() for episode in self.episodes), return_exceptions=True)
-    self.episodes, self.number = [], itertools.count(1)
-    self.step += self.cfg.eval_every if self.held_out else 0
+    await asyncio.gather(*(rollout.shut() for rollout in self.rollouts.values()), return_exceptions=True)
+    self.rollouts = {}
 
   def logging_tags(self) -> list[str]:
     return ["lab"]
-
-  def write(self, episode: Episode, metrics: dict, tags: dict, criteria: list | None) -> None:
-    """The episode as files a person or an agent can read, beside the run's others: its messages as lines of JSON, and what it wrote."""
-    run = Path(self.cfg.out, "trajectories", self.cfg.run + ("-eval" if self.held_out else ""))
-    folder, n = run / str(self.step) / self.task["name"].replace("/", "__"), next(self.number)
-    folder.mkdir(parents=True, exist_ok=True)
-    lines = [{"type": "episode", "group": self.task["name"], "n": n, "metrics": metrics, "tags": tags}, *episode.lines]
-    lines += [{"type": "list", "name": "criteria", "rows": criteria}] if criteria else []
-    (folder / f"{n}.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
-    if any((episode.run / "output").iterdir()):
-      shutil.copytree(episode.run / "output", folder / str(n) / "files" / "output", dirs_exist_ok=True)
-    name = f"{self.cfg.run} · held-out tasks" if self.held_out else self.cfg.run
-    (run / "run.json").write_text(json.dumps({"name": name, "model": self.cfg.model, "facts": [], "status": "Running"}))
 
 
 class Batches(RLDataset):
@@ -400,33 +343,15 @@ class Lab(RLDatasetBuilder):
     cfg = self.cfg
     # the tools and the grader run in threads, a few for each episode of a step
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(4 * cfg.batch * cfg.group))
-    chat, grading = Chat(cfg.model, cfg.think, cfg.tool_tokens), asyncio.Semaphore(cfg.grading)
+    renderer, grading = renderer_for(cfg), asyncio.Semaphore(cfg.grading)
     tasks, held_out = ([load_task(cfg.task)] * (cfg.batch * cfg.steps), []) if cfg.task else split()
     steps = [tasks[i * cfg.batch : (i + 1) * cfg.batch] for i in range(len(tasks) // cfg.batch)]
-    batches = [
-      [Group(cfg, chat, grading, t, cfg.group, step, False) for t in batch] for step, batch in enumerate(steps)
-    ]
-    evals = [Group(cfg, chat, grading, t, 1, 0, True) for t in held_out[: cfg.eval_tasks]]
+    batches = [[Group(cfg, renderer, grading, t, cfg.group) for t in batch] for batch in steps]
+    evals = [Group(cfg, renderer, grading, t, 1) for t in held_out[: cfg.eval_tasks]]
     return Batches(batches), Batches([evals]) if evals and cfg.eval_every else None
 
 
 # ***** a run *****
-
-
-async def last_eval(run: train.Config) -> None:
-  """The held-out tasks on the last weights. The cookbook's loop runs them before a step, and so never after the last one."""
-  _, held_out = await run.dataset_builder()
-  saved = checkpoint_utils.get_last_checkpoint(run.log_path, required_key="sampler_path")
-  if held_out is None or saved is None:
-    return
-  for group in held_out.get_batch(0):
-    group.step = run.max_steps
-  sampler = await tinker.ServiceClient(base_url=run.base_url).create_sampling_client(model_path=saved.sampler_path)
-  evaluator = RLTestSetEvaluator(held_out, max_tokens=run.max_tokens, strategy=run.effective_rollout_strategy())
-  metrics = await train.run_single_evaluation(evaluator, run, run.max_steps, sampler, "test")
-  print(
-    json.dumps({"eval": run.max_steps} | {k: v for k, v in metrics.items() if isinstance(v, (int, float))}), flush=True
-  )
 
 
 async def main(cfg: Config) -> None:
@@ -448,11 +373,13 @@ async def main(cfg: Config) -> None:
   )
   # the cookbook logs two groups of every step token by token, which for long episodes is megabytes a step
   logging.getLogger(train.__name__).addFilter(lambda record: record.funcName != "print_group")
-  await train.main(run)
-  if cfg.eval_every:
-    await last_eval(run)
-  for told in Path(cfg.out, "trajectories").glob("*/run.json"):
-    told.write_text(json.dumps(json.loads(told.read_text()) | {"status": "Completed"}))
+  captured = contextlib.nullcontext()
+  if cfg.capture:
+    from tinker_cookbook.capture.store import capture_to_store  # which starts a store daemon, so only when asked for
+
+    captured = capture_to_store("lab", data_dir=str(Path(cfg.out, "capture")))
+  with captured:
+    await train.main(run)
 
 
 if __name__ == "__main__":
