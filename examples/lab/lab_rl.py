@@ -10,7 +10,7 @@ is an Agent Substrate environment (substrate.py), which is suspended while the m
     python lab_rl.py base_url=http://localhost:18000 steps=35 eval_every=5
 
 The held-out tasks, the order of the training tasks and the system prompt are those of open-rl's examples/harvey_labs, so the two
-train and evaluate on the same tasks. Nothing is imported from it. See README.md.
+train and evaluate on the same tasks. Nothing is imported from it. Prompts are written by the model's chat template. See README.md.
 """
 
 import asyncio
@@ -210,7 +210,7 @@ async def open_sandbox(cfg: Config, task: dict, run: Path):
       run / "workspace",
       run / "output",
     )
-    return box.execute, box.metrics, lambda: box.close(run / "output")
+    return box.execute, box.metrics, box.close
 
   from sandbox.sandbox import Sandbox
 
@@ -421,9 +421,7 @@ async def last_eval(run: train.Config) -> None:
     return
   for group in held_out.get_batch(0):
     group.step = run.max_steps
-  sampler = await tinker.ServiceClient(base_url=run.base_url).create_sampling_client_async(
-    model_path=saved.sampler_path
-  )
+  sampler = await tinker.ServiceClient(base_url=run.base_url).create_sampling_client(model_path=saved.sampler_path)
   evaluator = RLTestSetEvaluator(held_out, max_tokens=run.max_tokens, strategy=run.effective_rollout_strategy())
   metrics = await train.run_single_evaluation(evaluator, run, run.max_steps, sampler, "test")
   print(

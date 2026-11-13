@@ -18,8 +18,11 @@ the sandbox and has LAB's judge grade what was written. Its group does nothing w
 left open. Sampled tokens are trained on as they were sampled: an episode's next prompt is its last one, the turn, and the
 tools' replies appended.
 
-The tasks, tools and grader are LAB's. The held-out tasks, the order of the training tasks and the first prompt are the same
-as in open-rl's `examples/harvey_labs` recipe, so a run here and a run there can be compared; no code is shared with it.
+The tasks, tools and grader are LAB's. The held-out tasks and the order of the training tasks are the same as in open-rl's
+`examples/harvey_labs` recipe, so a run here and a run there can be compared; no code is shared with it. Prompts are written
+by the model's own chat template. For Gemma 4 that gives open-rl's first prompt token for token. For Qwen 3.8 it does not:
+open-rl and the cookbook's renderer declare each tool as `{"name": ...}`, the chat template given OpenAI-style tools as
+`{"type": "function", "function": {...}}`, which makes a first prompt of 6,561 tokens where theirs is 6,517.
 
 ## Sandboxes
 
@@ -80,11 +83,18 @@ run that is restarted resumes from the cookbook's checkpoint, which needs a gate
   an episode that looks, writes, checks and stops becomes one training sequence over all its tokens with the advantage on
   exactly the sampled ones; each call is given the smaller of a turn's tokens and the room left; an episode ends itself on its
   turn limit, a cut-off turn and a tool call that cannot be read; and one whose sampler fails leaves no sandbox behind.
-- **`substrate.py` against open-rl's Substrate sandbox, on the same task.** 17 tool calls (glob, grep in three modes, read of a
-  docx, a missing file, write, edit, a write to the read-only documents, bash with an exit code, a bash timeout) gave the same
-  results, the same tool metrics and the same files brought home.
+- **This folder's image, one step with the held-out tasks before and after.** Same settings: eval reward 0.28, the training
+  step on 172,298 tokens with a sampler-trainer KL of 0.0004, the last eval, exit 0. (The image of the commit before the
+  search script was removed; the scripted rollout above was rerun after.)
+- **`substrate.py` against open-rl's Substrate sandbox, on the same task.** 23 tool calls: glob, grep in three modes, read of a
+  docx, a missing file, write, edit, a write to the read-only documents, bash with an exit code, a bash timeout, and searches
+  of files the episode made with bash, of a file it deleted, and of an output folder holding a link to `/etc/passwd`. 22 gave
+  the same result, with the same tool metrics and the same files brought home. The other was a grep count whose lines came in
+  a different order: LAB's grep runs on the host here and in the sandbox there, and neither sorts. The link leaked nothing,
+  and was left behind when the outputs came home; open-rl's sandbox fails to bring its outputs home when one is there.
 - **Tasks and prompt against open-rl's recipe.** The 50 held-out tasks and the first 300 training tasks are the same, in the
-  same order, and the first prompts of three tasks are the same tokens (6,460, 6,270 and 6,420 for Gemma 4 E4B).
+  same order. For Gemma 4 E4B the first prompts of three tasks are the same tokens (6,460, 6,270 and 6,420); for Qwen 3.8
+  they differ in how the tools are declared, as said above.
 - **Before the move onto the cookbook's loop, the same episode logic as a plain script: 35 steps of 8 tasks × 6 on 4 B200s.**
   Gemma 4 E4B, with sandboxes from an Agent Sandbox warm pool. Reward on the 50 held-out tasks went from 0.087 to 0.380, and
   the pass rate from 0.168 to 0.403. Its training tasks were in a slightly different order from position 127 on, since fixed.
