@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import chz
@@ -53,8 +54,7 @@ class Config:
   substrate_image: str  # LAB's sandbox image, pinned by digest
   substrate_idle: float = 30.0  # seconds without a call before a sandbox is suspended
   model: str = "google/gemma-4-E4B-it"
-  renderer: str = ""  # a cookbook renderer by name; without one, the cookbook's choice for the model, or gemma4.py
-  think: bool = True  # Gemma 4's thinking; for other models the renderer's name says
+  renderer: str | None = None  # a cookbook renderer's name, gemma4 or gemma4_no_thinking; None: the model's usual one
   base_url: str = "http://localhost:18000"
   out: str = "out"  # the cookbook's logs and checkpoints
   rank: int = 32
@@ -62,7 +62,7 @@ class Config:
   steps: int = 1
   batch: int = 8  # tasks per step
   group: int = 6  # episodes per task
-  task: str = ""  # train on this one task instead of the split
+  task: str | None = None  # train on this one task instead of the split
   eval_every: int = 0  # run the held-out tasks before every so many steps and after the last; 0 for never
   eval_tasks: int = 50
   save_every: int = 5
@@ -70,7 +70,7 @@ class Config:
   turn_tokens: int = 8192
   traj_tokens: int = 32768
   tool_tokens: int = 4096
-  judge: str = "gpt-gemma-4-31b-it"
+  judge: str = "gpt-glm-5.2"
   judge_parallel: int = 16
   grading: int = 6  # episodes graded at once
   capture: bool = False  # keep every call's tokens in the cookbook's capture store, under out/capture
@@ -79,21 +79,31 @@ class Config:
 # ***** tasks *****
 
 
-def load_task(name: str) -> dict | None:
-  """A task that can run and be graded: instructions, criteria and documents."""
+@dataclass(frozen=True)
+class Task:
+  name: str
+  instructions: str
+  documents: Path
+
+
+def load_task(name: str) -> Task:
+  """A task that can run and be graded: one with instructions, criteria and documents. Another raises ValueError."""
   folder = LAB_ROOT / "tasks" / name
   config = json.loads((folder / "task.json").read_text())
   documents = folder / "documents"
   if not (config.get("instructions") and config.get("criteria") and documents.is_dir() and any(documents.rglob("*"))):
-    return None
-  return {"name": name, "instructions": config["instructions"], "documents": documents}
+    raise ValueError(f"{name} lacks instructions, criteria or documents")
+  return Task(name, config["instructions"], documents)
 
 
-def split() -> tuple[list[dict], list[dict]]:
+def split() -> tuple[list[Task], list[Task]]:
   """open-rl's split: 50 held-out tasks from a seeded shuffle, and for training the rest that share no family with them."""
   # sorted as paths, folder by folder, which is the order open-rl shuffles: as strings, "a-b/c" would come before "a/c"
   names = [p.parent.relative_to(LAB_ROOT / "tasks").as_posix() for p in sorted((LAB_ROOT / "tasks").rglob("task.json"))]
-  tasks = {n: t for n in names if (t := load_task(n))}
+  tasks = {}
+  for name in names:
+    with contextlib.suppress(ValueError):
+      tasks[name] = load_task(name)
   shuffled = list(tasks)
   random.Random(0).shuffle(shuffled)
   held_out = shuffled[300:350]
@@ -106,11 +116,11 @@ def split() -> tuple[list[dict], list[dict]]:
 # ***** prompt *****
 
 
-def system_prompt(task: dict) -> str:
+def system_prompt(task: Task) -> str:
   prompt = (LAB_ROOT / "harness" / "system_prompt.md").read_text()
   for skill in SKILLS:
     prompt += f"\n\n## Skill: {skill}\n\n{(LAB_ROOT / 'harness' / 'skills' / skill / 'SKILL.md').read_text()}"
-  outputs = list(dict.fromkeys(re.findall(r"`([^`]+\.(?:docx|xlsx|pptx|pdf|md|txt))`", task["instructions"], re.I)))
+  outputs = list(dict.fromkeys(re.findall(r"`([^`]+\.(?:docx|xlsx|pptx|pdf|md|txt))`", task.instructions, re.I)))
   if not outputs:
     return prompt
   # the write tool and bash see the output folder under different paths, which the model otherwise gets wrong
@@ -160,11 +170,14 @@ def keep_sampled_tokens(renderer: Renderer) -> Renderer:
   return renderer
 
 
+GEMMA4 = {"gemma4": True, "gemma4_no_thinking": False}  # gemma4.py's renderer by name, and whether the model thinks
+
+
 def make_renderer(cfg: Config) -> Renderer:
-  tokenizer = get_tokenizer(cfg.model)
-  if "gemma-4" in cfg.model and not cfg.renderer:
-    return Gemma4Renderer(tokenizer, cfg.model, cfg.think)
-  name = cfg.renderer or model_info.get_recommended_renderer_name(cfg.model)
+  tokenizer, usual = get_tokenizer(cfg.model), "gemma4" if "gemma-4" in cfg.model else None
+  name = cfg.renderer or usual or model_info.get_recommended_renderer_name(cfg.model)
+  if name in GEMMA4:
+    return Gemma4Renderer(tokenizer, cfg.model, GEMMA4[name])
   return keep_sampled_tokens(renderers.get_renderer(name, tokenizer, model_name=cfg.model))
 
 
@@ -180,20 +193,20 @@ def truncate_tool_result(tokenizer, result: str, limit: int) -> str:
 # ***** an episode *****
 
 
-def grade(cfg: Config, run_id: str, task: str) -> tuple[float, dict]:
-  """The fraction of the task's rubric that LAB's judge passes, 0 when the episode wrote nothing."""
+def grade(cfg: Config, run_id: str, task: str) -> tuple[float, dict[str, float]]:
+  """The fraction of the task's rubric that LAB's judge passes, 0 when the episode wrote nothing, and the episode's metrics."""
   run = LAB_ROOT / "results" / run_id
   if not any(p.is_file() and p.stat().st_size for p in (run / "output").rglob("*")):
-    return 0.0, {"graded": "no output"}
+    return 0.0, {"graded": 0.0, "wrote_nothing": 1.0}
   python = LAB_ROOT / ".venv" / "bin" / "python"
   flags = ["--run-id", run_id, "--task", task, "--judge-model", cfg.judge, "--parallel", str(cfg.judge_parallel)]
   done = subprocess.run([python, "-m", "evaluation.run_eval", *flags], cwd=LAB_ROOT, capture_output=True, text=True)
   (run / "grading.log").write_text(done.stdout + done.stderr)
   scores = json.loads(scores_file.read_text()) if (scores_file := run / "scores.json").exists() else {}
-  if done.returncode or not scores.get("n_criteria"):
-    return 0.0, {"graded": "judge failed"}
-  passed = {"criteria": scores["n_criteria"], "criteria_passed": scores["n_passed"]}
-  return scores["n_passed"] / scores["n_criteria"], {"graded": "yes", **passed}
+  if done.returncode or not scores.get("n_criteria"):  # the judge failed
+    return 0.0, {"graded": 0.0, "wrote_nothing": 0.0}
+  criteria, passed = scores["n_criteria"], scores["n_passed"]
+  return passed / criteria, {"graded": 1.0, "wrote_nothing": 0.0, "criteria": criteria, "criteria_passed": passed}
 
 
 class LabTool:
@@ -209,16 +222,17 @@ class LabTool:
 
 
 class Rollout:
-  """One episode: the cookbook's environment for it, a sandbox of its own, opened by its first tool call, and its end, where the
-  sandbox is closed and what the episode wrote is graded, once."""
+  """One episode: the cookbook's environment for it, a sandbox of its own, created by its first tool call, and its end, where
+  the sandbox is deleted and what the episode wrote is graded, once."""
 
   def __init__(self, group: "LabEnvGroupBuilder"):
     self.group, self.cfg, self.task = group, group.cfg, group.task
     cfg, renderer, specs = self.cfg, group.renderer, get_all_tool_definitions()
-    self.run_id = f"tinyrl/{self.task['name'].replace('/', '__')}/{uuid.uuid4().hex[:12]}"
+    self.run_id = f"tinyrl/{self.task.name.replace('/', '__')}/{uuid.uuid4().hex[:12]}"
     self.run = LAB_ROOT / "results" / self.run_id  # where LAB's grader looks for what an episode wrote
-    self.sandbox = self.tools = self.result = None
-    tools, user = [LabTool(self, spec) for spec in specs], {"role": "user", "content": self.task["instructions"]}
+    self.tools: substrate.LabTools | None = None  # LAB's tools on the episode's sandbox, from its first tool call on
+    self.result: tuple[float, dict] | None = None  # the grade, once the episode has ended
+    tools, user = [LabTool(self, spec) for spec in specs], {"role": "user", "content": self.task.instructions}
     messages = [*renderer.create_conversation_prefix_with_tools(specs, system_prompt(self.task)), user]
     # the cookbook's runner gives each call a turn's worth of tokens, or what room is left
     limits = RolloutLimits(max_turn_tokens=cfg.turn_tokens, max_trajectory_tokens=cfg.traj_tokens)
@@ -231,28 +245,22 @@ class Rollout:
     self.env = build_agent_tool_env(renderer, tools, messages, self.final_reward, rollout_config=config, **options)
 
   async def execute(self, name: str, arguments: dict) -> str:
-    if self.sandbox is None:
+    if self.tools is None:
       (self.run / "output").mkdir(parents=True)
       (self.run / "workspace").mkdir()
       for skill in SKILLS:
         if (scripts := LAB_ROOT / "harness" / "skills" / skill / "scripts").exists():
           shutil.copytree(scripts, self.run / "workspace" / "skills" / skill / "scripts")
-      cfg, documents = self.cfg, self.task["documents"]
-      workspace, output = self.run / "workspace", self.run / "output"
+      cfg = self.cfg
       substrate_args = cfg.substrate_endpoint, cfg.substrate_image, cfg.substrate_idle
-      sandbox = await substrate.create_sandbox(*substrate_args, documents, workspace)
-      files = substrate.LabSandbox(sandbox, asyncio.get_running_loop(), documents, workspace, output, timeout=60)
-      self.sandbox, self.tools = sandbox, substrate.LabTools(sandbox=files, shell_timeout=60)
+      self.tools = await substrate.create_tools(*substrate_args, self.task.documents, self.run)
     result = await asyncio.to_thread(self.tools.execute, name, arguments)
-    if self.sandbox.crashed:  # which LAB's tools would have told the model as one more error
-      raise self.sandbox.crashed
     return truncate_tool_result(self.group.renderer.tokenizer, result, self.cfg.tool_tokens)
 
-  async def close_sandbox(self) -> None:
-    """Delete the sandbox, once: at the episode's end, or by its group when the episode failed."""
-    if sandbox := self.sandbox:
-      self.sandbox = None
-      await sandbox.cleanup()
+  async def delete_sandbox(self) -> None:
+    """At the episode's end, or by its group when the episode failed. Deleting twice is harmless."""
+    if self.tools:
+      await self.tools.sandbox.substrate.cleanup()
 
   async def final_reward(self, messages: list[Message] | None = None) -> tuple[float, dict]:
     """The episode's grade, which the cookbook's environment asks for at an episode's end, and the group for the rest."""
@@ -261,22 +269,21 @@ class Rollout:
     return self.result
 
   async def close_and_grade(self) -> tuple[float, dict]:
-    if self.sandbox:
-      (self.run / "metrics.json").write_text(json.dumps(self.tools.get_metrics() | {"suspends": self.sandbox.suspends}))
+    if tools := self.tools:
+      metrics = tools.get_metrics() | {"suspends": tools.sandbox.substrate.suspends}
+      (self.run / "metrics.json").write_text(json.dumps(metrics))
       try:
-        await substrate.copy_to_host(self.sandbox, self.run / "workspace", self.run / "output")
+        await tools.sandbox.download()
       finally:
-        await self.close_sandbox()
+        await self.delete_sandbox()
     async with self.group.grading:
-      reward, graded = await asyncio.to_thread(grade, self.cfg, self.run_id, self.task["name"])
-    metrics = {"graded": float(graded["graded"] == "yes"), "wrote_nothing": float(graded["graded"] == "no output")}
-    return reward, metrics | {k: graded[k] for k in ("criteria", "criteria_passed") if k in graded}
+      return await asyncio.to_thread(grade, self.cfg, self.run_id, self.task.name)
 
 
 class LabEnvGroupBuilder(EnvGroupBuilder):
   """A task's episodes in one step."""
 
-  def __init__(self, cfg: Config, renderer: Renderer, grading: asyncio.Semaphore, task: dict, size: int):
+  def __init__(self, cfg: Config, renderer: Renderer, grading: asyncio.Semaphore, task: Task, size: int):
     self.cfg, self.renderer, self.grading, self.task, self.size = cfg, renderer, grading, task, size
     self.rollouts: dict[int, Rollout] = {}
 
@@ -296,7 +303,7 @@ class LabEnvGroupBuilder(EnvGroupBuilder):
     return await asyncio.gather(*map(grade_if_needed, envs))
 
   async def cleanup(self) -> None:
-    await asyncio.gather(*(rollout.close_sandbox() for rollout in self.rollouts.values()), return_exceptions=True)
+    await asyncio.gather(*(rollout.delete_sandbox() for rollout in self.rollouts.values()), return_exceptions=True)
     self.rollouts = {}
 
   def logging_tags(self) -> list[str]:

@@ -70,7 +70,8 @@ Settings are `name=value` arguments, the fields of `Config` at the top of `lab_r
 | Setting | Default | |
 |---|---|---|
 | `model` | `google/gemma-4-E4B-it` | Gemma 4, or a model the cookbook has a renderer for. |
-| `renderer` | | A cookbook renderer by name, e.g. `qwen3_8_medium_reasoning`; without one, the cookbook's choice for the model. |
+| `renderer` | the model's usual one | A cookbook renderer by name, e.g. `qwen3_8_medium_reasoning`, or `gemma4` / `gemma4_no_thinking` for `gemma4.py`. |
+| `judge` | `gpt-glm-5.2` | The judge model's name at `OPENAI_BASE_URL`, as open-rl's recipe serves it. |
 | `batch`, `group`, `steps` | 8, 6, 1 | Tasks per step, episodes per task, steps. |
 | `eval_every`, `eval_tasks` | 0, 50 | Held-out tasks run before every so many steps and after the last. |
 | `traj_tokens`, `turn_tokens`, `max_turns` | 32768, 8192, 40 | An episode's context, a turn's length, and its turns. |

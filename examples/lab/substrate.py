@@ -2,7 +2,7 @@
 tools run against it. The environment is suspended once nothing has been asked of it for a while, so it holds no worker while the
 model generates, and the next call resumes it.
 
-`SubstrateSandbox` is a tinker-cookbook sandbox (its SandboxInterface); `LabSandbox` and `LabTools` run LAB's tools on one.
+`SubstrateSandbox` is a tinker-cookbook sandbox (its SandboxInterface); `create_tools` gives LAB's tools on a new one.
 
 Substrate keeps an environment until it is deleted and has no call that lists them, so a driver that is stopped deletes its own.
 """
@@ -79,8 +79,8 @@ class SubstrateSandbox:
 
   async def guest_call(self, coro, seconds: float):
     """One call to the environment, which wakes it. Substrate does not start a crashed environment again, so its episode cannot go
-    on: a call that fails on one raises the cookbook's SandboxTerminatedError, and `crashed` keeps it for callers that LAB's tools,
-    which turn every error into text for the model, stand between."""
+    on: a call that fails on one raises the cookbook's SandboxTerminatedError, and `crashed` keeps it for LabTools, whose base
+    class turns every error into text for the model."""
     self.call_seq += 1
     async with self.suspend_lock:
       self.in_flight += 1
@@ -129,8 +129,8 @@ class SubstrateSandbox:
 class LabSandbox:
   """What LAB's tools ask of a sandbox, answered by a SubstrateSandbox. The tools run in a thread, and each call here runs on the event loop."""
 
-  def __init__(self, sandbox: SubstrateSandbox, loop, documents: Path, workspace: Path, output: Path, timeout: int):
-    self.sandbox, self.loop, self.timeout = sandbox, loop, timeout
+  def __init__(self, substrate: SubstrateSandbox, loop, documents: Path, workspace: Path, output: Path, timeout: int):
+    self.substrate, self.loop, self.timeout = substrate, loop, timeout
     # the host's folders, which LAB counts documents in
     self.documents_dir, self.workspace_dir, self.output_dir = documents, workspace, output
 
@@ -146,7 +146,7 @@ class LabSandbox:
     exports = " ".join(f"{name}={shlex.quote(value)}" for name, value in env_vars.items())
     shell_line = f"env {exports} timeout --kill-after=2 {timeout} bash -lc {shlex.quote(command)}"
     try:
-      done = self.run_on_loop(self.sandbox.run_command(shell_line, workdir=cwd, timeout=timeout))
+      done = self.run_on_loop(self.substrate.run_command(shell_line, workdir=cwd, timeout=timeout))
     except (EnvError, TimeoutError) as e:
       return ExecResult(stdout="", stderr=f"sandbox exec failed: {type(e).__name__}: {e}", returncode=1)
     if done.exit_code in (124, 137):  # what timeout exits with, having ended or killed the command
@@ -156,7 +156,7 @@ class LabSandbox:
   def read_file(self, path: str) -> bytes:
     Paths.assert_sandbox_path(path)
     try:
-      return self.run_on_loop(self.sandbox.read_bytes(path))
+      return self.run_on_loop(self.substrate.read_bytes(path))
     except NotFoundError as e:
       raise FileNotFoundError(path) from e
     except EnvError as e:
@@ -166,7 +166,7 @@ class LabSandbox:
     Paths.assert_sandbox_path(path)
     if not Paths.is_writable(path):
       raise PermissionError(f"write denied: {path} is not under a writable mount")
-    self.run_on_loop(self.sandbox.write_file(path, content, timeout=240))
+    self.run_on_loop(self.substrate.write_file(path, content, timeout=240))
 
   def exists(self, path: str) -> bool:
     try:
@@ -175,19 +175,26 @@ class LabSandbox:
       return False
     return self.exec(f"test -e {shlex.quote(path)}", timeout=30).returncode == 0
 
-  def copy_to_host(self) -> None:
-    self.run_on_loop(copy_to_host(self.sandbox, self.workspace_dir, self.output_dir))
+  async def download(self) -> None:
+    await copy_to_host(self.substrate, self.workspace_dir, self.output_dir)
 
 
 class LabTools(ToolExecutor):
   """LAB's tools. Its glob and grep walk the host's folders, which podman mounts into its container. A remote sandbox shares no folder with the host, so what the episode has written is copied to the host before they look."""
 
+  def execute(self, name: str, arguments: dict) -> str:
+    result = super().execute(name, arguments)
+    # LAB's tools turn every error into text for the model, a sandbox that has crashed among them
+    if crashed := self.sandbox.substrate.crashed:
+      raise crashed
+    return result
+
   def _glob(self, *args) -> str:
-    self.sandbox.copy_to_host()
+    self.sandbox.run_on_loop(self.sandbox.download())
     return super()._glob(*args)
 
   def _grep(self, *args) -> str:
-    self.sandbox.copy_to_host()
+    self.sandbox.run_on_loop(self.sandbox.download())
     return super()._grep(*args)
 
 
@@ -248,3 +255,11 @@ async def create_sandbox(endpoint: str, image: str, idle: float, documents: Path
       await delete(endpoint, name)
     raise
   return sandbox
+
+
+async def create_tools(endpoint: str, image: str, idle: float, documents: Path, run: Path) -> LabTools:
+  """LAB's tools on a new sandbox for one episode, whose host folders are run/workspace and run/output."""
+  workspace, output = run / "workspace", run / "output"
+  substrate = await create_sandbox(endpoint, image, idle, documents, workspace)
+  files = LabSandbox(substrate, asyncio.get_running_loop(), documents, workspace, output, timeout=60)
+  return LabTools(sandbox=files, shell_timeout=60)
