@@ -77,6 +77,10 @@ class FutureRequest(BaseModel):
   request_id: str
 
 
+class WeightsInfoRequest(BaseModel):
+  tinker_path: str
+
+
 def ttl(seconds: int | None) -> int | None:
   """A checkpoint's TTL, which the Tinker API bounds between an hour and ten years."""
   if seconds is not None and not 3600 <= seconds <= 10 * 365 * 24 * 3600:
@@ -287,6 +291,23 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def load_weights(req: LoadRequest):
     uri = checkpoint_uri(req.model_id, "weights", req.path)
     return await submit(req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer}, req.seq_id)
+
+  @api.post("/api/v1/weights_info")
+  async def weights_info(req: WeightsInfoRequest):
+    """What the SDK asks before it resumes from a checkpoint: how to create a run like the one that saved it. The checkpoint
+    says so itself, as its run is deleted soon after its client stops."""
+    try:
+      meta = await asyncio.to_thread(store.read_meta, checkpoint_uri("", "", req.tinker_path))
+    except (OSError, IndexError, ValueError):
+      meta = {}
+    if "base" not in meta:
+      raise HTTPException(404, f"no checkpoint {req.tinker_path} that names its base model")
+    made = meta["targets"]
+    trained = {"train_unembed": "lm_head" in made, "train_mlp": "gate_proj" in made, "train_attn": "q_proj" in made}
+    # the SDK reads LoRA shaped metadata, even for a full fine-tune
+    return {"base_model": meta["base"], "is_lora": True, "lora_rank": meta["rank"] or 16} | (
+      trained if meta["rank"] else {}
+    )
 
   @api.post("/api/v1/delete_model")
   async def delete_model(req: ModelRequest):

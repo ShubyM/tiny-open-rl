@@ -357,7 +357,10 @@ class Model:
       if optim and p in optim.state:
         for k in ("exp_avg", "exp_avg_sq", "step"):
           tensors[f"{name}.{k}"] = full_tensor(optim.state[p][k].detach())
-    return tensors, {"optimizer": True}
+    # the base model and the adapter's shape, for a client that resumes from this after its run is gone
+    adapter = self.lm.peft_config[run] if self.lora else None
+    made = sorted({t.rsplit(".", 1)[-1] for t in adapter.target_modules}) if adapter else []
+    return tensors, {"optimizer": True, "base": self.base, "rank": adapter.r if adapter else 0, "targets": made}
 
   def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
