@@ -255,7 +255,7 @@ class TestModel(unittest.TestCase):
     model, (lora_run,) = lora_runs()
     train(model, lora_run, steps=3)
     store.put(f"tinker://{lora_run}/sampler_weights/final", *model.sampler_weights(lora_run))
-    lora_dir = store.path(f"tinker://{lora_run}/sampler_weights/final")
+    lora_dir, _ = store.local_folder(f"tinker://{lora_run}/sampler_weights/final")
     with torch.no_grad():
       torch.testing.assert_close(
         PeftModel.from_pretrained(tiny(), lora_dir).eval()(ids).logits,
@@ -266,7 +266,7 @@ class TestModel(unittest.TestCase):
     fft.create_run(fft_run, "tiny", 0, {})
     train(fft, fft_run, steps=3)
     store.put(f"tinker://{fft_run}/sampler_weights/final", *fft.sampler_weights(fft_run))
-    fft_dir = store.path(f"tinker://{fft_run}/sampler_weights/final")
+    fft_dir, _ = store.local_folder(f"tinker://{fft_run}/sampler_weights/final")
     with torch.no_grad():
       torch.testing.assert_close(
         LlamaForCausalLM.from_pretrained(fft_dir).eval()(ids).logits,
@@ -314,7 +314,6 @@ class TestTrainer(RedisTest):
 
   async def test_graceful_replacement_registers_and_restores_weights_optimizer_and_pending_gradients(self):
     self.node.gpus = 2
-    self.node.state.nodes[self.node.id] = (2, 0)
     for rank, lora, width in ((4, LORA, 2), (0, {}, 1)):
       ctrl, run = new_id(), new_id()
       for r, worker in ((run, f"p-{rank}"), (ctrl, f"ctrl-{rank}")):
@@ -326,6 +325,7 @@ class TestTrainer(RedisTest):
           )
         await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
         await self.node.drain(r)
+      self.node.pinned.discard(f"p-{rank}")
       desired = self.node.state.workers[f"p-{rank}"]
       desired.node, desired.gpus = None, ()  # the parked wide worker must regain its actual GPUs to checkpoint
       self.node.notify()
@@ -348,10 +348,13 @@ class TestTrainer(RedisTest):
     run, uri = new_id(), "tinker://saved/weights/step-1"
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
     await self.submit(
-      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      (Op.SAVE_WEIGHTS, {"uri": uri}),
+      (Op.OPTIM_STEP, {"adam_params": {}}),  # acknowledged mutation AFTER the durable save
     )
     await self.node.drain(run)
-    self.node.tasks["p"].cancel()  # a lost process has no park checkpoint
+    self.node.tasks["p"].cancel()  # a lost process has no park checkpoint covering the unsaved step
     await self.finish_worker("p")
     ids = await self.submit(
       run,
@@ -365,6 +368,23 @@ class TestTrainer(RedisTest):
     replies = [await self.bus.wait_for_reply(request_id, 1) for request_id in ids]
     self.assertEqual([reply.ok for reply in replies], [False, False, False, True, True])
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
+
+  async def test_a_run_resumes_automatically_when_durable_checkpoint_covers_acknowledged_progress(self):
+    run, uri = new_id(), "tinker://saved/weights/clean-boundary"
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    await self.submit(
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      (Op.FORWARD_BACKWARD, proto_body(run)),
+      (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
+      (Op.SAVE_WEIGHTS, {"uri": uri}),
+    )
+    await self.node.drain(run)
+    self.node.tasks["p"].cancel()  # abrupt loss with zero unsaved mutations after durable save
+    await self.finish_worker("p")
+    [req] = await self.submit(run, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
+    await self.node.drain(run)
+    self.assertTrue((await self.bus.wait_for_reply(req, 1)).ok)
 
 
 class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):

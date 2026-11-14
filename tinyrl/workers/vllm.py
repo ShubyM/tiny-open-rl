@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import glob
+import hashlib
+import importlib.metadata
 import json
 import os
 import shlex
@@ -19,9 +21,10 @@ import aiohttp
 
 from tinyrl.control.process import launch, reap, target_pid
 from tinyrl.storage import models
+from tinyrl.storage.store import Store
 from tinyrl.trace import span
 from tinyrl.workers import snapshot
-from tinyrl.workers.sampler import Out, Seq
+from tinyrl.workers.sampler import Out, SamplingAbortedError, Seq
 
 CUDAGRAPH_CONFIG = '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128,256]}'
 KERNEL_CONFIG = '{"enable_flashinfer_autotune":false}'
@@ -47,6 +50,8 @@ def unix_client(sock: str) -> aiohttp.ClientSession:
 
 def parse(body: bytes) -> Out:
   choices = sorted(json.loads(body)["choices"], key=lambda c: c["index"])
+  if not choices or any(c.get("finish_reason") == "abort" for c in choices):
+    raise SamplingAbortedError("vLLM aborted completion before finishing")
   seqs = [
     Seq(
       c["token_ids"],
@@ -57,6 +62,78 @@ def parse(body: bytes) -> Out:
     for c in choices
   ]
   return Out(seqs, [by_id(d) if d else None for d in choices[0].get("prompt_logprobs") or []])
+
+
+def _pkg_version(name: str) -> str:
+  with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+    return importlib.metadata.version(name)
+  return "unknown"
+
+
+def compiled_artifact_key(
+  base: str,
+  lora: bool,
+  tp: int,
+  flags: list[str] | tuple[str, ...] = (),
+  env: dict[str, str] | None = None,
+) -> dict:
+  """Compatibility fingerprint for compiled vLLM/Inductor/FlashAttention startup artifacts."""
+  opts = os.environ if env is None else env
+  gpu_arch = opts.get("TINYRL_GPU_ARCH", "")
+  if not gpu_arch:
+    with contextlib.suppress(Exception):
+      import torch
+
+      if torch.cuda.is_available():
+        gpu_arch = "sm_" + "".join(map(str, torch.cuda.get_device_capability(0)))
+  compat = {
+    "base": base,
+    "lora": bool(lora),
+    "tp": int(tp),
+    "vllm": opts.get("TINYRL_VLLM_VERSION") or _pkg_version("vllm"),
+    "torch": opts.get("TINYRL_TORCH_VERSION") or _pkg_version("torch"),
+    "gpu_arch": gpu_arch or "cpu",
+    "flags": list(flags),
+  }
+  digest = hashlib.sha256(json.dumps(compat, sort_keys=True).encode()).hexdigest()[:24]
+  return {"key": digest, "compat": compat}
+
+
+def stage_compiled_artifact(
+  store: Store,
+  uri: str,
+  expected: dict,
+  cache_root: str,
+  version: str | None = None,
+  peers: list[str] | tuple[str, ...] = (),
+) -> bool:
+  """Stage a compatible compiled artifact into cache_root, returning False on mismatch or absence."""
+  try:
+    meta = store.read_meta(uri, version, peers=peers)
+  except Exception:
+    return False
+  if meta.get("artifact_key") != expected["key"] or meta.get("compat") != expected["compat"]:
+    return False
+  try:
+    with store.pin_local(uri, version, peers=peers) as (folder, _):
+      os.makedirs(cache_root, exist_ok=True)
+      for root_dir, _, fnames in os.walk(folder):
+        for fname in fnames:
+          if fname == "manifest.json":
+            continue
+          src = os.path.join(root_dir, fname)
+          rel = os.path.relpath(src, folder)
+          dst = os.path.join(cache_root, rel)
+          os.makedirs(os.path.dirname(dst), exist_ok=True)
+          shutil.copy2(src, dst)
+    return True
+  except Exception:
+    return False
+
+
+def publish_compiled_artifact(store: Store, uri: str, expected: dict, cache_root: str) -> tuple[str, int]:
+  """Publish compiled startup caches as an immutable versioned artifact with compatibility metadata."""
+  return store.put_files(uri, cache_root, meta={"artifact_key": expected["key"], "compat": expected["compat"]})
 
 
 class VLLM:
@@ -106,6 +183,20 @@ class VLLM:
     ):
       extra += ["--kv-cache-memory-bytes", kv]
     flags += extra
+    if artifact_root := options.get("TINYRL_ARTIFACT_CACHE"):
+      env.setdefault("VLLM_CACHE_ROOT", os.path.join(artifact_root, "vllm"))
+      env.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(artifact_root, "inductor"))
+      env["FLASH_ATTENTION_CUTE_DSL_CACHE_DIR"] = os.path.join(artifact_root, "fa-cute")
+      if artifact_uri := options.get("TINYRL_COMPILED_ARTIFACT_URI"):
+        expected = compiled_artifact_key(base, lora, tp, flags, env)
+        await asyncio.to_thread(
+          stage_compiled_artifact,
+          Store(),
+          artifact_uri,
+          expected,
+          artifact_root,
+          options.get("TINYRL_COMPILED_ARTIFACT_VERSION"),
+        )
 
     def serve(*listen: str) -> list[str]:
       return ["vllm", "serve", path, "--served-model-name", base, *listen, *flags]
@@ -230,6 +321,12 @@ class VLLM:
       await self.post("/reset_prefix_cache")
       self.clean = False
       self.loaded = {name}
+
+  async def pause(self, mode: str = "wait") -> None:
+    await self.post("/pause", params={"mode": mode})
+
+  async def resume(self) -> None:
+    await self.post("/resume")
 
   async def sleep(self) -> None:
     await self.post("/sleep", params={"level": 1})

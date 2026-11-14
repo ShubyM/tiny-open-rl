@@ -130,7 +130,8 @@ class TestAPI(RedisTest):
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
     self.assertEqual(sampler["path"], f"tinker://{run_id}/sampler_weights/step-0")
-    with open(f"{self.store.path(sampler['path'])}/adapter_config.json") as f:
+    folder, _ = self.store.local_folder(sampler["path"])
+    with open(f"{folder}/adapter_config.json") as f:
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}
@@ -290,9 +291,11 @@ class TestAPI(RedisTest):
 
     saved = (await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final_pin"}))).json()
 
-    folder = self.store.path(saved["path"])
+    folder, _ = self.store.local_folder(saved["path"])
     files = os.listdir(folder)
-    self.assertTrue(all(f.endswith(".safetensors") for f in files), f"Found non-safetensors files: {files}")
+    self.assertTrue(
+      all(f.endswith(".safetensors") or f == "manifest.json" for f in files), f"Found unexpected files: {files}"
+    )
 
     found_exp_avg = False
     for f in glob.glob(f"{folder}/*.safetensors"):
@@ -309,7 +312,8 @@ class TestAPI(RedisTest):
     saved = (
       await self.result(await self.post("save_weights_for_sampler", json={"model_id": run, "path": "sampler"}))
     ).json()
-    files = glob.glob(f"{self.store.path(saved['path'])}/*.safetensors")
+    folder, _ = self.store.local_folder(saved["path"])
+    files = glob.glob(f"{folder}/*.safetensors")
     self.assertTrue(files)
     for path in files:
       self.assertTrue(all(t.dtype == torch.bfloat16 for t in safetensors.torch.load_file(path).values()))
@@ -412,8 +416,62 @@ class TestAPI(RedisTest):
 
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
+    # Acknowledge drain on synthetic node-1 (real node daemons emit this automatically on tick/cleanup).
+    cur_rev = scheduler.from_table(await self.bus.read_table()).workers[worker].rev
+    await self.bus.node_heartbeat(
+      "node-1",
+      8,
+      workers={worker: {"rev": cur_rev + 1, "phase": "drained", "gpu_released": True, "gpus_held": []}},
+      wake_scheduler=True,
+    )
     data = await self.scheduling_until(lambda d: worker not in d["state"]["workers"])
     self.assertNotIn(run_id, data["state"]["jobs"])
+
+  async def test_weights_info_and_fresh_session_restore_for_full_ft_and_nondefault_lora(self):
+    # Nondefault LoRA (rank=8, train_mlp=False, train_unembed=False)
+    lora_run = await self.create_model(
+      lora_config={"rank": 8, "seed": 7, "train_attn": True, "train_mlp": False, "train_unembed": False}
+    )
+    await self.result(await self.post("forward_backward", content=proto_body(lora_run), headers=PROTO))
+    await self.result(
+      await self.post("optim_step", json={"model_id": lora_run, "adam_params": {"learning_rate": 1e-2}})
+    )
+    lora_saved = (await self.result(await self.post("save_weights", json={"model_id": lora_run, "path": "nd"}))).json()
+
+    info = (await self.post("weights_info", json={"tinker_path": lora_saved["path"]})).json()
+    self.assertEqual((info["base_model"], info["is_lora"], info["lora_rank"]), ("tiny", True, 8))
+    self.assertEqual((info["train_attn"], info["train_mlp"], info["train_unembed"]), (True, False, False))
+
+    # Full fine-tuning
+    fft_run = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
+    await self.result(await self.post("forward_backward", content=proto_body(fft_run), headers=PROTO))
+    await self.result(await self.post("optim_step", json={"model_id": fft_run, "adam_params": {"learning_rate": 1e-2}}))
+    fft_saved = (await self.result(await self.post("save_weights", json={"model_id": fft_run, "path": "fft"}))).json()
+
+    fft_info = (await self.post("weights_info", json={"tinker_path": fft_saved["path"]})).json()
+    self.assertEqual((fft_info["base_model"], fft_info["is_lora"], fft_info["lora_rank"]), ("tiny", False, None))
+
+    # Fresh session create-via-load_weights reconstructs BOTH nondefault LoRA and full-FT accurately
+    fresh_sess = (await self.post("create_session")).json()["session_id"]
+    for idx, (saved_path, expected_rank) in enumerate(((lora_saved["path"], 8), (fft_saved["path"], 0))):
+      res = await self.result(
+        await self.post(
+          "load_weights",
+          json={"session_id": fresh_sess, "model_seq_id": idx, "path": saved_path, "optimizer": True},
+        )
+      )
+      body = res.json()
+      restored_id = body["model_id"]
+      run_rec = await self.bus.get_run(restored_id)
+      self.assertEqual(run_rec["rank"], expected_rank)
+      if expected_rank:
+        self.assertEqual(run_rec["lora"].get("train_mlp"), False)
+        self.assertEqual(run_rec["lora"].get("train_unembed"), False)
+      # Restored model can step immediately in the fresh session
+      step = await self.result(
+        await self.post("optim_step", json={"model_id": restored_id, "adam_params": {"learning_rate": 1e-2}})
+      )
+      self.assertEqual(step.status_code, 200)
 
   async def scheduling_until(self, done, tries: int = 100) -> dict:
     """GET /api/v1/scheduling until `done` says yes about it."""

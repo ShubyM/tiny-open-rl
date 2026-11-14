@@ -16,8 +16,13 @@ import numpy as np
 
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Reply
+from tinyrl.storage.store import shared_lock
 
 MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
+
+
+class SamplingAbortedError(RuntimeError):
+  """Raised when the sampling engine aborts an in-flight completion (e.g. during pause/drain)."""
 
 
 @dataclass(frozen=True)
@@ -87,10 +92,24 @@ class Sampler:
         if checkpoint:
           path, version = checkpoint
           name = hashlib.sha256(f"{uri}\0{version}".encode()).hexdigest()
-          await self.running.load_checkpoint(name, path)
+          if os.path.isdir(path):
+            with shared_lock(path):
+              await self.running.load_checkpoint(name, path)
+          else:
+            await self.running.load_checkpoint(name, path)
       return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, await self.running.sample(job, name)))
+    except SamplingAbortedError:
+      raise
     except Exception as e:
       return Reply.error(e)
+
+  async def pause(self, mode: str = "wait") -> None:
+    if self.running and hasattr(self.running, "pause"):
+      await self.running.pause(mode)
+
+  async def resume_engine(self) -> None:
+    if self.running and hasattr(self.running, "resume"):
+      await self.running.resume()
 
   async def resume(self, gpu: int | None = None) -> None:
     if self.running:
