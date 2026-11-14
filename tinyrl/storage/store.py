@@ -1,8 +1,13 @@
 """Checkpoint storage behind put(uri) and get(uri).
 
-Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write the layout PEFT and vLLM load directly (adapter_model.safetensors + adapter_config.json, or model.safetensors + config.json, sharded with a model.safetensors.index.json when large).
+Each saved version is an immutable directory containing safetensors/config files and a manifest.json written last.
+Tensors are stored in safetensors with JSON metadata in the header, never torch.save pickle. Sampler checkpoints write
+the layout PEFT and vLLM load directly.
 
-CKPT is a local directory, or a URL like gs://bucket/prefix that every node can reach. With a URL, the node is a cache in front of it: put writes a checkpoint into CKPT_CACHE under a new version and returns, so this node reads it at once. After start(), a background thread uploads the node's saves behind, in order, to <uri>/<version>/ with <uri>/_latest pointing at it last. The node daemon starts it, so a trainer exits, and gives its GPUs back, right after its last save. Another node copies the version it wants from the node that saved it, which serves its cache until its saves upload, else from the bucket, once, into its own CKPT_CACHE, since engines load from a local path. A node lost before its uploads finish loses those versions.
+CKPT is a local directory or a URL like gs://bucket/prefix that every node can reach. With a URL, the node stages
+saves into CKPT_CACHE/<version>/ and a background thread uploads them to <uri>/<version>/ (writing manifest.json last),
+updating <uri>/_latest monotonically. Complete local/peer copies (manifest.json) are distinct from confirmed durable
+uploads (.durable + remote manifest.json). Cross-process flock pins protect active readers from eviction and deletion.
 """
 
 from __future__ import annotations
@@ -10,6 +15,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import ctypes
+import fcntl
 import glob
 import hashlib
 import http.server
@@ -25,6 +31,7 @@ import time
 import urllib.request
 import uuid
 import weakref
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import fsspec
@@ -35,14 +42,17 @@ if TYPE_CHECKING:
 from tinyrl.helpers import getenv
 from tinyrl.trace import span
 
-CKPT = getenv("CKPT", "/tmp/tinyrl")
-CKPT_CACHE = getenv("CKPT_CACHE", "/tmp/tinyrl-cache")
-SHARD_BYTES = getenv("SHARD_BYTES", 256 * 1024 * 1024)  # a full checkpoint this big is written as parallel shards
-MAX_SHARDS = 16
-# a save copies GPU tensors off in pieces this big, through two pinned buffers per file
-STREAM_CHUNK = 256 * 1024 * 1024
-# trim_cache() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
-CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)
+CKPT, CKPT_CACHE = getenv("CKPT", "/tmp/tinyrl"), getenv("CKPT_CACHE", "/tmp/tinyrl-cache")
+SHARD_BYTES, MAX_SHARDS, STREAM_CHUNK = getenv("SHARD_BYTES", 256 * 1024 * 1024), 16, 256 * 1024 * 1024
+CACHE_BYTES, MANIFEST, FORMAT_VERSION = getenv("CKPT_CACHE_BYTES", 0), "manifest.json", 1
+
+
+def parse_version(ref: str | None) -> tuple[str, str]:
+  """Split a version reference (optionally legacy 'version@peer') into (version, peer)."""
+  if not ref:
+    return "", ""
+  ver, _, peer = ref.partition("@")
+  return ver, peer
 
 
 def pinned_bytes(size: int) -> torch.Tensor:
@@ -72,7 +82,7 @@ def nbytes(t: torch.Tensor) -> int:
 
 
 def aligned(n: int) -> int:
-  return (n + 7) & ~7  # so a view of the pinned buffer can start any dtype
+  return (n + 7) & ~7
 
 
 def as_bytes(t: torch.Tensor) -> torch.Tensor:
@@ -99,35 +109,143 @@ def chunks(n: int, size: int) -> list[slice]:
   return [slice(i, min(i + size, n)) for i in range(0, n, size)]
 
 
-def fetch(url: str, path: str) -> None:
+def lock_file(folder: str) -> str:
+  return f"{folder.rstrip('/')}.lock"
+
+
+@contextlib.contextmanager
+def shared_lock(folder: str):
+  """Hold a cross-process shared lock beside a version folder while reading or serving it."""
+  if parent := os.path.dirname(folder.rstrip("/")):
+    os.makedirs(parent, exist_ok=True)
+  f = open(lock_file(folder), "a+")
+  try:
+    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+    yield f
+  finally:
+    with contextlib.suppress(OSError):
+      fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    f.close()
+
+
+def try_exclusive_lock(folder: str):
+  """Try a non-blocking cross-process exclusive lock before evicting or deleting a version folder."""
+  if not os.path.isdir(os.path.dirname(folder.rstrip("/"))):
+    return None
+  f = open(lock_file(folder), "a+")
+  try:
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return f
+  except BlockingIOError:
+    f.close()
+    return None
+
+
+def release_lock(f) -> None:
+  if f is None:
+    return
+  try:
+    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+  finally:
+    f.close()
+
+
+def _valid_manifest(data) -> dict | None:
+  return (
+    data
+    if isinstance(data, dict) and data.get("format") == FORMAT_VERSION and isinstance(data.get("files"), dict)
+    else None
+  )
+
+
+def read_manifest(folder: str) -> dict | None:
+  path = os.path.join(folder, MANIFEST)
+  if not os.path.isfile(path):
+    return None
+  with contextlib.suppress(OSError, ValueError), open(path) as f:
+    return _valid_manifest(json.load(f))
+  return None
+
+
+def verify_manifest(folder: str, manifest: dict) -> bool:
+  return all(
+    os.path.isfile(p := os.path.join(folder, n)) and os.path.getsize(p) == sz
+    for n, sz in manifest.get("files", {}).items()
+  )
+
+
+def _is_ready_folder(folder: str) -> bool:
+  return (m := read_manifest(folder)) is not None and verify_manifest(folder, m)
+
+
+def fetch(
+  url: str, path: str, on_bytes: Callable[[int], None] | None = None, cancel: threading.Event | None = None
+) -> int:
+  written = 0
   with urllib.request.urlopen(url, timeout=10) as r, open(path, "wb") as f:
-    shutil.copyfileobj(r, f, 16 * 1024 * 1024)
-    if r.length:  # the connection closed early
+    while chunk := r.read(1024 * 1024):
+      if cancel and cancel.is_set():
+        raise InterruptedError(f"cancelled fetch {url}")
+      f.write(chunk)
+      written += len(chunk)
+      if on_bytes:
+        on_bytes(len(chunk))
+    if r.length:
       raise OSError(f"{url} ended {r.length} bytes short")
+  return written
 
 
 class CacheFiles(http.server.SimpleHTTPRequestHandler):
-  """Serves a node's cache to other nodes: a version's files, and a version folder as the JSON list of its files."""
+  """Serves only complete manifest-published versions from a node's cache, holding a shared flock while serving."""
+
+  def _version_folder(self) -> str | None:
+    parts = [p for p in self.path.split("?", 1)[0].split("/") if p]
+    return os.path.join(self.directory, parts[0]) if parts and parts[0] not in ("..", ".", "latest") else None
+
+  def do_GET(self) -> None:
+    if not (folder := self._version_folder()):
+      self.send_error(404)
+      return
+    with shared_lock(folder):
+      if read_manifest(folder) is None:
+        self.send_error(404)
+        return
+      super().do_GET()
 
   def list_directory(self, path: str) -> None:
+    if (manifest := read_manifest(path)) is None:
+      self.send_error(404)
+      return
+    body = json.dumps(sorted([*manifest["files"], MANIFEST])).encode()
     self.send_response(200)
-    self.end_headers()  # HTTP/1.0: the body ends when the connection closes
-    self.wfile.write(json.dumps(sorted(os.listdir(path))).encode())
+    self.send_header("Content-Length", str(len(body)))
+    self.end_headers()
+    self.wfile.write(body)
+
+  def log_message(self, format: str, *args) -> None:
+    pass
 
 
 class Store:
-  def __init__(self, root: str | None = None, cache: str | None = None):
+  def __init__(
+    self, root: str | None = None, cache: str | None = None, on_durable: Callable[[str, str], None] | None = None
+  ):
     self.root = (CKPT if root is None else root).rstrip("/")
     self.remote = "://" in self.root
-    # a file:// URL makes folders as it writes. No listings cache: other nodes write the bucket, so exists() and glob() must look
     self.fs, self.base = fsspec.core.url_to_fs(self.root, auto_mkdir=True, use_listings_cache=False)
     if not self.remote:
       self.base = os.path.realpath(self.base)
-    self.cache = CKPT_CACHE if cache is None else cache
-    self.buffers: dict[int, list[torch.Tensor]] = {}  # shard -> pinned buffers its writer keeps, since pinning is slow
-    self.lock = threading.RLock()  # one save at a time, since saves share self.buffers
-    self.uploading, self.stopping, self.uploader, self.server = threading.Lock(), threading.Event(), None, None
-    self.peer = os.environ.get("CKPT_PEER", "")  # host:port of this node's cache server, set by start()
+    self.cache, self.on_durable = CKPT_CACHE if cache is None else cache, on_durable
+    self.buffers: dict[int, list[torch.Tensor]] = {}
+    self.lock, self.uploading, self.stopping = threading.RLock(), threading.Lock(), threading.Event()
+    self.uploader, self.server = None, None
+    self._upload_wake, self._durable_cond, self._transfer_lock = (
+      threading.Event(),
+      threading.Condition(),
+      threading.Lock(),
+    )
+    self.transfers: dict[str, dict] = {}
+    self.peer = os.environ.get("CKPT_PEER", "")
 
   def path(self, uri: str) -> str:
     return f"{self.base}/{uri.removeprefix('tinker://')}"
@@ -137,11 +255,10 @@ class Store:
     return {"CKPT": self.root, "CKPT_CACHE": self.cache, "CKPT_PEER": self.peer}
 
   def start(self) -> None:
-    """Make this node's folders, serve its cache to other nodes, and upload its saves behind from now on. The node daemon calls it once."""
-    # a sampler restored from a snapshot sees only the folders under /tmp and /dev/shm that exist when it restores
+    """Make this node's folders, serve its cache to other nodes, and upload its saves behind from now on."""
     for folder in [self.cache] + ([] if self.remote else [self.base]):
       os.makedirs(folder, exist_ok=True)
-    if self.remote:  # other nodes copy a new save from here, rather than wait for its upload
+    if self.remote:
       self.server = http.server.ThreadingHTTPServer(("", 0), lambda *a: CacheFiles(*a, directory=self.cache))
       threading.Thread(target=self.server.serve_forever, daemon=True).start()
       self.peer = f"{socket.gethostbyname(socket.gethostname())}:{self.server.server_port}"
@@ -149,22 +266,30 @@ class Store:
     self.uploader.start()
 
   def keep_uploading(self) -> None:
-    while not self.stopping.wait(0.25):  # seconds between looks for new saves
-      with contextlib.suppress(Exception):  # it logs a failed upload. On any failure the next pass retries
-        self.upload_pending_saves()
+    while not self.stopping.is_set():
+      self._upload_wake.wait(0.25)
+      self._upload_wake.clear()
+      if not self.stopping.is_set():
+        with contextlib.suppress(Exception):
+          self.upload_pending_saves()
 
   def close(self) -> None:
     """Return once every save this node made has uploaded."""
     self.stopping.set()
-    self.uploader.join()
+    self._upload_wake.set()
+    if self.uploader:
+      self.uploader.join()
     self.upload_pending_saves()
-    if self.server:  # the bucket has every save now
+    with self._durable_cond:
+      self._durable_cond.notify_all()
+    if self.server:
       self.server.shutdown()
+      self.server.server_close()
 
   # ***** put *****
 
   def write_safetensors(self, i: int, path: str, tensors: dict[str, torch.Tensor], meta: dict) -> None:
-    """safetensors.torch.save_file, but GPU tensors stream through two pinned buffers, so each piece is written while the next copies off the GPU, and the save never holds a host copy of itself."""
+    """safetensors.torch.save_file streaming GPU tensors through two pinned buffers."""
     import torch
 
     def dtype(d: torch.dtype) -> str:
@@ -200,7 +325,7 @@ class Store:
         stream.wait_stream(torch.cuda.current_stream())
         src.record_stream(stream)
         for piece in chunks(len(src), STREAM_CHUNK):
-          flush(1)  # write out the buffer this piece is about to reuse
+          flush(1)
           buf, j = bufs[j % 2], j + 1
           with torch.cuda.stream(stream):
             buf[: piece.stop - piece.start].copy_(src[piece], non_blocking=True)
@@ -224,8 +349,10 @@ class Store:
     if cfg:
       files["adapter_config.json" if lora else "config.json"] = cfg
     if cfg and n > 1:
-      weight_map = {k: w for w, shard in zip(weights, shards) for k in shard}
-      files["model.safetensors.index.json"] = {"metadata": {"total_size": total}, "weight_map": weight_map}
+      files["model.safetensors.index.json"] = {
+        "metadata": {"total_size": total},
+        "weight_map": {k: w for w, s in zip(weights, shards) for k in s},
+      }
     for name, obj in files.items():
       with open(f"{folder}/{name}", "w") as f:
         json.dump(obj, f)
@@ -235,55 +362,107 @@ class Store:
     )
     return [*files, *weights]
 
-  @span("store.put")
-  def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None) -> str | None:
-    """Save a checkpoint, and return the version to read it by on another node, which names this node so others can copy it from here. A local store has no versions: None."""
-    dest = self.path(uri)
+  def _publish_local_latest(self, dest: str, version: str, names: list[str], created: float) -> None:
+    rel, latest_path, cur = dest[len(self.base) + 1 :], f"{dest}/_latest", {}
+    if os.path.isfile(latest_path):
+      with contextlib.suppress(OSError, ValueError), open(latest_path) as f:
+        cur = json.load(f)
+    if created < cur.get("created", 0.0):
+      return
+    tmp = f"{dest}/._latest.{uuid.uuid4().hex}"
+    with open(tmp, "w") as f:
+      json.dump(
+        {"format": FORMAT_VERSION, "version": version, "dir": f"{rel}/{version}", "files": names, "created": created}, f
+      )
+    os.replace(tmp, latest_path)
+
+  def _stage_version(
+    self, uri: str, writer: Callable[[str], list[str]], meta: dict, priority: int = 1
+  ) -> tuple[str, dict]:
+    dest, version, now = self.path(uri), uuid.uuid4().hex[:16], time.time()
+    if not self.remote and os.path.islink(dest):  # migrate legacy symlink in place cleanly
+      legacy_target = os.path.realpath(dest)
+      os.unlink(dest)
+      os.makedirs(dest, exist_ok=True)
+      if os.path.isdir(legacy_target):
+        shutil.move(legacy_target, f"{dest}/legacy-{uuid.uuid4().hex[:8]}")
+    parent = self.cache if self.remote else dest
+    os.makedirs(parent, exist_ok=True)
+    tmp = tempfile.mkdtemp(dir=parent, prefix=f".{version}.")
+    try:
+      names = writer(tmp)
+      manifest = {
+        "format": FORMAT_VERSION,
+        "version": version,
+        "uri": uri,
+        "created": now,
+        "files": {n: os.path.getsize(f"{tmp}/{n}") for n in names},
+        "meta": meta,
+      }
+      with open(f"{tmp}/{MANIFEST}", "w") as f:
+        json.dump(manifest, f)
+      os.rename(tmp, f"{parent}/{version}")
+      tmp = ""
+    finally:
+      if tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+
     if self.remote:
-      os.makedirs(self.cache, exist_ok=True)
-      folder, version = tempfile.mkdtemp(dir=self.cache), uuid.uuid4().hex[:16]
-      try:
-        with self.lock:
-          names = self.write_checkpoint_files(folder, tensors, dict(meta or {}))
-        os.rename(folder, f"{self.cache}/{version}")
-      finally:
-        shutil.rmtree(folder, ignore_errors=True)
       self.record_latest_version(uri, version)
       with open(f"{self.cache}/{version}.upload.tmp", "w") as f:
-        json.dump({"uri": uri, "names": names}, f)
-      # upload_pending_saves() takes it from here
+        json.dump({"uri": uri, "version": version, "names": names, "priority": priority, "created": now}, f)
       os.replace(f"{self.cache}/{version}.upload.tmp", f"{self.cache}/{version}.upload")
-      return f"{version}@{self.peer}" if self.peer else version
-    parent, base = os.path.dirname(dest), os.path.basename(dest)
-    os.makedirs(parent, exist_ok=True)
-    folder = tempfile.mkdtemp(dir=parent, prefix=f".{base}.")
-    link, prev = f"{folder}.link", f"{parent}/.{base}.prev"
-    try:
+      self._upload_wake.set()
+      return (f"{version}@{self.peer}" if self.peer else version), manifest
+    self._publish_local_latest(dest, version, names, now)
+    if self.on_durable:
+      with contextlib.suppress(Exception):
+        self.on_durable(uri, version)
+    return version, manifest
+
+  @span("store.put")
+  def put(self, uri: str, tensors: dict[str, torch.Tensor], meta: dict | None = None, priority: int = 1) -> str:
+    """Save a checkpoint as an immutable version with manifest.json, returning its version reference."""
+    info = dict(meta or {})
+
+    def write(folder: str) -> list[str]:
       with self.lock:
-        self.write_checkpoint_files(folder, tensors, dict(meta or {}))
-        cur = os.readlink(dest) if os.path.islink(dest) else None
-        stale = os.readlink(prev) if os.path.islink(prev) else None
-        os.symlink(os.path.basename(folder), link)
-        if os.path.isdir(dest) and not os.path.islink(dest):
-          os.rename(dest, f"{folder}.old")
-          os.replace(link, dest)
-          shutil.rmtree(f"{folder}.old", ignore_errors=True)
+        return self.write_checkpoint_files(folder, tensors, info)
+
+    return self._stage_version(uri, write, info, priority=priority)[0]
+
+  def put_files(
+    self, uri: str, files: dict[str, bytes] | str, meta: dict | None = None, priority: int = 1
+  ) -> tuple[str, int]:
+    """Publish arbitrary immutable files (e.g., compiled artifacts or mirrored bases) as a versioned manifest folder."""
+
+    def write(folder: str) -> list[str]:
+      names = []
+      items = (
+        [
+          (os.path.relpath(os.path.join(r, fn), files), os.path.join(r, fn))
+          for r, _, fns in os.walk(files)
+          for fn in sorted(fns)
+        ]
+        if isinstance(files, str)
+        else sorted(files.items())
+      )
+      for rel, payload in items:
+        dst = os.path.join(folder, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if isinstance(files, str):
+          shutil.copy2(payload, dst)
         else:
-          os.replace(link, dest)
-        if cur:
-          os.symlink(cur, link)
-          os.replace(link, prev)
-        folder = ""
-      if stale and stale != cur:
-        shutil.rmtree(f"{parent}/{stale}", ignore_errors=True)
-    finally:
-      if folder:
-        shutil.rmtree(folder, ignore_errors=True)
-      if os.path.lexists(link):  # left only if the swap failed
-        os.unlink(link)
+          with open(dst, "wb") as f:
+            f.write(payload)
+        names.append(rel)
+      return names
+
+    ref, manifest = self._stage_version(uri, write, dict(meta or {}), priority=priority)
+    return ref, sum(manifest["files"].values())
 
   def record_latest_version(self, uri: str, version: str) -> None:
-    """Record on this node which version of a checkpoint it saved last, for this node's other processes."""
+    """Record on this node which version of a checkpoint it saved last, for discovery when no version is given."""
     os.makedirs(f"{self.cache}/latest", exist_ok=True)
     tmp = f"{self.cache}/latest/.{uuid.uuid4().hex}"
     with open(tmp, "w") as f:
@@ -292,195 +471,561 @@ class Store:
 
   def latest_version_here(self, uri: str) -> str | None:
     pointer = f"{self.cache}/latest/{hashlib.sha256(uri.encode()).hexdigest()[:32]}"
-    if not os.path.exists(pointer):  # nothing saved on this node yet
+    if not os.path.exists(pointer):
       return None
     with open(pointer) as f:
-      return f.read()
+      return f.read().strip() or None
 
-  def upload_version(self, dest: str, version: str, names: list[str]) -> None:
+  def upload_version(self, uri: str, dest: str, version: str, names: list[str], created: float = 0.0) -> None:
     folder, rel = f"{self.cache}/{version}", dest[len(self.base) + 1 :]
-    info, files = {"version": version, "dir": f"{rel}/{version}", "files": names}, [f"{folder}/{n}" for n in names]
-    parallel(lambda f: self.fs.put_file(f, f"{self.base}/{info['dir']}/{os.path.basename(f)}"), files)
-    old = self.latest(dest)
-    self.fs.pipe_file(f"{dest}/_latest", json.dumps(info).encode())
-    keep = {"_latest", version, old.get("version")}
-    if not old.get("dir"):
-      keep.update(old.get("files", []))
-    for e in self.fs.ls(dest, detail=False):
-      if os.path.basename(e) not in keep:
-        self.fs.rm(e, recursive=True)
-    open(f"{folder}.uploaded", "w").close()  # beside the folder, so engines that list it never see it
+    with shared_lock(folder):
+      if (manifest := read_manifest(folder)) is None:
+        raise FileNotFoundError(f"incomplete local version {version}")
+      remote_dir = f"{self.base}/{rel}/{version}"
+      if files := [f"{folder}/{n}" for n in names]:
+        parallel(lambda f: self.fs.put_file(f, f"{remote_dir}/{os.path.relpath(f, folder)}"), files)
+      self.fs.put_file(f"{folder}/{MANIFEST}", f"{remote_dir}/{MANIFEST}")
+      ts = created or manifest.get("created", time.time())
+      if ts >= self.latest(dest).get("created", 0.0):
+        info = {"format": FORMAT_VERSION, "version": version, "dir": f"{rel}/{version}", "files": names, "created": ts}
+        self.fs.pipe_file(f"{dest}/_latest", json.dumps(info).encode())
+      open(f"{folder}.durable", "w").close()
+    if self.on_durable:
+      with contextlib.suppress(Exception):
+        self.on_durable(uri, version)
 
   def upload_pending_saves(self) -> None:
-    """Upload this node's saves in the order they were made. A failed upload skips the rest for that URI, so _latest never goes backward, and the next flush tries again."""
-    with self.uploading:  # the node daemon's last call at shutdown waits for the one running behind
+    """Upload this node's saves ordered by priority then creation time. Never deletes older versions automatically."""
+    with self.uploading:
       found = [e for e in os.scandir(self.cache) if e.name.endswith(".upload")] if os.path.isdir(self.cache) else []
-      failed = set()
-      for e in sorted(found, key=lambda e: (e.stat().st_mtime_ns, e.name)):
-        version = e.name.removesuffix(".upload")
-        with open(e.path) as f:
+      jobs = []
+      for e in found:
+        with contextlib.suppress(OSError, ValueError), open(e.path) as f:
           job = json.load(f)
+          jobs.append((job.get("priority", 1), job.get("created", e.stat().st_mtime), e.name, e.path, job))
+      failed: set[str] = set()
+      for _, created, name, path, job in sorted(jobs):
+        version = name.removesuffix(".upload")
         if job["uri"] in failed:
           continue
         if os.path.isdir(f"{self.cache}/{version}"):
           try:
-            self.upload_version(self.path(job["uri"]), version, job["names"])
+            self.upload_version(job["uri"], self.path(job["uri"]), version, job["names"], created)
           except Exception as exc:
             failed.add(job["uri"])
             print(f"upload failed for {version}, trying again: {exc!r}", file=sys.stderr, flush=True)
             continue
-        os.unlink(e.path)
+        with contextlib.suppress(FileNotFoundError):
+          os.unlink(path)
+      with self._durable_cond:
+        self._durable_cond.notify_all()
+
+  def is_durable(self, uri: str, version: str) -> bool:
+    if not (ver := parse_version(version)[0]):
+      return False
+    if not self.remote:
+      return read_manifest(f"{self.path(uri)}/{ver}") is not None
+    if os.path.exists(f"{self.cache}/{ver}.durable"):
+      return True
+    if self.fs.exists(f"{self.path(uri)}/{ver}/{MANIFEST}"):
+      if os.path.isdir(f"{self.cache}/{ver}"):
+        with contextlib.suppress(OSError):
+          open(f"{self.cache}/{ver}.durable", "w").close()
+      return True
+    return False
+
+  def wait_durable(self, uri: str, version: str, timeout: float | None = None) -> bool:
+    """Wait until an immutable version is durably committed in storage."""
+    ver, _ = parse_version(version)
+    if self.is_durable(uri, ver):
+      return True
+    if not self.remote:
+      return False
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while not self.is_durable(uri, ver):
+      if self.uploader is None or not self.uploader.is_alive():
+        self.upload_pending_saves()
+        if self.is_durable(uri, ver):
+          return True
+        if not os.path.exists(f"{self.cache}/{ver}.upload"):
+          return False
+      self._upload_wake.set()
+      with self._durable_cond:
+        if self.is_durable(uri, ver):
+          return True
+        if self.stopping.is_set() and not os.path.exists(f"{self.cache}/{ver}.upload"):
+          return False
+        rem = None if deadline is None else deadline - time.monotonic()
+        if rem is not None and rem <= 0:
+          raise TimeoutError(f"timed out waiting for durable commit of {uri}@{ver}")
+        self._durable_cond.wait(min(0.2, rem) if rem is not None else 0.2)
+    return True
 
   # ***** get *****
 
   def latest(self, dest: str) -> dict:
-    return json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
+    if self.remote:
+      return json.loads(self.fs.cat_file(f"{dest}/_latest")) if self.fs.exists(f"{dest}/_latest") else {}
+    if not os.path.isfile(p := f"{dest}/_latest"):
+      return {}
+    with open(p) as f:
+      return json.load(f)
 
-  def local_folder(self, uri: str, version: str | None = None) -> tuple[str, str]:
-    """A local directory holding the checkpoint, and its version, which changes when the checkpoint is saved again. A version put() returned comes from this node's cache, else the node that saved it, else the bucket."""
-    dest = self.path(uri)
+  def _remote_manifest(self, dest: str, version: str) -> dict | None:
+    if not self.fs.exists(path := f"{dest}/{version}/{MANIFEST}"):
+      return None
+    with contextlib.suppress(Exception):
+      return _valid_manifest(json.loads(self.fs.cat_file(path)))
+    return None
+
+  def _peer_manifest(self, peer: str, version: str) -> dict | None:
+    with contextlib.suppress(Exception):
+      with urllib.request.urlopen(f"http://{peer}/{version}/{MANIFEST}", timeout=10) as r:
+        return _valid_manifest(json.loads(r.read()))
+    return None
+
+  def _is_legacy_local(self, dest: str) -> str | None:
+    real = os.path.join(os.path.dirname(dest), os.readlink(dest)) if os.path.islink(dest) else dest
+    if (
+      os.path.isdir(real)
+      and not os.path.isfile(f"{real}/_latest")
+      and any(n.endswith(".safetensors") for n in os.listdir(real))
+    ):
+      return real
+    return None
+
+  def transfer_status(self) -> dict[str, dict]:
+    """Snapshot of active in-flight transfers and complete local versions for node observations."""
+    out: dict[str, dict] = {}
+    if self.remote and os.path.isdir(self.cache):
+      for e in os.scandir(self.cache):
+        if e.is_dir() and not e.name.startswith(".") and e.name != "latest" and (m := read_manifest(e.path)):
+          out[e.name] = {
+            "ready": True,
+            "durable": os.path.exists(f"{e.path}.durable"),
+            "bytes": sum(m["files"].values()),
+            "uri": m.get("uri", ""),
+          }
+    with self._transfer_lock:
+      for ver, info in self.transfers.items():
+        out[ver] = {
+          "ready": False,
+          "durable": False,
+          "progress": min(1.0, info["bytes_done"] / max(1, info["bytes_total"])),
+          "bytes": info["bytes_total"],
+          "uri": info["uri"],
+        }
+    return out
+
+  def local_folder(
+    self,
+    uri: str,
+    version: str | None = None,
+    peers: list[str] | tuple[str, ...] = (),
+    cancel: threading.Event | None = None,
+  ) -> tuple[str, str]:
+    """Resolve an explicit version directly (never re-consulting _latest) or discover _latest when version is None."""
+    dest, (ver, inline_peer) = self.path(uri), parse_version(version)
+    peer_list = ([inline_peer] if inline_peer else []) + [p for p in peers if p and p != inline_peer and p != self.peer]
+
     if not self.remote:
-      real = os.path.join(os.path.dirname(dest), os.readlink(dest)) if os.path.islink(dest) else dest
-      if not os.path.isdir(real):
-        raise ValueError(f"no checkpoint at {uri}")
-      with os.scandir(real) as it:
-        stats = sorted((e.name, s.st_size, s.st_mtime_ns) for e in it for s in [e.stat()])
-      if not any(n.endswith(".safetensors") for n, _, _ in stats):
-        raise ValueError(f"no checkpoint at {uri}")
-      return dest, hashlib.blake2b(repr((real, stats)).encode(), digest_size=8).hexdigest()
-    version, _, peer = (version or "").partition("@")
-    # without a version: the one this node saved last, else the bucket's
-    want = version or self.latest_version_here(uri)
-    if want and os.path.isdir(f"{self.cache}/{want}"):
-      os.utime(f"{self.cache}/{want}")  # so trim_cache() takes the ones nobody read for longest
-      return f"{self.cache}/{want}", want
-    if peer and (folder := self.copy_from(peer, version)):
-      return folder, version
-    info = self.latest(dest)
-    if version and info.get("version") != version:
-      raise ValueError(f"version {version} of {uri} has not landed" + (f", and {peer} failed to copy" if peer else ""))
-    if not info:
+      if ver:
+        if _is_ready_folder(vdir := f"{dest}/{ver}"):
+          return vdir, ver
+        if self._is_legacy_local(dest) is not None:
+          raise ValueError(f"legacy checkpoint at {uri} cannot resolve explicit version {ver}")
+        raise ValueError(f"version {ver} of {uri} not found")
+      if (latest_ver := self.latest(dest).get("version")) and _is_ready_folder(vdir := f"{dest}/{latest_ver}"):
+        return vdir, latest_ver
+      if legacy := self._is_legacy_local(dest):
+        with os.scandir(legacy) as it:
+          stats = sorted((e.name, s.st_size, s.st_mtime_ns) for e in it for s in [e.stat()])
+        return legacy, hashlib.blake2b(repr((legacy, stats)).encode(), digest_size=8).hexdigest()
       raise ValueError(f"no checkpoint at {uri}")
-    version, names = info["version"], info["files"]
-    if not any(n.endswith(".safetensors") for n in names):
-      raise ValueError(f"no checkpoint at {uri}")
-    src = f"{self.base}/{info['dir']}" if info.get("dir") else dest
-    return self.cached_folder(version, lambda tmp: self.download_files(src, names, tmp)), version
 
-  def copy_from(self, peer: str, version: str) -> str | None:
-    """A version copied from the node that saved it, which keeps it until it has uploaded. None if the copy fails: that node is gone, or no longer has it."""
-    url = f"http://{peer}/{version}"
+    if not ver:
+      if (local_ver := self.latest_version_here(uri)) and read_manifest(f"{self.cache}/{local_ver}") is not None:
+        os.utime(f"{self.cache}/{local_ver}")
+        return f"{self.cache}/{local_ver}", local_ver
+      info = self.latest(dest)
+      if not (ver := info.get("version")):
+        raise ValueError(f"no checkpoint at {uri}")
+      if not info.get("format") and not self.fs.exists(f"{dest}/{ver}/{MANIFEST}"):
+        names = info.get("files", [])
+        if not any(n.endswith(".safetensors") for n in names):
+          raise ValueError(f"no checkpoint at {uri}")
+        src = f"{self.base}/{info['dir']}" if info.get("dir") else dest
+        return self._fetch_cached(uri, ver, lambda tmp, _: self.download_files(src, names, tmp), durable=True), ver
+
+    folder = f"{self.cache}/{ver}"
+    if _is_ready_folder(folder):
+      with contextlib.suppress(OSError):
+        os.utime(folder)
+      return folder, ver
+    return self._fetch_version(uri, dest, ver, peer_list, cancel), ver
+
+  def _fetch_version(self, uri: str, dest: str, ver: str, peers: list[str], cancel: threading.Event | None) -> str:
+    while True:
+      with self._transfer_lock:
+        if _is_ready_folder(f"{self.cache}/{ver}"):
+          return f"{self.cache}/{ver}"
+        existing = self.transfers.get(ver)
+        if owner := existing is None:
+          state = self.transfers[ver] = {
+            "uri": uri,
+            "bytes_done": 0,
+            "bytes_total": 0,
+            "done": threading.Event(),
+            "error": None,
+          }
+      if not owner:
+        while not existing["done"].wait(0.05):
+          if cancel and cancel.is_set():
+            raise InterruptedError(f"cancelled wait for {ver}")
+        if _is_ready_folder(f"{self.cache}/{ver}"):
+          return f"{self.cache}/{ver}"
+        if existing["error"] is not None:
+          if isinstance(existing["error"], InterruptedError):
+            continue
+          raise existing["error"]
+        continue
+      try:
+        return self._download_from_peers_or_remote(uri, dest, ver, peers, state, cancel)
+      except BaseException as exc:
+        state["error"] = exc
+        raise
+      finally:
+        with self._transfer_lock:
+          self.transfers.pop(ver, None)
+        state["done"].set()
+
+  def _download_from_peers_or_remote(
+    self, uri: str, dest: str, ver: str, peers: list[str], state: dict, cancel: threading.Event | None
+  ) -> str:
+    def add_bytes(n: int) -> None:
+      state["bytes_done"] += n
+
+    for peer in peers:
+      if cancel and cancel.is_set():
+        raise InterruptedError(f"cancelled fetch {ver}")
+      if folder := self.copy_from(peer, ver, state, add_bytes, cancel):
+        return folder
+    if cancel and cancel.is_set():
+      raise InterruptedError(f"cancelled fetch {ver}")
+    if (manifest := self._remote_manifest(dest, ver)) is not None:
+      state["bytes_total"], state["bytes_done"] = sum(manifest["files"].values()), 0
+      names, src = list(manifest["files"]), f"{dest}/{ver}"
+
+      def fill(tmp: str, _) -> None:
+        self.download_files(src, names, tmp, on_bytes=add_bytes, cancel=cancel)
+        if not verify_manifest(tmp, manifest):
+          raise OSError(f"remote version {ver} failed manifest size verification")
+        with open(f"{tmp}/{MANIFEST}", "w") as f:
+          json.dump(manifest, f)
+
+      return self._fetch_cached(uri, ver, fill, durable=True)
+
+    info = self.latest(dest)
+    if info and not info.get("format") and info.get("version") == ver:
+      src = f"{self.base}/{info['dir']}" if info.get("dir") else dest
+      return self._fetch_cached(
+        uri, ver, lambda tmp, _: self.download_files(src, info.get("files", []), tmp), durable=True
+      )
+    raise ValueError(f"version {ver} of {uri} has not landed{f', and {peers[0]} failed to copy' if peers else ''}")
+
+  def copy_from(
+    self,
+    peer: str,
+    version: str,
+    state: dict | None = None,
+    on_bytes: Callable[[int], None] | None = None,
+    cancel: threading.Event | None = None,
+  ) -> str | None:
+    """Copy a complete manifest-verified version from a peer node. Never marks the copy as durable."""
+    if (manifest := self._peer_manifest(peer, version)) is None:
+      return None
+    if state is not None:
+      state["bytes_total"], state["bytes_done"] = sum(manifest["files"].values()), 0
+    url, names = f"http://{peer}/{version}", list(manifest["files"])
     try:
-      names = json.load(urllib.request.urlopen(f"{url}/", timeout=10))
-      return self.cached_folder(version, lambda tmp: parallel(lambda n: fetch(f"{url}/{n}", f"{tmp}/{n}"), names))
-    except Exception:  # the bucket has it, or it's lost
+
+      def fill(tmp: str, _) -> None:
+        if names:
+          parallel(
+            lambda n: (
+              os.makedirs(os.path.dirname(f"{tmp}/{n}"), exist_ok=True),
+              fetch(f"{url}/{n}", f"{tmp}/{n}", on_bytes, cancel),
+            ),
+            names,
+          )
+        if not verify_manifest(tmp, manifest):
+          raise OSError(f"peer copy {version} from {peer} failed manifest size verification")
+        with open(f"{tmp}/{MANIFEST}", "w") as f:
+          json.dump(manifest, f)
+
+      return self._fetch_cached(manifest.get("uri", ""), version, fill, durable=False)
+    except InterruptedError:
+      raise
+    except Exception:
       return None
 
-  def cached_folder(self, version: str, fill) -> str:
-    """This node's folder for a version, which fill(folder) makes the first time."""
+  def _fetch_cached(self, uri: str, version: str, fill, durable: bool) -> str:
     folder = f"{self.cache}/{version}"
-    if not os.path.isdir(folder):
+    if read_manifest(folder) is None:
       os.makedirs(self.cache, exist_ok=True)
-      tmp = tempfile.mkdtemp(dir=self.cache)
+      tmp = tempfile.mkdtemp(dir=self.cache, prefix=f".{version}.")
       try:
-        fill(tmp)
+        fill(tmp, uri)
         try:
           os.rename(tmp, folder)
+          tmp = ""
         except OSError:
           if not os.path.isdir(folder):
             raise
-        open(f"{folder}.uploaded", "w").close()  # the bucket has it, so trim_cache() may drop it here
       finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        if tmp:
+          shutil.rmtree(tmp, ignore_errors=True)
+    if durable:
+      open(f"{folder}.durable", "w").close()
     return folder
 
-  def download_files(self, src: str, names: list[str], folder: str) -> None:
-    parallel(lambda n: self.fs.get_file(f"{src}/{n}", f"{folder}/{n}"), names)
+  def download_files(
+    self,
+    src: str,
+    names: list[str],
+    folder: str,
+    on_bytes: Callable[[int], None] | None = None,
+    cancel: threading.Event | None = None,
+  ) -> None:
+    def one(n: str) -> None:
+      if cancel and cancel.is_set():
+        raise InterruptedError(f"cancelled download {src}/{n}")
+      dst = f"{folder}/{n}"
+      os.makedirs(os.path.dirname(dst), exist_ok=True)
+      self.fs.get_file(f"{src}/{n}", dst)
+      if on_bytes:
+        on_bytes(os.path.getsize(dst))
 
-  def weight_files(self, uri: str, version: str | None = None) -> list[str]:
-    folder = self.local_folder(uri, version)[0]
+    if names:
+      parallel(one, names)
+
+  @contextlib.contextmanager
+  def pin_local(self, uri: str, version: str | None = None, peers: list[str] | tuple[str, ...] = ()):
+    """Resolve and cross-process pin a local version directory for the duration of a read."""
+    for attempt in range(2):
+      folder, ver = self.local_folder(uri, version, peers=peers)
+      with shared_lock(folder):
+        if os.path.isdir(folder) and (read_manifest(folder) is not None or self._is_legacy_local(folder) is not None):
+          yield folder, ver
+          return
+        if attempt == 1:
+          raise FileNotFoundError(f"version {ver} of {uri} disappeared before read pin")
+
+  def weight_files(self, uri: str, version: str | None = None, peers: list[str] | tuple[str, ...] = ()) -> list[str]:
+    folder = self.local_folder(uri, version, peers=peers)[0]
     if os.path.islink(folder):
       folder = os.path.join(os.path.dirname(folder), os.readlink(folder))
     return sorted(glob.glob(f"{folder}/*.safetensors"))
 
   @span("store.get")
-  def get(self, uri: str, version: str | None = None) -> tuple[dict[str, torch.Tensor], dict]:
+  def get(
+    self, uri: str, version: str | None = None, peers: list[str] | tuple[str, ...] = ()
+  ) -> tuple[dict[str, torch.Tensor], dict]:
     import safetensors
 
     def load(path: str) -> dict[str, torch.Tensor]:
       with safetensors.safe_open(path, framework="pt", device="cpu") as f:
         return {k: f.get_tensor(k) for k in f.keys()}
 
-    paths = self.weight_files(uri, version)
-    return {k: v for s in parallel(load, paths) for k, v in s.items()}, header(paths[0])
+    with self.pin_local(uri, version, peers=peers) as (folder, _):
+      paths = sorted(glob.glob(f"{folder}/*.safetensors"))
+      if not paths:
+        raise ValueError(f"no safetensors files in {uri}")
+      tensors = {k: v for s in parallel(load, paths) for k, v in s.items()}
+      return tensors, manifest["meta"] if (manifest := read_manifest(folder)) is not None else header(paths[0])
 
-  def read_meta(self, uri: str) -> dict:
-    return header(self.weight_files(uri)[0])
+  def read_meta(self, uri: str, version: str | None = None, peers: list[str] | tuple[str, ...] = ()) -> dict:
+    """Read checkpoint metadata from manifest.json directly without downloading safetensors shards."""
+    dest, (ver, inline_peer) = self.path(uri), parse_version(version)
+    peer_list = ([inline_peer] if inline_peer else []) + [p for p in peers if p and p != inline_peer and p != self.peer]
+    if not self.remote:
+      ver = ver or self.latest(dest).get("version", "")
+      if ver and (m := read_manifest(f"{dest}/{ver}")) is not None:
+        return dict(m.get("meta", {}))
+      if (
+        not ver and (legacy := self._is_legacy_local(dest)) and (paths := sorted(glob.glob(f"{legacy}/*.safetensors")))
+      ):
+        return header(paths[0])
+      raise ValueError(f"no checkpoint metadata at {uri}" + (f" version {ver}" if ver else ""))
 
-  # ***** delete *****
+    if not ver:
+      if (local_ver := self.latest_version_here(uri)) and (m := read_manifest(f"{self.cache}/{local_ver}")) is not None:
+        return dict(m.get("meta", {}))
+      ver = self.latest(dest).get("version", "")
+    if ver:
+      if (m := read_manifest(f"{self.cache}/{ver}")) is not None:
+        return dict(m.get("meta", {}))
+      for peer in peer_list:
+        if (m := self._peer_manifest(peer, ver)) is not None:
+          return dict(m.get("meta", {}))
+      if (m := self._remote_manifest(dest, ver)) is not None:
+        return dict(m.get("meta", {}))
+    return header(self.weight_files(uri, version, peers=peers)[0])
+
+  # ***** delete & sweep *****
+
+  def _rm_local_dir(self, folder: str, remove_markers: bool = False) -> bool:
+    if not os.path.isdir(folder):
+      return True
+    if (lk := try_exclusive_lock(folder)) is None:
+      return False
+    try:
+      shutil.rmtree(folder, ignore_errors=True)
+      if remove_markers:
+        for ext in (".durable", ".upload", ".upload.tmp"):
+          with contextlib.suppress(FileNotFoundError):
+            os.unlink(f"{folder}{ext}")
+      return True
+    finally:
+      release_lock(lk)
+      with contextlib.suppress(FileNotFoundError):
+        os.unlink(lock_file(folder))
+
+  def delete_version(self, uri: str, version: str) -> bool:
+    """Delete one version from durable storage and local cache, honoring cross-process read locks."""
+    if not (ver := parse_version(version)[0]):
+      self.delete(uri)
+      return True
+    deleted_cache = self._rm_local_dir(f"{self.cache}/{ver}", remove_markers=True) if self.remote else True
+    dest = self.path(uri)
+    if self.remote:
+      if self.fs.exists(vpath := f"{dest}/{ver}"):
+        self.fs.rm(vpath, recursive=True)
+      if self.fs.exists(dest) and [os.path.basename(e) for e in self.fs.ls(dest, detail=False)] in ([], ["_latest"]):
+        with contextlib.suppress(Exception):
+          self.fs.rm(dest, recursive=True)
+      return deleted_cache
+    deleted = self._rm_local_dir(f"{dest}/{ver}")
+    if (
+      deleted
+      and os.path.isdir(dest)
+      and [n for n in os.listdir(dest) if not n.startswith(".") and not n.endswith(".lock")] in ([], ["_latest"])
+    ):
+      shutil.rmtree(dest, ignore_errors=True)
+    return deleted
 
   def delete(self, uri: str) -> None:
-    """Delete a checkpoint and every version of it this store kept."""
+    """Delete a checkpoint URI and all unpinned versions under it."""
     dest = self.path(uri)
     if self.remote:
       if self.fs.exists(dest):
         self.fs.rm(dest, recursive=True)
       return
-    parent, base = os.path.split(dest)
-    # the random suffix of a version folder has no dot, so step-1 never takes step-1.5's
-    tail = len(parent) + len(base) + 3
-    versions = [p for p in glob.glob(f"{glob.escape(parent)}/.{glob.escape(base)}.*") if "." not in p[tail:]]
-    for p in [dest, *versions]:  # the link to the live version, the .prev link, and the folders they name
-      if os.path.islink(p):
-        os.unlink(p)
-      else:
-        shutil.rmtree(p, ignore_errors=True)
+    if os.path.islink(dest):
+      os.unlink(dest)
+    elif os.path.isdir(dest):
+      for e in list(os.scandir(dest)):
+        if e.is_dir() and not e.name.startswith("."):
+          self._rm_local_dir(e.path)
+      if not [n for n in os.listdir(dest) if not n.startswith(".") and not n.endswith(".lock") and n != "_latest"]:
+        shutil.rmtree(dest, ignore_errors=True)
 
   def list_checkpoints(self) -> list[str]:
-    """Every checkpoint in the store, including one whose upload never wrote its _latest."""
+    """Every checkpoint URI present in the store."""
     if self.remote:
       return [f"tinker://{p[len(self.base) + 1 :]}" for p in self.fs.glob(f"{self.base}/*/*/*")]
-    found = glob.glob(f"{glob.escape(self.base)}/*/*/*")  # glob skips the dot folders a save writes into
-    return [f"tinker://{os.path.relpath(p, self.base)}" for p in found]
+    return [f"tinker://{os.path.relpath(p, self.base)}" for p in glob.glob(f"{glob.escape(self.base)}/*/*/*")]
+
+  def list_versions(self) -> list[tuple[str, str, float]]:
+    """Every (uri, version, created_ts) stored in durable storage (legacy unversioned URIs have version='')."""
+    out: list[tuple[str, str, float]] = []
+    for uri in self.list_checkpoints():
+      dest = self.path(uri)
+      if self.remote:
+        entries = self.fs.ls(dest, detail=False) if self.fs.exists(dest) else []
+        vers = [os.path.basename(e) for e in entries if os.path.basename(e) != "_latest"]
+        if not vers:
+          out.append((uri, "", self.saved_at(uri)))
+        for v in vers:
+          m = self._remote_manifest(dest, v)
+          out.append((uri, v, m["created"] if m and "created" in m else self.saved_at(uri)))
+      elif self._is_legacy_local(dest) is not None:
+        out.append((uri, "", os.lstat(dest).st_mtime))
+      elif os.path.isdir(dest):
+        dest_mtime = os.lstat(dest).st_mtime
+        for e in (x for x in os.scandir(dest) if x.is_dir() and not x.name.startswith(".")):
+          m = read_manifest(e.path)
+          out.append(
+            (
+              uri,
+              e.name,
+              min(m["created"], dest_mtime, e.stat().st_mtime)
+              if m and "created" in m
+              else min(dest_mtime, e.stat().st_mtime),
+            )
+          )
+    return out
 
   def saved_at(self, uri: str) -> float:
-    """When a checkpoint was last saved."""
     if self.remote and self.fs.exists(latest := f"{self.path(uri)}/_latest"):
       return self.fs.modified(latest).timestamp()
-    if self.remote:  # an upload that never finished: when its newest file landed
+    if self.remote:
       return max((self.fs.modified(f).timestamp() for f in self.fs.find(self.path(uri))), default=0.0)
     return os.lstat(self.path(uri)).st_mtime
 
-  def sweep(self, registered: set[str], since: float | None, grace: float) -> None:
-    """Delete what the registry doesn't have, saved after since, when it began, and more than grace seconds ago: checkpoints deleted, expired or their run's, and saves of those checkpoints still waiting to upload. Then keep the cache under CKPT_CACHE_BYTES."""
-    self.trim_cache()
-    if since is None:  # so turning the registry on never deletes what came before
+  def sweep(
+    self,
+    registered: set[str],
+    since: float | None,
+    grace: float,
+    protected_versions: set[str] | None = None,
+    versionless_uris: set[str] | None = None,
+  ) -> None:
+    """Delete unreferenced checkpoints/versions saved after since and older than grace, then trim cache."""
+    protected = set(protected_versions or ())
+    legacy_uris = (
+      set(versionless_uris or ())
+      if versionless_uris is not None
+      else (registered if protected_versions is None else set())
+    )
+    self.trim_cache(protected_versions=protected)
+    if since is None:
       return
     before = time.time() - grace
-    for uri in set(self.list_checkpoints()) - registered:
+    for uri, ver, created in self.list_versions():
+      if (ver and (ver in protected or uri in legacy_uris)) or (not ver and uri in registered):
+        continue
       try:
-        if since < self.saved_at(uri) < before:
-          self.delete(uri)
-      except Exception as e:  # one checkpoint it can't read or delete mustn't stop the rest of the sweep
-        print(f"sweep could not delete {uri}, trying again next sweep: {e!r}", file=sys.stderr, flush=True)
+        if since < created < before:
+          self.delete_version(uri, ver)
+      except Exception as e:
+        print(f"sweep could not delete {uri}@{ver}, trying again next sweep: {e!r}", file=sys.stderr, flush=True)
     for e in list(os.scandir(self.cache)) if os.path.isdir(self.cache) else []:
       if e.name.endswith(".upload") and since < e.stat().st_mtime < before:
-        with contextlib.suppress(OSError, ValueError), open(e.path) as f:  # it may have uploaded meanwhile
-          if json.load(f)["uri"] not in registered:
-            shutil.rmtree(f"{self.cache}/{e.name.removesuffix('.upload')}", ignore_errors=True)
-            os.unlink(e.path)
+        if (ver := e.name.removesuffix(".upload")) in protected:
+          continue
+        with contextlib.suppress(OSError, ValueError), open(e.path) as f:
+          if json.load(f)["uri"] not in legacy_uris and self._rm_local_dir(f"{self.cache}/{ver}", remove_markers=True):
+            with contextlib.suppress(FileNotFoundError):
+              os.unlink(e.path)
 
-  def trim_cache(self) -> None:
-    """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the bucket has: a version still uploading stays."""
+  def trim_cache(self, protected_versions: set[str] = frozenset()) -> None:
+    """Evict least-recently-used durable cached versions until under CKPT_CACHE_BYTES, honoring pins and active reads."""
     if not os.path.isdir(self.cache):
       return
     limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2
-    found = [e for e in os.scandir(self.cache) if e.is_dir() and os.path.exists(f"{e.path}.uploaded")]
-    size = {e.path: sum(f.stat().st_size for f in os.scandir(e.path)) for e in found}
-    total = sum(size.values())
+    found = [
+      e
+      for e in os.scandir(self.cache)
+      if e.is_dir() and not e.name.startswith(".") and e.name != "latest" and os.path.exists(f"{e.path}.durable")
+    ]
+    sizes = {}
+    for e in found:
+      with contextlib.suppress(OSError):
+        sizes[e.path] = sum(os.path.getsize(os.path.join(r, fn)) for r, _, fns in os.walk(e.path) for fn in fns)
+    total = sum(sizes.values())
     for e in sorted(found, key=lambda e: e.stat().st_mtime):
       if total <= limit:
         break
-      shutil.rmtree(e.path, ignore_errors=True)
-      os.unlink(f"{e.path}.uploaded")
-      total -= size[e.path]
+      if e.name not in protected_versions and self._rm_local_dir(e.path, remove_markers=True):
+        total -= sizes.get(e.path, 0)

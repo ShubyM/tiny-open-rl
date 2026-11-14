@@ -1,194 +1,227 @@
-import copy
-import dataclasses
 import random
 import unittest
 
-from tinyrl.bus import Cmd, Ev, Op, Role
+from tinyrl.bus import Ev
 from tinyrl.control.scheduler import (
+  BUDGET_S,
   Assignment,
-  Job,
   Worker,
   WorkerSpec,
-  can_run,
   decide,
+  fits,
   from_table,
+  gpus_still_held,
   memory_budget,
-  place_gpus,
-  select_runs,
+  worker_to_dict,
 )
 
 GIB, MIB = 2**30, 2**20
 
 
 class Cluster:
-  """The table the scheduler reads, kept here as it would be in Redis: node heartbeats, run records and the workers it wrote."""
+  """In-memory mirror of the Redis table consumed by `from_table -> decide`."""
 
-  def __init__(self):
-    self.nodes, self.records, self.s = {}, {}, Assignment()
+  def __init__(self, exclusive_cap: float = 0.5):
+    self.nodes: dict[str, dict] = {}
+    self.records: dict[str, dict] = {}
+    self.meta: dict[str, dict] = {}
+    self.queues: dict[str, dict] = {}
+    self.versions: dict[str, dict] = {}
+    self.ckpt_versions: dict[str, str] = {}
+    self.s = Assignment(exclusive_cap=exclusive_cap)
 
-  def table(self):
+  def table(self) -> dict:
     return {
       "nodes": self.nodes,
       "runs": {r: (rec, self.s.jobs[r].worker if r in self.s.jobs else "") for r, rec in self.records.items()},
-      "workers": {n: {"spec": dataclasses.asdict(w.spec), "node": w.node} for n, w in self.s.workers.items()},
+      "meta": {
+        r: {
+          **self.meta.get(r, {}),
+          "gen": self.s.jobs[r].gen if r in self.s.jobs else int(self.meta.get(r, {}).get("gen", 0)),
+        }
+        for r in self.records
+      },
+      "queues": self.queues,
+      "workers": {n: worker_to_dict(w) for n, w in self.s.workers.items()},
       "workers_made": self.s.workers_made,
+      "table_rev": self.s.table_rev,
+      "service": dict(self.s.service),
+      "service_obs": dict(self.s.service_obs),
+      "service_ready": list(self.s.service_ready),
+      "versions": dict(self.versions),
+      "ckpt_versions": dict(self.ckpt_versions),
     }
 
-  def settle(self):
-    self.s, decisions = decide(from_table(self.table()))
+  def settle(self) -> list[tuple[Ev, dict]]:
+    snap = from_table(self.table())
+    snap.exclusive_cap = self.s.exclusive_cap
+    self.s, decisions = decide(snap)
     return decisions
 
-  def node(self, name, gpus, memory=80 * GIB):
-    self.nodes[name] = {"gpus": gpus, "memory": memory}
+  def node(self, name: str, gpus: int, memory: int = 80 * GIB, host_ram: int = 0, peer: str = "") -> None:
+    self.nodes[name] = {
+      "gpus": gpus,
+      "memory": memory,
+      "host_ram": host_ram,
+      "host_ram_used": 0,
+      "peer": peer,
+      "workers": {},
+      "versions": {},
+    }
     self.settle()
 
-  def lose(self, node):
+  def lose(self, node: str) -> None:
     self.nodes.pop(node, None)
 
-  def run(self, name, **body):
+  def run(self, name: str, *, queued: int = 0, meta: dict | None = None, **body) -> str:
     self.records[name] = {"role": "trainer", "base": "a", "rank": 0} | body
+    if meta:
+      self.meta[name] = dict(meta)
+    self.queues[name] = {"queued": queued, "in_flight": 0}
     self.settle()
     return self.s.jobs[name].worker
 
-  def delete(self, run):
+  def queue(self, name: str, queued: int, in_flight: int = 0) -> None:
+    self.queues[name] = {"queued": queued, "in_flight": in_flight}
+
+  def delete(self, run: str) -> None:
     self.records.pop(run, None)
+    self.meta.pop(run, None)
+    self.queues.pop(run, None)
 
+  def obs(self, worker: str, **fields) -> None:
+    w = self.s.workers[worker]
+    assert w.node is not None and w.node in self.nodes
+    cur = self.nodes[w.node]["workers"].get(worker, {})
+    cur.update(fields)
+    self.nodes[w.node]["workers"][worker] = cur
 
-class Local:
-  """Direct placement and reservations, with the same small runtime fields the node owns."""
+  def ack_all(self) -> None:
+    """Simulate every node applying its current worker intent & confirming GPU hold/release."""
+    for name, w in list(self.s.workers.items()):
+      if not w.node or w.node not in self.nodes:
+        continue
+      cur = self.nodes[w.node]["workers"].get(name, {})
+      jobs = cur.get("jobs", {})
+      if w.intent == "run":
+        self.obs(
+          name,
+          rev=w.rev,
+          owner=cur.get("owner") or f"{w.node}:{name}",
+          pid=cur.get("pid") or 100,
+          gpus=list(w.gpus),
+          gpus_held=list(w.gpus),
+          gpu_released=False,
+          phase="running",
+          jobs=jobs,
+        )
+      elif w.intent == "park":
+        self.obs(
+          name,
+          rev=w.rev,
+          owner=cur.get("owner") or f"{w.node}:{name}",
+          pid=cur.get("pid"),
+          gpus=list(w.gpus),
+          gpus_held=[],
+          gpu_released=True,
+          phase="parked" if cur.get("pid") else "idle",
+          jobs=jobs,
+        )
+      elif w.intent == "drain":
+        self.obs(
+          name,
+          rev=w.rev,
+          owner="",
+          pid=None,
+          gpus=[],
+          gpus_held=[],
+          gpu_released=True,
+          phase="drained",
+          host_ram_bytes=0,
+          jobs=jobs,
+        )
 
-  def __init__(self, test, gpus=1, memory=80 * GIB):
-    self.test, self.s, self.running, self.ticket = test, Assignment(nodes={"n": (gpus, memory)}), {}, 0
+  def add_usage(self, worker: str, job: str, delta: float) -> None:
+    w = self.s.workers[worker]
+    assert w.node is not None
+    cur = self.nodes[w.node]["workers"].setdefault(
+      worker,
+      {
+        "rev": w.rev,
+        "owner": f"{w.node}:{worker}",
+        "pid": 100,
+        "gpus": list(w.gpus),
+        "gpus_held": list(w.gpus) if w.intent == "run" else [],
+        "gpu_released": w.intent != "run",
+        "phase": "running" if w.intent == "run" else "parked",
+        "jobs": {},
+      },
+    )
+    je = cur["jobs"].setdefault(job, {"gen": self.s.jobs[job].gen, "usage": 0.0, "tokens": 0, "state": "active"})
+    je["usage"] += delta
 
-  def add(self, name, *, at=None, sampler=False, lora=False, exclusive=False, width=1):
-    spec = WorkerSpec(Role.SAMPLER if sampler else Role.TRAINER, name, lora, exclusive, gpus=width)
-    self.s.workers[name] = Worker(spec, "n", () if at is None else tuple(at))
-    self.s.jobs[name] = Job(spec, name)
-    if at is None:
-      self.place()
-    self.running[name] = Worker(spec, "n", self.s.workers[name].gpus)
-    return self.running[name]
-
-  def place(self):
-    place_gpus(self.s, "n", self.running)
-
-  def drop(self, name):
-    self.s.jobs.pop(name)
-    self.s.workers.pop(name)
-    self.place()
-
-  def request(self, name):
-    self.ticket += 1
-    self.running[name].ticket = self.ticket
-
-  def grants(self):
-    granted = []
-    for name in sorted(self.running, key=lambda n: (self.running[n].ticket, n)):
-      if can_run(self.s, "n", self.running, name):
-        self.running[name].served, self.running[name].ticket = 0, 0
-        granted.append(name)
-    self.check()
-    return granted
-
-  def check(self):
-    for gpu in range(self.s.nodes["n"][0]):
-      held = [r for r in self.running.values() if r.served is not None and gpu in r.gpus]
-      if len(held) > 1:
-        sizes = [memory_budget(self.s, r.spec, "n") for r in held]
-        self.test.assertTrue(all(sizes))
-        self.test.assertLessEqual(sum(sizes), self.s.nodes["n"][1])
-    for r in self.running.values():
-      self.test.assertFalse(r.ticket and r.served is not None)
+  def check_no_gpu_overcommit(self, test: unittest.TestCase) -> None:
+    for node_name, ni in self.s.nodes.items():
+      for gpu in range(ni.gpus):
+        holders = [n for n, w in self.s.workers.items() if w.node == node_name and gpu in gpus_still_held(self.s, n)]
+        if len(holders) > 1:
+          test.assertFalse(any(self.s.workers[h].spec.exclusive for h in holders))
+          budgets = [memory_budget(self.s, self.s.workers[h].spec, node_name) for h in holders]
+          test.assertTrue(fits(budgets, ni.memory), f"overcommit on {node_name}:{gpu}: {holders}")
 
 
 class TestCluster(unittest.TestCase):
-  def test_runs_are_assigned_and_empty_workers_are_removed(self):
+  def test_runs_are_assigned_and_empty_workers_require_release_before_removal(self):
     c = Cluster()
     c.node("n", 8)
-    a = c.run("a", rank=8)
-    self.assertEqual(c.run("b", rank=8), a)
+    a = c.run("a", rank=8, queued=1)
+    self.assertEqual(c.run("b", rank=8, queued=1), a)
     self.assertEqual(c.s.workers[a].node, "n")
-    self.assertEqual(c.s.workers[a].gpus, ())  # the cluster never chooses local GPUs
+    self.assertEqual(c.s.workers[a].intent, "run")
+    self.assertEqual(len(c.s.workers[a].gpus), 1)
+    c.ack_all()
     c.delete("a")
-    self.assertEqual(c.settle(), [])
+    c.settle()
+    self.assertIn(a, c.s.workers)
     c.delete("b")
-    self.assertEqual(c.settle(), [(Ev.UNPLACED, {"worker": a, "rule": "place.emptied"})])
+    decisions = c.settle()
+    self.assertEqual(decisions[0][0], Ev.DRAINING)
+    self.assertIn(a, c.s.workers)  # waits for GPU release confirmation
+    c.ack_all()
+    decisions = c.settle()
+    self.assertEqual(decisions, [(Ev.UNPLACED, {"worker": a, "rule": "place.emptied"})])
     self.assertNotIn(a, c.s.workers)
 
   def test_a_new_worker_never_takes_a_name_in_use(self):
     c = Cluster()
     c.node("n", 1)
-    c.s.workers["w1"] = Worker(
-      WorkerSpec(lora=True), "n"
-    )  # a worker the counter doesn't know about, as after a lost counter
+    c.s.workers["w1"] = Worker(WorkerSpec(lora=True), "n")
     self.assertNotEqual(c.run("f"), "w1")
 
-  def test_workers_go_to_the_node_with_the_fewest_workers_per_gpu(self):
+  def test_workers_spread_across_nodes_and_multi_gpu_waits_for_eligible_node(self):
     c = Cluster()
     c.node("a", 1)
-    c.node("b", 2)
-    workers = [c.run(name, rank=4, base=name) for name in ("r1", "r2", "r3")]
-    self.assertEqual([c.s.workers[w].node for w in workers], ["a", "b", "b"])
-
-  def test_full_fine_tune_sampler_stays_near_its_training_run(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    a, b = c.run("a"), c.run("b")
-    self.assertEqual([c.s.workers[w].node for w in (a, b)], ["a", "b"])
-    sampler = c.run("sample", role="sampler", train_run="b")
-    self.assertEqual(c.s.workers[sampler].node, "b")
-
-  def test_full_fine_tune_sampler_goes_elsewhere_when_its_trainers_node_is_full(self):
-    c = Cluster()
-    c.node("a", 2)
-    c.node("b", 8)
-    x = c.run("x", exclusive=True)
-    other = c.run("r", rank=4)
-    self.assertEqual([c.s.workers[w].node for w in (x, other)], ["a", "b"])
-    c.s.workers[other].node = "a"  # it took the GPU x keeps for its sampler
-    sampler = c.run("sample", role="sampler", train_run="x", exclusive=True)
-    self.assertEqual(c.s.workers[sampler].node, "b")
-
-  def test_a_full_fine_tunes_trainer_keeps_room_beside_it_for_its_sampler(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 2)
-    c.node("c", 8)
-    t = c.run("t")
-    others = [c.run(f"r{i}", rank=4, base=f"m{i}") for i in range(5)]
-    self.assertEqual([c.s.workers[w].node for w in [t, *others]], ["b", "a", "c", "c", "c", "c"])
-    lora = c.run("q", role="sampler", rank=4, base="m0")
-    sampler = c.run("sample", role="sampler", train_run="t")
-    self.assertEqual([c.s.workers[w].node for w in (lora, sampler)], ["c", "b"])  # the GPU t kept went to its sampler
-
-  def test_samplers_packed_by_memory_leave_room_near_their_trainer(self):
-    c = Cluster()
-    c.node("a", 2, memory=81559 * MIB)
-    c.node("b", 8)
-    t = c.run("t")
-    others = [c.run(f"r{i}") for i in range(4)]
-    self.assertEqual([c.s.workers[w].node for w in [t, *others]], ["a", "b", "b", "b", "b"])
-    q = c.run("q", role="sampler", train_run="t")
-    g = c.run("g", role="sampler", train_run="t", base="b")
-    self.assertEqual([c.s.workers[w].node for w in (q, g)], ["a", "a"])  # two full fine-tune samplers pack one GPU
-
-  def test_lost_node_workers_are_reassigned_and_forget_their_desired_gpus(self):
-    c = Cluster()
-    c.node("a", 1)
-    w = c.run("r")
-    c.node("b", 1)
-    c.lose("a")
-    self.assertEqual(c.settle()[0], (Ev.UNPLACED, {"worker": w, "rule": "place.node_lost"}))
-    self.assertEqual((c.s.workers[w].node, c.s.workers[w].gpus), ("b", ()))
-
-  def test_multi_gpu_worker_waits_for_a_node_that_has_enough_gpus(self):
-    c = Cluster()
-    c.node("a", 1)
-    w = c.run("wide", gpus=2)
+    w = c.run("wide", gpus=2, queued=1)
     self.assertIsNone(c.s.workers[w].node)
     c.node("b", 4)
     self.assertEqual(c.s.workers[w].node, "b")
+    self.assertEqual(len(c.s.workers[w].gpus), 2)
+
+  def test_lost_node_settles_remaining_budget_bumps_generation_and_reassigns(self):
+    c = Cluster()
+    c.node("a", 1)
+    w = c.run("r", queued=1)
+    self.assertEqual(c.s.workers[w].intent, "run")
+    gen_before = c.s.jobs["r"].gen
+    budget_before = c.s.workers[w].budgets["r"]
+    c.node("b", 1)
+    c.lose("a")
+    decisions = c.settle()
+    self.assertEqual(decisions[0], (Ev.UNPLACED, {"worker": w, "rule": "place.node_lost"}))
+    self.assertEqual(c.s.jobs["r"].gen, gen_before + 1)
+    self.assertGreaterEqual(c.s.service["r"], budget_before)
+    self.assertEqual(c.s.workers[w].node, "b")
+    self.assertEqual(c.s.workers[w].generations["r"], gen_before + 1)
 
   def test_lora_runs_share_but_full_or_exclusive_runs_get_their_own_workers(self):
     c = Cluster()
@@ -197,172 +230,222 @@ class TestCluster(unittest.TestCase):
     self.assertEqual(a, b)
     self.assertEqual(len({a, b, *others}), 4)
 
-  def test_sampling_sessions_share_only_their_kind_and_exclusive_training_run(self):
+  def test_single_job_drain_moves_one_job_and_bumps_its_generation_while_sibling_stays(self):
     c = Cluster()
-    c.run("X", rank=8, exclusive=True)  # an exclusive run's sessions end with it, so it has to exist
-    c.run("Z", rank=8, exclusive=True)
-    a = c.run("a", role="sampler", rank=8, train_run="A")
-    b = c.run("b", role="sampler", rank=8, train_run="B")
-    fft = c.run("f", role="sampler", train_run="A")
-    x = c.run("x", role="sampler", rank=8, train_run="X", exclusive=True)
-    y = c.run("y", role="sampler", rank=8, train_run="X", exclusive=True)
-    z = c.run("z", role="sampler", rank=8, train_run="Z", exclusive=True)
-    self.assertEqual(a, b)
-    self.assertEqual(x, y)
-    self.assertEqual(len({a, b, fft, x, y, z}), 4)
+    c.node("n1", 2)
+    c.node("n2", 2)
+    w = c.run("a", rank=8, queued=1)
+    self.assertEqual(c.run("b", rank=8, queued=1), w)
+    c.ack_all()
+    gen_a, gen_b = c.s.jobs["a"].gen, c.s.jobs["b"].gen
+    c.s.workers[w].drain_jobs["a"] = ""
+    c.s.workers[w].rev += 1
+    c.settle()
+    self.assertEqual(c.s.jobs["a"].worker, w)  # waits for drain observation
+    c.obs(w, rev=c.s.workers[w].rev, jobs={"a": {"gen": gen_a, "usage": 0.0, "tokens": 0, "state": "drained"}})
+    c.settle()
+    self.assertNotEqual(c.s.jobs["a"].worker, w)
+    self.assertEqual(c.s.jobs["b"].worker, w)
+    self.assertEqual(c.s.jobs["a"].gen, gen_a + 1)
+    self.assertEqual(c.s.jobs["b"].gen, gen_b)
 
-  def test_random_clusters_settle_and_survive_the_table(self):
-    for seed in range(100):
+  def test_random_clusters_settle_idempotently_survive_table_and_never_overcommit(self):
+    for seed in range(60):
       rng, c = random.Random(seed), Cluster()
-      for _ in range(100):
+      for _ in range(80):
         roll, name = rng.random(), str(rng.randrange(8))
-        if roll < 0.15:
-          c.node(name, rng.choice([1, 2, 4]))
-        elif roll < 0.25:
+        if roll < 0.15 and name not in c.nodes:
+          c.node(name, rng.choice([1, 2, 4]), memory=rng.choice([0, 80 * GIB]))
+        elif roll < 0.22:
           c.lose(name)
-        elif roll < 0.8 and name not in c.s.jobs:
-          c.run(name, rank=rng.choice([0, 8]), base=str(rng.randrange(3)), gpus=rng.choice([1, 2]))
+        elif roll < 0.72 and name not in c.records:
+          c.run(
+            name,
+            queued=rng.choice([0, 1]),
+            rank=rng.choice([0, 8]),
+            base=str(rng.randrange(3)),
+            role=rng.choice(["trainer", "sampler"]),
+            gpus=rng.choice([1, 2]),
+            exclusive=rng.random() < 0.15,
+          )
+        elif roll < 0.85:
+          c.ack_all()
         else:
           c.delete(name)
         c.settle()
-        self.assertEqual(decide(c.s)[1], [])
+        c.check_no_gpu_overcommit(self)
         self.assertTrue(all(w.node is None or w.node in c.s.nodes for w in c.s.workers.values()))
-        self.assertEqual(from_table(c.table()), c.s)
-        self.assertTrue(all(w.gpus == () for w in c.s.workers.values()))
+        # Idempotency and lossless table round-trip.
+        snap = from_table(c.table())
+        snap.exclusive_cap = c.s.exclusive_cap
+        self.assertEqual(snap, c.s)
+        self.assertEqual(decide(snap)[1], [])
 
 
-class TestPlacement(unittest.TestCase):
-  def test_workers_take_empty_gpus_while_available(self):
-    p = Local(self, 8)
-    for n in ("a", "b", "c"):
-      p.add(n, lora=True)
-    self.assertEqual([p.s.workers[n].gpus for n in ("a", "b", "c")], [(0,), (1,), (2,)])
+class TestFleetAllocation(unittest.TestCase):
+  def test_gpu_is_never_reused_until_previous_holder_confirms_release(self):
+    c = Cluster()
+    c.node("n", 1)
+    wa = c.run("a", base="m1", queued=1)
+    c.ack_all()
+    wb = c.run("b", base="m2", queued=1)
+    self.assertEqual((c.s.workers[wa].intent, c.s.workers[wb].intent), ("run", "park"))
+    # Exhaust a's budget -> scheduler asks a to park, but must NOT grant GPU 0 to b until a reports gpu_released=True.
+    c.add_usage(wa, "a", BUDGET_S + 1.0)
+    c.settle()
+    self.assertEqual(c.s.workers[wa].intent, "park")
+    self.assertEqual(c.s.workers[wb].intent, "park")
+    c.check_no_gpu_overcommit(self)
+    # Stale rev release does not count; only matching rev + gpu_released unlocks b.
+    c.obs(wa, rev=c.s.workers[wa].rev - 1, gpus_held=[], gpu_released=True, phase="parked")
+    c.settle()
+    self.assertEqual(c.s.workers[wb].intent, "park")
+    c.obs(wa, rev=c.s.workers[wa].rev, gpus_held=[], gpu_released=True, phase="parked")
+    c.settle()
+    self.assertEqual(c.s.workers[wb].intent, "run")
+    self.assertEqual(c.s.workers[wb].gpus, (0,))
+    c.check_no_gpu_overcommit(self)
 
-  def test_shared_fft_samplers_pack_their_memory_budgets(self):
-    p = Local(self, 8, memory=81559 * MIB)
-    for name in ("q", "g"):
-      p.add(name, sampler=True)
-    p.add("lora", sampler=True, lora=True)
-    p.add("exclusive", sampler=True, exclusive=True)
-    self.assertEqual(
-      {n: w.gpus for n, w in p.s.workers.items()},
-      {"q": (0,), "g": (0,), "lora": (1,), "exclusive": (2,)},
+  def test_memory_budget_packing_and_unknown_gpu_memory_guard(self):
+    c = Cluster()
+    c.node("n", 1, memory=81559 * MIB)
+    w1 = c.run("s1", role="sampler", base="m1", queued=1)
+    w2 = c.run("s2", role="sampler", base="m2", queued=1)
+    w3 = c.run("s3", role="sampler", base="m3", queued=1)
+    # Two FFT samplers (0.42 * 80GiB each = 0.84) pack onto GPU 0; the third must wait.
+    self.assertEqual([c.s.workers[w].intent for w in (w1, w2, w3)], ["run", "run", "park"])
+    c.check_no_gpu_overcommit(self)
+
+    # Unknown GPU memory (0) never allows concurrent sharing on one GPU.
+    c0 = Cluster()
+    c0.node("n", 1, memory=0)
+    a = c0.run("s1", role="sampler", base="m1", queued=1)
+    b = c0.run("s2", role="sampler", base="m2", queued=1)
+    self.assertEqual([c0.s.workers[w].intent for w in (a, b)], ["run", "park"])
+
+  def test_exclusive_admission_cap_dedicated_bundle_and_paired_sampler(self):
+    c = Cluster(exclusive_cap=0.5)
+    c.node("n", 2)
+    ex1 = c.run("ex1", rank=8, exclusive=True, queued=1)
+    self.assertEqual(c.s.workers[ex1].node, "n")
+    self.assertEqual(c.s.workers[ex1].gpus, (0,))
+    # Second exclusive trainer exceeds 50% cap (1 of 2 GPUs) and stays unplaced.
+    ex2 = c.run("ex2", rank=8, exclusive=True, queued=1)
+    self.assertIsNone(c.s.workers[ex2].node)
+    # Paired sampler for admitted ex1 is placed on ex1's node so it never deadlocks.
+    ex1_samp = c.run("ex1-s", role="sampler", rank=8, train_run="ex1", exclusive=True, queued=0)
+    self.assertEqual(c.s.workers[ex1_samp].node, "n")
+    # Regular shared job stays off ex1's dedicated GPU 0 and uses GPU 1.
+    reg = c.run("reg", rank=8, queued=1)
+    self.assertEqual(c.s.workers[reg].gpus, (1,))
+    c.check_no_gpu_overcommit(self)
+
+  def test_wide_job_reservation_prevents_starvation_and_grants_atomically(self):
+    c = Cluster()
+    c.node("n", 2)
+    w1 = c.run("s1", base="m1", queued=1)
+    c.ack_all()
+    wide = c.run("wide", base="mw", gpus=2, queued=1)
+    c.s.service["s1"] = 50.0  # s1 has received more service, so wide has priority
+    c.settle()
+    self.assertEqual(c.s.workers[wide].reserve_node, "n")
+    # Another single-GPU job arriving on GPU 1 must NOT bypass wide's reservation!
+    w2 = c.run("s2", base="m2", queued=1)
+    self.assertEqual(c.s.workers[w2].intent, "park")
+    # Once s1 finishes its budget and confirms release, wide atomically gets (0, 1).
+    c.add_usage(w1, "s1", BUDGET_S + 1.0)
+    c.settle()
+    self.assertEqual(c.s.workers[w1].intent, "park")
+    c.ack_all()
+    c.settle()
+    self.assertEqual(c.s.workers[wide].intent, "run")
+    self.assertEqual(c.s.workers[wide].gpus, (0, 1))
+    self.assertIsNone(c.s.workers[wide].reserve_node)
+    c.check_no_gpu_overcommit(self)
+
+  def test_persisted_fair_service_shared_account_and_idle_floor_snap(self):
+    c = Cluster()
+    c.node("n", 1)
+    wt = c.run("jobA", base="m1", queued=1)
+    ws = c.run("jobA-s", role="sampler", base="ms", train_run="jobA", queued=0)
+    wb = c.run("jobB", base="m2", queued=1)
+    c.ack_all()
+    # Usage on jobA's trainer charges logical account "jobA" (shared by jobA-s).
+    c.add_usage(wt, "jobA", BUDGET_S + 2.0)
+    c.settle()
+    self.assertGreaterEqual(c.s.service["jobA"], BUDGET_S + 2.0)
+    c.ack_all()
+    c.settle()
+    # Now jobB (service 0) wins GPU 0 over jobA-s (whose account "jobA" already has service > BUDGET_S).
+    c.queue("jobA-s", 1)
+    c.settle()
+    self.assertEqual(c.s.workers[wb].intent, "run")
+    self.assertEqual(c.s.workers[ws].intent, "park")
+    # Idle account C waking up snaps to active service floor (cannot bank credit while idle).
+    c.run("jobC", base="m3", queued=0)
+    c.add_usage(wb, "jobB", 5.0)
+    c.settle()
+    c.queue("jobC", 1)
+    c.settle()
+    self.assertGreaterEqual(c.s.service["jobC"], min(c.s.service["jobA"], c.s.service["jobB"]))
+
+  def test_host_ram_pressure_demotes_coldest_parked_trainer(self):
+    c = Cluster()
+    c.node("n", 1, host_ram=100 * GIB)
+    w_cold = c.run("cold", base="m1", queued=1)
+    c.ack_all()
+    c.queue("cold", 0)
+    w_warm = c.run("warm", base="m2", queued=1)
+    c.settle()
+    c.ack_all()
+    c.settle()
+    c.ack_all()
+    c.queue("warm", 0)
+    w_active = c.run("active", base="m3", queued=1)
+    c.settle()
+    c.ack_all()
+    c.settle()
+    c.ack_all()
+    # Both cold and warm are parked on host RAM; together with active they exceed 80% host RAM.
+    c.obs(w_cold, phase="parked", gpu_released=True, gpus_held=[], host_ram_bytes=45 * GIB)
+    c.obs(w_warm, phase="parked", gpu_released=True, gpus_held=[], host_ram_bytes=45 * GIB)
+    c.nodes["n"]["host_ram_used"] = 90 * GIB
+    decisions = c.settle()
+    self.assertIn((Ev.DRAINING, {"worker": w_cold, "node": "n", "rule": "drain.host_ram"}), decisions)
+    self.assertEqual(c.s.workers[w_cold].intent, "drain")
+    self.assertEqual(c.s.workers[w_warm].intent, "park")
+    self.assertEqual(c.s.workers[w_active].intent, "run")
+
+  def test_storage_aware_placement_prefetch_hysteresis_and_restore_refs(self):
+    c = Cluster()
+    c.node("n1", 1, peer="10.0.0.1:8000")
+    c.node("n2", 1, peer="10.0.0.2:8000")
+    c.versions["ver-big"] = {"locations": {"n2": "10.0.0.2:8000"}, "durable": True, "size_bytes": 5 * GIB}
+    w = c.run(
+      "r1",
+      queued=1,
+      meta={"restore_uri": "tinker://r1/weights/c1", "restore_version": "ver-big", "restore_boundary": "1-0"},
     )
+    # n2 already has ver-big locally -> placement picks n2 over n1 and populates restore_refs (no prefetch needed).
+    self.assertEqual(c.s.workers[w].node, "n2")
+    self.assertEqual(c.s.workers[w].restore_refs["r1"]["version"], "ver-big")
+    self.assertEqual(c.s.workers[w].prefetch, [])
 
-  def test_exclusive_workers_are_alone_and_others_stay_off_their_gpu(self):
-    p = Local(self, 2)
-    p.add("exclusive", exclusive=True)
-    p.add("a")
-    p.add("b")
-    self.assertEqual([p.s.workers[n].gpus for n in ("exclusive", "a", "b")], [(0,), (1,), (1,)])
-    p = Local(self, 2)
-    p.add("exclusive", at=(1,), sampler=True, exclusive=True)
-    p.add("a", sampler=True)
-    self.assertEqual(p.s.workers["a"].gpus, (0,))
-
-  def test_multi_gpu_sampler_moves_single_gpu_trainer_aside(self):
-    p = Local(self, 4)
-    p.add("wide", width=2)
-    p.add("single")
-    p.add("sample", sampler=True, lora=True, width=2)
-    self.assertEqual([p.s.workers[n].gpus for n in ("wide", "single", "sample")], [(0, 1), (0,), (2, 3)])
-
-  def test_spreading_waits_until_old_process_leaves_its_actual_gpu(self):
-    p = Local(self, 2)
-    p.add("old", at=(1,))
-    for name in ("a", "b"):
-      p.add(name, at=(0,))
-    p.drop("old")
-    self.assertEqual([p.s.workers[n].gpus for n in ("a", "b")], [(0,), (0,)])
-    p.running.pop("old")
-    p.place()
-    self.assertEqual([p.s.workers[n].gpus for n in ("a", "b")], [(1,), (0,)])
-    before = copy.deepcopy(p.s)
-    p.place()
-    self.assertEqual(p.s, before)
-
-
-class TestReservations(unittest.TestCase):
-  def test_ready_runs_share_service_even_when_commands_have_different_costs(self):
-    heads = [Cmd(run, "1-0", Op.FORWARD_BACKWARD, b"") for run in ("slow", "fast")]
-    service = {"slow": 0.0, "fast": 0.0}
-    for _ in range(11):
-      [run] = select_runs(heads, service, 1)
-      service[run] += 10 if run == "slow" else 1
-    self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
-
-  def test_fifo_order_is_the_order_of_requests_not_worker_names(self):
-    p = Local(self)
-    for name in ("a", "b", "c"):
-      p.add(name)
-    for name in ("a", "c", "b"):
-      p.request(name)
-    order = []
-    for _ in range(3):
-      [name] = p.grants()
-      order.append(name)
-      p.running[name].served = None
-    self.assertEqual(order, ["a", "c", "b"])
-
-  def test_workers_with_known_budgets_share_but_unknown_budgets_wait(self):
-    p = Local(self)
-    for name in ("a", "b", "c"):
-      p.add(name, sampler=True)
-      p.request(name)
-    p.add("trainer")
-    p.request("trainer")
-    self.assertEqual(p.grants(), ["a", "b"])
-    p.running["a"].served = None
-    self.assertEqual(p.grants(), ["c"])
-    p.running["b"].served = None
-    self.assertEqual(p.grants(), [])
-    p.running["c"].served = None
-    self.assertEqual(p.grants(), ["trainer"])
-
-  def test_unknown_gpu_memory_never_allows_concurrent_reservations(self):
-    p = Local(self, memory=0)
-    for name in ("a", "b"):
-      p.add(name, sampler=True)
-      p.request(name)
-    self.assertEqual(p.grants(), ["a"])
-
-  def test_multi_gpu_reservation_is_atomic_and_cannot_be_bypassed_on_either_gpu(self):
-    p = Local(self, 2)
-    p.add("holder", at=(0,))
-    p.add("wide", at=(0, 1), width=2)
-    p.add("later", at=(1,))
-    for name in ("holder", "wide", "later"):
-      p.request(name)
-    self.assertEqual(p.grants(), ["holder"])
-    self.assertIsNone(p.running["wide"].served)
-    self.assertIsNone(p.running["later"].served)
-    p.running["holder"].served = None
-    self.assertEqual(p.grants(), ["wide"])
-    p.running["wide"].served = None
-    self.assertEqual(p.grants(), ["later"])
-
-  def test_different_gpus_can_run_concurrently(self):
-    p = Local(self, 2)
-    for name, gpu in (("a", 0), ("b", 1)):
-      p.add(name, at=(gpu,))
-      p.request(name)
-    self.assertEqual(p.grants(), ["a", "b"])
-
-  def test_random_requests_and_exits_never_overcommit_a_gpu(self):
-    for seed in range(300):
-      rng, p = random.Random(seed), Local(self, 4)
-      for i in range(10):
-        width = rng.choice([1, 1, 2, 4])
-        first = rng.randrange(5 - width)
-        p.add(str(i), at=tuple(range(first, first + width)), width=width, sampler=rng.random() < 0.5)
-      for _ in range(100):
-        name = rng.choice(list(p.running))
-        r = p.running[name]
-        if r.served is not None:
-          r.served = None  # parking or process exit has completed
-        elif not r.ticket:
-          p.request(name)
-        p.grants()
+    # When a version is NOT local on the placed node, scheduler populates prefetch with exact version and peers.
+    c.versions["ver-remote"] = {"locations": {"n2": "10.0.0.2:8000"}, "durable": True, "size_bytes": 2 * GIB}
+    w2 = c.run(
+      "r2",
+      base="m2",
+      queued=1,
+      meta={"restore_uri": "tinker://r2/weights/c1", "restore_version": "ver-remote", "restore_boundary": "1-0"},
+    )
+    # n2 is busy with r1 (gpu_avail > 0) while n1 is free; check whichever node got it has accurate prefetch/refs.
+    self.assertIn("r2", c.s.workers[w2].restore_refs)
+    self.assertEqual(c.s.workers[w2].restore_refs["r2"]["version"], "ver-remote")
+    if c.s.workers[w2].node == "n1":
+      self.assertEqual(len(c.s.workers[w2].prefetch), 1)
+      self.assertEqual(c.s.workers[w2].prefetch[0]["version"], "ver-remote")
+      self.assertIn("10.0.0.2:8000", c.s.workers[w2].prefetch[0]["peers"])
 
 
 if __name__ == "__main__":

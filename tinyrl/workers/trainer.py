@@ -28,7 +28,7 @@ def ok(body: dict) -> Reply:
 def serve_follower(model: Model) -> None:
   while True:
     dist.broadcast_object_list(msg := [None], src=0)
-    with contextlib.suppress(ValueError, KeyError):  # rejected the same way on every rank, before any collective
+    with contextlib.suppress(ValueError, KeyError):
       getattr(model, msg[0][0])(*msg[0][1])
 
 
@@ -45,29 +45,86 @@ class Trainer:
       with span(f"model.{method}"):
         return getattr(self.model, method)(*args)
     except Exception as e:
-      # The other ranks may be waiting in a collective this rank left; torchrun must restart them all.
       if self.world_size > 1 and not isinstance(e, (ValueError, KeyError)):
         os._exit(1)
       raise
 
   def save(
-    self, run: str, uri: str, sampler: bool = False, ttl_seconds: int | None = None, owned: bool = False
+    self,
+    run: str,
+    uri: str,
+    sampler: bool = False,
+    ttl_seconds: int | None = None,
+    owned: bool = False,
+    priority: int = 1,
+    completed_id: str = "",
+    source_version: str | None = None,
+    allow_recovery_pending: bool = False,
   ) -> dict:
-    tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
-    version = self.store.put(uri, tensors, meta)
+    if not allow_recovery_pending and run in self.model.needs_recovery:
+      raise RuntimeError("cannot publish state after a partially failed forward_backward before recovery")
+    if sampler:
+      tensors, meta = self.call_model("sampler_weights", run, source_version)
+    else:
+      tensors, meta = self.call_model("training_state", run)
+    if completed_id:
+      meta["completed_id"] = completed_id
+    version = self.store.put(uri, tensors, meta, priority=priority)
     return {
       "uri": uri,
       "size": sum(map(nbytes, tensors.values())),
       "ttl": ttl_seconds,
       "owned": owned,
       "version": version,
+      "durable": not self.store.remote,
+      "meta": meta,
+      "completed_id": completed_id,
     }
 
-  def load_run(self, run: str, uri: str, version: str | None, optimizer: bool, gradients: bool) -> None:
-    self.call_model("restore_run", run, *self.store.get(uri, version), optimizer, gradients)
+  def load_run(
+    self,
+    run: str,
+    uri: str,
+    version: str | None,
+    optimizer: bool,
+    gradients: bool,
+    peers: list[str] | tuple[str, ...] = (),
+  ) -> None:
+    with self.store.pin_local(uri, version, peers=peers) as (folder, _):
+      self.call_model("restore_from_folder", run, folder, optimizer, gradients)
+
+  def restore_job(
+    self,
+    run_id: str,
+    run: dict,
+    uri: str,
+    version: str | None = None,
+    peers: list[str] | tuple[str, ...] = (),
+    optimizer: bool = True,
+    gradients: bool = True,
+  ) -> None:
+    """Explicit job restoration before executing commands: create adapter/base if absent, then load exact version."""
+    created = False
+    try:
+      if run_id not in self.model.params:
+        self.call_model("create_run", run_id, run["base"], run["rank"], run.get("lora", {}))
+        created = True
+      self.load_run(run_id, uri, version, optimizer=optimizer, gradients=gradients, peers=peers)
+      created = False
+    except Exception:
+      if created:
+        with contextlib.suppress(Exception):
+          self.call_model("delete_run", run_id)
+      raise
 
   def execute(
-    self, cmd: Cmd, run: dict | None = None, parked: tuple[str, str | None] | None = None, version: str | None = None
+    self,
+    cmd: Cmd,
+    run: dict | None = None,
+    parked: tuple[str, str | None] | None = None,
+    version: str | None = None,
+    peers: list[str] | tuple[str, ...] = (),
+    source_version: str | None = None,
   ) -> tuple[Reply, dict]:
     with span("trainer.execute"):
       effects, created = {}, False
@@ -82,9 +139,9 @@ class Trainer:
           self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
           created = True
           if parked:
-            self.load_run(cmd.run, *parked, optimizer=True, gradients=True)
+            self.load_run(cmd.run, parked[0], parked[1], optimizer=True, gradients=True, peers=peers)
             effects["restored"] = parked[0]
-            created = False  # recovery succeeded, even if the command that follows is rejected
+            created = False
 
         if cmd.op == Op.FORWARD_BACKWARD:
           req = wire.parse(cmd.body)
@@ -95,20 +152,25 @@ class Trainer:
         args = json.loads(cmd.body)
         match cmd.op:
           case Op.CREATE_MODEL:
-            self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
+            if cmd.run not in self.model.params:
+              self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
           case Op.OPTIM_STEP:
             metrics = self.call_model("optim_step", cmd.run, args["adam_params"])
             return ok({"type": cmd.op, "metrics": metrics}), effects
           case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
+            sampler = cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER
             effects["saved"] = self.save(
               cmd.run,
               args["uri"],
-              cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER,
-              args.get("ttl_seconds"),
-              args.get("owned", False),
+              sampler=sampler,
+              ttl_seconds=args.get("ttl_seconds"),
+              owned=args.get("owned", False),
+              priority=2 if sampler else 0,
+              completed_id=cmd.entry_id,
+              source_version=source_version,
             )
           case Op.LOAD_WEIGHTS:
-            self.load_run(cmd.run, args["uri"], version, optimizer=args["optimizer"], gradients=False)
+            self.load_run(cmd.run, args["uri"], version, optimizer=args["optimizer"], gradients=False, peers=peers)
           case Op.DELETE_MODEL:
             self.call_model("delete_run", cmd.run)
           case _:
@@ -119,15 +181,30 @@ class Trainer:
           reply["sampling_session_id"] = args["sampling_session_id"]
         return ok(reply), effects
       except Exception as e:
-        if created:  # a failed restore must not leave a fresh model serving requests as recovered state
-          self.call_model("delete_run", cmd.run)
+        if created:
+          with contextlib.suppress(Exception):
+            self.call_model("delete_run", cmd.run)
         return Reply.error(e), effects
 
-  def park_all(self) -> list[dict]:
-    return [
-      {"run": run, **self.save(run, f"tinker://{run}/parked/{time.time_ns()}", owned=True)}
-      for run in list(self.model.params)
-    ]
+  def has_run(self, run: str) -> bool:
+    return run in self.model.params
+
+  def _park_one(self, run: str, completed_id: str = "") -> dict:
+    uri = f"tinker://{run}/parked/{time.time_ns()}"
+    saved = self.save(run, uri, owned=True, priority=0, completed_id=completed_id, allow_recovery_pending=True)
+    return {"run": run, **saved}
+
+  def park_run(self, run: str, completed_id: str = "") -> dict | None:
+    """Serialize one run's portable state and drop it from a shared trainer while sibling runs stay live."""
+    if run not in self.model.params:
+      return None
+    out = self._park_one(run, completed_id)
+    self.call_model("delete_run", run)
+    return out
+
+  def park_all(self, boundaries: dict[str, str] | None = None) -> list[dict]:
+    bounds = boundaries or {}
+    return [self._park_one(run, bounds.get(run, "")) for run in list(self.model.params)]
 
   def park(self) -> None:
     self.call_model("park_on_host")
@@ -137,11 +214,14 @@ class Trainer:
       torch.cuda.set_device(gpu)
     self.call_model("resume_on_gpu")
 
+  def host_ram_bytes(self) -> int:
+    return self.model.host_ram_bytes()
+
 
 def main(path: str) -> None:
   from tinyrl.control.process import die_with_parent, serve
 
-  die_with_parent()  # also for torchrun ranks, whose sessions are outside their launcher's process group
+  die_with_parent()
   if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
   if int(os.environ.get("WORLD_SIZE", 1)) > 1:

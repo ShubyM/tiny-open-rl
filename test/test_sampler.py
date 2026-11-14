@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -13,7 +14,8 @@ from tinyrl.api.gateway import app
 from tinyrl.bus import Op, Role, Run, key
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
-from tinyrl.workers.sampler import Out, Seq, encode
+from tinyrl.workers import vllm
+from tinyrl.workers.sampler import Out, SamplingAbortedError, Seq, encode
 
 JOB = {
   "prompt": [1, 2, 3],
@@ -111,14 +113,14 @@ class TestSampler(RedisTest):
     self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
 
   async def test_a_tensor_parallel_sampler_takes_turns_on_both_its_gpus(self):
-    await self.bus.create_run(Run("t1", "t1", "base", 0))
-    await self.bus.create_run(Run("samp-1", "sampler:base", "base", 1, role=Role.SAMPLER, gpus=2))
+    await self.bus.create_run(Run("t1", "", "base", 0))
+    await self.bus.create_run(Run("samp-1", "", "base", 1, role=Role.SAMPLER, gpus=2))
     node = self.node(gpus=2)
-    await node.add("t1", gpus=[1])
-    node.processes["t1"].trainer.model.create_run("t1", "base", 0, {})
-    await node.add("sampler:base", gpus=[0, 1])
+    await node.announce_node()
+    self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     self.pump(node)
     for run, op, body in [
+      ("t1", Op.CREATE_MODEL, {"base_model": "base", "rank": 0, "lora": {}}),
       ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
       ("samp-1", Op.SAMPLE, JOB),
       ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
@@ -191,7 +193,8 @@ class TestSampler(RedisTest):
       [error] = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
       self.assertIsInstance(error, RuntimeError)
       self.assertIsNone(sampler.running)
-      self.assertIsNone(reservation.served)
+      self.assertTrue(reservation.gpu_released)
+      self.assertEqual(reservation.gpus_held, ())
       self.assertIsNone(await self.bus.lease_owner("sampler"))
       self.assertIsNone(await self.bus.wait_for_reply(future, 0))
       self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
@@ -233,12 +236,12 @@ class TestSampler(RedisTest):
 
   async def test_a_new_preparation_error_replies_while_its_worker_is_waiting_for_gpu(self):
     store = Store(tempfile.mkdtemp())
-    for run, worker, path in (
-      ("busy", "busy", None),
-      ("ready", "waiting", None),
-      ("broken", "waiting", "tinker://r/sampler_weights/missing"),
+    for run, base, path in (
+      ("busy", "base-a", None),
+      ("ready", "base-b", None),
+      ("broken", "base-b", "tinker://r/sampler_weights/missing"),
     ):
-      await self.bus.create_run(Run(run, worker, "base", 4, role=Role.SAMPLER, model_path=path))
+      await self.bus.create_run(Run(run, "", base, 4, role=Role.SAMPLER, model_path=path))
     sampling, finish = asyncio.Event(), asyncio.Event()
 
     class Occupied(FakeEngine):
@@ -249,14 +252,14 @@ class TestSampler(RedisTest):
         return await super().sample(job, name)
 
     node = self.node(store, gpus=1, engine=Occupied)
-    await node.add("busy", gpus=[0])
-    waiting = await node.add("waiting", gpus=[0])
+    await node.announce_node()
+    self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     self.pump(node)
     holding = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
     try:
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
-      await self.until(lambda: bool(waiting.ticket))
+      await self.until(lambda: "ready" in node.state.jobs and node.state.jobs["ready"].worker in node.running)
       broken = await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode())
       reply = await self.bus.wait_for_reply(broken, 3)
       self.assertIsNotNone(reply, "a healthy head waiting for GPU must not hold up a preparation error")
@@ -270,8 +273,8 @@ class TestSampler(RedisTest):
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
 
   async def test_a_busy_holder_yields_its_gpu_after_its_turn_of_tokens(self):
-    for run, worker in (("busy", "busy"), ("ready", "waiting")):
-      await self.bus.create_run(Run(run, worker, "base", 4, role=Role.SAMPLER))
+    for run, base in (("busy", "base-a"), ("ready", "base-b")):
+      await self.bus.create_run(Run(run, "", base, 4, role=Role.SAMPLER))
     order, sampling, finish = [], asyncio.Event(), asyncio.Event()
 
     class Recording(FakeEngine):
@@ -283,20 +286,81 @@ class TestSampler(RedisTest):
         return await super().sample(job, name)
 
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
-    await node.add("busy", gpus=[0])
-    waiting = await node.add("waiting", gpus=[0])
+    await node.announce_node()
     self.pump(node)
-    with mock.patch.object(scheduler, "TURN", 1):
+    with mock.patch.object(scheduler, "BUDGET_S", 0.05):
+      self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode())
-      await self.until(lambda: bool(waiting.ticket))
+      await self.until(lambda: "ready" in node.state.jobs and node.state.jobs["ready"].worker in node.running)
       more = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [33]}).encode())
-      await asyncio.sleep(0.5)  # so the holder has its next command ready when the first one ends
+      await asyncio.sleep(0.15)  # exceed BUDGET_S so the holder yields GPU 0 after completing its active command
       finish.set()
       for request in (first, ready, more):
         self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
     self.assertEqual(order, [[11], [22], [33]])
+
+  async def test_vllm_abort_does_not_publish_truncated_output_and_replays_cleanly(self):
+    aborted_payload = json.dumps(
+      {
+        "choices": [
+          {
+            "index": 0,
+            "token_ids": [1],
+            "finish_reason": "abort",
+            "logprobs": {"token_logprobs": [-1.0], "top_logprobs": [{}]},
+          }
+        ]
+      }
+    ).encode()
+    with self.assertRaises(SamplingAbortedError):
+      vllm.parse(aborted_payload)
+    with self.assertRaises(SamplingAbortedError):
+      vllm.parse(json.dumps({"choices": []}).encode())
+
+    await self.bus.create_run(Run("s1", "sampler", "base", 4, role=Role.SAMPLER))
+    aborted = asyncio.Event()
+
+    class AbortDuringDrain(FakeEngine):
+      async def sample(self, job, name):
+        aborted.set()
+        raise SamplingAbortedError("paused during drain")
+
+    node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=AbortDuringDrain)
+    req = await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    await node.add("sampler")
+    await asyncio.wait_for(aborted.wait(), 5)
+    # Aborted attempt must not publish a truncated reply; command remains pending until takeover/replay.
+    self.assertIsNone(await self.bus.wait_for_reply(req, 0))
+    await node.close(graceful=False)
+    self.assertIsNone(await self.bus.wait_for_reply(req, 0))
+    node2 = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=FakeEngine)
+    await node2.add("sampler")
+    reply = await self.bus.wait_for_reply(req, 5)
+    self.assertIsNotNone(reply)
+    self.assertTrue(reply.ok, reply.body)
+
+  def test_compiled_artifact_publish_stage_and_reject_mismatch(self):
+    with tempfile.TemporaryDirectory() as folder:
+      store = Store(f"{folder}/store")
+      src = f"{folder}/src_cache"
+      os.makedirs(f"{src}/vllm/sub", exist_ok=True)
+      with open(f"{src}/vllm/sub/kernel.bin", "wb") as f:
+        f.write(b"compiled-kernel")
+      env = {"TINYRL_GPU_ARCH": "sm_90", "TINYRL_VLLM_VERSION": "0.10.0", "TINYRL_TORCH_VERSION": "2.7.0"}
+      key = vllm.compiled_artifact_key("base/m", True, 2, ["--enable-sleep-mode"], env)
+      uri = "tinker://artifacts/compiled/v1"
+      ver, size = vllm.publish_compiled_artifact(store, uri, key, src)
+      self.assertGreater(size, 0)
+      dst = f"{folder}/dst_cache"
+      self.assertTrue(vllm.stage_compiled_artifact(store, uri, key, dst, version=ver))
+      with open(f"{dst}/vllm/sub/kernel.bin", "rb") as f:
+        self.assertEqual(f.read(), b"compiled-kernel")
+      wrong_arch = vllm.compiled_artifact_key(
+        "base/m", True, 2, ["--enable-sleep-mode"], env | {"TINYRL_GPU_ARCH": "sm_80"}
+      )
+      self.assertFalse(vllm.stage_compiled_artifact(store, uri, wrong_arch, f"{folder}/dst_wrong", version=ver))
 
   async def test_invalid_backlog_does_not_starve_a_ready_sibling(self):
     await self.bus.create_run(

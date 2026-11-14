@@ -25,8 +25,8 @@ class TestStore(unittest.TestCase):
       "w.step": torch.tensor(3.0),
     }
     store.put(uri, want, {"optimizer": True})
-    folder = store.path(uri)
-    self.assertEqual(os.listdir(folder), ["state.safetensors"])
+    folder, _ = store.local_folder(uri)
+    self.assertEqual(sorted(os.listdir(folder)), ["manifest.json", "state.safetensors"])
 
     got, meta = store.get(uri)
     self.assertEqual(meta, {"optimizer": True})
@@ -45,14 +45,17 @@ class TestStore(unittest.TestCase):
     saver.upload_pending_saves()  # what start() does in the background
 
     folder, version = loader.local_folder(uri, saved)
-    self.assertEqual(sorted(os.listdir(folder)), ["adapter_config.json", "adapter_model.safetensors"])
+    self.assertEqual(sorted(os.listdir(folder)), ["adapter_config.json", "adapter_model.safetensors", "manifest.json"])
     self.assertTrue(torch.equal(loader.get(uri)[0]["w"], torch.ones(4)))
     self.assertEqual(loader.local_folder(uri), (folder, version))  # downloaded once
 
-    saver.put(uri, {"w": torch.zeros(4)}, {"lora": True, "config": {"r": 4}})  # the same name, saved again
+    v2 = saver.put(uri, {"w": torch.zeros(4)}, {"lora": True, "config": {"r": 4}})  # the same name, saved again
     saver.upload_pending_saves()
     self.assertNotEqual(loader.local_folder(uri)[1], version)
     self.assertTrue(torch.equal(loader.get(uri)[0]["w"], torch.zeros(4)))
+    # Explicit older version A remains independently readable after B becomes _latest.
+    self.assertTrue(torch.equal(loader.get(uri, saved)[0]["w"], torch.ones(4)))
+    self.assertTrue(torch.equal(loader.get(uri, v2)[0]["w"], torch.zeros(4)))
     with self.assertRaises(ValueError):
       loader.get("tinker://run-1/weights/missing")
 
@@ -85,7 +88,7 @@ class TestStore(unittest.TestCase):
       "w3": torch.tensor(3.0),
     }
     store.put(uri, want, {"optimizer": True, "lora": False})
-    folder = store.path(uri)
+    folder, _ = store.local_folder(uri)
     files = sorted(os.listdir(folder))
     self.assertTrue(any("state-00001-of-" in f for f in files))
 
@@ -100,7 +103,7 @@ class TestStore(unittest.TestCase):
     self.assertNotEqual(v1, v2)
 
     store.put(uri + "-sampler", want, {"lora": False, "config": {"test": True}})
-    sampler_folder = store.path(uri + "-sampler")
+    sampler_folder, _ = store.local_folder(uri + "-sampler")
     sampler_files = sorted(os.listdir(sampler_folder))
     self.assertIn("config.json", sampler_files)
     self.assertIn("model.safetensors.index.json", sampler_files)
@@ -112,7 +115,7 @@ class TestStore(unittest.TestCase):
       "t4": torch.ones(8, dtype=torch.uint8),
     }
     store.put(uri + "-huge", want_huge, {"lora": False, "config": {"test": True}})
-    huge_folder = store.path(uri + "-huge")
+    huge_folder, _ = store.local_folder(uri + "-huge")
     st_file = next(f for f in sorted(os.listdir(huge_folder)) if f.endswith(".safetensors"))
     import safetensors
 
@@ -171,17 +174,7 @@ class TestStore(unittest.TestCase):
     try:
       for step in range(2, 7):
         store.put(uri, {"a": ones * step, "b": ones * step, "c": ones * step})
-        if step == 2:
-          self.assertTrue(os.path.exists(p1), "p1 shard files stay intact for in-flight reader")
-        if step == 3:
-          self.assertFalse(os.path.exists(p1), "p1 is garbage-collected after two newer saves")
-          parent = os.path.dirname(store.path(uri))
-          atomic_entries = [
-            n
-            for n in os.listdir(parent)
-            if (n == "atomic" or n.startswith(".atomic.")) and not n.startswith(".atomic.bak.")
-          ]
-          self.assertLessEqual(len(atomic_entries), 4)
+        self.assertTrue(os.path.exists(p1), "prior immutable version remains readable until reference-counted sweep")
     finally:
       running = False
       t.join()
@@ -256,24 +249,25 @@ class TestStore(unittest.TestCase):
     saver.upload_pending_saves()
     self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))
 
-  def test_three_saves_leave_exactly_two_versions(self):
+  def test_all_published_versions_remain_readable_until_explicitly_deleted(self):
     root = f"memory://tinyrl-test-d4-count-{uuid.uuid4()}"
     store = Store(root=root, cache=tempfile.mkdtemp())
     uri = "tinker://r/weights/d4_count"
 
-    store.put(uri, {"w": torch.ones(1)})
+    v1 = store.put(uri, {"w": torch.ones(1)})
+    store.upload_pending_saves()
+    v2 = store.put(uri, {"w": torch.ones(2)})
+    store.upload_pending_saves()
+    v3 = store.put(uri, {"w": torch.ones(3)})
     store.upload_pending_saves()
 
-    store.put(uri, {"w": torch.ones(2)})
-    store.upload_pending_saves()
-
-    store.put(uri, {"w": torch.ones(3)})
-    store.upload_pending_saves()
-
-    # Check that exactly two versions exist in the bucket
     remote_dir = f"{store.base}/r/weights/d4_count"
     versions = [e for e in store.fs.ls(remote_dir, detail=False) if os.path.basename(e) != "_latest"]
-    self.assertEqual(len(versions), 2)
+    self.assertEqual(len(versions), 3)
+    self.assertEqual([store.get(uri, v)[0]["w"].numel() for v in (v1, v2, v3)], [1, 2, 3])
+    self.assertTrue(store.delete_version(uri, v1))
+    versions_after = [e for e in store.fs.ls(remote_dir, detail=False) if os.path.basename(e) != "_latest"]
+    self.assertEqual(len(versions_after), 2)
 
 
 class TestRegistry(RedisTest):

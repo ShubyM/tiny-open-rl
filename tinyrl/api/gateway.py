@@ -25,8 +25,8 @@ from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 
-WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
-CKPT_TTL = getenv("CKPT_TTL", 0)  # the TTL of a checkpoint saved without one, at least 3600. 0 keeps it until deleted
+WAIT = getenv("WAIT", 30.0)
+CKPT_TTL = getenv("CKPT_TTL", 0)
 
 
 # ***** requests *****
@@ -37,7 +37,7 @@ class SessionRequest(BaseModel):
 
 
 class CreateSessionRequest(BaseModel):
-  tags: list[str] = []  # TINKER_TAGS: open-rl clients ask for full fine-tuning with openrl.fine_tuning_type=full
+  tags: list[str] = []
   user_metadata: dict[str, Any] | None = None
 
 
@@ -68,7 +68,13 @@ class TTLRequest(BaseModel):
   ttl_seconds: int | None = None
 
 
-class LoadRequest(ModelRequest):
+class LoadRequest(BaseModel):
+  model_id: str | None = None
+  seq_id: int | None = None
+  session_id: str | None = None
+  model_seq_id: int | None = None
+  base_model: str | None = None
+  user_metadata: dict[str, Any] | None = None
   path: str
   optimizer: bool = False
 
@@ -77,8 +83,11 @@ class FutureRequest(BaseModel):
   request_id: str
 
 
+class WeightsInfoRequest(BaseModel):
+  tinker_path: str
+
+
 def ttl(seconds: int | None) -> int | None:
-  """A checkpoint's TTL, which the Tinker API bounds between an hour and ten years."""
   if seconds is not None and not 3600 <= seconds <= 10 * 365 * 24 * 3600:
     raise HTTPException(400, "ttl_seconds must be between 3600 and 10 years")
   return seconds
@@ -89,18 +98,28 @@ def iso(t: float | None) -> str | None:
 
 
 def public(c: dict) -> dict:
-  """A registry entry as the Tinker API's Checkpoint."""
   keep = {k: c[k] for k in ("checkpoint_id", "checkpoint_type", "tinker_path", "size_bytes")}
   return keep | {"time": iso(c["time"]), "expires_at": iso(c["expires_at"])}
 
 
 def checkpoint_uri(run: str, kind: str, name: str) -> str:
-  """The logical tinker://<run>/<kind>/<name> URI for a checkpoint."""
-  if name.startswith("tinker://"):  # a checkpoint by URI, maybe another run's to resume from
+  if name.startswith("tinker://"):
     run, kind, name = name.removeprefix("tinker://").split("/", 2)
   if not name or name.startswith("/") or ".." in f"{run}/{kind}/{name}".split("/"):
     raise ValueError(f"bad checkpoint name {name}")
   return f"tinker://{run}/{kind}/{name}"
+
+
+def _lora_config_from_meta(meta: dict) -> dict:
+  made = meta.get("targets") or []
+  rank = int(meta.get("rank", 0))
+  cfg: dict[str, Any] = {
+    "rank": rank,
+    "train_attn": bool(meta.get("train_attn", "q_proj" in made)) if rank else False,
+    "train_mlp": bool(meta.get("train_mlp", "gate_proj" in made)) if rank else False,
+    "train_unembed": bool(meta.get("train_unembed", "lm_head" in made)) if rank else False,
+  }
+  return cfg | {k: meta[k] for k in ("lora_alpha", "lora_dropout", "target_modules", "seed") if meta.get(k) is not None}
 
 
 def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
@@ -114,6 +133,14 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   api.add_exception_handler(ValueError, bad_request)
   api.add_exception_handler(KeyError, bad_request)
+
+  async def resolve_meta(uri: str) -> tuple[dict, str]:
+    """Resolve checkpoint metadata from the exact registered version without downloading safetensors shards."""
+    ver_id, peers, ver_rec = await registry.resolve_version(uri)
+    if ver_rec and isinstance(ver_rec.get("meta"), dict) and "base" in ver_rec["meta"]:
+      return dict(ver_rec["meta"]), ver_id
+    meta = await asyncio.to_thread(store.read_meta, uri, ver_id or None, peers)
+    return meta, ver_id
 
   async def submit(run: str, op: Op, body: bytes | dict, seq_id: int | None = None, cost: int = 1) -> dict[str, str]:
     if isinstance(body, dict):
@@ -133,7 +160,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       if train.get("base"):
         base, lora = train["base"], train["rank"] > 0
       else:
-        meta = store.read_meta(uri)
+        meta, _ = await resolve_meta(uri)
         base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
       if not base:
         raise ValueError("could not resolve base_model")
@@ -152,7 +179,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.get("/api/v1/scheduling")
   async def scheduling():
-    """The cluster's assignment, with each worker's GPUs and process from its node's last heartbeat."""
+    """The cluster's assignment, with each worker's observed GPUs, phase, and process from its node."""
     table = await bus.read_table()
     state = dataclasses.asdict(scheduler.from_table(table))
     for node, info in table["nodes"].items():
@@ -167,7 +194,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/sessions/{session_id}/finish")
   async def finish_session(session_id: str):
-    await bus.finish_session(session_id)  # the SDK's close(), and the end of a `with ServiceClient()` block
+    await bus.finish_session(session_id)
     return {"status": "ok"}
 
   @api.post("/api/v1/telemetry")
@@ -177,7 +204,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.post("/api/v1/client/config")
   @api.post("/api/v1/client/dynamic_config")
   async def client_config():
-    return {}  # the SDK's defaults
+    return {}
 
   @api.get("/api/v1/get_server_capabilities")
   async def get_server_capabilities():
@@ -198,8 +225,15 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.post("/api/v1/create_model")
   async def create_model(req: CreateModelRequest):
     session = await bus.get_session(req.session_id) or {}
-    metadata, lora = session.get("metadata", {}) | (req.user_metadata or {}), req.lora_config or {}
-    rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
+    metadata = session.get("metadata", {}) | (req.user_metadata or {})
+    lora = dict(req.lora_config or {})
+    full_ft = (
+      metadata.get("openrl.fine_tuning_type") == "full"
+      or metadata.get("is_lora") is False
+      or str(metadata.get("is_lora", "")).lower() == "false"
+      or (req.lora_config is not None and int(lora.get("rank", 16)) == 0)
+    )
+    rank = 0 if full_ft else int(lora.get("rank", 16))
     exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
 
     if req.session_id and req.model_seq_id is not None:
@@ -219,7 +253,6 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     if run is None:
       raise HTTPException(404, f"no model {req.model_id}")
 
-    # the SDK reads LoRA shaped metadata, even for a full fine-tune
     return {
       "type": "get_info",
       "model_id": req.model_id,
@@ -242,7 +275,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     body = wire.from_json(data)
     return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"), wire.cost(wire.parse(body)))
 
-  @api.post("/api/v1/forward")  # SDKs before 0.25
+  @api.post("/api/v1/forward")
   async def forward(request: Request):
     data = await request.json()
     body = wire.from_json(data, forward_only=True)
@@ -259,7 +292,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     args = {"uri": checkpoint_uri(req.model_id, kind, name), "ttl_seconds": ttl(kept)}
     return await submit(req.model_id, op, args, req.seq_id)
 
-  @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
+  @api.post("/api/v1/save_weights")
   async def save_weights(req: SaveRequest):
     return await save(req, Op.SAVE_WEIGHTS, "weights")
 
@@ -275,7 +308,6 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
     name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
     uri = checkpoint_uri(req.model_id, "sampler_weights", name)
-    # a sampling session's weights, which its run owns
     owned = req.path is None or req.sampling_session_seq_id is not None
     kept = req.ttl_seconds if req.ttl_seconds is not None or owned else CKPT_TTL or None
     args = {"uri": uri, "ttl_seconds": ttl(kept)}
@@ -285,12 +317,66 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):
-    uri = checkpoint_uri(req.model_id, "weights", req.path)
-    return await submit(req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer}, req.seq_id)
+    # Support both loading into an existing model_id and fresh-session create-via-load (Tinker SDK >= 0.39).
+    if req.model_id:
+      uri = checkpoint_uri(req.model_id, "weights", req.path)
+      return await submit(req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer}, req.seq_id)
+    if not req.session_id or req.model_seq_id is None:
+      raise HTTPException(400, "model_id or (session_id, model_seq_id) required")
+    uri = checkpoint_uri("", "weights", req.path)
+    try:
+      meta, ver_id = await resolve_meta(uri)
+    except (OSError, IndexError, ValueError) as e:
+      raise HTTPException(404, f"no checkpoint {req.path}: {e}") from e
+    if "base" not in meta:
+      raise HTTPException(404, f"no checkpoint {req.path} that names its base model")
+    session = await bus.get_session(req.session_id) or {}
+    metadata = session.get("metadata", {}) | (req.user_metadata or {})
+    base = req.base_model or meta["base"]
+    is_lora = bool(meta.get("lora", bool(meta.get("rank", 0))))
+    rank = int(meta.get("rank", 0)) if is_lora else 0
+    lora = _lora_config_from_meta(meta) if is_lora else {}
+    exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
+    profile = meta.get("profile") or {}
+    default_gpus = int(
+      profile.get("world_size") or (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full"))
+    )
+    gpus = int(metadata.get("openrl.gpus") or default_gpus)
+    run = f"{req.session_id}:train:{req.model_seq_id}"
+    if not await bus.get_run(run):
+      await bus.create_run(Run(run, "", base, rank, req.session_id, None, lora, exclusive, gpus=gpus, profile=profile))
+    payload = {"uri": uri, "optimizer": req.optimizer, **({"version": ver_id} if ver_id else {})}
+    return await submit(run, Op.LOAD_WEIGHTS, payload, req.seq_id if req.seq_id is not None else 0)
+
+  @api.post("/api/v1/weights_info")
+  async def weights_info(req: WeightsInfoRequest):
+    """Resolve checkpoint configuration from the exact registered version so a fresh session can reconstruct full-FT or LoRA."""
+    try:
+      meta, _ = await resolve_meta(checkpoint_uri("", "", req.tinker_path))
+    except (OSError, IndexError, ValueError):
+      meta = {}
+    if "base" not in meta:
+      raise HTTPException(404, f"no checkpoint {req.tinker_path} that names its base model")
+    is_lora = bool(meta.get("lora", bool(meta.get("rank", 0))))
+    out: dict[str, Any] = {
+      "base_model": meta["base"],
+      "is_lora": is_lora,
+      "lora_rank": int(meta["rank"]) if is_lora and meta.get("rank") else None,
+    }
+    if is_lora:
+      cfg = _lora_config_from_meta(meta)
+      out |= {
+        k: cfg[k]
+        for k in ("train_unembed", "train_mlp", "train_attn", "lora_alpha", "lora_dropout", "target_modules")
+        if k in cfg
+      }
+    if meta.get("profile"):
+      out["profile"] = meta["profile"]
+    return out
 
   @api.post("/api/v1/delete_model")
   async def delete_model(req: ModelRequest):
-    await submit(req.model_id, Op.DELETE_MODEL, {}, req.seq_id)  # queued behind the run's work, which still finishes
+    await submit(req.model_id, Op.DELETE_MODEL, {}, req.seq_id)
     return {"status": "ok"}
 
   @api.post("/api/v1/retrieve_future")
@@ -301,7 +387,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     if reply.content_type == wire.PROTO and wire.PROTO not in accept:
       if req.request_id.startswith("samp-"):
         return wire.sample_json(reply.body)
-      return wire.output_json(reply.body)  # an older client, which reads JSON
+      return wire.output_json(reply.body)
     return Response(reply.body, media_type=reply.content_type)
 
   # ***** sampling *****
@@ -389,7 +475,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.delete("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}")
   async def delete_checkpoint(run: str, checkpoint_id: str):
-    if not await registry.unregister_checkpoints(f"tinker://{run}/{checkpoint_id}"):  # its files go with the next sweep
+    if not await registry.unregister_checkpoints(f"tinker://{run}/{checkpoint_id}"):
       raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
 
   @api.put("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}/ttl")
@@ -415,7 +501,6 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.get("/metrics")
   async def metrics():
-    """Every run's counters for Prometheus. README.md has the queries for utilization, queueing delay and fairness."""
     lines = []
     for (worker, run), counters in (await bus.run_counters()).items():
       for name, n in counters.items():
