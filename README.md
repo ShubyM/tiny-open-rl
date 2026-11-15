@@ -186,7 +186,8 @@ Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains t
 to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/scheduler.py) for placement, GPU grants and ready-run selection,
 and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes, run ownership and GPU handoff,
 [store.py](tinyrl/storage/store.py) to see how checkpoints are stored, and [trainer.py](tinyrl/workers/trainer.py) and
-[model.py](tinyrl/workers/model.py) to see how a command runs on the model.
+[model.py](tinyrl/workers/model.py) to see how a command runs on the model. [docs/model](docs/model/README.md) lists
+the Redis state the scheduler, nodes and workers share and the rules for writing it, with the TLA+ model of them.
 
 | File | Responsibility |
 |---|---|
