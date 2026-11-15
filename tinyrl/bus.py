@@ -371,6 +371,8 @@ class Bus:
         grant = json.loads(raw) if (raw := await p.hget(key("turns"), turn)) else {}
         if (grant.get("engine"), grant.get("node"), grant.get("gpus")) != (engine, obs["node"], obs["gpus"]):
           return False, False
+      if previous == obs and not turn:
+        return False, True
       p.multi()
       p.hset(key("obs"), engine, json.dumps(obs))
       return True, True
