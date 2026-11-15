@@ -111,14 +111,12 @@ class TestSampler(RedisTest):
     self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
 
   async def test_a_tensor_parallel_sampler_takes_turns_on_both_its_gpus(self):
-    await self.bus.create_run(Run("t1", "t1", "base", 0))
-    await self.bus.create_run(Run("samp-1", "sampler:base", "base", 1, role=Role.SAMPLER, gpus=2))
+    await self.bus.create_run(Run("t1", "", "base", 0))
+    await self.bus.create_run(Run("samp-1", "", "base", 1, role=Role.SAMPLER, gpus=2))
     node = self.node(gpus=2)
-    await node.add("t1", gpus=[1])
-    node.processes["t1"].trainer.model.create_run("t1", "base", 0, {})
-    await node.add("sampler:base", gpus=[0, 1])
     self.pump(node)
     for run, op, body in [
+      ("t1", Op.CREATE_MODEL, {"base_model": "base", "rank": 0, "lora": {}}),
       ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
       ("samp-1", Op.SAMPLE, JOB),
       ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
@@ -175,10 +173,12 @@ class TestSampler(RedisTest):
 
     node = self.node(store, gpus=1, engine=Broken)
     first = await self.bus.submit_command("first", Op.SAMPLE, json.dumps(JOB).encode())
-    reservation = await node.add("sampler")
-    sampler, task = node.samplers["sampler"], node.tasks["sampler"]
+    worker = await node.worker_for("first")
+    await node.add(worker)
+    task = node.tasks[worker]
     try:
       await asyncio.wait_for(booting.wait(), 5)
+      sampler = node.samplers[worker]
       later = await self.bus.submit_command("later", Op.SAMPLE, json.dumps(JOB).encode())
       future = await self.bus.submit_command("later", Op.SAMPLE, json.dumps(JOB).encode())
       self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 2, "in_flight": []})
@@ -191,22 +191,24 @@ class TestSampler(RedisTest):
       [error] = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
       self.assertIsInstance(error, RuntimeError)
       self.assertIsNone(sampler.running)
-      self.assertIsNone(reservation.served)
-      self.assertIsNone(await self.bus.lease_owner("sampler"))
+      self.assertNotIn(worker, node.running)
+      self.assertIsNone(await self.bus.lease_owner(worker))
       self.assertIsNone(await self.bus.wait_for_reply(future, 0))
       self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
     finally:
       finish_boot.set()
     node.engine_type = FakeEngine
-    await node.add("sampler")
+    await node.sync()
+    await node.add(worker)
+    self.pump(node)
     self.assertTrue((await self.bus.wait_for_reply(future, 5)).ok)
 
-  async def test_fft_sessions_do_not_overlap_and_reload_changed_checkpoints(self):
+  async def test_fft_sessions_do_not_overlap_pin_their_version_and_load_new_sessions(self):
     store = Store(tempfile.mkdtemp())
     paths = {f"s{i}": f"tinker://r{i}/sampler_weights/s0" for i in (1, 2)}
     for run, uri in paths.items():
       store.put(uri, {}, {"base": "base", "lora": False, "config": {}})
-      await self.bus.create_run(Run(run, "sampler:fft:base", "base", 0, role=Role.SAMPLER, model_path=uri))
+      await self.bus.create_run(Run(run, "", "base", 0, role=Role.SAMPLER, model_path=uri))
     case = self
 
     class UnmixedEngine(FakeEngine):
@@ -217,28 +219,34 @@ class TestSampler(RedisTest):
         return await super().sample(job, name)
 
     node = self.node(store, engine=UnmixedEngine)
-    requests = []
-    for run in ("s1", "s2", "s1", "s2"):
-      requests.append(await self.bus.submit_command(run, Op.SAMPLE, json.dumps(JOB).encode()))
-    await node.add("sampler:fft:base")
+    self.pump(node)
+    requests = [
+      await self.bus.submit_command(run, Op.SAMPLE, json.dumps(JOB).encode()) for run in ("s1", "s2", "s1", "s2")
+    ]
     self.assertTrue(all([(await self.bus.wait_for_reply(request, 5)).ok for request in requests]))
-    engine = node.samplers["sampler:fft:base"].running
+    worker = await node.worker_for("s1")
+    engine = node.samplers[worker].running
     request = await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
     self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
     before = set(engine.loaded)
+    # Overwriting the alias does not change s1's pinned version, while a new session discovers and loads the new version.
     store.put(paths["s1"], {}, {"base": "base", "lora": False, "config": {}})
     request = await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
+    self.assertEqual(engine.loaded, before)
+    await self.bus.create_run(Run("s3", "", "base", 0, role=Role.SAMPLER, model_path=paths["s1"]))
+    request = await self.bus.submit_command("s3", Op.SAMPLE, json.dumps(JOB).encode())
     self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
     self.assertNotEqual(engine.loaded, before)
 
   async def test_a_new_preparation_error_replies_while_its_worker_is_waiting_for_gpu(self):
     store = Store(tempfile.mkdtemp())
-    for run, worker, path in (
-      ("busy", "busy", None),
-      ("ready", "waiting", None),
-      ("broken", "waiting", "tinker://r/sampler_weights/missing"),
+    for run, base, path in (
+      ("busy", "base-a", None),
+      ("ready", "base-b", None),
+      ("broken", "base-b", "tinker://r/sampler_weights/missing"),
     ):
-      await self.bus.create_run(Run(run, worker, "base", 4, role=Role.SAMPLER, model_path=path))
+      await self.bus.create_run(Run(run, "", base, 4, role=Role.SAMPLER, model_path=path))
     sampling, finish = asyncio.Event(), asyncio.Event()
 
     class Occupied(FakeEngine):
@@ -249,14 +257,13 @@ class TestSampler(RedisTest):
         return await super().sample(job, name)
 
     node = self.node(store, gpus=1, engine=Occupied)
-    await node.add("busy", gpus=[0])
-    waiting = await node.add("waiting", gpus=[0])
     self.pump(node)
     holding = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
     try:
       await asyncio.wait_for(sampling.wait(), 5)
+      waiting = await node.worker_for("ready")
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
-      await self.until(lambda: bool(waiting.ticket))
+      await self.until(lambda: waiting in node.running and node.state.workers[waiting].gpus == ())
       broken = await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode())
       reply = await self.bus.wait_for_reply(broken, 3)
       self.assertIsNotNone(reply, "a healthy head waiting for GPU must not hold up a preparation error")
@@ -270,8 +277,8 @@ class TestSampler(RedisTest):
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
 
   async def test_a_busy_holder_yields_its_gpu_after_its_turn_of_tokens(self):
-    for run, worker in (("busy", "busy"), ("ready", "waiting")):
-      await self.bus.create_run(Run(run, worker, "base", 4, role=Role.SAMPLER))
+    for run, base in (("busy", "base-a"), ("ready", "base-b")):
+      await self.bus.create_run(Run(run, "", base, 4, role=Role.SAMPLER))
     order, sampling, finish = [], asyncio.Event(), asyncio.Event()
 
     class Recording(FakeEngine):
@@ -283,16 +290,15 @@ class TestSampler(RedisTest):
         return await super().sample(job, name)
 
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
-    await node.add("busy", gpus=[0])
-    waiting = await node.add("waiting", gpus=[0])
     self.pump(node)
     with mock.patch.object(scheduler, "TURN", 1):
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode())
-      await self.until(lambda: bool(waiting.ticket))
+      waiting = await node.worker_for("ready")
+      await self.until(lambda: waiting in node.running and node.state.jobs["ready"].queued == 1)
       more = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [33]}).encode())
-      await asyncio.sleep(0.5)  # so the holder has its next command ready when the first one ends
+      await asyncio.sleep(0.2)  # so the holder has its next command ready when the first one ends
       finish.set()
       for request in (first, ready, more):
         self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)

@@ -42,7 +42,9 @@ class TestAPI(RedisTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.store = Store(root=tempfile.mkdtemp())
-    self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app(self.bus)), base_url="http://tinyrl")
+    self.http = httpx.AsyncClient(
+      transport=httpx.ASGITransport(app=gateway.app(self.bus, self.store)), base_url="http://tinyrl"
+    )
     self.node = TestNode(self.bus, store=self.store)
 
   async def asyncTearDown(self):
@@ -141,6 +143,54 @@ class TestAPI(RedisTest):
       response = await self.post("save_weights", json={"model_id": run_id, "path": bad})
       self.assertEqual(response.status_code, 400)
 
+  async def test_weights_info_reconstructs_lora_and_full_finetune(self):
+    lora_cfg = {
+      "rank": 8,
+      "lora_alpha": 32,
+      "lora_dropout": 0.0,
+      "seed": 7,
+      "train_attn": True,
+      "train_mlp": False,
+      "train_unembed": False,
+    }
+    lora_run = await self.create_model(lora_config=lora_cfg)
+    lora_ckpt = (
+      await self.result(await self.post("save_weights", json={"model_id": lora_run, "path": "custom"}))
+    ).json()["path"]
+    lora_info = (await self.post("weights_info", json={"tinker_path": lora_ckpt})).json()
+    self.assertEqual(
+      (
+        lora_info["base_model"],
+        lora_info["is_lora"],
+        lora_info["lora_rank"],
+        lora_info["lora_alpha"],
+        lora_info["train_attn"],
+        lora_info["train_mlp"],
+        lora_info["train_unembed"],
+      ),
+      ("tiny", True, 8, 32, True, False, False),
+    )
+
+    full_run = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
+    full_ckpt = (await self.result(await self.post("save_weights", json={"model_id": full_run, "path": "fft"}))).json()[
+      "path"
+    ]
+    full_info = (await self.post("weights_info", json={"tinker_path": full_ckpt})).json()
+    self.assertEqual((full_info["base_model"], full_info["is_lora"], full_info["lora_rank"]), ("tiny", False, None))
+
+    sid = (await self.post("create_session")).json()["session_id"]
+    recreated = await self.post(
+      "load_weights", json={"session_id": sid, "model_seq_id": 0, "path": full_ckpt, "optimizer": True}
+    )
+    loaded = (await self.result(recreated)).json()
+    self.assertEqual((loaded["type"], loaded["path"]), ("load_weights", full_ckpt))
+    rebuilt_info = (await self.post("get_info", json={"model_id": recreated.json()["model_id"]})).json()
+    self.assertEqual((rebuilt_info["is_lora"], rebuilt_info["lora_rank"]), (False, None))
+
+    self.assertEqual(
+      (await self.post("weights_info", json={"tinker_path": "tinker://nope/weights/x"})).status_code, 404
+    )
+
   async def test_checkpoints_are_listed_expire_and_delete(self):
     run_id = await self.create_model()
     await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final", "ttl_seconds": 7200}))
@@ -204,7 +254,10 @@ class TestAPI(RedisTest):
     self.assertEqual(workers[0], workers[1])
     self.assertEqual(len(set(workers)), 3)
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
-    self.assertEqual((await self.post("get_info", json={"model_id": full})).json()["lora_rank"], 16)
+    full_info = (await self.post("get_info", json={"model_id": full})).json()
+    self.assertEqual((full_info["is_lora"], full_info["lora_rank"]), (False, None))
+    lora_info = (await self.post("get_info", json={"model_id": shared})).json()
+    self.assertEqual((lora_info["is_lora"], lora_info["lora_rank"]), (True, 4))
 
   async def test_session_tags_apply_to_its_models(self):
     """TINKER_TAGS reach the server on create_session, which is how open-rl clients ask for a full fine-tune."""
@@ -399,9 +452,10 @@ class TestAPI(RedisTest):
 
     await self.bus.node_heartbeat("node-1", 8)
     await self.bus.append_event("node_up", node="node-1", gpus=8, memory=0)
+    await self.bus.r.hdel(bus.key("nodes"), self.node.id)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     worker = await self.worker(run_id)
-    data = await self.scheduling_until(lambda d: d["state"]["workers"].get(worker, {}).get("node"))
+    data = await self.scheduling_until(lambda d: d["state"]["workers"].get(worker, {}).get("node") == "node-1")
     self.assertEqual(data["state"]["workers"][worker]["node"], "node-1")
     sampler = data["state"]["workers"][await self.worker(samp_id)]
     self.assertEqual(
@@ -410,6 +464,9 @@ class TestAPI(RedisTest):
     )
     self.assertIn("node-1", data["nodes"])
 
+    await self.bus.r.hdel(bus.key("nodes"), "node-1")
+    await self.node.announce_node()
+    await self.scheduling_until(lambda d: d["state"]["workers"].get(worker, {}).get("node") == self.node.id)
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
     data = await self.scheduling_until(lambda d: worker not in d["state"]["workers"])
@@ -452,7 +509,17 @@ class TestAPI(RedisTest):
     await self.scheduling_until(lambda d: d["state"]["workers"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)
-    await self.scheduling_until(lambda d: sampler not in d["state"]["workers"])
+
+    async def wait_unplaced():
+      for _ in range(100):
+        await self.node.tick()
+        data = (await self.http.get("/api/v1/scheduling")).json()
+        if data["state"] and sampler not in data["state"]["workers"]:
+          return
+        await asyncio.sleep(0.05)
+      self.fail(f"never: {data}")
+
+    await wait_unplaced()
 
 
 if __name__ == "__main__":

@@ -72,6 +72,34 @@ class TestTinkerSDK(unittest.TestCase):
       with open(f"{final}/_latest") as f:
         version = json.load(f)["version"]
       self.assertTrue(os.path.exists(f"{final}/{version}/adapter_model.safetensors"))
+
+      # A fresh Tinker SDK session queries weights_info and resumes from the saved durable state with optimizer.
+      state_uri = out.stdout.split("state")[1].split()[0]
+      resume_code = """
+import os, tinker
+from tinker import types
+sc = tinker.ServiceClient(base_url=os.environ["BASE_URL"], api_key="tml-local")
+rest = sc.create_rest_client()
+info = rest.get_weights_info_by_tinker_path(os.environ["STATE_URI"]).result()
+assert info.is_lora is True and info.lora_rank == 8, info
+tc = sc.create_training_client_from_state_with_optimizer(os.environ["STATE_URI"]).result()
+datum = types.Datum(
+  model_input=types.ModelInput.from_ints([1, 2, 3, 4]),
+  loss_fn_inputs={"target_tokens": [2, 3, 4, 5], "weights": [1.0, 1.0, 1.0, 1.0]},
+)
+fb = tc.forward_backward([datum], "cross_entropy").result()
+op = tc.optim_step(types.AdamParams(learning_rate=1e-3)).result()
+print("resumed_loss", fb.metrics["loss:sum"])
+"""
+      resumed = subprocess.run(
+        [os.environ["TINKER_PYTHON"], "-c", resume_code],
+        env={**sdk_env, "STATE_URI": state_uri},
+        capture_output=True,
+        text=True,
+        timeout=180,
+      )
+      self.assertEqual(resumed.returncode, 0, resumed.stderr[-3000:])
+      self.assertIn("resumed_loss", resumed.stdout)
     finally:
       for proc in procs:
         proc.terminate()
@@ -79,6 +107,7 @@ class TestTinkerSDK(unittest.TestCase):
           proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
           proc.kill()
+          proc.wait(timeout=5)
 
 
 if __name__ == "__main__":

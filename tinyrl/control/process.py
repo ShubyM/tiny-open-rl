@@ -18,7 +18,6 @@ import time
 def die_with_parent(sig: int = signal.SIGKILL) -> None:
   parent = os.getppid()
   expected = int(os.environ.get("TINYRL_PARENT_PID", parent))
-  # The exec child sets this to itself for its own children, including torchrun's detached ranks.
   if expected == os.getpid():
     expected = parent
   if ctypes.CDLL(None).prctl(1, sig) != 0:  # PR_SET_PDEATHSIG
@@ -42,6 +41,47 @@ def reap(proc: subprocess.Popen) -> None:
     os.killpg(proc.pid, signal.SIGKILL)
 
 
+def group_pids(pid: int | None) -> list[int]:
+  """Every live non-zombie process belonging to process group `pid` or descended from `pid`."""
+  if not pid or pid <= 0 or not os.path.isdir("/proc"):
+    return []
+  live, children = [], {}
+  for name in os.listdir("/proc"):
+    if not name.isdigit():
+      continue
+    with contextlib.suppress(OSError, ValueError):
+      with open(f"/proc/{name}/stat") as f:
+        tail = f.read().rsplit(")", 1)[1].split()
+      state, ppid, pgrp = tail[0], int(tail[1]), int(tail[2])
+      if state == "Z":
+        continue
+      p = int(name)
+      children.setdefault(ppid, []).append(p)
+      if p == pid or pgrp == pid:
+        live.append(p)
+  seen, stack = set(live), list(live)
+  while stack:
+    for c in children.get(stack.pop(), ()):
+      if c not in seen:
+        seen.add(c)
+        stack.append(c)
+  return sorted(seen)
+
+
+def gpu_pids_clear(pid: int | None) -> bool:
+  """Verify the worker process group and all descendants have exited."""
+  return not group_pids(pid)
+
+
+def rss_bytes(pid: int | None) -> int:
+  total = 0
+  for p in group_pids(pid):
+    with contextlib.suppress(OSError, ValueError):
+      with open(f"/proc/{p}/statm") as f:
+        total += int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+  return total
+
+
 def target_pid(proc: subprocess.Popen) -> int:
   """The actual command PID, for CRIU. Its supervisor is not part of the saved tree."""
   while proc.poll() is None:
@@ -57,7 +97,6 @@ def supervise(cmd: list[str], checkpointable: bool = False) -> None:
   signal.signal(signal.SIGUSR1, lambda *_: os.killpg(0, signal.SIGKILL))
   die_with_parent(signal.SIGUSR1)
   os.environ["TINYRL_PARENT_PID"] = str(os.getpid())
-  # This fresh, single-threaded supervisor is the only place we fork before setting parent-death state and exec.
   child = os.fork()
   if child == 0:
     if not checkpointable:
@@ -66,7 +105,7 @@ def supervise(cmd: list[str], checkpointable: bool = False) -> None:
     os.execvp(cmd[0], cmd)
 
   def forward(sig, _):
-    signal.signal(sig, signal.SIG_IGN)  # the group includes this supervisor
+    signal.signal(sig, signal.SIG_IGN)
     os.killpg(0, sig)
 
   signal.signal(signal.SIGTERM, forward)
@@ -109,6 +148,13 @@ class Process:
       self.folder.cleanup()
       raise
 
+  @property
+  def pid(self) -> int | None:
+    return None if self.closed else self.proc.pid
+
+  def released(self) -> bool:
+    return self.proc.poll() is not None and gpu_pids_clear(self.proc.pid)
+
   async def call(self, method: str, *args):
     if self.closed or self.broken:
       raise RuntimeError("model connection is closed")
@@ -125,22 +171,27 @@ class Process:
       size = int.from_bytes(await self.reader.readexactly(4), "big")
       ok, result = pickle.loads(await self.reader.readexactly(size))
     except BaseException:
-      self.broken = True  # a cancelled read cannot be matched to a later command
+      self.broken = True
       raise
     if not ok:
       raise RuntimeError(result)
     return result
 
-  async def close(self) -> None:
+  async def close(self, graceful: bool = False) -> bool:
     if self.closed:
-      return
+      return True
+    if graceful and not self.broken and self.writer is not None and self.proc.poll() is None:
+      with contextlib.suppress(Exception):
+        await asyncio.wait_for(self.call("shutdown"), timeout=5.0)
     if self.writer:
       self.writer.close()
     reap(self.proc)
-    while self.proc.poll() is None:
+    while self.proc.poll() is None or not gpu_pids_clear(self.proc.pid):
+      reap(self.proc)
       await asyncio.sleep(0.01)
     self.folder.cleanup()
     self.closed = True
+    return True
 
 
 if __name__ == "__main__":

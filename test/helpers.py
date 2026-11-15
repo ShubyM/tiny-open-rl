@@ -1,5 +1,4 @@
 import asyncio
-import dataclasses
 import os
 import subprocess
 import tempfile
@@ -29,7 +28,6 @@ def tiny(name: str = "") -> LlamaForCausalLM:
 
 
 def new_id() -> str:
-  # run ids are uuids, since PEFT finds an adapter's weights by its name
   return str(uuid.uuid4())
 
 
@@ -61,6 +59,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   def tearDownClass(cls):
     if cls.proc:
       cls.proc.terminate()
+      cls.proc.wait(timeout=5)
 
   async def asyncSetUp(self):
     self.renewal_tasks = []
@@ -69,7 +68,6 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     await self.bus.r.flushall()
 
   async def worker(self, run: str) -> str:
-    """The run's worker, once every new run is assigned the way the scheduler assigns it."""
     await assign_new_runs(self.bus)
     return (await self.bus.get_run(run))["worker"]
 
@@ -81,24 +79,26 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
 
 async def assign_new_runs(bus) -> None:
-  """Assign new runs the way the scheduler would, without placing anything."""
+  """Assign new runs through the real scheduler decision logic."""
   from tinyrl.control import scheduler
 
   s = scheduler.from_table(await bus.read_table())
-  new, changes = scheduler.decide(s)
-  runs = {body["run"]: body["worker"] for kind, body in changes if kind == "assigned"}
-  new_workers = {
-    w: {"spec": dataclasses.asdict(new.workers[w].spec), "node": None} for w in set(runs.values()) - s.workers.keys()
-  }
-  await bus.write_table(runs, new_workers, [], new.workers_made, [])
+  new, changes, gen_bumps = scheduler.decide(s)
+  await scheduler.commit(bus, s, new, changes, gen_bumps)
 
 
 class FakeEngine:
-  """A CPU sampling engine: tokens count up from the last prompt token, with logprob -1."""
+  """A CPU sampling engine implementing vLLM's sample, adapter load/unload, pause/resume, abort and sleep contracts."""
 
   def __init__(self):
     self.loaded: set[str] = set()
     self.lora = True
+    self.paused = False
+    self.sleeping = False
+    self.aborted: set[str] = set()
+    self.artifact_key = "fake-artifact"
+    self.startup_mode = "cached"
+    self.startup_s = 0.001
 
   @classmethod
   async def start(cls, base: str, lora: bool, env: dict[str, str] | None = None) -> "FakeEngine":
@@ -109,18 +109,32 @@ class FakeEngine:
   async def load_checkpoint(self, name: str, path: str) -> None:
     self.loaded = self.loaded | {name} if self.lora else {name}
 
+  async def unload_checkpoint(self, name: str) -> None:
+    self.loaded.discard(name)
+
+  async def pause(self, mode: str = "wait") -> None:
+    self.paused = True
+
+  async def resume(self) -> None:
+    self.paused = False
+
+  async def abort(self, request_ids: list[str]) -> None:
+    self.aborted.update(request_ids)
+
   async def sleep(self) -> None:
-    pass
+    self.sleeping = True
 
   async def wake(self) -> None:
-    pass
+    self.sleeping = False
 
   async def close(self) -> None:
     pass
 
-  async def sample(self, job: dict, name: str | None):
+  async def sample(self, job: dict, name: str | None, request_id: str | None = None):
     from tinyrl.workers.sampler import Out, Seq
 
+    if request_id and request_id in self.aborted:
+      raise asyncio.CancelledError
     tokens = [(job["prompt"][-1] + 1 + i) % 32 for i in range(job["max_tokens"])]
     top = [{t: -1.0, 0: -2.0} for t in tokens]
     seqs = [Seq(tokens, [-1.0] * len(tokens), top, False) for _ in range(job["num_samples"])]

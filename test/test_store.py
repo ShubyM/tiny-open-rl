@@ -149,8 +149,8 @@ class TestStore(unittest.TestCase):
     ones = torch.ones(8, dtype=torch.float32)
 
     store.put(uri + ".bak", {"a": ones * 7, "b": ones * 7, "c": ones * 7})
-    store.put(uri, {"a": ones, "b": ones * 2, "c": ones * 3})
-    p1 = os.path.realpath(store.local_folder(uri)[0])
+    v1 = store.put(uri, {"a": ones, "b": ones * 2, "c": ones * 3})
+    p1 = os.path.realpath(store.local_folder(uri, v1)[0])
 
     errors = []
     running = True
@@ -171,21 +171,18 @@ class TestStore(unittest.TestCase):
     try:
       for step in range(2, 7):
         store.put(uri, {"a": ones * step, "b": ones * step, "c": ones * step})
-        if step == 2:
-          self.assertTrue(os.path.exists(p1), "p1 shard files stay intact for in-flight reader")
-        if step == 3:
-          self.assertFalse(os.path.exists(p1), "p1 is garbage-collected after two newer saves")
-          parent = os.path.dirname(store.path(uri))
-          atomic_entries = [
-            n
-            for n in os.listdir(parent)
-            if (n == "atomic" or n.startswith(".atomic.")) and not n.startswith(".atomic.bak.")
-          ]
-          self.assertLessEqual(len(atomic_entries), 4)
+      # Explicit version v1 stays independently readable across later saves until explicitly deleted.
+      self.assertTrue(os.path.exists(p1))
+      self.assertTrue(torch.equal(store.get(uri, v1)[0]["c"], ones * 3))
     finally:
       running = False
       t.join()
     self.assertEqual(errors, [])
+    self.assertTrue(store.delete_version(uri, v1))
+    self.assertFalse(os.path.exists(p1))
+    with self.assertRaises(ValueError):
+      store.get(uri, v1)
+    self.assertTrue(torch.equal(store.get(uri)[0]["a"], ones * 6))
     self.assertTrue(
       torch.equal(store.get(uri + ".bak")[0]["a"], ones * 7), "sibling checkpoint with prefix stays intact"
     )
@@ -256,24 +253,80 @@ class TestStore(unittest.TestCase):
     saver.upload_pending_saves()
     self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))
 
-  def test_three_saves_leave_exactly_two_versions(self):
-    root = f"memory://tinyrl-test-d4-count-{uuid.uuid4()}"
+  def test_explicit_versions_stay_readable_after_later_saves_until_deleted(self):
+    root = f"memory://tinyrl-test-versions-{uuid.uuid4()}"
+    writer, reader = Store(root=root, cache=tempfile.mkdtemp()), Store(root=root, cache=tempfile.mkdtemp())
+    uri = "tinker://r/weights/series"
+    versions = []
+    for i in (1, 2, 3):
+      versions.append(writer.put(uri, {"w": torch.full((4,), float(i))}, {"step": i}))
+      writer.upload_pending_saves()
+    # Version 1 is still readable after versions 2 and 3 moved _latest forward, and read_meta avoids shard downloads.
+    self.assertEqual(reader.read_meta(uri, versions[0]), {"step": 1})
+    self.assertEqual(reader.cached_versions(), [])
+    self.assertTrue(torch.equal(reader.get(uri, versions[0])[0]["w"], torch.full((4,), 1.0)))
+    self.assertTrue(torch.equal(reader.get(uri)[0]["w"], torch.full((4,), 3.0)))
+    self.assertTrue(writer.delete_version(uri, versions[0]))
+    fresh = Store(root=root, cache=tempfile.mkdtemp())
+    with self.assertRaisesRegex(ValueError, "has not landed"):
+      fresh.get(uri, versions[0])
+    self.assertTrue(torch.equal(fresh.get(uri, versions[1])[0]["w"], torch.full((4,), 2.0)))
+
+  def test_legacy_layouts_still_read_and_fail_explicitly_on_unknown_version(self):
+    import json
+
+    import safetensors.torch
+
+    # Legacy remote layout: files in <uri>/<ver>/ + _latest, with no <ver>.json manifest.
+    root = f"memory://tinyrl-legacy-{uuid.uuid4()}"
     store = Store(root=root, cache=tempfile.mkdtemp())
-    uri = "tinker://r/weights/d4_count"
+    uri, dest = "tinker://r/weights/legacy", store.path("tinker://r/weights/legacy")
+    tmp = tempfile.mkdtemp()
+    safetensors.torch.save_file(
+      {"w": torch.tensor([7.0])}, f"{tmp}/state.safetensors", metadata={"meta": '{"base":"m"}'}
+    )
+    store.fs.put_file(f"{tmp}/state.safetensors", f"{dest}/oldver/state.safetensors")
+    store.fs.pipe_file(
+      f"{dest}/_latest",
+      json.dumps({"version": "oldver", "dir": "r/weights/legacy/oldver", "files": ["state.safetensors"]}).encode(),
+    )
+    self.assertEqual(store.read_meta(uri), {"base": "m"})
+    self.assertTrue(torch.equal(Store(root, cache=tempfile.mkdtemp()).get(uri, "oldver")[0]["w"], torch.tensor([7.0])))
+    with self.assertRaisesRegex(ValueError, "has not landed"):
+      Store(root, cache=tempfile.mkdtemp()).get(uri, "otherver")
 
-    store.put(uri, {"w": torch.ones(1)})
+    # Legacy local layout: plain folder holding state.safetensors, no manifest.
+    local = Store(root=tempfile.mkdtemp())
+    ldir = local.path(uri)
+    os.makedirs(ldir)
+    safetensors.torch.save_file(
+      {"w": torch.tensor([9.0])}, f"{ldir}/state.safetensors", metadata={"meta": '{"ok":true}'}
+    )
+    got, meta = local.get(uri)
+    self.assertEqual(meta, {"ok": True})
+    self.assertTrue(torch.equal(got["w"], torch.tensor([9.0])))
+    with self.assertRaisesRegex(ValueError, "not found"):
+      local.get(uri, "missing-legacy")
+
+  def test_priority_uploads_outrun_ordinary_saves_without_moving_latest_backward(self):
+    root = f"memory://tinyrl-prio-{uuid.uuid4()}"
+    store = Store(root=root, cache=tempfile.mkdtemp())
+    uri = "tinker://r/weights/p"
+    ordinary = store.put(uri, {"w": torch.tensor([1.0])}, priority=False)
+    time.sleep(0.01)
+    urgent = store.put(uri, {"w": torch.tensor([2.0])}, priority=True)
+    order = []
+    real_upload = store.upload_version
+
+    def record(u, v):
+      order.append(v)
+      return real_upload(u, v)
+
+    store.upload_version = record
     store.upload_pending_saves()
-
-    store.put(uri, {"w": torch.ones(2)})
-    store.upload_pending_saves()
-
-    store.put(uri, {"w": torch.ones(3)})
-    store.upload_pending_saves()
-
-    # Check that exactly two versions exist in the bucket
-    remote_dir = f"{store.base}/r/weights/d4_count"
-    versions = [e for e in store.fs.ls(remote_dir, detail=False) if os.path.basename(e) != "_latest"]
-    self.assertEqual(len(versions), 2)
+    self.assertEqual(order, [urgent, ordinary])
+    # Even though `ordinary` finished uploading after `urgent`, _latest stays at the newer `urgent`.
+    self.assertEqual(Store(root, cache=tempfile.mkdtemp()).get(uri)[0]["w"].item(), 2.0)
 
 
 class TestRegistry(RedisTest):
@@ -321,6 +374,249 @@ class TestRegistry(RedisTest):
     self.assertTrue(os.path.exists(f"{store.cache}/{versions[0]}.upload"))
     self.assertFalse(os.path.isdir(f"{store.cache}/{versions[1]}"))
     self.assertFalse(os.path.exists(f"{store.cache}/{versions[1]}.upload"))
+
+
+SOURCE_SUBPROCESS = """
+import json, sys, torch
+from tinyrl.storage.store import Store
+root, cache = sys.argv[1], sys.argv[2]
+store = Store(root, cache=cache)
+store.start()
+store.stopping.set()
+store.wake.set()
+store.uploader.join()
+print(json.dumps({"peer": store.peer}), flush=True)
+for line in sys.stdin:
+  cmd = json.loads(line)
+  if cmd["op"] == "put":
+    ref = store.put(cmd["uri"], {"w": torch.full((cmd.get("n", 256),), float(cmd["val"]))}, {"tag": cmd["tag"]})
+    print(json.dumps({"ref": ref, "durable": store.is_durable(cmd["uri"], ref)}), flush=True)
+  elif cmd["op"] == "upload":
+    ok = store.upload_version(cmd["uri"], cmd["version"])
+    print(json.dumps({"ok": ok, "durable": store.is_durable(cmd["uri"], cmd["version"])}), flush=True)
+"""
+
+READER_SUBPROCESS = """
+import json, sys, torch
+from tinyrl.storage.store import Store
+root, cache, uri, version, peer = sys.argv[1:6]
+store = Store(root, cache=cache)
+with store.hold(uri, version, (peer,) if peer else ()) as (folder, ver):
+  print(json.dumps({"locked": folder, "version": ver}), flush=True)
+  sys.stdin.readline()
+  got, meta = store.get(uri, ver)
+  print(json.dumps({"val": got["w"][0].item(), "len": got["w"].numel(), "meta": meta}), flush=True)
+"""
+
+
+class TestStorageLifecycle(RedisTest):
+  """Scenario 1: real subprocesses, peer HTTP transfer, file:// durable backend, reader protection and sweep."""
+
+  def spawn(self, code: str, *args: str, env: dict | None = None) -> subprocess.Popen:
+    proc = subprocess.Popen(
+      [sys.executable, "-c", code, *args],
+      stdin=subprocess.PIPE,
+      stdout=subprocess.PIPE,
+      text=True,
+      env={**os.environ, **(env or {})},
+    )
+
+    def stop():
+      if proc.poll() is None:
+        proc.kill()
+        proc.wait()
+      for pipe in (proc.stdin, proc.stdout):
+        if pipe:
+          pipe.close()
+
+    self.addCleanup(stop)
+    return proc
+
+  async def test_versions_durability_reader_protection_and_incomplete_publication(self):
+    import json
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = f"file://{tmp}/bucket"
+      src_cache, dst_cache = f"{tmp}/src", f"{tmp}/dst"
+      uri = "tinker://job-1/weights/state"
+
+      # 1. Incomplete local/peer copy held before manifest publication is never read or served.
+      dst = Store(root, cache=dst_cache)
+      src = self.spawn(SOURCE_SUBPROCESS, root, src_cache)
+      peer = json.loads(await asyncio.to_thread(src.stdout.readline))["peer"]
+      os.makedirs(f"{src_cache}/halfver", exist_ok=True)
+      with open(f"{src_cache}/halfver/state.safetensors", "wb") as f:
+        f.write(b"partial")
+      with self.assertRaisesRegex(ValueError, "has not landed"):
+        dst.get(uri, f"halfver@{peer}")
+
+      # 2. Publish A and B under the same URI; A is readable from peer before upload and is NOT claimed durable.
+      src.stdin.write(json.dumps({"op": "put", "uri": uri, "val": 11.0, "tag": "A", "n": 4096}) + "\n")
+      src.stdin.flush()
+      pub_a = json.loads(await asyncio.to_thread(src.stdout.readline))
+      self.assertFalse(pub_a["durable"])
+      ver_a = await self.registry.register_checkpoint(
+        uri, 16384, version=pub_a["ref"], meta={"tag": "A"}, durable=False
+      )
+      self.assertFalse((await self.registry.get_version(ver_a))["durable"])
+
+      # Peer-transferred copy gives availability on dst, still NOT durable and NOT evictable by trim_cache.
+      reader = self.spawn(READER_SUBPROCESS, root, dst_cache, uri, ver_a, peer)
+      held = json.loads(await asyncio.to_thread(reader.stdout.readline))
+      self.assertEqual(held["version"], ver_a)
+      self.assertFalse(dst.is_durable(uri, ver_a))
+      self.assertEqual(dst.trim_cache(limit=1), [])
+      await self.registry.set_location(ver_a, "dst-peer", True)
+
+      # Publish B on the same URI, overwriting the logical checkpoint name (moving _latest to B once uploaded).
+      src.stdin.write(json.dumps({"op": "put", "uri": uri, "val": 22.0, "tag": "B", "n": 4096}) + "\n")
+      src.stdin.flush()
+      pub_b = json.loads(await asyncio.to_thread(src.stdout.readline))
+      ver_b = await self.registry.register_checkpoint(
+        uri, 16384, version=pub_b["ref"], meta={"tag": "B"}, durable=False
+      )
+      self.assertNotEqual(ver_a, ver_b)
+
+      # Commit A and B durably, plus C (kept strictly non-durable to verify honesty on source death).
+      for v in (ver_a, ver_b):
+        src.stdin.write(json.dumps({"op": "upload", "uri": uri, "version": v}) + "\n")
+        src.stdin.flush()
+        up = json.loads(await asyncio.to_thread(src.stdout.readline))
+        self.assertTrue(up["ok"] and up["durable"])
+        await self.registry.mark_durable(v, peer)
+      self.assertTrue(dst.is_durable(uri, ver_a))  # marks local copy durable now that bucket has A.json
+
+      ephem_uri = "tinker://job-1/sampler_weights/ephem"
+      src.stdin.write(json.dumps({"op": "put", "uri": ephem_uri, "val": 33.0, "tag": "C"}) + "\n")
+      src.stdin.flush()
+      pub_c = json.loads(await asyncio.to_thread(src.stdout.readline))
+      ver_c = await self.registry.register_checkpoint(ephem_uri, 1024, version=pub_c["ref"], durable=False)
+      self.assertFalse((await self.registry.get_version(ver_c))["durable"])
+
+      # 3. Terminate source process abruptly: A and B survive from durable backend (A still reads despite B being _latest);
+      # non-durable C never advertised durability and fails cleanly.
+      src.kill()
+      await asyncio.to_thread(src.wait)
+      fresh = Store(root, cache=f"{tmp}/fresh")
+      got_a, meta_a = fresh.get(uri, ver_a)
+      self.assertEqual((got_a["w"][0].item(), meta_a), (11.0, {"tag": "A"}))
+      got_latest, meta_latest = fresh.get(uri)
+      self.assertEqual((got_latest["w"][0].item(), meta_latest), (22.0, {"tag": "B"}))
+      with self.assertRaisesRegex(ValueError, "has not landed"):
+        fresh.get(ephem_uri, f"{ver_c}@{peer}")
+
+      # 4. Active reader protection (both cluster ref and cross-process flock) defeats concurrent sweep + cache eviction.
+      # ver_a already lost its ckpt:<uri> ref when B overwrote it; hold a cluster reader ref and sweep.
+      self.assertIsNotNone(await self.registry.acquire_ref(ver_a, "read:active", ttl=60))
+      await self.registry.sweep(dst, grace=0, live_peers=set())
+      self.assertEqual((await self.registry.get_version(ver_a))["state"], "live")
+      # Even with cluster ref dropped, the reader subprocess still holds OS flock(LOCK_SH) on dst_cache:
+      # neither tight trim_cache(limit=1) nor sweep may delete the files out from under it.
+      await self.registry.release_ref(ver_a, "read:active")
+      self.assertEqual(dst.trim_cache(limit=1), [])
+      await self.registry.sweep(dst, grace=0, live_peers=set())
+      # Deletion has been claimed in Redis, so new reference acquisition must fail immediately.
+      self.assertIsNone(await self.registry.acquire_ref(ver_a, "read:late", ttl=60))
+      # Yet the already-running reader subprocess finishes reading A cleanly!
+      reader.stdin.write("go\n")
+      reader.stdin.flush()
+      done = json.loads(await asyncio.to_thread(reader.stdout.readline))
+      self.assertEqual((done["val"], done["len"], done["meta"]), (11.0, 4096, {"tag": "A"}))
+      self.assertEqual(await asyncio.to_thread(reader.wait, 10), 0)
+
+      # Once the reader exits, sweep deletes A's local and remote files while leaving B completely intact.
+      await self.registry.sweep(dst, grace=0, live_peers=set())
+      self.assertIsNone(await self.registry.get_version(ver_a))
+      self.assertFalse(os.path.exists(f"{dst_cache}/{ver_a}"))
+      with self.assertRaisesRegex(ValueError, "has not landed"):
+        Store(root, cache=f"{tmp}/after").get(uri, ver_a)
+      self.assertEqual(Store(root, cache=f"{tmp}/after").get(uri, ver_b)[0]["w"][0].item(), 22.0)
+
+      # 5. Previous durable recovery point stays protected while its replacement is only local, and releases once durable.
+      await self.registry.acquire_ref(ver_b, "job:j:durable")
+      await self.registry.unregister_checkpoints(uri)  # only recovery ref keeps ver_b now
+      ver_d = dst.put(uri, {"w": torch.full((16,), 44.0)}, {"tag": "D"})
+      ver_d_id = await self.registry.publish_version(uri, ver_d, 64, durable=False, refs={"job:j:work": 0.0})
+      await self.registry.sweep(dst, grace=0, live_peers=set())
+      self.assertEqual(Store(root, cache=f"{tmp}/rec1").get(uri, ver_b)[0]["w"][0].item(), 22.0)
+      dst.upload_version(uri, ver_d_id)
+      await self.registry.mark_durable(ver_d_id)
+      await self.registry.acquire_ref(ver_d_id, "job:j:durable")
+      await self.registry.release_ref(ver_b, "job:j:durable")
+      await self.registry.sweep(dst, grace=0, live_peers=set())
+      self.assertIsNone(await self.registry.get_version(ver_b))
+      self.assertEqual(Store(root, cache=f"{tmp}/rec2").get(uri, ver_d_id)[0]["w"][0].item(), 44.0)
+
+  async def test_single_flight_lane_priority_and_prompt_prefetch_cancellation(self):
+    import threading
+
+    from tinyrl.storage.store import TransferCancelled, split_version
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = f"file://{tmp}/bucket"
+      writer = Store(root, cache=f"{tmp}/writer")
+      writer.start()
+      try:
+        # 1. Single-flight deduplication: 4 concurrent readers of the same remote version copy from peer once.
+        uri_sf = "tinker://job/weights/shared"
+        v_sf, peer = split_version(writer.put(uri_sf, {"w": torch.arange(65536, dtype=torch.float32)}, {"tag": "sf"}))
+        reader = Store(root, cache=f"{tmp}/reader")
+        calls, real_copy = 0, reader._copy_from_peer
+
+        def counted_copy(*args, **kwargs):
+          nonlocal calls
+          calls += 1
+          time.sleep(0.05)
+          return real_copy(*args, **kwargs)
+
+        reader._copy_from_peer = counted_copy
+        folders = await asyncio.gather(
+          *(asyncio.to_thread(reader.local_folder, uri_sf, v_sf, (peer,), lane="required") for _ in range(4))
+        )
+        self.assertEqual(len(set(folders)), 1)
+        self.assertEqual(calls, 1)
+        self.assertGreater(reader.cache_status()["transferred_bytes"], 0)
+
+        # 2. Prompt chunk-level prefetch cancellation stops mid-transfer, leaves no partial files, and records cancelled_bytes;
+        # while the prefetch lane is completely saturated, the `required` lane proceeds immediately without blocking.
+        uri_pre = "tinker://job/weights/prefetch"
+        uri_req = "tinker://job/weights/required"
+        v_pre, _ = split_version(writer.put(uri_pre, {"w": torch.ones(1_048_576, dtype=torch.float32)}, {"tag": "pre"}))
+        v_req, _ = split_version(writer.put(uri_req, {"w": torch.full((1024,), 9.0)}, {"tag": "req"}))
+
+        dst = Store(root, cache=f"{tmp}/dst")
+        dst.lanes["prefetch"] = threading.BoundedSemaphore(1)
+        started, allow_next, cancel = threading.Event(), threading.Event(), threading.Event()
+        orig_chunk = dst._on_chunk
+
+        def gated_chunk(tr, ev, n):
+          orig_chunk(tr, ev, n)
+          if ev is cancel and n > 0 and not started.is_set():
+            started.set()
+            allow_next.wait(timeout=5)
+            orig_chunk(tr, ev, 0)
+
+        dst._on_chunk = gated_chunk
+        prefetch_task = asyncio.create_task(
+          asyncio.to_thread(dst.local_folder, uri_pre, v_pre, (peer,), cancel, "prefetch")
+        )
+        self.assertTrue(await asyncio.to_thread(started.wait, 5))
+        # Required lane completes cleanly while prefetch lane is completely saturated.
+        req_folder, req_ver = await asyncio.to_thread(dst.local_folder, uri_req, v_req, (peer,), None, "required")
+        self.assertEqual(req_ver, v_req)
+        self.assertTrue(os.path.isdir(req_folder))
+        self.assertEqual(dst.get(uri_req, v_req)[0]["w"][0].item(), 9.0)
+
+        # Cancel the obsolete prefetch mid-stream: raises TransferCancelled promptly and leaves zero partial artifacts.
+        cancel.set()
+        allow_next.set()
+        with self.assertRaises(TransferCancelled):
+          await prefetch_task
+        self.assertGreater(dst.cache_status()["cancelled_bytes"], 0)
+        self.assertFalse(os.path.exists(f"{tmp}/dst/{v_pre}"))
+        self.assertEqual([f for f in os.listdir(f"{tmp}/dst") if v_pre in f and ".tmp" in f], [])
+      finally:
+        writer.close(False)
 
 
 if __name__ == "__main__":

@@ -74,12 +74,14 @@ class TestLease(RedisTest):
     base = f"{self.folder.name}/base"
     tiny().save_pretrained(base)
     run = new_id()
-    await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
+    await self.bus.create_run(Run(run, "", base, 4, lora=LORA))
     first = self.daemon()
     scheduling = asyncio.create_task(scheduler.run(self.bus))
     self.tasks.append(scheduling)
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
-    old_owner = await self.bus.lease_owner("worker")
+    worker = (await self.bus.get_run(run))["worker"]
+    gen_before = await self.bus.get_generation(run)
+    old_owner = await self.bus.lease_owner(worker)
     [first_node] = await self.bus.live_nodes()
     second = self.daemon()
 
@@ -88,12 +90,12 @@ class TestLease(RedisTest):
 
     await self.until(both_up)
     await asyncio.sleep(1.5 * LEASE_MS / 1000)
-    self.assertEqual(await self.bus.lease_owner("worker"), old_owner)
+    self.assertEqual(await self.bus.lease_owner(worker), old_owner)
     self.assertEqual(len(await self.bus.r.xinfo_consumers(key("q", run), GROUP)), 1)
 
     async def reported():
       node = (await self.bus.live_nodes(details=True)).get(first_node, {})
-      return node.get("workers", {}).get("worker", {}).get("pid")
+      return node.get("workers", {}).get(worker, {}).get("pid")
 
     await self.until(reported)
     model_pid = await reported()
@@ -110,8 +112,9 @@ class TestLease(RedisTest):
       await self.bus.r.hdel(key("nodes"), first_node)  # its heartbeat ran out
       expected = await self.bus.wait_for_reply(request, 30)
       self.assertFalse(expected.ok)
-      self.assertIn("lost the worker", json.loads(expected.body)["error"])
-      new_owner = await self.bus.lease_owner("worker")
+      self.assertIn("lost the job", json.loads(expected.body)["error"])
+      self.assertGreater(await self.bus.get_generation(run), gen_before)
+      new_owner = await self.bus.lease_owner(worker)
       self.assertNotEqual(new_owner, old_owner)
     finally:
       first.send_signal(signal.SIGCONT)
@@ -126,7 +129,7 @@ class TestLease(RedisTest):
     self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
     self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
     other = new_id()
-    await self.bus.create_run(Run(other, "worker", base, 4, lora=LORA))
+    await self.bus.create_run(Run(other, "", base, 4, lora=LORA))
     self.assertTrue((await self.call(other, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
     self.assertIsNone(second.poll())
 
@@ -135,19 +138,25 @@ class TestLease(RedisTest):
     base = f"{self.folder.name}/base"
     tiny().save_pretrained(base)
     run = new_id()
-    await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
+    await self.bus.create_run(Run(run, "", base, 4, lora=LORA))
     proc = self.daemon()
     self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
+    worker = (await self.bus.get_run(run))["worker"]
     proc.terminate()
     self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
-    uri = await self.bus.parked_checkpoint(run)
-    self.assertIsNotNone(uri)
-    tensors, meta = self.store.get(uri)
+    working = (await self.bus.get_run(run))["state"]["working"]
+    self.assertIsNotNone(working)
+    tensors, meta = self.store.get(working["uri"], working["version"])
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])
-    self.assertIsNotNone(await self.registry.get_checkpoint(uri))
-    self.assertIsNone(await self.bus.lease_owner("worker"))
+    self.assertIsNotNone(await self.registry.get_version(working["version"]))
+    self.assertIsNone(await self.bus.lease_owner(worker))
+    obs = (await self.bus.read_table())["observations"][worker]
+    self.assertEqual((obs["gpu_state"], obs["pids_clear"]), ("released", True))
+    # A replacement daemon restores from that committed handoff boundary and advances cleanly.
+    self.daemon()
+    self.assertTrue((await self.call(run, Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})).ok)
 
 
 if __name__ == "__main__":

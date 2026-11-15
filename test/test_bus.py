@@ -98,16 +98,22 @@ class TestBus(RedisTest):
   async def test_delete_removes_owned_checkpoints_and_keeps_saved_weights(self):
     run = await self.new_run()
     owned, saved = [f"tinker://{run}/{path}" for path in ("sampler_weights/session", "weights/save")]
-    for uri in (owned, saved):
-      await self.registry.register_checkpoint(uri, 1, ttl=60, owned=uri == owned)
-    await self.bus.set_parked_checkpoint(run, owned, "p", "w0")
+    park_uri = f"tinker://{run}/weights/.park"
+    await self.registry.register_checkpoint(owned, 1, ttl=60, owned=True, version="v-owned")
+    await self.registry.register_checkpoint(saved, 1, ttl=60, owned=False, version="v-saved", durable=True)
+    gen = await self.bus.get_generation(run)
+    self.assertTrue(
+      await self.bus.commit_job_state(run, gen, park_uri, "v-park", "0-1", 1, durable=False, optimizer=True)
+    )
+    self.assertIn(f"job:{run}:work", await self.registry.version_refs("v-park"))
     request = await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
-    [cmd] = await self.bus.take_commands([run], "w0", count=1)
-    publishing = asyncio.create_task(self.bus.write_reply(cmd, ok(), "p", "w0"))
+    [cmd] = await self.bus.take_commands({run: gen}, "w0", count=1)
+    publishing = asyncio.create_task(self.bus.write_reply(cmd, ok(), "p", "w0", generation=gen))
     try:
       self.assertEqual(await self.bus.wait_for_reply(request, 5), ok())
-      self.assertFalse(await self.bus.r.exists(key("q", run), key("parked", run)))
+      self.assertFalse(await self.bus.r.exists(key("q", run)))
       self.assertFalse(await self.bus.r.sismember(key("runs"), run))
+      self.assertEqual(await self.registry.version_refs("v-park"), {})
       self.assertIsNone(await self.registry.get_checkpoint(owned))
       self.assertIsNotNone(await self.registry.get_checkpoint(saved))
       for index in ("ckpts", "expiry"):

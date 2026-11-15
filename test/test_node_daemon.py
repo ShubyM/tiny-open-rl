@@ -81,20 +81,21 @@ class TestNodeDaemon(RedisTest):
     node, a, b = self.node(), new_id(), new_id()
     creates = {}
     for run in (a, b):
-      await self.bus.create_run(Run(run, "worker", "tiny", 4, lora=LORA))
+      await self.bus.create_run(Run(run, "", "tiny", 4, lora=LORA))
       creates[run] = await self.bus.submit_command(
         run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
       )
     for _ in range(12):
       await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
-    await node.add("worker")
-    child = node.processes["worker"]
+    worker = await node.worker_for(a)
+    await node.add(worker)
     self.assertTrue((await self.bus.wait_for_reply(creates[b], 5)).ok)
+    child = node.processes[worker]
     self.assertLessEqual((await self.bus.get_run(a))["steps"], 4)
     self.assertGreater((await self.bus.queued_and_in_flight(a))["queued"], 0)
     await node.drain(a)
     self.assertEqual((await self.bus.get_run(a))["steps"], 12)
-    self.assertIs(node.processes["worker"], child)
+    self.assertIs(node.processes[worker], child)
 
   async def test_a_slow_checkpoint_read_does_not_block_ready_work_or_gpu_handoff(self):
     with tempfile.TemporaryDirectory() as folder:
@@ -102,27 +103,27 @@ class TestNodeDaemon(RedisTest):
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       release, read = threading.Event(), node.store.local_folder
 
-      def slow_read(*args):  # a big copy still running
+      def slow_read(*args, **kwargs):  # a big copy still running on host/disk
         release.wait()
-        return read(*args)
+        return read(*args, **kwargs)
 
       node.store.local_folder = slow_read
       uri = "tinker://training/sampler_weights/slow"
       version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
       await self.registry.register_checkpoint(uri, 0, version=version)
-      await self.bus.create_run(Run("slow", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
-      await self.bus.create_run(Run("ready", "sampler", "tiny", 4, role=Role.SAMPLER))
-      resident = await node.add("sampler")
+      await self.bus.create_run(Run("slow", "", "tiny", 4, role=Role.SAMPLER, model_path=uri))
+      await self.bus.create_run(Run("ready", "", "tiny", 4, role=Role.SAMPLER))
+      resident = await node.worker_for("ready")
       slow = await self.bus.submit_command("slow", Op.SAMPLE, json.dumps(JOB).encode())
       try:
         ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(ready, node)
-        await self.bus.create_run(Run("other", "other", "tiny", 4, role=Role.SAMPLER))
-        contender = await node.add("other", gpus=[0])
+        await self.bus.create_run(Run("other", "", "tiny-other", 4, role=Role.SAMPLER))
         request = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(request, node)
-        self.assertIsNone(resident.served)
-        self.assertIsNotNone(contender.served)
+        contender = await node.worker_for("other")
+        self.assertEqual(node.running[resident]["gpu_state"], "offloaded")
+        self.assertEqual(node.running[contender]["gpu_state"], "active")
         self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
         self.assertEqual(await self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
       finally:
@@ -138,8 +139,7 @@ class TestNodeDaemon(RedisTest):
       uri = "tinker://training/sampler_weights/lost"
       version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
       await self.registry.register_checkpoint(uri, 0, version=version)
-      await self.bus.create_run(Run("lost", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
-      await node.add("sampler")
+      await self.bus.create_run(Run("lost", "", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
       waiting = self.background(self.bus.wait_for_reply(request, 10))
       await self.until(waiting.done, node)
@@ -152,29 +152,39 @@ class TestNodeDaemon(RedisTest):
     base = f"{node.store.root}/base"
     tiny().save_pretrained(base)
     a, b = new_id(), new_id()
-    for run, worker in ((a, "a"), (b, "b")):
-      await self.bus.create_run(Run(run, worker, base, 4, lora=LORA))
+    await self.bus.create_run(Run(a, "", base, 0))
+    await self.bus.create_run(Run(b, "", base, 0))
     await node.announce_node()
     self.background(scheduler.run(self.bus))
-    await self.create(a, base, node)
-    holder = node.running["a"]
-    os.killpg(holder.pid, signal.SIGSTOP)
+    await self.reply(
+      await self.bus.submit_command(
+        a, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
+      ),
+      node,
+    )
+    wa = (await self.bus.get_run(a))["worker"]
+    wb = (await self.bus.get_run(b))["worker"]
+    holder_pid = node.running[wa]["pid"]
+    os.killpg(holder_pid, signal.SIGSTOP)
     try:
       request = await self.bus.submit_command(
-        b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
+        b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
       )
-      await self.until(lambda: "b" in node.running and node.running["b"].ticket > 0, node)
-      self.assertIsNotNone(holder.served)
-      self.assertIsNone(node.running["b"].served)
+      await self.until(lambda: wb in node.running and node.state.workers[wa].intent == "drain", node)
+      # Physical GPU 0 is never granted to wb while wa's process has not acknowledged release/offload.
+      self.assertEqual(node.running[wa]["gpu_state"], "active")
+      self.assertEqual(node.running[wb]["gpu_state"], "released")
+      self.assertEqual(node.state.workers[wb].gpus, ())
       self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})
       heartbeat = (await self.bus.live_nodes(details=True))[node.id]["until"]
       await node.tick()
       self.assertGreater((await self.bus.live_nodes(details=True))[node.id]["until"], heartbeat)
     finally:
       with contextlib.suppress(ProcessLookupError):
-        os.killpg(holder.pid, signal.SIGCONT)
+        os.killpg(holder_pid, signal.SIGCONT)
     await self.reply(request, node)
-    self.assertIsNone(holder.served)
+    self.assertEqual(node.running[wa]["gpu_state"], "offloaded")
+    self.assertEqual(node.running[wb]["gpu_state"], "active")
 
   async def test_real_model_process_serves_moves_and_restarts(self):
     require_unix()
@@ -182,19 +192,38 @@ class TestNodeDaemon(RedisTest):
     base = f"{node.store.root}/base"
     tiny().save_pretrained(base)
     run = new_id()
-    await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
+    await self.bus.create_run(Run(run, "", base, 4, lora=LORA))
     await node.announce_node()
-    self.background(scheduler.run(self.bus))
+    sched = self.background(scheduler.run(self.bus))
     await self.create(run, base, node)
-    first = node.running["worker"].pid
-    node.state.workers["worker"].gpus = (1,)
+    worker = (await self.bus.get_run(run))["worker"]
+    first = node.running[worker]["pid"]
+    # Issue a fleet GPU reassignment to physical GPU 1.
+    sched.cancel()
+    await asyncio.gather(sched, return_exceptions=True)
+    s = await node.read_state()
+    w = s.workers[worker]
+    w.gpus, w.intent, w.budgets, w.revision = (1,), "run", {run: scheduler.TURN}, w.revision + 1
+    await self.bus.write_table({}, {worker: scheduler.worker_to_dict(w)}, [], s.workers_made, [])
     request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
     await self.reply(request, node)
-    self.assertEqual(node.running["worker"].pid, first)
-    self.assertEqual(node.running["worker"].gpus, (1,))
+    self.assertEqual(node.running[worker]["pid"], first)
+    self.assertEqual(node.running[worker]["gpus"], (1,))
+    self.background(scheduler.run(self.bus))
     os.killpg(first, signal.SIGKILL)
-    await self.until(lambda: "worker" in node.running and node.running["worker"].pid != first, node)
-    await self.create(run, base, node)
+    gen_before = await self.bus.get_generation(run)
+    # Acknowledged OPTIM_STEP had no durable save -> restarted worker bumps generation and surfaces rollback.
+    denied = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    waiting = self.background(self.bus.wait_for_reply(denied, 30))
+    await self.until(waiting.done, node)
+    self.assertGreater(await self.bus.get_generation(run), gen_before)
+    self.assertFalse(waiting.result().ok)
+    self.assertIn("rolled back", waiting.result().body.decode())
+    # A new sibling run on the recovered worker launches a fresh model process.
+    other = new_id()
+    await self.bus.create_run(Run(other, "", base, 4, lora=LORA))
+    await self.create(other, base, node)
+    self.assertNotIn(node.running[worker]["pid"], (None, first))
 
   async def test_the_node_uploads_what_its_model_saved(self):
     with tempfile.TemporaryDirectory() as folder:

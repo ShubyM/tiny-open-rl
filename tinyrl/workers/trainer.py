@@ -6,19 +6,23 @@ Model tensors, optimizer state and checkpoint I/O stay here. Only request bytes,
 from __future__ import annotations
 
 import contextlib
+import datetime
 import json
 import os
 import sys
-import time
 
 import torch
 import torch.distributed as dist
 
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Reply
-from tinyrl.storage.store import Store, nbytes
+from tinyrl.helpers import getenv
+from tinyrl.storage.store import Store, nbytes, split_version
 from tinyrl.trace import span
 from tinyrl.workers.model import Model
+
+COLL_TIMEOUT_S = getenv("COLL_TIMEOUT_S", 180)
+CONTROL = None  # gloo group for idle RPC dispatch so parked followers neither spin GPUs nor hit NCCL's timeout
 
 
 def ok(body: dict) -> Reply:
@@ -27,9 +31,13 @@ def ok(body: dict) -> Reply:
 
 def serve_follower(model: Model) -> None:
   while True:
-    dist.broadcast_object_list(msg := [None], src=0)
-    with contextlib.suppress(ValueError, KeyError):  # rejected the same way on every rank, before any collective
-      getattr(model, msg[0][0])(*msg[0][1])
+    dist.broadcast_object_list(msg := [None], src=0, group=CONTROL)
+    method, args = msg[0]
+    if method == "__stop__":
+      dist.barrier()
+      return
+    with contextlib.suppress(ValueError, KeyError):  # rejected identically on every rank before any collective
+      getattr(model, method)(*args)
 
 
 class Trainer:
@@ -41,76 +49,161 @@ class Trainer:
   def call_model(self, method: str, *args):
     try:
       if self.world_size > 1:
-        dist.broadcast_object_list([(method, args)], src=0)
+        dist.broadcast_object_list([(method, args)], src=0, group=CONTROL)
       with span(f"model.{method}"):
         return getattr(self.model, method)(*args)
     except Exception as e:
-      # The other ranks may be waiting in a collective this rank left; torchrun must restart them all.
       if self.world_size > 1 and not isinstance(e, (ValueError, KeyError)):
         os._exit(1)
       raise
 
-  def save(
-    self, run: str, uri: str, sampler: bool = False, ttl_seconds: int | None = None, owned: bool = False
+  def ensure_run(self, run: str, base: str, rank: int, lora: dict | None = None) -> dict:
+    if run not in self.model.params:
+      self.call_model("create_run", run, base, rank, lora or {})
+    return {"profile": self.model.profile(), "lora_config": dict(self.model.configs[run])}
+
+  def restore_job(
+    self,
+    run: str,
+    base: str,
+    rank: int,
+    lora: dict | None,
+    uri: str,
+    version: str | None = None,
+    peers: tuple[str, ...] = (),
+    optimizer: bool = True,
+    gradients: bool = True,
   ) -> dict:
-    tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
-    version = self.store.put(uri, tensors, meta)
-    return {
-      "uri": uri,
-      "size": sum(map(nbytes, tensors.values())),
-      "ttl": ttl_seconds,
-      "owned": owned,
-      "version": version,
+    created = run not in self.model.params
+    if created:
+      self.call_model("create_run", run, base, rank, lora or {})
+    try:
+      tensors, meta = self.store.get(uri, version, peers)
+      info = self.call_model("restore_run", run, tensors, meta, optimizer, gradients)
+      return info | {"profile": self.model.profile(), "lora_config": dict(self.model.configs[run])}
+    except Exception:
+      if created and run in self.model.params:
+        self.call_model("delete_run", run)
+      raise
+
+  def drop_run(self, run: str) -> dict:
+    if run in self.model.params:
+      self.call_model("delete_run", run)
+    return self.model.memory_state()
+
+  def save(
+    self,
+    run: str,
+    uri: str,
+    *,
+    sampler: bool = False,
+    ttl_seconds: int | None = None,
+    owned: bool = False,
+    boundary: str = "",
+    source_version: str | None = None,
+    priority: bool = False,
+  ) -> dict:
+    if sampler:
+      tensors, meta = self.call_model("sampler_weights", run, source_version, boundary)
+    else:
+      tensors, meta = self.call_model("training_state", run, boundary)
+    raw = self.store.put(uri, tensors, meta, priority=priority)
+    ver, loc = split_version(raw)
+    size = self.store.version_size(uri, ver) or sum(map(nbytes, tensors.values()))
+    head = {"uri": uri, "size": size, "ttl": ttl_seconds, "owned": owned, "version": ver, "location": loc}
+    return head | {
+      "durable": self.store.is_durable(uri, ver),
+      "boundary": boundary,
+      "optimizer": not sampler,
+      "meta": meta,
     }
 
-  def load_run(self, run: str, uri: str, version: str | None, optimizer: bool, gradients: bool) -> None:
-    self.call_model("restore_run", run, *self.store.get(uri, version), optimizer, gradients)
+  def snapshot_job(self, run: str, uri: str, boundary: str, priority: bool = False) -> dict:
+    return self.save(run, uri, owned=True, boundary=boundary, priority=priority)
 
   def execute(
-    self, cmd: Cmd, run: dict | None = None, parked: tuple[str, str | None] | None = None, version: str | None = None
+    self,
+    cmd: Cmd,
+    run: dict | None = None,
+    version: str | None = None,
+    peers: tuple[str, ...] = (),
+    boundary: str = "",
+    source_version: str | None = None,
   ) -> tuple[Reply, dict]:
     with span("trainer.execute"):
       effects, created = {}, False
       try:
-        if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
-          if cmd.op == Op.DELETE_MODEL:
-            return ok({"type": cmd.op, "model_id": cmd.run}), effects
-          if not parked and cmd.op != Op.LOAD_WEIGHTS:
-            raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
-          if run is None:
-            raise KeyError(f"no training run {cmd.run}")
-          self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
-          created = True
-          if parked:
-            self.load_run(cmd.run, *parked, optimizer=True, gradients=True)
-            effects["restored"] = parked[0]
-            created = False  # recovery succeeded, even if the command that follows is rejected
+        if cmd.op == Op.DELETE_MODEL:
+          if cmd.run in self.model.params:
+            self.call_model("delete_run", cmd.run)
+          return ok({"type": cmd.op, "model_id": cmd.run}), effects
 
         if cmd.op == Op.FORWARD_BACKWARD:
+          if cmd.run not in self.model.params:
+            raise KeyError(f"model {cmd.run} is not restored on this trainer; call load_weights")
           req = wire.parse(cmd.body)
           fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
           logprobs, metrics = self.call_model("forward_backward", *fb)
+          effects["mutated"] = not req.forward_only
           return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), effects
 
         args = json.loads(cmd.body)
+        if cmd.op not in (Op.CREATE_MODEL, Op.LOAD_WEIGHTS) and cmd.run not in self.model.params:
+          raise KeyError(f"model {cmd.run} is not restored on this trainer; call load_weights")
+
         match cmd.op:
           case Op.CREATE_MODEL:
             self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
+            effects["profile"] = self.model.profile()
+            effects["lora_config"] = dict(self.model.configs[cmd.run])
           case Op.OPTIM_STEP:
             metrics = self.call_model("optim_step", cmd.run, args["adam_params"])
+            effects["mutated"] = True
             return ok({"type": cmd.op, "metrics": metrics}), effects
-          case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
+          case Op.SAVE_WEIGHTS:
             effects["saved"] = self.save(
               cmd.run,
               args["uri"],
-              cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER,
-              args.get("ttl_seconds"),
-              args.get("owned", False),
+              ttl_seconds=args.get("ttl_seconds"),
+              owned=args.get("owned", False),
+              boundary=boundary or cmd.entry_id,
+              priority=True,
             )
+          case Op.SAVE_WEIGHTS_FOR_SAMPLER:
+            saved = self.save(
+              cmd.run,
+              args["uri"],
+              sampler=True,
+              ttl_seconds=args.get("ttl_seconds"),
+              owned=args.get("owned", False),
+              boundary=boundary,
+              source_version=source_version,
+            )
+            if sid := args.get("sampling_session_id"):
+              saved["sampling_session_id"] = sid
+            effects["saved"] = saved
           case Op.LOAD_WEIGHTS:
-            self.load_run(cmd.run, args["uri"], version, optimizer=args["optimizer"], gradients=False)
-          case Op.DELETE_MODEL:
-            self.call_model("delete_run", cmd.run)
+            if cmd.run not in self.model.params:
+              if run is None:
+                raise KeyError(f"no training run {cmd.run}")
+              self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
+              created = True
+            with self.store.hold(args["uri"], version, peers) as (_, resolved):
+              tensors, meta = self.store.get(args["uri"], resolved, peers)
+            info = self.call_model("restore_run", cmd.run, tensors, meta, args["optimizer"], False)
+            created = False
+            effects["mutated"] = True
+            ld = {
+              "uri": args["uri"],
+              "version": resolved,
+              "optimizer": bool(args["optimizer"]),
+              "boundary": cmd.entry_id,
+            }
+            effects["loaded"] = ld | {
+              "durable": self.store.is_durable(args["uri"], resolved),
+              "profile": self.model.profile(),
+              "rng_remapped": info["rng_remapped"],
+            }
           case _:
             raise ValueError(f"unknown op {cmd.op}")
 
@@ -119,34 +212,40 @@ class Trainer:
           reply["sampling_session_id"] = args["sampling_session_id"]
         return ok(reply), effects
       except Exception as e:
-        if created:  # a failed restore must not leave a fresh model serving requests as recovered state
+        if created and cmd.run in self.model.params:
           self.call_model("delete_run", cmd.run)
         return Reply.error(e), effects
 
-  def park_all(self) -> list[dict]:
-    return [
-      {"run": run, **self.save(run, f"tinker://{run}/parked/{time.time_ns()}", owned=True)}
-      for run in list(self.model.params)
-    ]
+  def park(self) -> dict:
+    return self.call_model("park_on_host")
 
-  def park(self) -> None:
-    self.call_model("park_on_host")
-
-  def resume(self, gpu: int | None = None) -> None:
+  def resume(self, gpu: int | None = None) -> dict:
     if gpu is not None and torch.cuda.is_available():
       torch.cuda.set_device(gpu)
-    self.call_model("resume_on_gpu")
+    return self.call_model("resume_on_gpu")
+
+  def memory(self) -> dict:
+    return self.model.memory_state()
+
+  def shutdown(self) -> bool:
+    if self.world_size > 1 and dist.is_initialized():
+      dist.broadcast_object_list([("__stop__", ())], src=0, group=CONTROL)
+      dist.barrier()
+    return True
 
 
 def main(path: str) -> None:
+  global CONTROL
   from tinyrl.control.process import die_with_parent, serve
 
-  die_with_parent()  # also for torchrun ranks, whose sessions are outside their launcher's process group
+  die_with_parent()
   if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
   if int(os.environ.get("WORLD_SIZE", 1)) > 1:
     dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
-    dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", device_id=dev)
+    timeout = datetime.timedelta(seconds=COLL_TIMEOUT_S)
+    dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", device_id=dev, timeout=timeout)
+    CONTROL = dist.new_group(backend="gloo", timeout=datetime.timedelta(days=365))
   try:
     if dist.is_initialized() and dist.get_rank() > 0:
       serve_follower(Model())
@@ -155,7 +254,8 @@ def main(path: str) -> None:
       serve(path, lambda method, *args: getattr(trainer, method)(*args))
   finally:
     if dist.is_initialized():
-      dist.destroy_process_group()
+      with contextlib.suppress(Exception):
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
