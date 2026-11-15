@@ -1,14 +1,12 @@
-"""The fleet owns GPU bundles and bounded job grants. Nodes execute and acknowledge them."""
+"""Claims own live job state. Immutable turns own GPU execution until physical release."""
 
 from __future__ import annotations
 
 import asyncio
 import copy
-import dataclasses
 import itertools
 import json
 import secrets
-from dataclasses import dataclass, field
 
 from tinyrl.bus import Bus, Role, key
 from tinyrl.helpers import getenv
@@ -17,80 +15,14 @@ from tinyrl.storage.registry import Registry
 TURN, TICK_MS = getenv("TURN", 200_000), getenv("TICK_MS", 100)
 
 
-@dataclass(frozen=True)
-class WorkerSpec:
-  role: Role = Role.TRAINER
-  base: str = ""
-  lora: bool = False
-  exclusive: bool = False
-  train_run: str | None = None
-  gpus: int = 1
+def account(run: str, info: dict) -> str:
+  return info.get("train_run") or run
 
 
-@dataclass
-class Job:
-  spec: WorkerSpec
-  worker: str = ""
-  generation: int = 0
-  account: str = ""
-  target_node: str | None = None
-
-
-@dataclass
-class Worker:
-  spec: WorkerSpec = WorkerSpec()
-  node: str | None = None
-  gpus: tuple[int, ...] = ()
-  revision: int = 0
-  budgets: dict[str, int] = field(default_factory=dict)
-  members: dict[str, int] = field(default_factory=dict)
-  owner: str = ""
-
-
-@dataclass
-class Assignment:
-  nodes: dict[str, dict] = field(default_factory=dict)
-  workers: dict[str, Worker] = field(default_factory=dict)
-  jobs: dict[str, Job] = field(default_factory=dict)
-  observations: dict[str, dict] = field(default_factory=dict)
-  owners: dict[str, str] = field(default_factory=dict)
-  service: dict[str, float] = field(default_factory=dict)
-  settled: dict[str, dict] = field(default_factory=dict)
-
-
-def jobs_of(s: Assignment, worker: str) -> list[str]:
-  return [r for r, j in s.jobs.items() if j.worker == worker]
-
-
-def from_table(table: dict) -> Assignment:
-  s = Assignment(**{k: table.get(k, {}) for k in ("nodes", "observations", "owners", "service", "settled")})
-  for r, (rec, worker, st) in table["runs"].items():
-    role = Role(rec.get("role", "trainer"))
-    exclusive, train_run = rec.get("exclusive", False), rec.get("train_run")
-    spec = WorkerSpec(
-      role, rec.get("base", ""), rec.get("rank", 0) > 0, exclusive, train_run if exclusive else None, rec.get("gpus", 1)
-    )
-    s.jobs[r] = Job(
-      spec,
-      worker or "",
-      st.get("generation", 0),
-      train_run or r,
-      st.get("target_node"),
-    )
-  s.jobs = {r: j for r, j in s.jobs.items() if not j.spec.train_run or j.spec.train_run in s.jobs}
-  for n, d in table["workers"].items():
-    spec = WorkerSpec(**d["spec"] | {"role": Role(d["spec"]["role"])})
-    s.workers[n] = Worker(**d | {"spec": spec, "gpus": tuple(d.get("gpus", ()))})
-  for j in s.jobs.values():
-    if j.worker:
-      s.workers.setdefault(j.worker, Worker(j.spec))
-  return s
-
-
-def observed(s: Assignment, name: str) -> dict:
-  w, o = s.workers[name], s.observations.get(name, {})
-  owner = s.owners.get(name)
-  return o if o.get("node") == w.node and (o.get("owner") == owner or (not owner and o.get("closed"))) else {}
+def compatible(run: str, info: dict) -> tuple:
+  role, lora = info.get("role", Role.TRAINER), bool(info.get("rank", 0))
+  private = account(run, info) if info.get("exclusive") else run if role == Role.TRAINER and not lora else None
+  return role, info.get("base", ""), lora, info.get("gpus", 1), private
 
 
 def bundles(info: dict, width: int) -> list[tuple[int, ...]]:
@@ -105,242 +37,209 @@ def bundles(info: dict, width: int) -> list[tuple[int, ...]]:
   )
 
 
-def decide(state: Assignment) -> Assignment:
-  s = copy.deepcopy(state)
-  obs = {n: observed(s, n) for n in s.workers}
-  for n, o in obs.items():
-    if not o:
-      continue
-    prev = s.settled.get(n, {})
-    used = prev.get("usage", {}) if prev.get("owner") == o.get("owner") else {}
-    for account, total in o.get("usage", {}).items():
-      s.service[account] = s.service.get(account, 0.0) + max(0.0, total - used.get(account, 0.0))
-      used[account] = max(total, used.get(account, 0.0))
-    s.settled[n] = {"owner": o.get("owner"), "usage": used}
-
-  def change(w: Worker, **values) -> None:
-    if any(getattr(w, k) != v for k, v in values.items()):
-      for k, v in values.items():
-        setattr(w, k, v)
-      w.revision += 1
-
-  def released(n: str) -> bool:
-    o, w = obs.get(n, {}), s.workers[n]
-    return bool(o.get("released") and o.get("revision") == w.revision and o.get("owner") == w.owner)
-
-  def advance(n: str) -> None:
-    s.workers[n].revision += 1
-    for r in jobs_of(s, n):
-      s.jobs[r].generation += 1
-      if r in s.workers[n].members:
-        s.workers[n].members[r] = s.jobs[r].generation
-
-  for n, w in s.workers.items():
-    o = obs[n]
-    if w.node and w.node not in s.nodes:
-      change(w, node=None, gpus=(), budgets={}, owner="")
-      advance(n)
-      obs[n] = {}
-    elif o and s.owners.get(n) and o["owner"] != w.owner:
-      if w.owner:
-        advance(n)
-      change(w, owner=o["owner"], budgets={})
-    elif o.get("closed") and o.get("revision") == w.revision and w.members and (released(n) or not w.owner):
-      advance(n)
-      change(w, owner="", gpus=(), budgets={})
-  for r, j in s.jobs.items():
-    if not j.worker:
-      continue
-    w, o = s.workers[j.worker], obs.get(j.worker, {})
-    moving = (
-      w.node and j.target_node in s.nodes and w.node != j.target_node and bundles(s.nodes[j.target_node], j.spec.gpus)
-    )
-    if not moving:
-      change(w, members=w.members | {r: j.generation})
-    else:
-      if r in w.members:
-        change(
-          w,
-          members={k: v for k, v in w.members.items() if k != r},
-          budgets={k: v for k, v in w.budgets.items() if k != r},
-        )
-      elif o.get("revision") == w.revision and o.get("owner") == w.owner and r not in o.get("resident", {}):
-        j.worker = ""
-  for r, j in s.jobs.items():
-    if j.worker:
-      continue
-    sharing = j.spec.role == Role.SAMPLER or (j.spec.lora and not j.spec.exclusive)
-    name = next(
-      (
-        n
-        for n, w in s.workers.items()
-        if sharing and w.spec == j.spec and (not j.target_node or w.node in (None, j.target_node))
-      ),
-      None,
-    )
-    if name is None:
-      s.workers[name := f"w:{r}:{j.generation + 1}"] = Worker(j.spec)
-    j.worker, j.generation = name, j.generation + 1
-    change(s.workers[name], members=s.workers[name].members | {r: j.generation})
-  exports = {}
-  for n, w in list(s.workers.items()):
-    members = {r: g for r, g in w.members.items() if r in s.jobs and s.jobs[r].worker == n}
-    resident = set(obs.get(n, {}).get("resident", {}))
-    leaving = (resident - members.keys()) | (resident & set(obs.get(n, {}).get("export", ())))
-    exports[n] = set(jobs_of(s, n)) & leaving
-    change(w, members=members, budgets={r: b for r, b in w.budgets.items() if r in members or r in exports[n]})
-    if not jobs_of(s, n) and (
-      not w.node or (not w.owner and not s.owners.get(n)) or (released(n) and obs[n].get("closed"))
+def decide(table: dict) -> dict:
+  s = copy.deepcopy(table)
+  for name in ("claims", "turns", "observations", "service", "moves", "reservations", "fair"):
+    s.setdefault(name, {})
+  live = set(s.get("live", ()))
+  runs, nodes, claims, turns, obs = (s[n] for n in ("runs", "nodes", "claims", "turns", "observations"))
+  busy = {t["engine"] for t in turns.values()}
+  eligible = {n for n, v in nodes.items() if v.get("eligible", True) and not v.get("draining")}
+  for r, c in list(claims.items()):
+    o = obs.get(c["engine"])
+    cold = not (o or {}).get("gpus") and c["engine"] not in busy
+    if (
+      r not in runs
+      or c["node"] not in nodes
+      or (cold and (c["node"] not in eligible or r in s["moves"]))
+      or (o is not None and (o.get("closed") or o.get("node") != c["node"] or c["engine"] not in live))
     ):
-      del s.workers[n]
-      s.settled.pop(n, None)
-    elif not w.node and members:
-      target = next((s.jobs[r].target_node for r in members if s.jobs[r].target_node in s.nodes), None)
-      eligible = [k for k, v in s.nodes.items() if bundles(v, w.spec.gpus) and (not target or k == target)]
-      if eligible:
-        node = min(eligible, key=lambda k: (sum(x.node == k for x in s.workers.values()) / s.nodes[k]["gpus"], k))
-        change(w, node=node)
+      del claims[r]
+  s["moves"] = {r: n for r, n in s["moves"].items() if r in runs}
+  moves = s["moves"]
+  for r, c in claims.items():
+    if moves.get(r) == c["node"] and c["node"] in eligible and not obs.get(c["engine"], {}).get("draining"):
+      del moves[r]
 
-  ready_jobs = {
-    n: sorted((w.members.keys() & set(obs.get(n, {}).get("ready", ()))) | exports[n]) for n, w in s.workers.items()
+  owned, load = {}, dict.fromkeys(nodes, 0)
+  for r, c in claims.items():
+    owned.setdefault(c["engine"], []).append(r)
+    load[c["node"]] += runs[r].get("gpus", 1)
+
+  def jobs(engine):
+    return owned.get(engine, ())
+
+  def occupied(node, bundle, holders):
+    return any(v["node"] == node and set(bundle) & set(v["gpus"]) for v in holders)
+
+  def capacity(node, bundle, r, admit=False):
+    owned = s["reservations"].get(node, {})
+    a = account(r, runs[r])
+    if runs[r].get("exclusive"):
+      return all(owned.get(str(g)) == a or (admit and str(g) not in owned) for g in bundle)
+    return all(str(g) not in owned for g in bundle)
+
+  # Dedicated capacity follows accounts with claims on this node, not an engine's lifetime.
+  s["reservations"] = {
+    n: {g: a for g, a in held.items() if any(c["node"] == n and account(r, runs[r]) == a for r, c in claims.items())}
+    for n, held in s["reservations"].items()
+    if n in nodes
   }
-  ready = {s.jobs[r].account for runs in ready_jobs.values() for r in runs}
-  previous = s.settled.get("ready", {})
-  continuing = ready & set(previous.get("accounts", ()))
+  for r, info in sorted(runs.items()):
+    if r in claims:
+      continue
+    target = moves.get(r)
+    choices = []
+    for n in sorted(eligible):
+      if target and n != target:
+        continue
+      options = [b for b in bundles(nodes[n], info.get("gpus", 1)) if capacity(n, b, r, admit=True)]
+      if info.get("exclusive"):
+        foreign = [
+          o
+          for e, o in obs.items()
+          if e in live
+          and not o.get("closed")
+          and o.get("gpus")
+          and (
+            not jobs(e) or any(not runs[j].get("exclusive") or account(j, runs[j]) != account(r, info) for j in jobs(e))
+          )
+        ]
+        foreign += [
+          t for t in turns.values() if any(j not in runs or account(j, runs[j]) != account(r, info) for j in t["work"])
+        ]
+        options = [b for b in options if not occupied(n, b, foreign)]
+      if not options:
+        continue
+      own = s["reservations"].get(n, {})
+      bundle = min(options, key=lambda b: (sum(own.get(str(g)) != account(r, info) for g in b), b))
+      choices.append(
+        (not any(own.get(str(g)) == account(r, info) for g in bundle), load[n] / nodes[n]["gpus"], n, bundle)
+      )
+    if not choices:
+      continue
+    _, _, node, bundle = min(choices)
+    engines = [e for e, rs in owned.items() if claims[rs[0]]["node"] == node]
+    sharing = [
+      e
+      for e in engines
+      if not obs.get(e, {}).get("draining") and compatible(jobs(e)[0], runs[jobs(e)[0]]) == compatible(r, info)
+    ]
+    used = sum(runs[jobs(e)[0]].get("gpus", 1) for e in engines)
+    engine = (
+      min(sharing, key=lambda e: (len(jobs(e)), e))
+      if sharing and used >= nodes[node]["gpus"]
+      else "e-" + secrets.token_hex(12)
+    )
+    claims[r] = {"node": node, "engine": engine, "token": secrets.token_hex(16)}
+    owned.setdefault(engine, []).append(r)
+    load[node] += info.get("gpus", 1)
+    moves.pop(r, None)
+    if info.get("exclusive"):
+      s["reservations"].setdefault(node, {}).update({str(g): account(r, info) for g in bundle})
+  s["reservations"] = {n: v for n, v in s["reservations"].items() if v}
+
+  exporting = {
+    r for r, c in claims.items() if r in moves or c["node"] not in eligible or obs.get(c["engine"], {}).get("draining")
+  }
+  ready = {
+    r for r, c in claims.items() if c["engine"] in obs and (r in exporting or r in obs[c["engine"]].get("ready", ()))
+  }
+  active = {account(r, runs[r]) for r in ready}
+  previous = s["fair"]
+  continuing = active & set(previous.get("active", ()))
   floor = max(
     previous.get("floor", 0.0),
-    min((s.service.get(a, 0.0) for a in continuing or previous.get("accounts", ())), default=0.0),
+    min((s["service"].get(a, 0.0) for a in continuing or previous.get("active", ())), default=0.0),
   )
-  for a in ready:
-    s.service[a] = max(s.service.get(a, 0.0), floor) if a not in continuing else s.service.get(a, 0.0)
-  s.settled["ready"] = {"accounts": sorted(ready), "floor": floor}
-  s.service = {a: s.service[a] for a in {j.account for j in s.jobs.values()} & s.service.keys()}
+  for a in active - continuing:
+    s["service"][a] = max(s["service"].get(a, 0.0), floor)
+  accounts = {account(r, i) for r, i in runs.items()}
+  last = {a: e for a, e in previous.get("last", {}).items() if a in accounts}
+  s["fair"] = {"floor": floor, "active": sorted(active), "last": last}
+  s["service"] = {a: s["service"][a] for a in accounts & s["service"].keys()}
+  debt = {}
 
-  def priority(n):
-    return min((s.service.get(s.jobs[r].account, floor) for r in ready_jobs[n]), default=float("inf"))
+  def charge(turn):
+    for r, (token, _) in turn["work"].items():
+      c = claims.get(r, {})
+      if turn["engine"] in live and (c.get("engine"), c.get("token")) == (turn["engine"], token):
+        a = account(r, runs[r])
+        debt[a] = debt.get(a, 0.0) + 1 / len(turn["work"])
 
-  unfinished = {
-    n
-    for n, w in s.workers.items()
-    if w.budgets
-    and ready_jobs[n]
-    and (
-      obs.get(n, {}).get("revision") != w.revision
-      or any(obs[n].get("served", {}).get(r, 0) < b for r, b in w.budgets.items() if r in ready_jobs[n])
-    )
-  }
-  actual = {n: (w.node, w.gpus) for n, w in s.workers.items() if w.gpus and (w.budgets or not released(n))}
-  actual.update({n: (o["node"], tuple(o["gpus"])) for n, o in obs.items() if o.get("gpus") and not o.get("released")})
-  cached = {n: (o["node"], tuple(o["gpus"])) for n, o in obs.items() if o.get("gpus") and not o.get("closed")}
-  accounts = {n: next((s.jobs[r].account for r in jobs_of(s, n)), n) for n in s.workers}
-  reserved = {(w.node, g): accounts[n] for n, w in s.workers.items() if w.spec.exclusive for g in w.gpus}
-  planned, granted = {}, set()
+  for t in turns.values():
+    charge(t)
 
-  def available(node: str, bundle: tuple[int, ...], name: str, holders: dict) -> bool:
-    return all(n == name or at != node or set(bundle).isdisjoint(gs) for n, (at, gs) in holders.items())
+  def priority(r):
+    a = account(r, runs[r])
+    return debt.get(a, 0.0), s["service"].get(a, floor), claims[r]["engine"] == last.get(a)
 
-  # Fair order reserves a blocked gang's whole bundle until old grants finish. There is no separate reservation policy.
-  for n in sorted(
-    s.workers,
-    key=lambda n: (not s.workers[n].spec.exclusive, priority(n), sum(obs.get(n, {}).get("usage", {}).values()), n),
-  ):
-    w, o = s.workers[n], obs.get(n, {})
-    if not w.node or (not ready_jobs[n] and not w.spec.exclusive):
+  pending = {c["engine"] for r, c in claims.items() if r in ready} - busy
+  planned = []
+  # Issued turns count before receipts arrive, so one account cannot take every free GPU first.
+  while pending:
+    engine = min(pending, key=lambda e: (min(priority(r) for r in jobs(e) if r in ready), e))
+    pending.remove(engine)
+    work = [r for r in jobs(engine) if r in ready]
+    first, node = work[0], claims[work[0]]["node"]
+    if node not in nodes:
       continue
-    choices = bundles(s.nodes[w.node], w.spec.gpus)
-    if o.get("gpus") and not o.get("closed"):
-      choices = [tuple(o["gpus"])]
-    if w.spec.exclusive:
-      foreign = {
-        k: v for k, v in (actual | cached).items() if not s.workers[k].spec.exclusive or accounts[k] != accounts[n]
-      }
-      choices = [b for b in choices if available(w.node, b, n, foreign)]
-    choices.sort(
-      key=lambda b: (
-        sum(reserved.get((w.node, g)) != accounts[n] for g in b),
-        not available(w.node, b, n, actual),
-        b != w.gpus,
-        b,
-      )
-    )
-    bundle = next(
-      (
-        b
-        for b in choices
-        if available(w.node, b, n, planned)
-        and all((w.node, g) not in reserved or (w.spec.exclusive and reserved[w.node, g] == accounts[n]) for g in b)
-      ),
-      None,
-    )
+    bound = obs.get(engine, {}).get("gpus")
+    options = [b for b in bundles(nodes[node], runs[first].get("gpus", 1)) if not bound or b == tuple(bound)]
+    options = [b for b in options if capacity(node, b, first)]
+    options.sort(key=lambda b: (occupied(node, b, turns.values()), b))
+    bundle = next((b for b in options if not occupied(node, b, planned)), None)
     if bundle is None:
       continue
-    if w.spec.exclusive:
-      reserved.update({(w.node, g): accounts[n] for g in bundle})
-    if not ready_jobs[n]:
-      change(w, gpus=bundle, budgets={})
+    # A waiting gang keeps its fair position while existing turns finish; later turns cannot refill its bundle.
+    planned.append({"node": node, "gpus": bundle})
+    if occupied(node, bundle, turns.values()):
       continue
-    planned[n] = (w.node, bundle)
-    if n in unfinished:
-      granted.add(n)
-    elif available(w.node, bundle, n, actual):
-      selected = [r for r in ready_jobs[n] if s.service.get(s.jobs[r].account, floor) == priority(n)]
-      served = {} if o.get("closed") else o.get("served", {})
-      budgets = {r: served.get(r, 0) + max(1, TURN // len(selected)) for r in selected}
-      change(w, gpus=bundle, budgets=budgets)
-      granted.add(n)
-      actual[n] = (w.node, bundle)
-  for n, w in s.workers.items():
-    if n not in granted and n not in unfinished:
-      if w.budgets:
-        change(w, budgets={})
-      elif released(n) and not w.spec.exclusive:
-        change(w, gpus=())
+    best = min(map(priority, work))
+    selected = [r for r in work if priority(r) == best]
+    turn = {
+      "node": node,
+      "engine": engine,
+      "gpus": list(bundle),
+      "work": {r: [claims[r]["token"], 0 if r in exporting else max(1, TURN // len(selected))] for r in selected},
+    }
+    turns["t-" + secrets.token_hex(12)] = turn
+    charge(turn)
+    last.update({account(r, runs[r]): engine for r in selected})
+  referenced = {c["engine"] for c in claims.values()} | {t["engine"] for t in turns.values()}
+  s["observations"] = {e: o for e, o in obs.items() if not o.get("closed") or e in referenced}
   return s
 
 
-async def commit(bus: Bus, old: Assignment, new: Assignment, holder: str | None = None) -> bool:
-  jobs = {
-    r: j
-    for r, j in new.jobs.items()
-    if r not in old.jobs or (j.worker, j.generation) != (old.jobs[r].worker, old.jobs[r].generation)
-  }
-  workers = {n: dataclasses.asdict(w) for n, w in new.workers.items() if n not in old.workers or w != old.workers[n]}
-  gone = sorted(old.workers.keys() - new.workers.keys())
-  if not any((jobs, workers, gone, old.service != new.service, old.settled != new.settled)):
+async def commit(bus: Bus, old: dict, new: dict, holder: str | None = None) -> bool:
+  if any(new["turns"].get(t) != v for t, v in old["turns"].items()):
+    raise ValueError("only release_turn may retire a turn")
+  writable = ("claims", "turns", "moves", "service", "reservations", "fair")
+  retired = old["observations"].keys() - new["observations"].keys()
+  if not retired and all(old.get(n, {}) == new.get(n, {}) for n in writable):
     return False
-  owner_keys = [key("owner", n) for n in old.owners]
-  rkeys = {r: key("run", r) for r in jobs}
+  watched = [key(n) for n in ("runs", "nodes", "claims", "turns", "moves", "obs", "service", "reservations", "fair")]
+  watched += [key("run", r) for r in old["runs"]] + [key("live", e) for e in old["live"]] + [key("owner", "scheduler")]
 
   async def step(p):
     if holder and await p.get(key("owner", "scheduler")) != holder.encode():
       return False, False
-    owners = await p.mget(owner_keys) if owner_keys else []
-    if any((current or b"").decode() != owner for current, owner in zip(owners, old.owners.values())):
-      return False, False
-    observed = await p.hgetall(key("obs"))
-    for n in old.owners:
-      current, previous = json.loads(observed.get(n.encode(), b"{}")), old.observations.get(n, {})
-      if any(
-        current.get(k) != previous.get(k)
-        for k in ("node", "owner", "revision", "gpus", "released", "closed", "resident")
-      ):
-        return False, False
-    states = {r: json.loads(raw) if (raw := await p.hget(k, "state")) else None for r, k in rkeys.items()}
-    if any(st is None for st in states.values()):
+    current = await bus.read_table()
+    if current != old:
       return False, False
     p.multi()
-    for r, j in jobs.items():
-      p.hset(rkeys[r], mapping={"worker": j.worker, "state": json.dumps(states[r] | {"generation": j.generation})})
-    p.delete(key("service"), key("settled"))
-    for table, values in (("workers", workers), ("service", new.service), ("settled", new.settled)):
-      if values:
-        p.hset(key(table), mapping={k: json.dumps(v) for k, v in values.items()})
-    if gone:
-      for table in ("workers", "obs", "settled"):
-        p.hdel(key(table), *gone)
+    if retired:
+      p.hdel(key("obs"), *retired)
+    for name in writable[:-1]:
+      changed = {k: json.dumps(v) for k, v in new[name].items() if old[name].get(k) != v}
+      if changed:
+        p.hset(key(name), mapping=changed)
+      if gone := old[name].keys() - new[name].keys():
+        p.hdel(key(name), *gone)
+    p.set(key("fair"), json.dumps(new["fair"]))
     return True, True
 
-  return await bus.tx([key("owner", "scheduler"), key("obs"), *rkeys.values(), *owner_keys], step)
+  return await bus.tx(watched, step)
 
 
 async def run(bus: Bus) -> None:
@@ -352,7 +251,7 @@ async def run(bus: Bus) -> None:
     for session in await bus.expired_sessions():
       await bus.end_session(session)
     await registry.unregister_checkpoints(*await registry.expired_checkpoints())
-    old = from_table(await bus.read_table())
+    old = await bus.read_table()
     await commit(bus, old, decide(old), holder)
 
 

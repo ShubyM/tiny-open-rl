@@ -77,6 +77,11 @@ class Sampler:
     async with self.loading:
       if self.running is None:
         self.running = await self.engine_type.start(self.base, self.lora, self.env)
+        try:
+          await self.running.ready()
+        except BaseException:
+          await self.close()
+          raise
 
   async def execute(self, cmd: Cmd, run: dict | None, checkpoint: tuple[str, str] | None) -> Reply:
     self.inflight[cmd.request_id] = (cmd.run, asyncio.current_task())

@@ -93,7 +93,7 @@ class TestAPI(RedisTest):
     self.assertEqual((run["steps"], run["failed"], run["session"]), (8, 0, session_id))
     self.assertEqual((run["live"], run["queued"], run["in_flight"]), (True, 0, []))
     self.assertEqual(run["cmds"], 17)
-    metrics, worker = (await self.http.get("/metrics")).text, run["worker"]
+    metrics, worker = (await self.http.get("/metrics")).text, await self.worker(run_id)
     self.assertIn(f'tinyrl_steps_total{{worker="{worker}",run="{run_id}"}} 8\n', metrics)
     self.assertIn(f'tinyrl_busy_seconds_total{{worker="{worker}",run="{run_id}"}} {run["busy_ms"] / 1000}\n', metrics)
 
@@ -136,8 +136,9 @@ class TestAPI(RedisTest):
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}
-    missing = (await self.result(await self.post("load_weights", json=load))).json()
-    self.assertEqual(missing["category"], "user")
+    missing = await self.post("load_weights", json=load)
+    self.assertEqual(missing.status_code, 400)
+    self.assertIn("checkpoint is missing", missing.json()["error"])
 
     for bad in ("../../etc", "/etc", f"tinker://{run_id}/weights/../../x"):
       response = await self.post("save_weights", json={"model_id": run_id, "path": bad})
@@ -198,11 +199,13 @@ class TestAPI(RedisTest):
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 1)
 
   async def test_workers(self):
+    self.node.gpus = 1
     shared, also_shared = await self.create_model(), await self.create_model()
     full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
+    self.node.gpus = 2  # exclusive admission needs capacity free of another account's parked engine
     exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})
 
-    workers = [(await self.bus.get_run(run_id))["worker"] for run_id in (shared, also_shared, full, exclusive)]
+    workers = [await self.worker(run_id) for run_id in (shared, also_shared, full, exclusive)]
     self.assertEqual(workers[0], workers[1])
     self.assertEqual(len(set(workers)), 3)
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
@@ -217,7 +220,7 @@ class TestAPI(RedisTest):
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
     await self.node.sync()
-    self.assertEqual(scheduler.jobs_of(self.node.state, await self.worker(full)), [full])
+    self.assertEqual(list(self.node.jobs(await self.worker(full))), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -235,7 +238,7 @@ class TestAPI(RedisTest):
     sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
     samp_id = sampling.json()["sampling_session_id"]
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
+    await self.scheduling_until(lambda d: samp_id in d["state"]["runs"])
 
     stale = {session_id: time.time() - bus.SESSION_GRACE - 1}
     await self.bus.r.zadd(bus.key("seen"), stale)
@@ -244,7 +247,7 @@ class TestAPI(RedisTest):
     self.assertTrue((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
 
     await self.bus.r.zadd(bus.key("seen"), stale)  # its last heartbeat, longer ago than the grace
-    await self.scheduling_until(lambda d: samp_id not in d["state"]["jobs"])
+    await self.scheduling_until(lambda d: samp_id not in d["state"]["runs"])
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     self.assertFalse((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
@@ -256,10 +259,10 @@ class TestAPI(RedisTest):
     sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
     samp_id = sampling.json()["sampling_session_id"]
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
+    await self.scheduling_until(lambda d: samp_id in d["state"]["runs"])
 
     await self.post(f"sessions/{session_id}/finish", json={"reason": {"type": "success"}})
-    await self.scheduling_until(lambda d: samp_id not in d["state"]["jobs"])
+    await self.scheduling_until(lambda d: samp_id not in d["state"]["runs"])
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     self.assertEqual(await self.bus.expired_sessions(), [])
@@ -402,20 +405,20 @@ class TestAPI(RedisTest):
     samp_id = saved.json()["sampling_session_id"]
 
     await self.bus.node_heartbeat("node-1", 8)
-    worker = await self.worker(run_id)
-    data = await self.scheduling_until(lambda d: d["state"]["workers"].get(worker, {}).get("node"))
-    self.assertEqual(data["state"]["workers"][worker]["node"], self.node.id)
-    sampler = data["state"]["workers"][await self.worker(samp_id)]
+    data = await self.scheduling_until(lambda d: run_id in d["state"]["claims"])
+    self.assertEqual(data["state"]["claims"][run_id]["node"], self.node.id)
+    sampler = data["state"]["runs"][samp_id]
     self.assertEqual(
-      sampler["spec"],
-      {"role": "sampler", "base": "tiny", "lora": True, "exclusive": True, "train_run": excl_id, "gpus": 1},
+      {k: sampler[k] for k in ("role", "base", "exclusive", "train_run", "gpus")},
+      {"role": "sampler", "base": "tiny", "exclusive": True, "train_run": excl_id, "gpus": 1},
     )
+    self.assertEqual(sampler["version"], await self.registry.version(sampler["model_path"]))
     self.assertIn("node-1", data["nodes"])
 
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
-    data = await self.scheduling_until(lambda d: worker not in d["state"]["workers"])
-    self.assertNotIn(run_id, data["state"]["jobs"])
+    data = await self.scheduling_until(lambda d: run_id not in d["state"]["runs"])
+    self.assertNotIn(run_id, data["state"]["claims"])
 
   async def scheduling_until(self, done, tries: int = 100) -> dict:
     """GET /api/v1/scheduling until `done` says yes about it."""
@@ -427,7 +430,7 @@ class TestAPI(RedisTest):
     self.fail(f"never: {data}")
 
   async def sampler_runs(self) -> list[str]:
-    return [run for run, (record, _, _) in (await self.bus.read_table())["runs"].items() if record["role"] == "sampler"]
+    return [run for run, record in (await self.bus.read_table())["runs"].items() if record["role"] == "sampler"]
 
   async def test_only_sampling_sessions_get_a_sampler_and_it_ends_with_its_training_run(self):
     sft = await self.create_model()
@@ -444,13 +447,11 @@ class TestAPI(RedisTest):
     saved = await self.post("save_weights_for_sampler", json={"model_id": excl, "sampling_session_seq_id": 0})
     sid = (await self.result(saved)).json()["sampling_session_id"]
     self.assertEqual(await self.sampler_runs(), [sid])
-    sampler = await self.worker(sid)
-
-    await self.bus.node_heartbeat("n8", 8)
-    await self.scheduling_until(lambda d: d["state"]["workers"].get(sampler, {}).get("node"))
+    sampler = await self.bus.get_run(sid)
+    self.assertEqual(sampler["version"], await self.registry.version(sampler["model_path"]))
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)
-    await self.scheduling_until(lambda d: sampler not in d["state"]["workers"])
+    await self.scheduling_until(lambda d: sid not in d["state"]["runs"] and sid not in d["state"]["claims"])
 
 
 if __name__ == "__main__":

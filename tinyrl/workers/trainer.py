@@ -16,7 +16,7 @@ import torch.distributed as dist
 
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Reply, entry_key
-from tinyrl.storage.store import Store, nbytes, split_version
+from tinyrl.storage.store import Store, nbytes
 from tinyrl.trace import span
 from tinyrl.workers.model import Model
 
@@ -74,30 +74,59 @@ class Trainer:
       "meta": meta,
     }
 
-  def load_run(self, run: str, uri: str, version: str | None, optimizer: bool) -> str:
-    self.call_model("restore_run", run, *self.store.get(uri, version), optimizer)
-    return split_version(version)[0]
+  def load_run(self, run: str, record: dict | None, uri: str, version: str, optimizer: bool) -> None:
+    created = run not in self.model.params
+    try:
+      if created:
+        if record is None:
+          raise KeyError(f"no training run {run}")
+        self.call_model("create_run", run, record["base"], record["rank"], record.get("lora", {}))
+      self.call_model("restore_run", run, *self.store.get(uri, version), optimizer)
+    except Exception:
+      if created:
+        self.drop(run)
+      raise
 
-  def execute(
-    self, cmd: Cmd, run: dict | None = None, parked: tuple[str, str | None] | None = None, version: str | None = None
-  ) -> tuple[Reply, dict]:
+  def ensure(self, run: str, record: dict | None, parked: tuple[str, str] | None = None) -> None:
+    if run in self.model.params:
+      return
+    if record is None:
+      raise KeyError(f"no training run {run}")
+    state = record.get("state", {})
+    boundary = state.get("created", "")
+    if parked:
+      boundary = next(
+        (
+          cp["boundary"]
+          for cp in (state.get("working"), state.get("durable"))
+          if cp and (cp["uri"], cp["version"]) == parked
+        ),
+        "",
+      )
+    if not boundary or entry_key(state.get("mutation", "")) > entry_key(boundary):
+      raise RuntimeError(
+        f"model {run} rolled back to {boundary or 'creation'}; explicitly load a checkpoint before continuing"
+      )
+    if parked:
+      self.load_run(run, record, *parked, optimizer=True)
+    else:
+      self.call_model("create_run", run, record["base"], record["rank"], record.get("lora", {}))
+
+  def export(self, run: str, record: dict, parked: tuple[str, str] | None = None) -> dict | None:
+    state = record["state"]
+    if run not in self.model.params and not (state.get("created") or state.get("mutation")):
+      return None
+    self.ensure(run, record, parked)
+    return self.save(run, f"tinker://{run}/parked", owned=True, boundary=state["mutation"])
+
+  def execute(self, cmd: Cmd, run: dict | None = None, parked: tuple[str, str] | None = None) -> tuple[Reply, dict]:
     with span("trainer.execute"):
-      effects, created = {}, False
+      effects = {}
       try:
-        if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
-          if cmd.op == Op.DELETE_MODEL:
-            return ok({"type": cmd.op, "model_id": cmd.run}), effects
-          if run is None:
-            raise KeyError(f"no training run {cmd.run}")
-          state = run.get("state", {})
-          initial = state.get("created") and entry_key(state.get("mutation", "")) <= entry_key(state["created"])
-          if not parked and cmd.op != Op.LOAD_WEIGHTS and not initial:
-            raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
-          self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
-          created = bool(parked or cmd.op == Op.LOAD_WEIGHTS)
-          if parked:
-            self.load_run(cmd.run, *parked, optimizer=True)
-            created = False  # recovery succeeded, even if the command that follows is rejected
+        if cmd.op == Op.DELETE_MODEL and cmd.run not in self.model.params:
+          return ok({"type": cmd.op, "model_id": cmd.run}), effects
+        if cmd.op not in (Op.CREATE_MODEL, Op.LOAD_WEIGHTS):
+          self.ensure(cmd.run, run, parked)
 
         if cmd.op == Op.FORWARD_BACKWARD:
           req = wire.parse(cmd.body)
@@ -116,7 +145,7 @@ class Trainer:
             effects["mutated"] = True
             return ok({"type": cmd.op, "metrics": metrics}), effects
           case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
-            effects["saved"] = self.save(
+            effects["checkpoint"] = self.save(
               cmd.run,
               args["uri"],
               cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER,
@@ -125,10 +154,15 @@ class Trainer:
               cmd.entry_id,
             )
           case Op.LOAD_WEIGHTS:
-            resolved = self.load_run(cmd.run, args["uri"], version or args.get("version"), args["optimizer"])
-            created = False
+            self.load_run(cmd.run, run, args["uri"], args["version"], args["optimizer"])
             effects["mutated"] = True
-            effects["loaded"] = {"uri": args["uri"], "version": resolved, "optimizer": args["optimizer"]}
+            if args["optimizer"]:
+              effects["checkpoint"] = {
+                "uri": args["uri"],
+                "version": args["version"],
+                "optimizer": True,
+                "boundary": cmd.entry_id,
+              }
           case Op.DELETE_MODEL:
             self.call_model("delete_run", cmd.run)
           case _:
@@ -139,15 +173,15 @@ class Trainer:
           reply["sampling_session_id"] = args["sampling_session_id"]
         return ok(reply), effects
       except Exception as e:
-        if created:  # a failed restore must not leave a fresh model serving requests as recovered state
-          self.call_model("delete_run", cmd.run)
         return Reply.error(e), effects
-      finally:
-        effects["resident"] = cmd.run in self.model.params
 
   def drop(self, run: str) -> None:
     if run in self.model.params:
       self.call_model("delete_run", run)
+
+  def retain(self, runs) -> None:
+    for run in self.model.params.keys() - set(runs):
+      self.drop(run)
 
   def park(self) -> None:
     self.call_model("park_on_host")

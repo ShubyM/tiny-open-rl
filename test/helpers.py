@@ -80,9 +80,9 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     await p.execute()
 
   async def worker(self, run: str) -> str:
-    """The run's worker, once every new run is assigned the way the scheduler assigns it."""
+    """The engine named by the scheduler's current job claim."""
     await assign_new_runs(self.bus)
-    return (await self.bus.get_run(run))["worker"]
+    return (await self.bus.read_table())["claims"].get(run, {}).get("engine")
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
@@ -95,7 +95,7 @@ async def assign_new_runs(bus) -> None:
   """Assign new runs the way the scheduler would, without placing anything."""
   from tinyrl.control import scheduler
 
-  s = scheduler.from_table(await bus.read_table())
+  s = await bus.read_table()
   await scheduler.commit(bus, s, scheduler.decide(s))
 
 
@@ -115,6 +115,9 @@ class FakeEngine:
 
   async def load_checkpoint(self, name: str, path: str) -> None:
     self.loaded = self.loaded | {name} if self.lora else {name}
+
+  async def ready(self) -> None:
+    pass
 
   async def unload_checkpoint(self, name: str) -> None:
     if self.lora:

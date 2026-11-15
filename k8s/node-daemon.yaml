@@ -24,6 +24,8 @@ spec:
         envFrom:
         - configMapRef: {name: tinyrl}
         env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
         - {name: GPUS, value: "1"}
         - {name: MODEL_CACHE, value: /models/tinyrl}
         - {name: HF_HOME, value: /models/hf}

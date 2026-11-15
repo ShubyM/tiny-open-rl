@@ -83,24 +83,37 @@ class VLLM:
     with socket.socket() as s:
       s.bind(("127.0.0.1", 0))
       port = s.getsockname()[1]
-    server = launch(
-      ["vllm", "serve", path, "--served-model-name", base, "--host", "127.0.0.1", "--port", str(port), *flags, *extra],
-      env=env,
-    )
-    return await cls(f"http://127.0.0.1:{port}", base, lora, server).ready()
+    engine = cls(f"http://127.0.0.1:{port}", base, lora)
+    try:
+      engine.server = launch(
+        [
+          "vllm",
+          "serve",
+          path,
+          "--served-model-name",
+          base,
+          "--host",
+          "127.0.0.1",
+          "--port",
+          str(port),
+          *flags,
+          *extra,
+        ],
+        env=env,
+      )
+    except BaseException:
+      await engine.close()
+      raise
+    return engine
 
   async def ready(self) -> VLLM:
-    try:
-      while self.server.poll() is None:
-        with contextlib.suppress(aiohttp.ClientError, TimeoutError):
-          async with self.http.get("/health", timeout=aiohttp.ClientTimeout(total=1)) as res:
-            if res.ok:
-              return self
-        await asyncio.sleep(0.2)
-      raise RuntimeError(f"vllm serve exited with {self.server.returncode}")
-    except BaseException:
-      await self.close()
-      raise
+    while self.server.poll() is None:
+      with contextlib.suppress(aiohttp.ClientError, TimeoutError):
+        async with self.http.get("/health", timeout=aiohttp.ClientTimeout(total=1)) as res:
+          if res.ok:
+            return self
+      await asyncio.sleep(0.2)
+    raise RuntimeError(f"vllm serve exited with {self.server.returncode}")
 
   async def close(self) -> None:
     try:

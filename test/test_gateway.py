@@ -42,7 +42,7 @@ class TestGatewayDedupe(RedisTest):
 
     runs = await self.bus.r.smembers("tinyrl:runs")
     samplers = [r for r in runs if r.decode().startswith("samp-")]
-    self.assertEqual(len(samplers), 1)
+    self.assertEqual(samplers, [])  # a queued SAVE is not a partially constructed sampling job
 
 
 if __name__ == "__main__":

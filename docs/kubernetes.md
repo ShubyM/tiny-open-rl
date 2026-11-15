@@ -1,11 +1,13 @@
 # tinyrl on Kubernetes
 
-**Current implementation.** The fleet scheduler groups runs, places workers and grants exact GPU bundles with bounded
-token allowances. A trainer and its sampling sessions share logical-account service accounting. Each node owns worker
-leases, input preparation, grant execution and process lifetime; it reports readiness, residency and release to Redis.
-One engine can hold a physical GPU at a time. Multi-GPU training stays within one node, and a live process keeps its
-GPU bundle when parked and resumed. Portable complete checkpoints, explicit target migration, peer cache reads,
-background uploads and node-loss recovery are built. The scheduler polls Redis records; there is no Redis event log.
+**Current implementation.** The fleet scheduler assigns per-job owner claims and immutable GPU turns. Claims retain
+live training state across cheap host-memory parking; turns bound the jobs and token cost permitted on a physical
+bundle. A trainer and its owned samplers share account service, and exclusive accounts reserve dedicated capacity.
+The node reports prepared jobs and fixed engine bindings, executes turns, and acknowledges verified GPU release.
+Multi-GPU training stays within one node. Export atomically publishes complete state and clears one job's claim;
+its siblings may stay in the same engine. Captured SAVE futures settle from storage independently of the trainer.
+`NODE_NAME` is the physical Kubernetes node name, so a pod restart cannot bypass an outstanding turn on that hardware.
+Lease expiry fences publication but does not establish physical release. Unverified orphan turns remain quarantined.
 See the [README](../README.md) and [node_daemon.py](../tinyrl/control/node_daemon.py) for the running system.
 
 **Rollout.** Stop old nodes gracefully, then start the gateway, scheduler and nodes together against a fresh Redis
@@ -92,49 +94,28 @@ keeps a new node's node daemon from waiting on the full image pull.
 
 ## State in Redis
 
-The scheduler reads a coherent table, computes a new assignment and commits changes under its scheduler lease.
-`scheduler.commit` owns that transaction; [bus.py](../tinyrl/bus.py) owns command, reply and checkpoint transactions.
+The scheduler reads a coherent table and commits claims and new turns under its lease. `Bus.release_turn` is the
+only operation that retires a turn, after physical release, and charges measured account service once.
 
-| Key | Type | Written by | Read by |
-|---|---|---|---|
-| `worker` and `state` in `tinyrl:run:<run>` | assignment, generation, mutation boundary, working/durable versions and optional target node | scheduler for assignment/generation; fenced command transactions for progress and versions | nodes, scheduler |
-| `tinyrl:workers` | desired node, physical bundle, owner, revision, members and token ceilings | scheduler | nodes, scheduler |
-| `tinyrl:obs` | actual residency, readiness, cumulative usage, served cost and release/closed acknowledgments | the node holding each worker lease | scheduler |
-| `tinyrl:owner:<worker>` | execution lease, 10 s by default | node daemon | nodes, scheduler, fenced transactions |
-| `tinyrl:owner:scheduler` | fleet scheduler lease | scheduler | assignment transaction |
-| `tinyrl:nodes` | node heartbeat records with GPU count, rate and expiry | node daemons | scheduler, gateway |
-| `tinyrl:service`, `tinyrl:settled` | logical-account service, settled owner counters and fairness floor | scheduler | scheduler, scheduling endpoint |
-| `tinyrl:ckpt:<run>`, `tinyrl:ver:<version>`, `tinyrl:refs` | checkpoint aliases, immutable version metadata and live references | fenced command/registry transactions | nodes, registry, storage cleanup |
-| `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | completed commands and timing counters | `Bus.write_reply` | `GET /metrics`, run diagnostics |
+| Key | Fact | Writer |
+|---|---|---|
+| `record` and `state` in `tinyrl:run:<run>` | Job configuration, acknowledged mutation boundary, working and durable checkpoints | Gateway construction and fenced command publication |
+| `tinyrl:claims` | Job → physical node, engine incarnation, unique claim token | Scheduler; export/deletion clear claims |
+| `tinyrl:turns` | Immutable turn → node, engine, GPU IDs, expected claims and allowances | Scheduler creates; node releases after verified park/exit |
+| `tinyrl:obs` | Engine readiness, fixed GPU binding, PID and closed/draining state | Original engine launcher |
+| `tinyrl:live:<engine>` | Engine lease; an expired incarnation cannot restart | Node daemon |
+| `tinyrl:owner:scheduler` | Scheduler lease | Scheduler |
+| `tinyrl:nodes` | Physical node inventory, heartbeat and drain state | Node daemons |
+| `tinyrl:service`, `tinyrl:fair` | Account GPU service, active floor and rotation cursor | Turn release and scheduler |
+| `tinyrl:reservations` | Dedicated physical capacity per exclusive account | Scheduler |
+| `tinyrl:moves` | Explicit job export/destination requests | Operator/control request; scheduler consumes |
+| `tinyrl:saves` | Accepted exact captures awaiting durable SAVE completion | Fenced capture; storage finalizer |
+| `tinyrl:ckpt:<run>`, `tinyrl:ver:<version>`, `tinyrl:refs` | Aliases, immutable version metadata and retention owners | Fenced publication and registry |
 
-A planned handoff removes the job from desired residency. The old owner exports state and acknowledges absence;
-only then does the scheduler advance that job's generation and change its worker. An old owner or generation cannot
-publish a late reply. Physical GPU reuse also requires the current owner's matching release acknowledgment.
-
-## A run's life
-
-```mermaid
-sequenceDiagram
-  participant G as gateway
-  participant R as Redis
-  participant S as scheduler
-  participant A as node daemon
-  participant ST as store
-  G->>R: Create run and queue commands
-  S->>R: Assign worker, node and job generation
-  A->>R: Claim worker lease, report prepared jobs
-  S->>R: Grant physical bundle and token ceilings
-  A->>R: Fence activation, claim bounded commands
-  Note over A,ST: Trainer or engine executes under the node's grant
-  A->>ST: Publish immutable checkpoint version
-  A->>R: Commit fenced reply and checkpoint boundary
-  G->>R: Retrieve the same future on every retry
-  S->>R: Request target migration through desired residency
-  A->>ST: Export complete state under a GPU grant
-  A->>R: Publish working version and residency absence
-  S->>R: Advance job generation, assign destination
-  Note over A,ST: Destination restores a reachable version and checks its boundary
-```
+A planned move needs an export turn. The source saves complete tensors at the acknowledged boundary, publishes that
+version and relinquishes the exact claim atomically. The destination gets a new claim and restores that version.
+The source need not acknowledge disappearance of a cached copy. Releasing the GPU is independent of exporting a job:
+a shared engine may still own other jobs, and no successor turn may overlap its bundle before verified release.
 
 ## The store: a trainer can resume anywhere
 

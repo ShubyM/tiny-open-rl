@@ -140,13 +140,13 @@ class TestRegistry(RedisTest):
       store, uri = Store(tmp), "tinker://r/weights/saved"
       a, b = [store.put(uri, {"w": torch.tensor(i)}) for i in (1, 2)]
       await self.seed_checkpoint(uri, 1, version=a)
-      await self.bus.create_run(Run("consumer", "worker", "base", 0))
+      await self.bus.create_run(Run("consumer", "base", 0))
       await self.bus.submit_command("consumer", Op.LOAD_WEIGHTS, json.dumps({"uri": uri, "version": a}).encode())
       await self.seed_checkpoint(uri, 1, version=b)
       await self.registry.sweep(store, 0)
       self.assertTrue(bool(manifest(store.folder(a))))
-      await self.bus.delete_run("consumer", "worker")
-      await self.bus.create_run(Run("next", "worker", "base", 0))
+      await self.bus.delete_run("consumer")
+      await self.bus.create_run(Run("next", "base", 0))
       with store.hold(uri, a):
         await self.registry.sweep(store, 0)
         with self.assertRaisesRegex(ValueError, "being deleted"):

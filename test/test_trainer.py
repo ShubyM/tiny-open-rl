@@ -16,7 +16,6 @@ from test.helpers import RedisTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Run
-from tinyrl.bus import key as redis_key
 from tinyrl.storage.store import Store, manifest
 from tinyrl.workers.model import LOSSES, Model, batches, target_logprobs
 from tinyrl.workers.trainer import Trainer
@@ -250,12 +249,13 @@ class TestModel(unittest.TestCase):
       train(model, run, steps=1)
       second = original.save(run, uri)
       self.assertNotEqual(first["version"], second["version"])
-      reply, _ = loaded.execute(
-        Cmd(run, "1-0", Op.LOAD_WEIGHTS, json.dumps({"uri": uri, "optimizer": True}).encode()),
+      pinned = first["version"] + "@127.0.0.1:9"  # the local copy is present; retain its peer hint for future owners
+      reply, effects = loaded.execute(
+        Cmd(run, "1-0", Op.LOAD_WEIGHTS, json.dumps({"uri": uri, "optimizer": True, "version": pinned}).encode()),
         run={"base": "tiny", "rank": 4, "lora": LORA},
-        version=first["version"],
       )
       self.assertTrue(reply.ok, reply.body)
+      self.assertEqual(effects["checkpoint"]["version"], pinned)
       torch.testing.assert_close(loaded.model.params[run], expected, atol=0, rtol=0)
       torch.testing.assert_close(
         {name: p.grad for name, p in loaded.model.params[run].items()}, gradients, atol=0, rtol=0
@@ -278,16 +278,22 @@ class TestModel(unittest.TestCase):
           trainer.model.optim_step("a", {"learning_rate": 0.01})
       for trainer in (shared, control):
         trainer.model.forward_backward("a", [counting(8)], "cross_entropy", {}, False)
-      saved = shared.save("a", "tinker://a/recovery/one", boundary="5-0")
+      record = {"base": "tiny", "rank": 4, "lora": cfg, "state": {"created": "1-0", "mutation": "5-0"}}
+      saved = shared.export("a", record)
       self.assertEqual(saved["meta"]["lora_config"]["lora_dropout"], 0.2)
       sibling = copy.deepcopy(shared.model.training_state("b")[0])
       engine = shared.model.lm
-      shared.drop("a")
+      shared.retain(["b"])
       self.assertIs(shared.model.lm, engine)
       torch.testing.assert_close(shared.model.training_state("b")[0], sibling, atol=0, rtol=0)
       restored = Trainer(Model(tiny), store)
       step = Cmd("a", "6-0", Op.OPTIM_STEP, b'{"adam_params":{"learning_rate":0.01}}')
-      reply, _ = restored.execute(step, {"base": "tiny", "rank": 4, "lora": cfg}, (saved["uri"], saved["version"]))
+      record["state"]["working"] = saved
+      stale = record | {"state": record["state"] | {"mutation": "5-1"}}
+      reply, _ = restored.execute(step, stale, (saved["uri"], saved["version"]))
+      self.assertFalse(reply.ok)
+      self.assertNotIn("a", restored.model.params)
+      reply, _ = restored.execute(step, record, (saved["uri"], saved["version"]))
       self.assertTrue(reply.ok, reply.body)
       self.assertTrue(control.execute(step)[0].ok)
       for trainer in (restored, control):
@@ -349,23 +355,22 @@ class TestTrainer(RedisTest):
         await self.node.tick()
         await asyncio.sleep(0.01)
 
-  async def finish_worker(self, worker):
-    await self.until(lambda: worker not in self.node.running)
-
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
-    await self.bus.create_run(Run(run, run, "tiny", 0))
-    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
+    await self.bus.create_run(Run(run, "tiny", 0))
+    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}))
     await self.node.drain(run)
-    child = self.node.processes[run]
-    await self.finish_worker(run)
+    child = self.node.processes[await self.node.worker_for(run)]
+    await self.submit(run, (Op.DELETE_MODEL, {}))
+    await self.node.drain(run)
+    await self.until(lambda: child.closed)
     self.assertTrue(child.closed)
-    self.assertIsNone(await self.bus.r.get(redis_key("owner", run)))
+    self.assertNotIn(run, (await self.bus.read_table())["claims"])
 
   async def test_graceful_replacement_registers_and_restores_weights_optimizer_and_pending_gradients(self):
     self.node.gpus = 2
     run, control = new_id(), Trainer(Model(tiny), self.store)
-    await self.bus.create_run(Run(run, "trainer", "tiny", 4, lora=LORA, gpus=2))
+    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA, gpus=2))
     commands = [
       (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
       (Op.FORWARD_BACKWARD, proto_body(run)),
@@ -391,12 +396,12 @@ class TestTrainer(RedisTest):
     [request] = await self.submit(run, (Op.OPTIM_STEP, body))
     await self.node.drain(run)
     self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
-    model = self.model((await self.bus.get_run(run))["worker"])
+    model = self.model(await self.node.worker_for(run))
     torch.testing.assert_close(model.training_state(run)[0], control.model.training_state(run)[0], atol=0, rtol=0)
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     run, uri = new_id(), "tinker://saved/weights/step-1"
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
     await self.submit(
       run,
       (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
@@ -405,19 +410,24 @@ class TestTrainer(RedisTest):
     )
     await self.node.drain(run)
     version = await self.registry.version(uri)
-    self.node.tasks["p"].cancel()  # a lost process has no park checkpoint
-    await asyncio.gather(self.node.tasks["p"], return_exceptions=True)
+    engine = await self.node.worker_for(run)
+    self.node.processes[engine].kill()  # a lost process has no handoff checkpoint
+    async with asyncio.timeout(10):
+      while (await self.bus.read_table())["claims"].get(run, {}).get("engine") == engine:
+        await asyncio.sleep(0.01)
+    with self.assertRaisesRegex(ValueError, "checkpoint is missing"):
+      await self.submit(
+        run, (Op.LOAD_WEIGHTS, {"uri": "tinker://gone/weights/missing", "optimizer": True, "version": None})
+      )
     ids = await self.submit(
       run,
-      (Op.OPTIM_STEP, {"adam_params": {}}),
-      (Op.LOAD_WEIGHTS, {"uri": "tinker://gone/weights/missing", "optimizer": True, "version": None}),
       (Op.OPTIM_STEP, {"adam_params": {}}),
       (Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": True, "version": version}),
       (Op.OPTIM_STEP, {"adam_params": {}}),
     )
     await self.node.drain(run)
     replies = [await self.bus.wait_for_reply(request_id, 1) for request_id in ids]
-    self.assertEqual([reply.ok for reply in replies], [False, False, False, True, True])
+    self.assertEqual([reply.ok for reply in replies], [False, True, True])
     self.assertIn("rolled back", json.loads(replies[0].body)["error"])
 
 
@@ -458,7 +468,7 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
               single.execute(cmd) if run == r1 else await asyncio.wait_for(multi.call("execute", cmd), 90)
             )
             self.assertEqual(reply.ok, i != 1, reply.body)
-            if saved := effects.get("saved"):
+            if saved := effects.get("checkpoint"):
               versions[run] = saved["version"]
         expected, actual = (store.get(f"tinker://{run}/sampler_weights/s1", versions[run])[0] for run in (r1, r2))
         self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")

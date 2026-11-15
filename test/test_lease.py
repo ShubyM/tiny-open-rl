@@ -1,89 +1,87 @@
 import asyncio
-import copy
 import json
 import unittest
 
 from test.helpers import RedisTest
-from test.test_bus import ok
-from tinyrl.bus import GROUP, Op, Run, key
-from tinyrl.control import scheduler
+from test.test_bus import grant, ok
+from tinyrl.bus import Op, Role, Run, key
 
 
 class TestLease(RedisTest):
-  async def asyncSetUp(self):
-    await super().asyncSetUp()
-    await self.bus.create_run(Run("r", "p", "base", 0))
-    old = scheduler.from_table(await self.bus.read_table())
-    new = copy.deepcopy(old)
-    new.workers["p"] = scheduler.Worker(old.jobs["r"].spec, "n", (0,), 1, {"r": 10}, {"r": 0}, "one")
-    self.assertTrue(await scheduler.commit(self.bus, old, new))
+  async def test_launch_and_release_use_the_original_incarnation_not_lease_expiry(self):
+    await self.bus.create_run(Run("r", "base", 0))
+    await self.bus.node_heartbeat("node", 1)
+    await self.bus.r.hset(key("claims"), "r", json.dumps({"node": "node", "engine": "engine", "token": "claim"}))
+    wins = await asyncio.gather(*(self.bus.start_engine("engine", "node") for _ in range(2)))
+    self.assertEqual(sum(wins), 1)
+    turn = {"node": "node", "engine": "engine", "gpus": [0], "work": {"r": ["claim", 10]}}
+    await self.bus.r.hset(key("turns"), "turn", json.dumps(turn))
+    obs = {"node": "node", "gpus": [0], "ready": ["r"], "closed": False}
+    self.assertFalse(await self.bus.write_observation("engine", obs | {"gpus": [1]}, turn="turn"))
+    self.assertTrue(await self.bus.write_observation("engine", obs, turn="turn"))
+    self.assertFalse(await self.bus.release_turn("turn", "stranger", {"r": 1.5}))
+    await self.bus.r.pexpire(key("live", "engine"), 0)
+    self.assertFalse(await self.bus.renew_lease("engine"))
+    self.assertFalse(await self.bus.start_engine("engine", "node"))
+    self.assertTrue(await self.bus.r.hexists(key("turns"), "turn"))
+    self.assertFalse(await self.bus.write_observation("engine", obs, turn="turn"))
+    self.assertTrue(await self.bus.release_turn("turn", "engine", {"r": 1.5}))
+    self.assertFalse(await self.bus.release_turn("turn", "engine", {"r": 1.5}))
+    self.assertEqual((await self.bus.read_table())["service"], {"r": 1.5})
+    self.assertTrue(await self.bus.write_observation("engine", obs | {"closed": True}))
+    self.assertFalse(await self.bus.start_engine("engine", "node"))
 
-  async def test_generation_and_owner_fence_replies_and_reclaim(self):
-    owners = ["one", "two"]
-    taken = await asyncio.gather(*(self.bus.take_lease("p", owner) for owner in owners))
-    self.assertEqual(sum(taken), 1)
-    owner = owners[taken.index(True)]
-    for op in (Op.OPTIM_STEP, Op.SAMPLE, Op.SAVE_WEIGHTS):
-      await self.bus.submit_command("r", op, b"{}")
-    mutation, sample, save = await self.bus.take_commands({"r": 0}, owner)
-    cp = {
-      "uri": "tinker://r/weights/saved",
-      "version": "saved",
-      "boundary": save.entry_id,
-      "meta": {"optimizer": True},
-      "durable": False,
-    }
-    self.assertTrue(await self.bus.write_reply(save, ok(), "p", owner, checkpoint=cp, defer=True))
-    await self.bus.release_lease("p", "stranger")
-    self.assertTrue(await self.bus.renew_lease("p", owner))
-    old = scheduler.from_table(await self.bus.read_table())
-    new = copy.deepcopy(old)
-    new.jobs["r"].generation = new.workers["p"].members["r"] = 1
-    self.assertTrue(await scheduler.commit(self.bus, old, new))
-    self.assertFalse(await self.bus.write_reply(mutation, ok(), "p", owner, mutated=True))
-    self.assertEqual(await self.bus.reclaim_commands({"r": 0}, "p", owner), [])
-    self.assertEqual(await self.bus.take_commands({"r": 0}, owner), [])
-    await self.bus.release_lease("p", owner)
-    self.assertTrue(await self.bus.take_lease("p", "next"))
-    self.assertFalse(await self.bus.renew_lease("p", owner))
-    self.assertFalse(await self.bus.write_reply(save, ok(), "p", owner, checkpoint=cp | {"durable": True}))
-    self.assertEqual(await self.bus.reclaim_commands({"r": 1}, "p", owner), [])
-    replay = await self.bus.reclaim_commands({"r": 1}, "p", "next")
-    self.assertEqual(
-      [(c.entry_id, c.generation, saved) for c, saved in replay], [(sample.entry_id, 1, None), (save.entry_id, 1, cp)]
+  async def test_claim_fencing_fails_uncertain_training_then_reprepares_the_next_command(self):
+    await self.bus.create_run(Run("r", "base", 0))
+    await grant(self.bus, "r")
+    first = await self.bus.submit_command("r", Op.OPTIM_STEP, b"{}")
+    [old] = await self.bus.take_commands("turn", "r")
+    await self.seed_checkpoint("tinker://source/weights/saved", version="saved")
+    second = await self.bus.submit_command(
+      "r", Op.LOAD_WEIGHTS, b'{"uri":"tinker://source/weights/saved","version":"saved"}'
     )
-    self.assertFalse((await self.bus.wait_for_reply(mutation.request_id, 0)).ok)
-    self.assertEqual(len((await self.bus.queued_and_in_flight("r"))["in_flight"]), 2)
-    for cmd, saved in replay:
-      self.assertTrue(
-        await self.bus.write_reply(cmd, ok(), "p", "next", checkpoint=saved | {"durable": True} if saved else None)
-      )
-    self.assertEqual((await self.bus.r.xpending(key("q", "r"), GROUP))["pending"], 0)
-    self.assertEqual(await self.registry.version(cp["uri"]), "saved")
+    await self.bus.r.pexpire(key("live", "engine"), 0)
+    await grant(self.bus, "r", engine="fresh", node="other-node", token="new-claim", turn="new-turn")
+    self.assertFalse(await self.bus.write_reply(old, ok(), "engine", mutated=True))
+    self.assertEqual(await self.bus.take_commands("turn", "r"), [])
+    self.assertEqual((await self.bus.head("r")).request_id, first)
+    self.assertEqual(await self.bus.take_commands("new-turn", "r"), [])
+    self.assertFalse((await self.bus.wait_for_reply(first, 0)).ok)
+    self.assertEqual((await self.bus.head("r")).request_id, second)
+    [load] = await self.bus.take_commands("new-turn", "r")
+    cp = {
+      "uri": "tinker://source/weights/saved",
+      "version": "saved",
+      "boundary": load.entry_id,
+      "optimizer": True,
+      "durable": True,
+    }
+    self.assertTrue(await self.bus.write_reply(load, ok(), "fresh", checkpoint=cp, mutated=True))
+    self.assertTrue(await self.bus.release_turn("new-turn", "fresh", {}))
+    await grant(self.bus, "r", engine="fresh", node="other-node", token="new-claim", turn="export", allowance=0)
+    self.assertFalse(await self.bus.export("export", "r", cp | {"boundary": "0-0"}, "fresh"))
+    self.assertTrue(await self.bus.export("export", "r", cp, "fresh"))
+    self.assertFalse(await self.bus.r.hexists(key("claims"), "r"))
+    self.assertTrue(await self.bus.r.hexists(key("turns"), "export"))
+    self.assertEqual((await self.bus.get_run("r"))["state"]["working"]["version"], "saved")
 
-  async def test_observations_fence_gpu_start_and_acknowledge_the_current_close(self):
-    self.assertTrue(await self.bus.take_lease("p", "one"))
-    obs = {"node": "n", "revision": 1, "gpus": [0], "released": False, "closed": False, "resident": {}}
-    for bad in ({"revision": 0}, {"gpus": [1]}):
-      self.assertFalse(await self.bus.write_observation("p", "one", obs | bad, starting=True))
-    self.assertTrue(await self.bus.write_observation("p", "one", obs, starting=True))
-    old = scheduler.from_table(await self.bus.read_table())
-    new = copy.deepcopy(old)
-    new.workers["p"].budgets["r"] = 20
-    self.assertTrue(await self.bus.write_observation("p", "one", obs | {"usage": {"r": 1.0}}))
-    self.assertTrue(await scheduler.commit(self.bus, old, new))  # accounting updates do not reject a safe grant
-    old = scheduler.from_table(await self.bus.read_table())
-    new = copy.deepcopy(old)
-    new.workers["p"].revision += 1
-    self.assertTrue(await self.bus.write_observation("p", "one", obs | {"released": True}))
-    self.assertFalse(await scheduler.commit(self.bus, old, new))
-    old = scheduler.from_table(await self.bus.read_table())
-    new = copy.deepcopy(old)
-    new.workers["p"].revision = 2
-    self.assertTrue(await scheduler.commit(self.bus, old, new))
-    self.assertTrue(await self.bus.write_observation("p", "one", obs | {"closed": True, "released": True}))
-    actual = json.loads(await self.bus.r.hget(key("obs"), "p"))
-    self.assertEqual(actual["revision"], 2)
+  async def test_sampling_reclaims_its_pending_input_and_old_turns_cannot_publish(self):
+    await self.seed_checkpoint("tinker://source/sampler_weights/saved", version="weights")
+    await self.bus.create_run(
+      Run("r", "base", 1, role=Role.SAMPLER, model_path="tinker://source/sampler_weights/saved", version="weights")
+    )
+    await grant(self.bus, "r")
+    await self.bus.submit_command("r", Op.SAMPLE, b"{}")
+    [old] = await self.bus.take_commands("turn", "r")
+    self.assertTrue(await self.bus.release_turn("turn", "engine", {}))
+    await grant(self.bus, "r", turn="next")
+    [replay] = await self.bus.take_commands("next", "r")
+    self.assertEqual((replay.request_id, replay.turn), (old.request_id, "next"))
+    self.assertFalse(await self.bus.write_reply(old, ok(), "engine"))
+    self.assertTrue(await self.bus.write_reply(replay, ok(), "engine"))
+    self.assertEqual(await self.bus.r.hget(key("refs"), "job:r:weights"), b"weights")
+    obs = {"node": "node", "gpus": [0], "ready": ["r"], "closed": False}
+    self.assertFalse(await self.bus.write_observation("engine", obs, turn="turn"))
 
 
 if __name__ == "__main__":

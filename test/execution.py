@@ -48,21 +48,21 @@ class TestNode(NodeDaemon):
     async with self.ticking:
       await super().tick()
 
-  def open_trainer(self, worker, env):
+  def open_trainer(self, worker, run, env):
     process = InlineProcess(Trainer(Model(self.default_model), self.store))
     self.processes[worker] = process
     return process
 
-  def open_sampler(self, worker, env):
-    sampler = super().open_sampler(worker, env)
+  def open_sampler(self, worker, run, env):
+    sampler = super().open_sampler(worker, run, env)
     sampler.engine_type = self.engine_type
     self.samplers[worker] = sampler
     return sampler
 
   async def read_state(self):
-    old = scheduler.from_table(await self.bus.read_table())
+    old = await self.bus.read_table()
     await scheduler.commit(self.bus, old, scheduler.decide(old))
-    return scheduler.from_table(await self.bus.read_table())
+    return await self.bus.read_table()
 
   async def sync(self):
     await self.tick()
@@ -71,25 +71,22 @@ class TestNode(NodeDaemon):
     async with asyncio.timeout(10):
       while True:
         await self.tick()
-        if (w := self.state.workers.get(worker)) and w.owner and worker in self.running:
-          return self.running[worker]
+        if observation := self.state["observations"].get(worker):
+          return observation
         await asyncio.sleep(0.001)
 
   async def worker_for(self, run):
     await self.tick()
-    return j.worker if (j := self.state.jobs.get(run)) else None
+    return self.state["claims"].get(run, {}).get("engine")
 
   async def drain(self, run):
     async with asyncio.timeout(30):
       while True:
         await self.tick()
-        if not (worker := await self.worker_for(run)):
-          return None
-        queues = await asyncio.gather(
-          *(self.bus.queued_and_in_flight(r) for r in scheduler.jobs_of(self.state, worker))
-        )
-        if not any(q.get("queued") or q.get("in_flight") for q in queues):
-          return self.running.get(worker)
+        queue = await self.bus.queued_and_in_flight(run)
+        saving = any(r.startswith(f"{run}/") for r in await self.bus.pending_saves())
+        if not queue.get("queued") and not queue.get("in_flight") and not saving:
+          return self.state["observations"].get(await self.worker_for(run))
         await asyncio.sleep(0.001)
 
   async def close(self, graceful=True):

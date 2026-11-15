@@ -1,254 +1,255 @@
-import dataclasses
+import copy
 import unittest
 
-from tinyrl.bus import Role
-from tinyrl.control.scheduler import TURN, Assignment, Job, WorkerSpec, bundles, decide, from_table
+from tinyrl.control.scheduler import TURN, account, bundles, decide
 
 
 class Fleet:
   def __init__(self, **nodes):
-    self.s = Assignment(nodes={n: {"gpus": g, "memory": 80 * 2**30} for n, g in nodes.items()})
+    self.s = {k: {} for k in ("runs", "claims", "turns", "observations", "service", "moves", "reservations", "fair")}
+    self.s["live"] = []
+    self.s["nodes"] = {n: {"gpus": g} for n, g in nodes.items()}
 
   def step(self):
+    before = copy.deepcopy(self.s)
     self.s = decide(self.s)
+    for t, grant in before["turns"].items():
+      assert self.s["turns"][t] == grant
     return self.s
 
-  def add(self, run, *, account=None, **spec):
-    self.s.jobs[run] = Job(WorkerSpec(**spec), account=account or run)
+  def add(self, run, **info):
+    self.s["runs"][run] = {
+      "role": "trainer",
+      "base": "model",
+      "rank": 0,
+      "gpus": 1,
+      "state": {"created": "1-0", "mutation": "1-0", "working": None, "durable": None},
+      **info,
+    }
     self.step()
-    return self.s.jobs[run].worker
+    return self.s["claims"].get(run, {}).get("engine")
 
-  def report(self, name, **fields):
-    w = self.s.workers[name]
-    owner = fields.pop("owner", self.s.owners.get(name, name + "-owner"))
-    self.s.owners[name] = owner
-    self.s.observations[name] = {
-      "node": w.node,
-      "owner": owner,
-      "revision": w.revision,
-      "gpus": list(w.gpus),
-      "released": False,
+  def report(self, engine, **fields):
+    previous = self.s["observations"].get(engine, {})
+    owned = {r: c for r, c in self.s["claims"].items() if c["engine"] == engine}
+    node = next(iter(owned.values()))["node"] if owned else previous["node"]
+    self.s["live"] = sorted(set(self.s["live"]) | {engine})
+    self.s["observations"][engine] = {
+      "node": node,
+      "gpus": previous.get("gpus", []),
+      "ready": list(owned),
       "closed": False,
-      "resident": dict(w.members),
-      "usage": {},
-      "served": {},
-      "ready": list(w.members),
       **fields,
     }
 
-  def boot(self, name):
-    self.report(name, released=True, gpus=[], resident={})
+  def boot(self, engine):
+    self.report(engine)
     self.step()
-    self.report(name)
-    self.step()
+    if turn := self.turn(engine):
+      self.s["observations"][engine]["gpus"] = list(turn[1]["gpus"])
+
+  def turn(self, engine):
+    return next(((t, v) for t, v in self.s["turns"].items() if v["engine"] == engine), None)
+
+  def release(self, engine, **usage):
+    t, _ = self.turn(engine)
+    del self.s["turns"][t]  # an explicit release receipt; expiry alone never does this
+    for a, value in usage.items():
+      self.s["service"][a] = self.s["service"].get(a, 0) + value
 
 
 class TestFleet(unittest.TestCase):
-  def test_reuse_waits_for_current_owner_and_release_revision(self):
+  def test_preparation_precedes_grant_and_pending_launch_is_not_dead(self):
     f = Fleet(n=1)
-    a = f.add("a", role=Role.SAMPLER, base="first")
-    f.boot(a)
-    b = f.add("b", role=Role.SAMPLER, base="second")
-    f.boot(b)
-    self.assertFalse(f.s.workers[b].budgets)  # separate engines never share an active GPU
-    f.report(a, usage={"a": 3}, ready=[])  # staging releases its turn even before the token ceiling
-    previous_revision = f.s.workers[a].revision
+    e = f.add("r")
+    claim = dict(f.s["claims"]["r"])
+    self.assertFalse(f.s["turns"])
     f.step()
-    self.assertFalse(f.s.workers[a].budgets)
-    for stale in ({"revision": previous_revision}, {"owner": "old-owner"}):
-      f.report(a, released=True, **stale)
-      f.s.owners[a] = a + "-owner"
-      f.step()
-      self.assertFalse(f.s.workers[b].budgets)
-    f.report(a, released=True)
+    self.assertEqual(f.s["claims"]["r"], claim)
+    f.report(e, ready=[])
     f.step()
-    self.assertEqual(f.s.workers[b].gpus, (0,))
-    self.assertTrue(f.s.workers[b].budgets)
+    self.assertFalse(f.s["turns"])
+    f.report(e)
+    f.step()
+    _, turn = f.turn(e)
+    self.assertEqual(turn["work"], {"r": [claim["token"], TURN]})
+    self.assertEqual(turn["gpus"], [0])
+    for observed in (False, True):
+      cold = Fleet(n=1)
+      e = cold.add("pending")
+      if observed:
+        cold.report(e, ready=[])
+      cold.s["nodes"]["n"]["draining"] = True
+      cold.step()
+      self.assertFalse(cold.s["claims"] or cold.s["turns"])
 
-  def test_owner_restart_resets_counter_baseline_and_grant_ceiling(self):
+  def test_engine_loss_changes_claim_but_never_recycles_a_turn(self):
     f = Fleet(n=1)
-    w = f.add("r")
-    revision = f.s.workers[w].revision
-    f.report(w, released=True, closed=True, resident={})
-    del f.s.owners[w]
+    e = f.add("r")
+    f.boot(e)
+    old_claim, old_turn = dict(f.s["claims"]["r"]), f.turn(e)
+    f.s["live"].remove(e)
     f.step()
-    self.assertGreater(f.s.workers[w].revision, revision)  # a crash before the first owner binding must retry
-    f.boot(w)
-    f.report(w, usage={"r": 100}, served={"r": 5 * TURN})
+    new = f.s["claims"]["r"]
+    self.assertNotEqual(new["engine"], e)
+    self.assertNotEqual(new["token"], old_claim["token"])
+    f.boot(new["engine"])
+    self.assertEqual(f.s["turns"], dict([old_turn]))
+    f.s["nodes"].clear()
     f.step()
-    gen = f.s.jobs["r"].generation
-    f.report(w, owner="replacement", released=True, served={}, usage={"r": 7})
+    self.assertFalse(f.s["claims"])
+    self.assertEqual(f.s["turns"], dict([old_turn]))
+    f.s["nodes"]["n"] = {"gpus": 1}
     f.step()
-    self.assertEqual(f.s.service["r"], 107)
-    self.assertEqual(f.s.jobs["r"].generation, gen + 1)
-    self.assertEqual(f.s.workers[w].owner, "replacement")
-    self.assertEqual(f.s.workers[w].budgets, {"r": TURN})
+    replacement = f.s["claims"]["r"]["engine"]
+    f.boot(replacement)
+    self.assertIsNone(f.turn(replacement))
+    f.s["nodes"]["fresh"] = {"gpus": 1}
+    f.s["moves"]["r"] = "fresh"
+    f.step()
+    replacement = f.s["claims"]["r"]["engine"]
+    f.add("other")
+    f.s["moves"]["other"] = "fresh"
+    f.step()
+    f.report(replacement)
+    f.report(f.s["claims"]["other"]["engine"])
+    f.s["service"]["other"] = 100
+    f.step()
+    self.assertIsNotNone(f.turn(replacement))  # a quarantined old turn is not useful service debt
+    self.assertEqual(f.s["turns"][old_turn[0]], old_turn[1])
+    f.release(e)
+    f.s["observations"][e]["closed"] = True
+    f.step()
+    self.assertIsNotNone(f.turn(replacement))
+    self.assertNotIn(e, f.s["observations"])
 
-  def test_trainer_and_sampler_share_service_and_idle_accounts_return_at_floor(self):
+  def test_use_capacity_then_share_compatible_lora_engine(self):
     f = Fleet(n=2)
-    train = f.add("train")
-    sample = f.add("sample", role=Role.SAMPLER, account="train", lora=True)
-    other = f.add("other")
-    for w in (train, sample, other):
-      f.boot(w)
-    f.report(train, usage={"train": 3})
-    f.report(sample, usage={"train": 7})
-    f.step()
-    self.assertEqual(f.s.service["train"], 10)
-    for w in (train, sample):
-      f.report(w, ready=[])
-    f.s.service["other"] = 20
-    f.step()
-    f.report(train)
-    f.step()
-    self.assertEqual(f.s.service["train"], 20)
-    for w in (train, other):
-      f.report(w, ready=[])
-    f.step()
-    f.boot(f.add("late"))
-    self.assertEqual(f.s.service["late"], 20)  # a wholly idle fleet retains its fairness floor
-
-  def test_waiting_gang_protects_its_bundle_without_preempting_unfinished_turns(self):
-    f = Fleet(n=2)
-    a, b = f.add("a"), f.add("b")
-    for w in (a, b):
-      f.boot(w)
-    f.report(a, usage={"a": 5})
-    f.report(b, usage={"b": 5})
-    wide = f.add("wide", gpus=2)
-    f.boot(wide)
-    self.assertTrue(f.s.workers[a].budgets and f.s.workers[b].budgets)
-    self.assertFalse(f.s.workers[wide].budgets)
-    for w, r in ((a, "a"), (b, "b")):
-      f.report(w, served={r: TURN}, usage={r: 10})
-    f.step()
-    f.report(a, released=True, usage={"a": 10})
-    f.step()
-    self.assertFalse(f.s.workers[a].budgets or f.s.workers[wide].budgets)
-    f.report(b, released=True, usage={"b": 10})
-    f.step()
-    self.assertEqual(f.s.workers[wide].gpus, (0, 1))
-    f.boot(wide)
-    f.report(wide, served={"wide": TURN}, usage={"wide": 30})
-    f.step()
-    f.report(wide, released=True, usage={"wide": 30})
-    f.step()
-    for w, r in ((a, "a"), (b, "b")):
-      f.report(w, served={r: TURN}, usage={r: 10})
-    f.step()
-    self.assertTrue(f.s.workers[a].budgets and f.s.workers[b].budgets)
-    self.assertFalse(f.s.workers[wide].budgets)
-
-  def test_shared_job_move_waits_for_residency_ack_then_fences_only_that_job(self):
-    f = Fleet(a=1, b=1)
-    w = f.add("x", lora=True)
-    self.assertEqual(f.add("y", lora=True), w)
-    f.boot(w)
-    old_generation = f.s.jobs["x"].generation
-    old_revision = f.s.workers[w].revision
-    f.s.jobs["x"].target_node = "b"
-    f.step()
-    self.assertNotIn("x", f.s.workers[w].members)
-    f.report(w, revision=old_revision, resident={})
-    f.step()
-    self.assertEqual(f.s.jobs["x"].worker, w)
-    f.report(w, resident={"y": f.s.jobs["y"].generation})
-    f.step()
-    moved = f.s.jobs["x"].worker
-    self.assertNotEqual(moved, w)
-    self.assertEqual(f.s.workers[moved].node, "b")
-    self.assertEqual(f.s.jobs["x"].generation, old_generation + 1)
-    self.assertEqual(f.s.jobs["y"].generation, 1)
-    del f.s.nodes["a"]
-    f.step()
-    self.assertEqual(f.s.jobs["y"].generation, 2)
-    f.report(w, usage={"x": 9, "y": 2})
-    del f.s.jobs["x"]
-    f.step()
-    self.assertNotIn("x", f.s.service)  # an old owner report cannot retain a finished account
-
-  def test_exclusive_idle_capacity_and_physical_bundles(self):
-    f = Fleet(n=2)
-    ex = f.add("exclusive", exclusive=True)
-    a, b = f.add("a"), f.add("b")
-    f.boot(a)
-    f.boot(b)
-    self.assertEqual(f.s.workers[ex].gpus, (0,))
-    self.assertEqual(f.s.workers[a].gpus, (1,))
-    self.assertFalse(f.s.workers[b].gpus)
+    a, b = f.add("a", rank=8), f.add("b", rank=16)
+    c = f.add("c", rank=8)
+    self.assertNotEqual(a, b)
+    self.assertIn(c, (a, b))
+    for e in (a, b):
+      f.boot(e)
+    self.assertEqual({tuple(t["gpus"]) for t in f.s["turns"].values()}, {(0,), (1,)})
+    self.assertTrue(any(len(t["work"]) == 2 for t in f.s["turns"].values()))
     self.assertEqual(bundles({"gpus": 4, "bundles": [[0, 1], [2, 3]]}, 1), [(0,), (1,), (2,), (3,)])
     self.assertEqual(bundles({"gpus": 4, "bundles": [[0, 1], [2, 3]]}, 2), [(0, 1), (2, 3)])
-    table = dataclasses.asdict(f.s)
-    table["runs"] = {
-      r: (
-        {
-          "role": j.spec.role,
-          "base": j.spec.base,
-          "rank": 8 if j.spec.lora else 0,
-          "exclusive": j.spec.exclusive,
-          "gpus": j.spec.gpus,
-        },
-        j.worker,
-        {"generation": j.generation, "target_node": j.target_node},
-      )
-      for r, j in f.s.jobs.items()
-    }
-    self.assertEqual(from_table(table), f.s)
+
+  def test_outstanding_turns_prevent_one_account_from_taking_the_fleet(self):
+    f = Fleet(n=2)
+    train = f.add("train")
+    sample = f.add("sample", role="sampler", train_run="train")
+    other = f.add("other")
+    for e in (train, sample, other):
+      f.report(e)
+    f.step()
+    served = {account(r, f.s["runs"][r]) for t in f.s["turns"].values() for r in t["work"]}
+    self.assertEqual(served, {"train", "other"})
+    self.assertEqual(len(f.s["turns"]), 2)
+    for e in (train, sample, other):
+      if f.turn(e):
+        f.release(e, **{"train" if e != other else "other": 1})
+    f.report(other, ready=[])
+    f.step()
+    self.assertEqual({t["engine"] for t in f.s["turns"].values()}, {train, sample})
+
+  def test_idle_fairness_floor_and_finished_account_cleanup(self):
+    f = Fleet(n=1)
+    a, b = f.add("a"), f.add("b")
+    f.report(a)
+    f.report(b)
+    f.s["service"] = {"a": 10, "b": 20}
+    f.step()
+    f.report(a, ready=[])
+    f.step()
+    f.report(a)
+    f.step()
+    self.assertEqual(f.s["service"]["a"], 20)
+    for e in (a, b):
+      f.report(e, ready=[])
+    f.step()
+    late = f.add("late")
+    f.report(late)
+    f.step()
+    self.assertEqual(f.s["service"]["late"], 20)
+    del f.s["runs"]["b"]
+    f.step()
+    self.assertNotIn("b", f.s["service"])
+
+  def test_waiting_gang_keeps_fair_position_until_old_turns_finish(self):
+    f = Fleet(n=2)
+    a, b = f.add("a"), f.add("b")
+    f.boot(a)
+    f.boot(b)
+    wide = f.add("wide", gpus=2)
+    f.boot(wide)
+    self.assertIsNone(f.turn(wide))
+    f.release(a, a=2)
+    f.step()
+    self.assertIsNone(f.turn(a))
+    self.assertIsNone(f.turn(wide))
+    f.release(b, b=2)
+    f.step()
+    self.assertEqual(f.turn(wide)[1]["gpus"], [0, 1])
+    f.release(wide, wide=8)
+    f.step()
+    self.assertTrue(f.turn(a) and f.turn(b))
+
+  def test_export_moves_one_claim_without_residency_absence_handshake(self):
+    f = Fleet(a=1)
+    e = f.add("x", rank=8)
+    self.assertEqual(f.add("y", rank=8), e)
+    f.boot(e)
+    other_claim = dict(f.s["claims"]["y"])
+    f.s["nodes"]["b"] = {"gpus": 1}
+    f.s["moves"]["x"] = "b"
+    f.step()
+    self.assertGreater(f.turn(e)[1]["work"]["x"][1], 0)
+    f.release(e)
+    f.step()
+    self.assertEqual(f.turn(e)[1]["work"]["x"][1], 0)
+    del f.s["claims"]["x"]  # Bus.export publishes its checkpoint and clears only this claim
+    f.s["runs"]["x"]["state"]["working"] = {"version": "v2", "boundary": "5-0"}
+    f.step()
+    self.assertEqual(f.s["claims"]["x"]["node"], "b")
+    self.assertEqual(f.s["claims"]["y"], other_claim)
+    self.assertNotIn("x", f.s["moves"])
+    self.assertIn("x", f.s["observations"][e]["ready"])
+    f.s["nodes"]["a"]["draining"] = True
+    f.release(e)
+    f.step()
+    self.assertEqual(f.turn(e)[1]["work"]["y"][1], 0)
+
+  def test_exclusive_capacity_is_for_account_and_does_not_steal_fixed_cache(self):
     f = Fleet(n=3)
     ordinary = f.add("ordinary")
     f.boot(ordinary)
+    f.release(ordinary)
     f.report(ordinary, ready=[])
-    f.step()
-    f.report(ordinary, ready=[], released=True)
-    f.step()
-    owner = f.add("owner", exclusive=True)
-    sampler = f.add("owned", role=Role.SAMPLER, exclusive=True, train_run="owner", account="owner")
-    self.assertEqual(f.s.workers[owner].gpus, (1,))
-    self.assertEqual(f.s.workers[sampler].gpus, (1,))
-    f.report(ordinary, released=True, gpus=[0])
-    f.step()
-    self.assertEqual(f.s.workers[ordinary].gpus, (0,))
-    self.assertTrue(f.s.workers[ordinary].budgets)  # exclusive admission cannot strand a foreign parked cache
-
-  def test_exclusive_trainer_and_its_sampler_alternate_on_the_reserved_gpu(self):
-    f = Fleet(n=1)
-    train = f.add("train", exclusive=True)
-    f.boot(train)
-    sample = f.add("sample", role=Role.SAMPLER, exclusive=True, train_run="train", account="train")
-    other = f.add("other")
+    parent = f.add("parent", exclusive=True)
+    sample = f.add("sample", exclusive=True, role="sampler", train_run="parent")
+    self.assertEqual(f.s["reservations"], {"n": {"1": "parent"}})
+    f.boot(parent)
     f.boot(sample)
-    f.boot(other)
-    for previous, following, run, cost in ((train, sample, "train", 10), (sample, train, "sample", 12)):
-      f.report(previous, served={run: TURN}, usage={"train": cost})
-      f.step()
-      self.assertFalse(f.s.workers[previous].budgets)
-      self.assertFalse(f.s.workers[following].budgets)
-      f.report(previous, released=True, served={run: TURN}, usage={"train": cost})
-      f.step()
-      self.assertEqual(f.s.workers[following].gpus, (0,))
-      self.assertTrue(f.s.workers[following].budgets)
-      self.assertFalse(f.s.workers[other].budgets)
-      if following == sample:
-        f.boot(sample)
-
-  def test_parked_gang_export_gets_a_grant_before_ownership_moves(self):
-    f = Fleet(a=2, b=2)
-    w = f.add("move", gpus=2)
-    f.boot(w)
-    f.report(w, ready=[])
+    self.assertEqual(f.turn(parent)[1]["gpus"], [1])
+    self.assertIsNone(f.turn(sample))
+    f.release(parent, parent=10)
     f.step()
-    f.report(w, released=True, ready=[])
+    self.assertEqual(f.turn(sample)[1]["gpus"], [1])
+    self.assertIsNone(f.turn(parent))
+    f.report(ordinary)
     f.step()
-    f.report(w, released=True, gpus=[0, 1], ready=[])
-    f.s.jobs["move"].target_node = "b"
-    f.step()
-    self.assertNotIn("move", f.s.workers[w].members)
-    self.assertIn("move", f.s.workers[w].budgets)
-    self.assertEqual(f.s.workers[w].gpus, (0, 1))
-    self.assertEqual(f.s.jobs["move"].worker, w)
-    f.report(w, resident={})
-    f.step()
-    self.assertEqual(f.s.workers[f.s.jobs["move"].worker].node, "b")
+    self.assertEqual(f.turn(ordinary)[1]["gpus"], [0])
+    g = Fleet(n=1)
+    e = g.add("dirty")
+    g.boot(e)
+    g.release(e)
+    g.report(e, ready=[])
+    self.assertIsNone(g.add("dedicated", exclusive=True))
+    g.s["live"].remove(e)
+    g.step()
+    self.assertIn("dedicated", g.s["claims"])
 
 
 if __name__ == "__main__":

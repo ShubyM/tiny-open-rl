@@ -6,7 +6,6 @@ Every training call becomes a command on its run's stream, and retrieve_future w
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import datetime
 import json
 import time
@@ -20,7 +19,7 @@ from pydantic import BaseModel
 
 from tinyrl.api import wire
 from tinyrl.bus import Bus, Op, Role, Run, key
-from tinyrl.control import estimator, scheduler
+from tinyrl.control import estimator
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
@@ -123,9 +122,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
 
-  async def open_sampler(
-    base_model: str | None, model_path: str | None, session_id: str = "", pending: bool = False
-  ) -> str:
+  async def open_sampler(base_model: str | None, model_path: str | None, session_id: str = "") -> str:
     version = None
     if model_path:
       if not model_path.startswith("tinker://"):
@@ -133,12 +130,9 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       uri = checkpoint_uri("x", "sampler_weights", model_path)
       train_run = uri.removeprefix("tinker://").split("/", 1)[0]
       train = await bus.get_run(train_run) or {}
-      if pending:
-        base, lora = train["base"], train["rank"] > 0
-      else:
-        version = await registry.version(uri)
-        meta = await asyncio.to_thread(store.read_meta, uri, version)
-        base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
+      version = await registry.version(uri)
+      meta = await asyncio.to_thread(store.read_meta, uri, version)
+      base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
       if not base:
         raise ValueError("could not resolve base_model")
     else:
@@ -150,7 +144,18 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     gpus = await asyncio.to_thread(estimator.gpus, base, "vllm")
     sid = f"samp-{uuid.uuid4().hex[:12]}"
     await bus.create_run(
-      Run(sid, "", base, int(lora), session_id, uri, {}, exclusive, Role.SAMPLER, train_run, gpus, version)
+      Run(
+        sid,
+        base,
+        int(lora),
+        session=session_id,
+        model_path=uri,
+        exclusive=exclusive,
+        role=Role.SAMPLER,
+        train_run=train_run,
+        gpus=gpus,
+        version=version,
+      )
     )
     return sid
 
@@ -160,8 +165,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def scheduling():
     """Fleet grants and the independently observed process state."""
     table = await bus.read_table()
-    state = dataclasses.asdict(scheduler.from_table(table))
-    return {"nodes": {n: v["gpus"] for n, v in table["nodes"].items()}, "state": state}
+    return {"nodes": table["nodes"], "state": table}
 
   @api.get("/api/v1/healthz")
   async def healthz():
@@ -211,7 +215,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     base = req.base_model
     gpus = int(metadata.get("openrl.gpus") or (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")))
     if not await bus.get_run(run):
-      await bus.create_run(Run(run, "", base, rank, req.session_id, None, lora, exclusive, gpus=gpus))
+      await bus.create_run(Run(run, base, rank, session=req.session_id, lora=lora, exclusive=exclusive, gpus=gpus))
     return await submit(run, Op.CREATE_MODEL, {"base_model": base, "rank": rank, "lora": lora}, req.model_seq_id)
 
   @api.post("/api/v1/get_info")
@@ -277,7 +281,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     args = {"uri": uri, "ttl_seconds": ttl(kept)}
     if owned:
       args |= {
-        "sampling_session_id": await open_sampler(train["base"], uri, train.get("session", ""), True),
+        "sampling_session_id": f"samp-{uuid.uuid4().hex[:12]}",
+        "sampler_gpus": await asyncio.to_thread(estimator.gpus, train["base"], "vllm"),
         "owned": True,
       }
     return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)

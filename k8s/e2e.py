@@ -59,10 +59,15 @@ def daemons() -> dict[str, str]:
   return {p["metadata"]["name"]: p["spec"].get("nodeName", "") for p in pods if p["status"].get("phase") == "Running"}
 
 
+def table(name: str) -> dict:
+  rows = redis("HGETALL", f"tinyrl:{name}").splitlines()
+  return {k: json.loads(v) for k, v in zip(rows[::2], rows[1::2])}
+
+
 def placements() -> dict[str, str]:
-  """Worker -> the node daemon pod the scheduler placed it on. A node daemon's id is its pod name and pid."""
-  workers = json.loads(redis("GET", "tinyrl:state") or "{}").get("workers", {})
-  return {worker: p["node"].rsplit("-", 1)[0] for worker, p in workers.items() if p["node"]}
+  """Claimed engine -> current pod on its physical node."""
+  pods = {node: pod for pod, node in daemons().items()}
+  return {c["engine"]: pods[c["node"]] for c in table("claims").values() if c["node"] in pods}
 
 
 def serving(worker: str) -> str | None:
@@ -70,18 +75,14 @@ def serving(worker: str) -> str | None:
 
 
 def live_workers() -> dict[tuple[str, str], dict]:
-  """Physical (pod, worker) -> live state, including its owned supervisor PID. Placement may already name another node."""
-  records = redis("HGETALL", "tinyrl:nodes").splitlines()
-  workers = {}
-  for node, raw in zip(records[::2], records[1::2]):
-    info = json.loads(raw)
-    if info["until"] <= time.time():
-      continue
-    for worker, state in info.get("workers", {}).items():
-      key = node.rsplit("-", 1)[0], worker
-      assert key not in workers, f"two live node daemons report {key}"
-      workers[key] = state
-  return workers
+  """Observed native engines, independently of whether their jobs have already moved."""
+  pods = {node: pod for pod, node in daemons().items()}
+  kinds = {c["engine"]: json.loads(redis("HGET", f"tinyrl:run:{r}", "record")) for r, c in table("claims").items()}
+  return {
+    (pods[o["node"]], e): o | {"kind": kinds.get(e, {})}
+    for e, o in table("obs").items()
+    if not o["closed"] and o["node"] in pods and redis("EXISTS", f"tinyrl:live:{e}") == "1"
+  }
 
 
 def processes(pod: str) -> dict[int, tuple[int, int, str]]:
@@ -96,7 +97,7 @@ def trainer_process(worker: str) -> tuple[str, int]:
   pod = serving(worker)
   state = live_workers()[(pod, worker)]
   pid = state["pid"]
-  assert state["kind"]["role"] == "trainer" and isinstance(pid, int) and pid > 1, state
+  assert state["kind"].get("role") == "trainer" and isinstance(pid, int) and pid > 1, state
   args = processes(pod)[pid][2]
   assert "-m tinyrl.control.process " in args and "-m tinyrl.workers.trainer " in args, args
   return pod, pid
@@ -106,7 +107,7 @@ def check_processes(placed: dict, workers: dict, procs: dict, owners: list[str])
   assert set(workers) == {(pod, worker) for worker, pod in placed.items()}, (placed, workers)
   for pod, ps in procs.items():
     local = {worker: state for (at, worker), state in workers.items() if at == pod}
-    missing = [worker for worker, s in local.items() if s["kind"]["role"] == "trainer" and s["pid"] is None]
+    missing = [worker for worker, s in local.items() if s["kind"].get("role") == "trainer" and s["pid"] is None]
     assert not missing, (pod, "trainers without a process", missing)
     expected = [s["pid"] for s in local.values() if s["pid"] is not None]
     supervisors = {pid for pid, (_, _, args) in ps.items() if "-m tinyrl.control.process " in args}
@@ -114,7 +115,7 @@ def check_processes(placed: dict, workers: dict, procs: dict, owners: list[str])
     owned, groups = set(expected), {ps[pid][1] for pid in expected}
     while children := {pid for pid, (parent, _, _) in ps.items() if parent in owned} - owned:
       owned.update(children)
-    # torchrun ranks may have separate process groups; restored vLLM copies have their own PID namespace.
+    # torchrun ranks may have separate process groups.
     names = ("tinyrl.workers.trainer", "vllm serve", "VLLM::")
     extra = {
       pid: args
@@ -154,8 +155,8 @@ class Run:
 
   @property
   def worker(self):
-    w = redis("HGET", f"tinyrl:run:{self.run_id}", "worker")
-    return w if w else self.run_id
+    claim = json.loads(redis("HGET", "tinyrl:claims", self.run_id) or "{}")
+    return claim.get("engine", "")
 
   def step(self) -> float:
     from tinker import types
@@ -214,11 +215,13 @@ def main() -> None:
   checkpoint = run.tc.save_state("e2e").result().path
 
   def trainer_killed():
-    pod, pid = trainer_process(run.worker)
+    both_step()  # acknowledged progress newer than the committed checkpoint
+    engine = run.worker
+    pod, pid = trainer_process(engine)
     kubectl("exec", pod, "--", "kill", "-9", str(pid))
-    restart = wait("a new trainer supervisor", lambda: trainer_process(run.worker) != (pod, pid), 15)
+    restart = wait("a new owner claim", lambda: run.worker not in ("", engine), 15)
     error = run.fails_cleanly()
-    assert "lost its unsaved steps" in error, error
+    assert "rolled back" in error, error
     run.tc.load_state_with_optimizer(checkpoint).result()
     return f"restarted in {restart:.0f} s, then the call failed with the expected error, and load_state recovered"
 
@@ -230,6 +233,8 @@ def main() -> None:
     return f"a step during the restart landed once (steps {before} -> {before + 1}), loss {loss:.3f}"
 
   def redis_restarted():
+    for job in (control, run):
+      job.tc.save_state("before-redis-restart").result()
     kubectl("scale", "statefulset/redis", "--replicas=0")
     kubectl("wait", "--for=delete", "pod/redis-0", "--timeout=120s", check=False)
     time.sleep(15)  # down longer than the 10 s worker lease, so every lease runs out
@@ -243,7 +248,9 @@ def main() -> None:
     node = daemons()[pod]
     kubectl("taint", "node", node, "tinyrl-e2e-drain=true:NoExecute")  # evicts the node daemon, as a Spot notice does
     try:
-      wait("the run parked", lambda: redis("EXISTS", f"tinyrl:parked:{run.run_id}") == "1", 40)
+      wait(
+        "the run exported", lambda: bool(json.loads(redis("HGET", f"tinyrl:run:{run.run_id}", "state"))["working"]), 40
+      )
       moved = wait("the worker moved", lambda: serving(run.worker) not in (None, pod), 90)
       c, r = both_step()
       gap = abs(r - c) / c
@@ -266,7 +273,7 @@ def main() -> None:
     )
     moved = wait("the worker moved off the dead node", lambda: serving(run.worker) not in (None, pod), 120)
     error = run.fails_cleanly()
-    assert "lost its unsaved steps" in error, error
+    assert "rolled back" in error, error
     run.tc.load_state_with_optimizer(checkpoint).result()
     run.step()
     return f"moved in {moved:.0f} s, the call failed with the expected error, and load_state recovered"
@@ -276,7 +283,7 @@ def main() -> None:
     placed = placements()
     workers = live_workers()
     procs = {pod: processes(pod) for pod in daemons()}
-    owners = [k.removeprefix("tinyrl:owner:") for k in redis("KEYS", "tinyrl:owner:*").split()]
+    owners = [k.removeprefix("tinyrl:live:") for k in redis("KEYS", "tinyrl:live:*").split()]
     check_processes(placed, workers, procs, owners)
     engines = sum(s["pid"] is not None for s in workers.values())
     return f"{len(placed)} workers, {engines} owned process groups, and no stray processes or leases"
