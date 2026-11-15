@@ -1,5 +1,4 @@
 import copy
-import dataclasses
 import random
 import unittest
 
@@ -9,12 +8,13 @@ from tinyrl.control.scheduler import (
   Job,
   Worker,
   WorkerSpec,
-  can_run,
   decide,
   from_table,
+  grant,
   memory_budget,
   place_gpus,
   select_runs,
+  to_table,
 )
 
 GIB, MIB = 2**30, 2**20
@@ -30,7 +30,7 @@ class Cluster:
     return {
       "nodes": self.nodes,
       "runs": {r: (rec, self.s.jobs[r].worker if r in self.s.jobs else "") for r, rec in self.records.items()},
-      "workers": {n: {"spec": dataclasses.asdict(w.spec), "node": w.node} for n, w in self.s.workers.items()},
+      "workers": to_table(self.s),
       "workers_made": self.s.workers_made,
     }
 
@@ -55,10 +55,10 @@ class Cluster:
 
 
 class Local:
-  """Direct placement and reservations, with the same small runtime fields the node owns."""
+  """One node as the scheduler sees it: its workers, their GPUs, who asked for theirs, and who holds theirs."""
 
   def __init__(self, test, gpus=1, memory=80 * GIB):
-    self.test, self.s, self.running, self.ticket = test, Assignment(nodes={"n": (gpus, memory)}), {}, 0
+    self.test, self.s, self.ready, self.service = test, Assignment(nodes={"n": (gpus, memory)}), {}, {}
 
   def add(self, name, *, at=None, sampler=False, lora=False, exclusive=False, width=1):
     spec = WorkerSpec(Role.SAMPLER if sampler else Role.TRAINER, name, lora, exclusive, gpus=width)
@@ -66,39 +66,36 @@ class Local:
     self.s.jobs[name] = Job(spec, name)
     if at is None:
       self.place()
-    self.running[name] = Worker(spec, "n", self.s.workers[name].gpus)
-    return self.running[name]
 
   def place(self):
-    place_gpus(self.s, "n", self.running)
+    place_gpus(self.s, "n")
 
   def drop(self, name):
     self.s.jobs.pop(name)
     self.s.workers.pop(name)
     self.place()
 
-  def request(self, name):
-    self.ticket += 1
-    self.running[name].ticket = self.ticket
+  def request(self, name, served=0):
+    self.ready[name], self.service[name] = [name], served
+
+  def release(self, name):
+    """Its work is done and its node gave its GPUs back."""
+    self.s.granted.pop(name)
+    self.ready.pop(name, None)
 
   def grants(self):
-    granted = []
-    for name in sorted(self.running, key=lambda n: (self.running[n].ticket, n)):
-      if can_run(self.s, "n", self.running, name):
-        self.running[name].served, self.running[name].ticket = 0, 0
-        granted.append(name)
+    made, _, _ = grant(self.s, self.ready, self.service, 0)
+    self.s.granted |= made
     self.check()
-    return granted
+    return list(made)
 
   def check(self):
     for gpu in range(self.s.nodes["n"][0]):
-      held = [r for r in self.running.values() if r.served is not None and gpu in r.gpus]
+      held = [n for n, (_, gpus) in self.s.granted.items() if gpu in gpus]
       if len(held) > 1:
-        sizes = [memory_budget(self.s, r.spec, "n") for r in held]
+        sizes = [memory_budget(self.s, self.s.workers[n].spec, "n") for n in held]
         self.test.assertTrue(all(sizes))
         self.test.assertLessEqual(sum(sizes), self.s.nodes["n"][1])
-    for r in self.running.values():
-      self.test.assertFalse(r.ticket and r.served is not None)
 
 
 class TestCluster(unittest.TestCase):
@@ -108,7 +105,7 @@ class TestCluster(unittest.TestCase):
     a = c.run("a", rank=8)
     self.assertEqual(c.run("b", rank=8), a)
     self.assertEqual(c.s.workers[a].node, "n")
-    self.assertEqual(c.s.workers[a].gpus, ())  # the cluster never chooses local GPUs
+    self.assertEqual(c.s.workers[a].gpus, (0,))  # the cluster chooses its GPUs too
     c.delete("a")
     self.assertEqual(c.settle(), [])
     c.delete("b")
@@ -173,14 +170,14 @@ class TestCluster(unittest.TestCase):
     g = c.run("g", role="sampler", train_run="t", base="b")
     self.assertEqual([c.s.workers[w].node for w in (q, g)], ["a", "a"])  # two full fine-tune samplers pack one GPU
 
-  def test_lost_node_workers_are_reassigned_and_forget_their_desired_gpus(self):
+  def test_lost_node_workers_are_reassigned_and_choose_gpus_again(self):
     c = Cluster()
     c.node("a", 1)
     w = c.run("r")
     c.node("b", 1)
     c.lose("a")
     self.assertEqual(c.settle()[0], (Ev.UNPLACED, {"worker": w, "rule": "place.node_lost"}))
-    self.assertEqual((c.s.workers[w].node, c.s.workers[w].gpus), ("b", ()))
+    self.assertEqual((c.s.workers[w].node, c.s.workers[w].gpus), ("b", (0,)))
 
   def test_multi_gpu_worker_waits_for_a_node_that_has_enough_gpus(self):
     c = Cluster()
@@ -228,7 +225,7 @@ class TestCluster(unittest.TestCase):
         self.assertEqual(decide(c.s)[1], [])
         self.assertTrue(all(w.node is None or w.node in c.s.nodes for w in c.s.workers.values()))
         self.assertEqual(from_table(c.table()), c.s)
-        self.assertTrue(all(w.gpus == () for w in c.s.workers.values()))
+        self.assertTrue(all(len(w.gpus) == (w.spec.gpus if w.node else 0) for w in c.s.workers.values()))
 
 
 class TestPlacement(unittest.TestCase):
@@ -272,9 +269,10 @@ class TestPlacement(unittest.TestCase):
     p.add("old", at=(1,))
     for name in ("a", "b"):
       p.add(name, at=(0,))
+    p.s.granted["old"] = ("n", (1,))  # its process is still there
     p.drop("old")
     self.assertEqual([p.s.workers[n].gpus for n in ("a", "b")], [(0,), (0,)])
-    p.running.pop("old")
+    p.s.granted.pop("old")
     p.place()
     self.assertEqual([p.s.workers[n].gpus for n in ("a", "b")], [(1,), (0,)])
     before = copy.deepcopy(p.s)
@@ -282,7 +280,7 @@ class TestPlacement(unittest.TestCase):
     self.assertEqual(p.s, before)
 
 
-class TestReservations(unittest.TestCase):
+class TestGrants(unittest.TestCase):
   def test_ready_runs_share_service_even_when_commands_have_different_costs(self):
     heads = [Cmd(run, "1-0", Op.FORWARD_BACKWARD, b"") for run in ("slow", "fast")]
     service = {"slow": 0.0, "fast": 0.0}
@@ -291,18 +289,30 @@ class TestReservations(unittest.TestCase):
       service[run] += 10 if run == "slow" else 1
     self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
 
-  def test_fifo_order_is_the_order_of_requests_not_worker_names(self):
+  def test_the_least_served_account_goes_first_whatever_the_worker_names(self):
     p = Local(self)
-    for name in ("a", "b", "c"):
+    for name, served in (("a", 2), ("b", 1), ("c", 0)):
       p.add(name)
-    for name in ("a", "c", "b"):
-      p.request(name)
+      p.request(name, served)
     order = []
     for _ in range(3):
       [name] = p.grants()
       order.append(name)
-      p.running[name].served = None
-    self.assertEqual(order, ["a", "c", "b"])
+      p.release(name)
+    self.assertEqual(order, ["c", "b", "a"])
+
+  def test_an_account_back_from_idle_holds_no_credit_and_a_waiting_one_keeps_its_place(self):
+    p = Local(self)
+    for name in ("busy", "idle", "behind"):
+      p.add(name)
+    ready, service = {"busy": ["busy"], "behind": ["behind"]}, {"busy": 100, "behind": 130}
+    _, lifts, floor = grant(p.s, ready, service, 0)
+    self.assertEqual((lifts, floor), ({}, 100))  # nobody waiting is changed, and the floor follows the least served
+    ready["idle"] = ["idle"]  # it has had no service at all
+    made, lifts, floor = grant(p.s, ready, service | {"idle": 0}, floor)
+    self.assertEqual((lifts, floor), ({"idle": 100}, 100))  # so it joins beside the least served, not ahead of everyone
+    self.assertEqual(list(made), ["busy"])
+    self.assertEqual(grant(p.s, {"idle": ["idle"]}, {"idle": 0}, 100)[1], {"idle": 100})  # even with no one else left
 
   def test_workers_with_known_budgets_share_but_unknown_budgets_wait(self):
     p = Local(self)
@@ -312,43 +322,54 @@ class TestReservations(unittest.TestCase):
     p.add("trainer")
     p.request("trainer")
     self.assertEqual(p.grants(), ["a", "b"])
-    p.running["a"].served = None
+    p.release("a")
     self.assertEqual(p.grants(), ["c"])
-    p.running["b"].served = None
+    p.release("b")
     self.assertEqual(p.grants(), [])
-    p.running["c"].served = None
+    p.release("c")
     self.assertEqual(p.grants(), ["trainer"])
 
-  def test_unknown_gpu_memory_never_allows_concurrent_reservations(self):
+  def test_unknown_gpu_memory_never_allows_concurrent_grants(self):
     p = Local(self, memory=0)
     for name in ("a", "b"):
       p.add(name, sampler=True)
       p.request(name)
     self.assertEqual(p.grants(), ["a"])
 
-  def test_multi_gpu_reservation_is_atomic_and_cannot_be_bypassed_on_either_gpu(self):
+  def test_a_wide_grant_is_atomic_and_cannot_be_bypassed_on_either_gpu(self):
     p = Local(self, 2)
     p.add("holder", at=(0,))
     p.add("wide", at=(0, 1), width=2)
     p.add("later", at=(1,))
-    for name in ("holder", "wide", "later"):
-      p.request(name)
+    for served, name in enumerate(("holder", "wide", "later")):
+      p.request(name, served)
     self.assertEqual(p.grants(), ["holder"])
-    self.assertIsNone(p.running["wide"].served)
-    self.assertIsNone(p.running["later"].served)
-    p.running["holder"].served = None
+    self.assertEqual(p.grants(), [])  # GPU 1 is free, but it is the wide worker's next
+    p.release("holder")
     self.assertEqual(p.grants(), ["wide"])
-    p.running["wide"].served = None
+    p.release("wide")
     self.assertEqual(p.grants(), ["later"])
 
-  def test_different_gpus_can_run_concurrently(self):
+  def test_different_gpus_are_granted_together(self):
     p = Local(self, 2)
     for name, gpu in (("a", 0), ("b", 1)):
       p.add(name, at=(gpu,))
       p.request(name)
     self.assertEqual(p.grants(), ["a", "b"])
 
-  def test_random_requests_and_exits_never_overcommit_a_gpu(self):
+  def test_a_grant_outlives_its_worker_until_the_node_gives_it_back(self):
+    p = Local(self)
+    for name in ("gone", "next"):
+      p.add(name)
+    p.request("gone")
+    self.assertEqual(p.grants(), ["gone"])
+    p.drop("gone")  # deleted, but its process is still on the GPU
+    p.request("next")
+    self.assertEqual(p.grants(), [])
+    p.release("gone")
+    self.assertEqual(p.grants(), ["next"])
+
+  def test_random_requests_and_releases_never_overcommit_a_gpu(self):
     for seed in range(300):
       rng, p = random.Random(seed), Local(self, 4)
       for i in range(10):
@@ -356,12 +377,11 @@ class TestReservations(unittest.TestCase):
         first = rng.randrange(5 - width)
         p.add(str(i), at=tuple(range(first, first + width)), width=width, sampler=rng.random() < 0.5)
       for _ in range(100):
-        name = rng.choice(list(p.running))
-        r = p.running[name]
-        if r.served is not None:
-          r.served = None  # parking or process exit has completed
-        elif not r.ticket:
-          p.request(name)
+        name = rng.choice(list(p.s.workers))
+        if name in p.s.granted:
+          p.release(name)
+        else:
+          p.request(name, rng.randrange(5))
         p.grants()
 
 

@@ -163,10 +163,13 @@ class TestNodeDaemon(RedisTest):
       request = await self.bus.submit_command(
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
       )
-      await self.until(lambda: "b" in node.running and node.running["b"].ticket > 0, node)
+      await self.until(lambda: "b" in node.running and "b" in node.ready, node)
       self.assertIsNotNone(holder.served)
       self.assertIsNone(node.running["b"].served)
       self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})
+      await self.bus.set_ready("b", None)  # its request is lost, as when an old process of the worker stops late
+      await node.tick()
+      await self.until(lambda: "b" in node.ready, node)  # and made again
       heartbeat = (await self.bus.live_nodes(details=True))[node.id]["until"]
       await node.tick()
       self.assertGreater((await self.bus.live_nodes(details=True))[node.id]["until"], heartbeat)
@@ -187,11 +190,14 @@ class TestNodeDaemon(RedisTest):
     self.background(scheduler.run(self.bus))
     await self.create(run, base, node)
     first = node.running["worker"].pid
-    node.state.workers["worker"].gpus = (1,)
+    table = await self.bus.read_table()  # the cluster moves it to the other GPU
+    moved = {"worker": table["workers"]["worker"] | {"gpus": (1,)}}
+    await self.bus.write_table({}, moved, [], table["workers_made"], [])
+    await self.until(lambda: node.running["worker"].gpus == (1,), node)
     request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
     await self.reply(request, node)
     self.assertEqual(node.running["worker"].pid, first)
-    self.assertEqual(node.running["worker"].gpus, (1,))
+    self.assertEqual(node.state.granted["worker"], (node.id, (1,)))
     os.killpg(first, signal.SIGKILL)
     await self.until(lambda: "worker" in node.running and node.running["worker"].pid != first, node)
     await self.create(run, base, node)

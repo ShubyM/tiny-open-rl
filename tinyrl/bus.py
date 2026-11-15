@@ -9,7 +9,9 @@ Every training call is a command on its run's Redis stream, tinyrl:q:<run>. The 
 
 A reply is a stream with a single entry, tinyrl:f:<request_id>. XREAD from id 0 blocks until it is written and never consumes it, so a client can retry retrieve_future, or many clients can wait on one, and every one gets the same answer.
 
-A worker has one owner, the node holding its lease, tinyrl:owner:<worker>. Replies are written in a WATCH/MULTI/EXEC transaction on the lease key, so a node that lost its worker, say after a long pause, can't answer for it.
+A run has one owner, tinyrl:owner:<run>: the worker process whose memory holds its live state. Replies are written in a WATCH/MULTI/EXEC transaction on that key, so a process that lost the run can't answer for it. A process is live while it renews its lease, tinyrl:lease:<process>, and the scheduler frees the runs of one that stopped, say after a long pause.
+
+A run's row carries what restores it elsewhere: `acked`, the stream id of the last command that changed its state, and `checkpoint`, where that state is saved. The reply that moves `acked` clears `checkpoint` in the same transaction, so a run has a checkpoint only while it restores the run exactly.
 """
 
 from __future__ import annotations
@@ -31,8 +33,9 @@ LIVE_SECONDS = 30  # a session is live this long after its last heartbeat, which
 SESSION_GRACE = getenv("SESSION_GRACE", 60)  # and its runs are deleted this long after it
 REPLY_TTL = getenv("REPLY_TTL", 3600)
 SESSION_TTL = getenv("SESSION_TTL", 7 * 24 * 3600)
-LEASE_MS = getenv("LEASE_MS", 10000)  # a node owns its worker this long after its last renewal
+LEASE_MS = getenv("LEASE_MS", 10000)  # a worker process is live this long after its last renewal
 NODE_MS = 30000  # a node daemon is live this long after its last heartbeat
+COUNTERS = ("steps", "failed", "cmds", "busy_ms", "wait_ms")
 
 
 def key(*parts: str) -> str:
@@ -201,7 +204,7 @@ class Bus:
     # how long XADD IDMP recognizes a retried call: Redis's longest window, a day, and its most ids
     p.execute_command("XCFGSET", key("q", run.id), "IDMP-DURATION", 86400, "IDMP-MAXSIZE", 10000)
     p.sadd(key("runs"), run.id)
-    mapping = {"record": record, "steps": 0, "failed": 0, "cmds": 0, "busy_ms": 0, "wait_ms": 0}
+    mapping = {"record": record} | dict.fromkeys(COUNTERS, 0)
     if run.worker:
       mapping["worker"] = run.worker
     p.hset(key("run", run.id), mapping=mapping)
@@ -216,19 +219,27 @@ class Bus:
   # ***** the cluster's assignment *****
 
   async def read_table(self) -> dict:
-    """What the scheduler places from, read together: live nodes, each job's record and worker, and each worker's spec and node."""
+    """What the scheduler decides from, read together: live nodes, each job's record and worker, each worker's spec, node and GPUs, the workers holding their GPUs on each node, the accounts each worker has work ready for, and the service every account has had."""
     nodes, runs = await self.live_nodes(details=True), sorted(r.decode() for r in await self.r.smembers(key("runs")))
     p = self.r.pipeline(transaction=True)
     for run in runs:
       p.hmget(key("run", run), "record", "worker")
-    p.hgetall(key("workers"))
-    p.get(key("workers_made"))
-    *records, workers, workers_made = await p.execute()
+    for node in nodes:
+      p.hgetall(key("granted", node))
+    for name in ("workers", "ready", "service"):
+      p.hgetall(key(name))
+    p.mget(key("workers_made"), key("floor"))
+    *rows, workers, ready, service, (workers_made, floor) = await p.execute()
+    records, granted = rows[: len(runs)], rows[len(runs) :]
     return {
       "nodes": nodes,
       "runs": {r: (json.loads(rec), w and w.decode()) for r, (rec, w) in zip(runs, records) if rec},
       "workers": {k.decode(): json.loads(v) for k, v in workers.items()},
       "workers_made": int(workers_made or 0),
+      "granted": {n: {w.decode(): json.loads(g) for w, g in held.items()} for n, held in zip(nodes, granted)},
+      "ready": {k.decode(): json.loads(v) for k, v in ready.items()},
+      "service": {k.decode(): int(v) for k, v in service.items()},
+      "floor": int(floor or 0),
     }
 
   async def write_table(
@@ -242,21 +253,47 @@ class Bus:
       p.hset(key("workers"), mapping={n: json.dumps(w) for n, w in workers.items()})
     if gone:
       p.hdel(key("workers"), *gone)
+      p.hdel(key("ready"), *gone)
     p.set(key("workers_made"), workers_made)
     for kind, body in changes:
       p.xadd(key("events"), {"kind": kind, "body": json.dumps(body)}, maxlen=1_000_000, approximate=True)
     await p.execute()
+
+  # ***** GPUs: the scheduler grants them, and only the node they are on gives them back *****
+
+  async def write_grants(self, grants: dict[str, tuple[str, tuple]], lifts: dict[str, int], floor: int) -> None:
+    """The workers that may use their GPUs from now on, and the service floor they were ordered by. A lift is added to an account's service, never written over it, since nodes charge accounts meanwhile."""
+    p = self.r.pipeline(transaction=True)
+    for worker, (node, gpus) in grants.items():
+      p.hset(key("granted", node), worker, json.dumps(gpus))
+    for account, lift in lifts.items():
+      p.hincrby(key("service"), account, lift)
+    p.set(key("floor"), floor)
+    await p.execute()
+
+  async def release_gpus(self, node: str, worker: str) -> None:
+    """A node gives back a worker's GPUs, once its process has left them or is gone."""
+    await self.r.hdel(key("granted", node), worker)
+
+  async def set_ready(self, worker: str, accounts: list[str] | None) -> None:
+    """The accounts a worker has work ready for, which is what asks the scheduler for its GPUs. None when it has none."""
+    if accounts is None:
+      await self.r.hdel(key("ready"), worker)
+    else:
+      await self.r.hset(key("ready"), worker, json.dumps(accounts))
 
   async def get_run(self, run_id: str) -> dict | None:
     fields = await self.r.hgetall(key("run", run_id))
     if not fields:
       return None
 
-    record = json.loads(fields.pop(b"record"))
-    if worker := fields.pop(b"worker", None):
-      record["worker"] = worker.decode()
-    counters = {name.decode(): int(value) for name, value in fields.items()}  # steps, failed, cmds, busy_ms, wait_ms
-    return {**record, **counters}
+    record = json.loads(fields[b"record"]) | {c: int(fields.get(c.encode(), 0)) for c in COUNTERS}
+    for name in ("worker", "acked"):
+      if name.encode() in fields:
+        record[name] = fields[name.encode()].decode()
+    if b"checkpoint" in fields:
+      record["checkpoint"] = json.loads(fields[b"checkpoint"])
+    return record
 
   async def join_sampling_session(self, run_id: str) -> int:
     return int(await self.r.incr(key("clients", run_id)))
@@ -268,7 +305,7 @@ class Bus:
     for run_id in runs:
       p.hgetall(key("run", run_id))
     return {
-      (f[b"worker"].decode(), run_id): {k.decode(): int(v) for k, v in f.items() if k not in (b"record", b"worker")}
+      (f[b"worker"].decode(), run_id): {c: int(f.get(c.encode(), 0)) for c in COUNTERS}
       for run_id, f in zip(runs, await p.execute())
       if b"worker" in f
     }
@@ -277,7 +314,7 @@ class Bus:
     """Take a deleted run out of its worker and delete its stream, in one transaction."""
     p = self.r.pipeline(transaction=True)
     p.srem(key("runs"), run_id)
-    p.delete(key("q", run_id), key("parked", run_id))
+    p.delete(key("q", run_id), key("owner", run_id))
     await p.execute()
     await self.append_event(Ev.RUN_DELETED, run=run_id, worker=worker)
 
@@ -337,8 +374,17 @@ class Bus:
       return await self.take_commands(runs, owner, count)
     return cmds
 
-  async def write_reply(self, cmd: Cmd, reply: Reply, worker: str, owner: str, started: float | None = None) -> bool:
-    """Write a command's reply, acknowledge the command, and count it, all at once, if `owner` still owns the worker. Returns False, having written nothing, if it doesn't: another trainer took the worker over and fails the command. A command run at time.time() `started` also counts its wait since it was queued, and how long it ran."""
+  async def write_reply(
+    self,
+    cmd: Cmd,
+    reply: Reply,
+    owner: str,
+    started: float | None = None,
+    account: str = "",
+    mutated: bool = False,
+    checkpoint: dict | None = None,
+  ) -> bool:
+    """Write a command's reply, acknowledge the command, and count it, all at once, if `owner` owns the run. Returns False, having written nothing, if it doesn't: the run's next owner fails the command. A command run at time.time() `started` also counts its wait since it was queued and how long it ran, and charges its tokens to `account`. One that `mutated` the run's state leaves its checkpoint behind, unless `checkpoint` says where the new state is saved."""
     counts = {"failed": 1} if not reply.ok else {"steps": 1} if cmd.op == Op.OPTIM_STEP else {}
     if started is not None:
       queued_ms = int(cmd.entry_id.split("-")[0])  # a stream entry id starts with Redis' clock when it was added
@@ -348,12 +394,13 @@ class Bus:
         "busy_ms": int((time.time() - started) * 1000),
       }
 
-    k, deleting = key("owner", worker), cmd.op == Op.DELETE_MODEL and reply.ok
+    owned, run = key("owner", cmd.run), key("run", cmd.run)
+    deleting = cmd.op == Op.DELETE_MODEL and reply.ok
     while True:
       try:
         async with self.r.pipeline(transaction=True) as p:
-          await p.watch(k, *([key("ckpt", cmd.run)] if deleting else []))
-          if await p.get(k) != owner.encode():
+          await p.watch(owned, *([key("ckpt", cmd.run)] if deleting else []))
+          if await p.get(owned) != owner.encode():
             await p.unwatch()
             return False
           checkpoints = await p.hgetall(key("ckpt", cmd.run)) if deleting else {}
@@ -364,7 +411,14 @@ class Bus:
           p.xack(key("q", cmd.run), GROUP, cmd.entry_id)
           p.xdel(key("q", cmd.run), cmd.entry_id)
           for name, n in counts.items():
-            p.hincrby(key("run", cmd.run), name, n)
+            p.hincrby(run, name, n)
+          if mutated:
+            p.hset(run, "acked", cmd.entry_id)
+            p.hdel(run, "checkpoint")
+          if checkpoint:
+            p.hset(run, "checkpoint", json.dumps(checkpoint))
+          if account:
+            p.hincrby(key("service"), account, cmd.cost)
           if deleting:
             # Completion includes deletion; a client observing its reply sees no owned checkpoint or live queue.
             for cid, data in checkpoints.items():
@@ -374,10 +428,10 @@ class Bus:
                 p.zrem(key("ckpts"), uri)
                 p.zrem(key("expiry"), uri)
             p.srem(key("runs"), cmd.run)
-            p.delete(key("q", cmd.run), key("parked", cmd.run))
+            p.delete(key("q", cmd.run), owned)
             p.xadd(
               key("events"),
-              {"kind": Ev.RUN_DELETED, "body": json.dumps({"run": cmd.run, "worker": worker})},
+              {"kind": Ev.RUN_DELETED, "body": json.dumps({"run": cmd.run})},
               maxlen=1_000_000,
               approximate=True,
             )
@@ -386,8 +440,8 @@ class Bus:
       except redis.WatchError:
         continue
 
-  async def fail_stranded_commands(self, runs: list[str], worker: str, owner: str, min_idle_ms: int = 0) -> None:
-    """Fail the worker's commands that have been in flight for at least min_idle_ms, on any trainer. Called by the node only when it has nothing in flight; claims are failed, never replayed."""
+  async def fail_stranded_commands(self, runs: list[str], owner: str, min_idle_ms: int = 0) -> None:
+    """Fail the commands of runs `owner` owns that have been in flight for at least min_idle_ms, on any process. Called by the node only when it has nothing in flight; claims are failed, never replayed."""
     for run_id in runs:
       stream = key("q", run_id)
       try:
@@ -399,62 +453,64 @@ class Bus:
       for entry_id, fields in entries:
         cmd = parse_cmd(run_id, entry_id, fields)
         reply = Reply.error(RuntimeError(f"its worker died, or lost the worker, during {cmd.op}"))
-        await self.write_reply(cmd, reply, worker, owner)
+        await self.write_reply(cmd, reply, owner)
 
-  # ***** parked runs: the state a stopping trainer saved, for the next trainer to restore *****
+  # ***** owners: the process whose memory holds a run's live state *****
 
-  async def set_parked_checkpoint(self, run_id: str, uri: str | None, worker: str, owner: str) -> bool:
-    """Record where a run's state was saved, or clear it with None, if `owner` still owns the run's worker."""
-    k = key("owner", worker)
+  async def take_ownership(self, run_id: str, owner: str) -> bool:
+    """Become a run's owner, if it has none: its last owner handed it off, or the scheduler freed it from a dead one."""
+    return bool(await self.r.set(key("owner", run_id), owner, nx=True))
+
+  async def hand_off(self, run_id: str, owner: str, checkpoint: dict | None = None) -> bool:
+    """Give up a run, if `owner` owns it. `checkpoint` is where its state was just saved, which the next owner restores, so the run loses nothing."""
+    owned = key("owner", run_id)
     while True:
       try:
         async with self.r.pipeline(transaction=True) as p:
-          await p.watch(k)
-          if await p.get(k) != owner.encode():
+          await p.watch(owned)
+          if await p.get(owned) != owner.encode():
             await p.unwatch()
             return False
           p.multi()
-          p.set(key("parked", run_id), uri) if uri else p.delete(key("parked", run_id))
+          if checkpoint:
+            p.hset(key("run", run_id), "checkpoint", json.dumps(checkpoint))
+          p.delete(owned)
           await p.execute()
           return True
-      except redis.WatchError:  # the lease was renewed, maybe by this owner
+      except redis.WatchError:  # the scheduler freed the run
         continue
 
-  async def parked_checkpoint(self, run_id: str) -> str | None:
-    uri = await self.r.get(key("parked", run_id))
-    return uri.decode() if uri else None
-
-  # ***** worker leases *****
-
-  async def take_lease(self, worker: str, owner: str, recover: bool = False) -> bool:
-    """Take an empty lease; resume existing state only if no other owner served the worker since."""
-    k, last = key("owner", worker), key("last_owner", worker)
-    while True:
-      try:
-        async with self.r.pipeline(transaction=True) as p:
-          await p.watch(k, last)
-          current, previous = await p.mget(k, last)
-          if current is not None or (recover and previous not in (None, owner.encode())):
-            await p.unwatch()
-            return False
+  async def free_orphaned_runs(self) -> None:
+    """Take runs from owners whose lease ran out: the process died, or its node did. The next owner restores each from its checkpoint, if it has one."""
+    runs = [r.decode() for r in await self.r.smembers(key("runs"))]
+    owners = await self.r.mget([key("owner", r) for r in runs]) if runs else []
+    held = [(run, owner) for run, owner in zip(runs, owners) if owner]
+    p = self.r.pipeline()
+    for _, owner in held:
+      p.exists(key("lease", owner.decode()))
+    dead = [(run, owner) for (run, owner), live in zip(held, await p.execute()) if not live]
+    if not dead:
+      return
+    leases = [key("lease", owner.decode()) for _, owner in dead]
+    try:
+      async with self.r.pipeline(transaction=True) as p:
+        await p.watch(*leases)  # a process back from a long pause renews its lease, and keeps its runs
+        if not await p.exists(*leases):
           p.multi()
-          p.set(k, owner, px=LEASE_MS)
-          p.set(last, owner)
+          for run, owner in dead:
+            p.delex(key("owner", run), ifeq=owner)
           await p.execute()
-          return True
-      except redis.WatchError:
-        continue
+    except redis.WatchError:
+      pass  # the next look frees the rest
 
-  async def renew_lease(self, worker: str, owner: str) -> bool:
-    """Hold the worker's lease for another LEASE_MS. False if `owner` doesn't hold it anymore."""
-    return bool(await self.r.set(key("owner", worker), owner, ifeq=owner, px=LEASE_MS))
+  # ***** leases: a worker process is live while it renews its own *****
 
-  async def release_lease(self, worker: str, owner: str) -> None:
-    await self.r.delex(key("owner", worker), ifeq=owner)
+  async def renew_lease(self, owner: str) -> None:
+    """A process is live for another LEASE_MS. One back from a pause longer than that keeps the runs nobody freed meanwhile."""
+    await self.r.set(key("lease", owner), 1, px=LEASE_MS)
 
-  async def lease_owner(self, worker: str) -> str | None:
-    owner = await self.r.get(key("owner", worker))
-    return owner.decode() if owner else None
+  async def release_lease(self, owner: str) -> None:
+    await self.r.delete(key("lease", owner))
 
   # ***** nodes *****
 
@@ -469,6 +525,7 @@ class Bus:
     nodes = {k.decode(): json.loads(v) for k, v in (await self.r.hgetall(key("nodes"))).items()}
     if dead := [k for k, v in nodes.items() if v["until"] < time.time()]:
       await self.r.hdel(key("nodes"), *dead)
+      await self.r.delete(*(key("granted", n) for n in dead))  # its GPUs left with it
     return {k: v if details else v["gpus"] for k, v in nodes.items() if k not in dead}
 
   # ***** replies *****

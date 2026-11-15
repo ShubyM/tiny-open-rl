@@ -2,7 +2,7 @@
 
 Needs kubectl pointed at a cluster running k8s/ on at least two GPU nodes, and the tinker SDK. It port-forwards the gateway, trains two LoRA runs through the SDK, then injects one failure at a time and checks what the user sees:
 
-  trainer_killed   a trainer's supervisor dies: the node daemon starts another, calls fail cleanly, load_state recovers
+  trainer_killed   a trainer's supervisor dies: the node daemon starts another, which resumes the run from its last save
   gateway_deleted  every gateway pod is deleted: the SDK's retries land and no call runs twice
   redis_restarted  Redis is down past the worker lease: runs survive on its append-only file and training goes on
   node_drained     a node is drained, as on a Spot notice: its trainer saves the run, which goes on on another node
@@ -102,7 +102,7 @@ def trainer_process(worker: str) -> tuple[str, int]:
   return pod, pid
 
 
-def check_processes(placed: dict, workers: dict, procs: dict, owners: list[str]) -> None:
+def check_processes(placed: dict, workers: dict, procs: dict, leases: list[str]) -> None:
   assert set(workers) == {(pod, worker) for worker, pod in placed.items()}, (placed, workers)
   for pod, ps in procs.items():
     local = {worker: state for (at, worker), state in workers.items() if at == pod}
@@ -123,7 +123,7 @@ def check_processes(placed: dict, workers: dict, procs: dict, owners: list[str])
     }
     assert not extra, (pod, "unowned model processes", extra)
   assert not (missing_pods := {pod for pod, _ in workers} - procs.keys()), missing_pods
-  assert not (leaked := set(owners) - placed.keys()), ("leases without a worker", leaked)
+  assert len(leases) == len(workers), ("a lease for each live worker process, and no others", leases)
 
 
 def wait(what: str, ok, timeout: float) -> float:
@@ -217,10 +217,10 @@ def main() -> None:
     pod, pid = trainer_process(run.worker)
     kubectl("exec", pod, "--", "kill", "-9", str(pid))
     restart = wait("a new trainer supervisor", lambda: trainer_process(run.worker) != (pod, pid), 15)
-    error = run.fails_cleanly()
-    assert "lost its unsaved steps" in error, error
-    run.tc.load_state_with_optimizer(checkpoint).result()
-    return f"restarted in {restart:.0f} s, then the call failed with the expected error, and load_state recovered"
+    c, r = both_step()  # nothing changed the run since its save, so the new trainer resumed from it
+    gap = abs(r - c) / c
+    assert gap < 0.05, f"after the restart the run's loss {r:.4f} is {gap:.1%} off the control's {c:.4f}"
+    return f"restarted in {restart:.0f} s and resumed from its save, next loss {r:.4f} vs control {c:.4f}"
 
   def gateway_deleted():
     before = run.server_steps()
@@ -243,12 +243,12 @@ def main() -> None:
     node = daemons()[pod]
     kubectl("taint", "node", node, "tinyrl-e2e-drain=true:NoExecute")  # evicts the node daemon, as a Spot notice does
     try:
-      wait("the run parked", lambda: redis("EXISTS", f"tinyrl:parked:{run.run_id}") == "1", 40)
+      wait("the run handed off", lambda: redis("HEXISTS", f"tinyrl:run:{run.run_id}", "checkpoint") == "1", 40)
       moved = wait("the worker moved", lambda: serving(run.worker) not in (None, pod), 90)
       c, r = both_step()
       gap = abs(r - c) / c
       assert gap < 0.05, f"after the move the run's loss {r:.4f} is {gap:.1%} off the control's {c:.4f}"
-      return f"parked, moved in {moved:.0f} s, next loss {r:.4f} vs control {c:.4f} ({gap:.2%} apart)"
+      return f"handed off, moved in {moved:.0f} s, next loss {r:.4f} vs control {c:.4f} ({gap:.2%} apart)"
     finally:
       kubectl("taint", "node", node, "tinyrl-e2e-drain-", check=False)
 
@@ -276,8 +276,7 @@ def main() -> None:
     placed = placements()
     workers = live_workers()
     procs = {pod: processes(pod) for pod in daemons()}
-    owners = [k.removeprefix("tinyrl:owner:") for k in redis("KEYS", "tinyrl:owner:*").split()]
-    check_processes(placed, workers, procs, owners)
+    check_processes(placed, workers, procs, redis("KEYS", "tinyrl:lease:*").split())
     engines = sum(s["pid"] is not None for s in workers.values())
     return f"{len(placed)} workers, {engines} owned process groups, and no stray processes or leases"
 

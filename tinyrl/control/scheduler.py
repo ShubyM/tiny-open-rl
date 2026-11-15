@@ -1,4 +1,4 @@
-"""The cluster assigns jobs to workers and workers to nodes. Its current assignment is a table in Redis: each job's worker, and each worker's spec and node. The scheduler reads it, fixes what's wrong and writes it back; events only trace what changed. A node chooses GPUs directly from its own running processes. Run one cluster scheduler."""
+"""The cluster assigns jobs to workers, workers to nodes and GPUs, and grants a worker its GPUs when it has work. Its current assignment is a table in Redis: each job's worker, each worker's spec, node and GPUs, and the workers holding their GPUs now. The scheduler reads it, fixes what's wrong and writes it back; events only trace what changed. A node runs its workers on the GPUs they are granted, and is the only one that gives a grant back. Run one cluster scheduler."""
 
 from __future__ import annotations
 
@@ -72,9 +72,19 @@ def fits(memory: list[int], gpu_bytes: int) -> bool:
   return len(memory) == 1 or (gpu_bytes > 0 and all(memory) and sum(memory) <= gpu_bytes)
 
 
+def can_share(s: Assignment, node: str, names: list[str]) -> bool:
+  """Whether these workers' processes can be on one of the node's GPUs at once. One always can; more only by their memory budgets, and never with an exclusive worker or one the table no longer has."""
+  if len(names) == 1:
+    return True
+  specs = [s.workers[n].spec for n in names if n in s.workers]
+  budgets = [memory_budget(s, spec, node) for spec in specs]
+  return len(specs) == len(names) and not any(x.exclusive for x in specs) and fits(budgets, s.nodes[node][1])
+
+
 # ***** the assignment *****
 
 TURN = getenv("TURN", 200_000)  # tokens a busy holder serves on its GPUs while others wait
+Grant = tuple[str, tuple[int, ...]]  # the node and GPUs a worker holds
 
 
 @dataclass(frozen=True)
@@ -100,31 +110,32 @@ class Job:
 
 @dataclass
 class Worker:
-  """One trainer or sampler process, serving one or more jobs with its spec. The cluster assigns it a node; the node picks its GPUs."""
+  """One trainer or sampler process, serving one or more jobs with its spec. The cluster assigns it a node and GPUs on it."""
 
   spec: WorkerSpec = WorkerSpec()
   node: str | None = None  # None until it is placed
-  gpus: tuple[int, ...] = ()  # desired GPUs, chosen by the node; a running process may still be on its old ones
-  # The node's local copy records actual GPUs and reservations; cluster assignments leave these fields empty.
-  ticket: int = 0
+  gpus: tuple[int, ...] = ()  # the GPUs it uses when granted them; a running process may still be on its old ones
+  # A node's record of its own process: the GPUs it is on. The cluster's table leaves these fields empty.
   served: int | None = None  # tokens it has served on its GPUs this turn, None while it is parked
   pid: int | None = None
 
 
 @dataclass
 class Assignment:
-  """The cluster's current assignment: the live nodes, each job's worker, and each worker's node. A node's own copy also holds its workers' GPUs and turns."""
+  """The cluster's current assignment: the live nodes, each job's worker, each worker's node and GPUs, and the workers holding their GPUs now."""
 
   workers_made: int = 0  # so the next new worker is w<workers_made + 1>
   nodes: dict[str, tuple[int, int]] = field(default_factory=dict)  # live node -> (GPUs, bytes per GPU)
   workers: dict[str, Worker] = field(default_factory=dict)
   jobs: dict[str, Job] = field(default_factory=dict)
+  granted: dict[str, Grant] = field(default_factory=dict)  # until its node gives them back
 
 
 def from_table(table: dict) -> Assignment:
-  """The assignment as Redis holds it: live nodes, each job's record and worker, and each worker's spec and node."""
+  """The assignment as Redis holds it: live nodes, each job's record and worker, each worker's spec, node and GPUs, and the grants."""
   nodes = {n: (v["gpus"], v.get("memory", 0)) for n, v in table["nodes"].items()}
-  s = Assignment(workers_made=table["workers_made"], nodes=nodes)
+  granted = {w: (n, tuple(gpus)) for n, held in table.get("granted", {}).items() for w, gpus in held.items()}
+  s = Assignment(workers_made=table["workers_made"], nodes=nodes, granted=granted)
   for job, (rec, worker) in table["runs"].items():
     role, base, lora = Role(rec.get("role", "trainer")), rec.get("base", ""), rec.get("rank", 0) > 0
     exclusive, train_run = rec.get("exclusive", False), rec.get("train_run")
@@ -133,19 +144,18 @@ def from_table(table: dict) -> Assignment:
   # an exclusive job's sampling sessions end with it
   s.jobs = {r: x for r, x in s.jobs.items() if not x.spec.train_run or x.spec.train_run in s.jobs}
   for name, w in table["workers"].items():
-    s.workers[name] = Worker(WorkerSpec(**w["spec"] | {"role": Role(w["spec"]["role"])}), w["node"])
+    spec = WorkerSpec(**w["spec"] | {"role": Role(w["spec"]["role"])})
+    s.workers[name] = Worker(
+      spec, w["node"], tuple(w.get("gpus", ()))
+    )  # a table from before the cluster chose GPUs has none
   for x in s.jobs.values():
     if x.worker:  # created in a worker already, as tests do
       s.workers.setdefault(x.worker, Worker(x.spec))
   return s
 
 
-def keep_chosen_gpus(new: Assignment, old: Assignment) -> Assignment:
-  """A node keeps the GPUs it chose for each worker that stays where it was."""
-  for name, w in new.workers.items():
-    if (was := old.workers.get(name)) and was.node == w.node:
-      w.gpus = was.gpus
-  return new
+def to_table(s: Assignment) -> dict[str, dict]:
+  return {n: {"spec": dataclasses.asdict(w.spec), "node": w.node, "gpus": w.gpus} for n, w in s.workers.items()}
 
 
 def assign(s: Assignment, job: str, worker: str) -> None:
@@ -185,6 +195,8 @@ def decide(state: Assignment) -> tuple[Assignment, list[tuple[Ev, dict]]]:
   for name in sorted(unplaced, key=lambda name: (not s.workers[name].spec.exclusive, name)):
     out.append((Ev.PLACED, placed := place(s, name)))
     s.workers[name].node = placed["node"]
+  for node in s.nodes:
+    place_gpus(s, node)
   return s, out
 
 
@@ -253,10 +265,8 @@ def place(s: Assignment, worker: str) -> dict:
   return {"worker": worker, "node": node, "rule": rule}
 
 
-def place_gpus(s: Assignment, node: str, running) -> None:
-  """Choose desired GPUs in place. Actual process placements and reservations stay in the node's running table."""
-  if node not in s.nodes:
-    return
+def place_gpus(s: Assignment, node: str) -> None:
+  """Choose the GPUs of the node's workers, in place. A worker keeps its GPUs while it stays on the node."""
   for name, w in sorted(s.workers.items(), key=lambda item: (not item[1].spec.exclusive, item[0])):
     if w.node != node or not jobs_of(s, name):
       continue
@@ -266,9 +276,9 @@ def place_gpus(s: Assignment, node: str, running) -> None:
         s.workers[aside[0]].gpus = choose_gpus(s, node, aside[0], avoid=gpus)[0]
       else:
         w.gpus = gpus
-  # Spread trainers after departures. A GPU is empty only after its old process has left it.
+  # Spread trainers after departures. A GPU is empty only after its old process has given it back.
   gpus, gpu_bytes = s.nodes[node]
-  occupied = {g for r in running.values() for g in r.gpus}
+  occupied = {g for at, held in s.granted.values() if at == node for g in held}
   while True:
     there = {g: [n for n, w in s.workers.items() if w.node == node and g in w.gpus] for g in range(gpus)}
     empty = [g for g in range(gpus) if not there[g] and g not in occupied]
@@ -280,28 +290,34 @@ def place_gpus(s: Assignment, node: str, running) -> None:
     if not empty or not (crowded := [g for g, names in movable.items() if names]):
       return
     g = max(crowded, key=lambda g: (len(there[g]), -g))
-    name = min(
-      movable[g], key=lambda n: (not s.workers[n].spec.lora, n in running and running[n].served is not None, n)
-    )
+    name = min(movable[g], key=lambda n: (not s.workers[n].spec.lora, n in s.granted, n))
     s.workers[name].gpus = (empty[0],)
 
 
-def someone_waits(running, gpus: tuple[int, ...]) -> bool:
-  return any(r.ticket > 0 and any(g in r.gpus for g in gpus) for r in running.values())
+# ***** grants *****
 
 
-def can_run(s: Assignment, node: str, running, name: str) -> bool:
-  """Reserve all actual GPUs together, in ticket order on each GPU, including processes still draining after unplacement."""
-  r = running[name]
-  if r.ticket <= 0 or r.served is not None or not r.gpus or node not in s.nodes:
-    return False
-  for gpu in r.gpus:
-    if any(x.ticket > 0 and (x.ticket, n) < (r.ticket, name) and gpu in x.gpus for n, x in running.items()):
-      return False
-    memory = [memory_budget(s, x.spec, node) for x in running.values() if x.served is not None and gpu in x.gpus]
-    if not fits([*memory, memory_budget(s, r.spec, node)], s.nodes[node][1]):
-      return False
-  return True
+def grant(s: Assignment, ready: dict[str, list[str]], service: dict[str, int], floor: int):
+  """Who gets their GPUs now, the service to add to accounts, and the service floor.
+
+  `ready` is the accounts each worker has work for, and `service` the tokens every account has been served. Every account with work ready is lifted to the floor, so one back from idle holds no credit, and the floor only rises. Waiting workers then go least-served first. One that doesn't fit yet still keeps its GPUs from the workers behind it, so narrow workers can't starve a wide one.
+  """
+  accounts = {a for w in ready if w in s.workers for a in ready[w]}
+  floor = max(floor, min((service.get(a, 0) for a in accounts), default=floor))
+  lifts = {a: floor - service.get(a, 0) for a in accounts if service.get(a, 0) < floor}
+
+  def served(w: str) -> int:
+    return min((max(service.get(a, 0), floor) for a in ready[w]), default=floor)
+
+  waiting = [w for w in ready if w in s.workers and w not in s.granted and s.workers[w].gpus]
+  held, grants = dict(s.granted), {}  # held: granted before, granted now, or waiting ahead
+  for name in sorted(waiting, key=lambda w: (served(w), w)):
+    node, gpus = s.workers[name].node, s.workers[name].gpus
+    on = {g: [n for n, (at, theirs) in held.items() if at == node and g in theirs] for g in gpus}
+    if all(can_share(s, node, [name, *others]) for others in on.values()):
+      grants[name] = (node, gpus)
+    held[name] = (node, gpus)
+  return grants, lifts, floor
 
 
 def takes_turns(w: Worker) -> bool:
@@ -346,21 +362,31 @@ def choose_gpus(s: Assignment, node: str, name: str, avoid: tuple[int, ...] = ()
 TICK_MS = getenv("TICK_MS", 100)  # how long it waits for an entry before it looks at the table again
 
 
+async def step(bus: Bus, registry: Registry) -> None:
+  """One look at the cluster: end what expired, fix the assignment, and grant GPUs."""
+  for session in await bus.expired_sessions():  # their clients stopped heartbeating
+    await bus.end_session(session)
+  # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
+  await registry.unregister_checkpoints(*await registry.expired_checkpoints())
+  await bus.free_orphaned_runs()
+  table = await bus.read_table()
+  s = from_table(table)
+  new, changes = decide(s)
+  if new != s:
+    assigned = {r: x.worker for r, x in new.jobs.items() if x.worker != s.jobs[r].worker}
+    await bus.write_table(
+      assigned, to_table(new), sorted(s.workers.keys() - new.workers.keys()), new.workers_made, changes
+    )
+  grants, lifts, floor = grant(new, table["ready"], table["service"], table["floor"])
+  if grants or lifts or floor != table["floor"]:
+    await bus.write_grants(grants, lifts, floor)
+
+
 async def run(bus: Bus) -> None:
   registry = Registry(bus)
   while True:
     await bus.read_events("$", count=1, block_ms=TICK_MS)  # wake on anything new, or each tick
-    for session in await bus.expired_sessions():  # their clients stopped heartbeating
-      await bus.end_session(session)
-    # checkpoints whose TTL ran out. The node daemons' sweeps delete their files
-    await registry.unregister_checkpoints(*await registry.expired_checkpoints())
-    s = from_table(await bus.read_table())
-    new, changes = decide(s)
-    if not changes:
-      continue
-    assigned = {r: x.worker for r, x in new.jobs.items() if x.worker != s.jobs[r].worker}
-    workers = {n: {"spec": dataclasses.asdict(w.spec), "node": w.node} for n, w in new.workers.items()}
-    await bus.write_table(assigned, workers, sorted(s.workers.keys() - new.workers.keys()), new.workers_made, changes)
+    await step(bus, registry)
 
 
 if __name__ == "__main__":

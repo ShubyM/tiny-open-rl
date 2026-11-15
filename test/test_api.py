@@ -212,8 +212,8 @@ class TestAPI(RedisTest):
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
-    await self.node.sync()
-    self.assertEqual(scheduler.jobs_of(self.node.state, await self.worker(full)), [full])
+    state = scheduler.from_table(await self.bus.read_table())
+    self.assertEqual(scheduler.jobs_of(state, await self.worker(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -230,7 +230,6 @@ class TestAPI(RedisTest):
     run_id = await self.create_model(session_id=session_id)
     sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
     samp_id = sampling.json()["sampling_session_id"]
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 
     stale = {session_id: time.time() - bus.SESSION_GRACE - 1}
@@ -251,7 +250,6 @@ class TestAPI(RedisTest):
     run_id = await self.create_model(session_id=session_id)
     sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
     samp_id = sampling.json()["sampling_session_id"]
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 
     await self.post(f"sessions/{session_id}/finish", json={"reason": {"type": "success"}})
@@ -397,18 +395,16 @@ class TestAPI(RedisTest):
     )
     samp_id = saved.json()["sampling_session_id"]
 
-    await self.bus.node_heartbeat("node-1", 8)
-    await self.bus.append_event("node_up", node="node-1", gpus=8, memory=0)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     worker = await self.worker(run_id)
     data = await self.scheduling_until(lambda d: d["state"]["workers"].get(worker, {}).get("node"))
-    self.assertEqual(data["state"]["workers"][worker]["node"], "node-1")
+    self.assertEqual(data["state"]["workers"][worker]["node"], self.node.id)
+    self.assertEqual(data["state"]["workers"][worker]["gpus"], [0])
     sampler = data["state"]["workers"][await self.worker(samp_id)]
     self.assertEqual(
       sampler["spec"],
       {"role": "sampler", "base": "tiny", "lora": True, "exclusive": True, "train_run": excl_id, "gpus": 1},
     )
-    self.assertIn("node-1", data["nodes"])
+    self.assertIn(self.node.id, data["nodes"])
 
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
@@ -446,9 +442,6 @@ class TestAPI(RedisTest):
     self.assertEqual(await self.sampler_runs(), [sid])
     sampler = await self.worker(sid)
 
-    await self.bus.node_heartbeat("n8", 8)
-    await self.bus.append_event("node_up", node="n8", gpus=8, memory=0)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     await self.scheduling_until(lambda d: d["state"]["workers"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)

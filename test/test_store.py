@@ -280,14 +280,14 @@ class TestRegistry(RedisTest):
   async def test_deletion_wins_over_concurrent_ttl_updates(self):
     run = new_id()
     await self.bus.create_run(Run(id=run, worker="p", base="base", rank=8))
-    await self.bus.take_lease("p", "owner")
+    await self.bus.take_ownership(run, "owner")
     uri = f"tinker://{run}/sampler_weights/session"
     await self.registry.register_checkpoint(uri, 1, ttl=60, owned=True)
     await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
     [cmd] = await self.bus.take_commands([run], "owner", count=1)
     await asyncio.gather(
       *(self.registry.set_checkpoint_ttl(uri, 600) for _ in range(20)),
-      self.bus.write_reply(cmd, Reply(True, "application/json", b"{}"), "p", "owner"),
+      self.bus.write_reply(cmd, Reply(True, "application/json", b"{}"), "owner"),
     )
     self.assertFalse(await self.registry.set_checkpoint_ttl(uri, 600))
     self.assertIsNone(await self.registry.get_checkpoint(uri))

@@ -179,6 +179,7 @@ class TestSampler(RedisTest):
     sampler, task = node.samplers["sampler"], node.tasks["sampler"]
     try:
       await asyncio.wait_for(booting.wait(), 5)
+      node.engine_type = FakeEngine  # the process the node starts next boots
       later = await self.bus.submit_command("later", Op.SAMPLE, json.dumps(JOB).encode())
       future = await self.bus.submit_command("later", Op.SAMPLE, json.dumps(JOB).encode())
       self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 2, "in_flight": []})
@@ -192,14 +193,10 @@ class TestSampler(RedisTest):
       self.assertIsInstance(error, RuntimeError)
       self.assertIsNone(sampler.running)
       self.assertIsNone(reservation.served)
-      self.assertIsNone(await self.bus.lease_owner("sampler"))
-      self.assertIsNone(await self.bus.wait_for_reply(future, 0))
-      self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
     finally:
       finish_boot.set()
-    node.engine_type = FakeEngine
-    await node.add("sampler")
-    self.assertTrue((await self.bus.wait_for_reply(future, 5)).ok)
+    self.assertTrue((await self.bus.wait_for_reply(future, 5)).ok)  # the failed boot had left it unclaimed
+    self.assertIsNot(node.samplers["sampler"], sampler)
 
   async def test_fft_sessions_do_not_overlap_and_reload_changed_checkpoints(self):
     store = Store(tempfile.mkdtemp())
@@ -256,7 +253,8 @@ class TestSampler(RedisTest):
     try:
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
-      await self.until(lambda: bool(waiting.ticket))
+      await self.until(lambda: "waiting" in node.ready)
+      self.assertIsNone(waiting.served)
       broken = await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode())
       reply = await self.bus.wait_for_reply(broken, 3)
       self.assertIsNotNone(reply, "a healthy head waiting for GPU must not hold up a preparation error")
@@ -284,13 +282,13 @@ class TestSampler(RedisTest):
 
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
     await node.add("busy", gpus=[0])
-    waiting = await node.add("waiting", gpus=[0])
+    await node.add("waiting", gpus=[0])
     self.pump(node)
     with mock.patch.object(scheduler, "TURN", 1):
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode())
-      await self.until(lambda: bool(waiting.ticket))
+      await self.until(lambda: "waiting" in node.ready)
       more = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [33]}).encode())
       await asyncio.sleep(0.5)  # so the holder has its next command ready when the first one ends
       finish.set()

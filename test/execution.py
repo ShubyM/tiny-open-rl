@@ -1,8 +1,9 @@
-"""Real node control with a synchronous CPU model in place of the local socket process."""
+"""Real node control and the real scheduler, with a synchronous CPU model in place of the local socket process."""
 
 import asyncio
+import dataclasses
 
-from test.helpers import FakeEngine, assign_new_runs, tiny
+from test.helpers import FakeEngine, tiny
 from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.workers.model import Model
@@ -32,11 +33,12 @@ class InlineProcess:
 
 
 class TestNode(NodeDaemon):
+  """The cluster's only node. Every tick is also one look by the scheduler, so workers are placed and granted GPUs as in a cluster."""
+
   def __init__(self, bus, store=None, gpus=8, node="test-node", model=tiny, engine=FakeEngine, gpu_mib=0):
     super().__init__(bus, gpus=gpus, node=node, gpu_mib=gpu_mib, store=store)
     self.default_model, self.engine_type = model, engine
-    self.processes, self.samplers, self.pinned = {}, {}, set()
-    self.state.nodes[self.id] = (gpus, gpu_mib * 2**20)
+    self.processes, self.samplers, self.pumping, self.stopping = {}, {}, None, set()
 
   def open_trainer(self, worker, env):
     process = InlineProcess(Trainer(Model(self.default_model), self.store))
@@ -49,40 +51,54 @@ class TestNode(NodeDaemon):
     self.samplers[worker] = sampler
     return sampler
 
-  async def read_state(self):
-    """The table, with the workers a test placed here itself, since no scheduler places them."""
-    state = scheduler.from_table(await self.bus.read_table())
-    state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))  # live before its first heartbeat
-    for worker in self.pinned & state.workers.keys():
-      state.workers[worker].node = self.id
-    return scheduler.keep_chosen_gpus(state, self.state)
+  async def tick(self):
+    await super().tick()
+    await scheduler.step(self.bus, self.registry)
 
-  async def sync(self):
-    self.state = await self.read_state()
+  async def read_state(self):
+    state, ready = await super().read_state()
+    for worker in self.stopping & state.workers.keys():
+      state.workers[worker].node = None  # as this node sees a worker the cluster moved away
+    return state, ready
+
+  async def restart(self, worker):
+    """Stop a worker's process the planned way, so it hands its runs off, and let the next tick start another."""
+    self.stopping.add(worker)
+    await asyncio.wait_for(asyncio.gather(self.tasks[worker], return_exceptions=True), 10)
+    self.stopping.discard(worker)
+
+  async def kill(self, worker):
+    """Lose a worker's process with no notice. The next tick starts another."""
+    self.tasks[worker].cancel()
+    await asyncio.wait_for(asyncio.gather(self.tasks[worker], return_exceptions=True), 10)
+
+  def pump(self):
+    async def run():
+      while True:
+        await self.tick()
+        await asyncio.sleep(0.005)
+
+    self.pumping = self.pumping or asyncio.create_task(run())
 
   async def add(self, worker, gpus=None):
-    self.pinned.add(worker)
-    await self.sync()
-    self.dispatch()
-    desired = self.state.workers[worker]
+    """Run a worker here, on the GPUs the scheduler chooses or the test names, and keep the cluster ticking."""
     if gpus is not None:
-      desired.gpus = tuple(gpus)
-    scheduler.place_gpus(self.state, self.id, self.running)
-    if worker in self.running:
-      return self.running[worker]
-    task = self.tasks.get(worker) or self.start(worker)
+      s = scheduler.from_table(await self.bus.read_table())
+      placed = {"spec": dataclasses.asdict(s.workers[worker].spec), "node": self.id, "gpus": tuple(gpus)}
+      await self.bus.write_table({}, {worker: placed}, [], s.workers_made, [])
+    self.pump()
     async with asyncio.timeout(5):
       while worker not in self.running:
-        if task.done():
+        if (task := self.tasks.get(worker)) and task.done():
           task.result()
-          raise AssertionError(f"could not acquire {worker}")
+          raise AssertionError(f"could not start {worker}")
         await asyncio.sleep(0.001)
     return self.running[worker]
 
   async def worker_for(self, run):
-    await assign_new_runs(self.bus)
-    await self.sync()
-    return r.worker if (r := self.state.jobs.get(run)) else None
+    await scheduler.step(self.bus, self.registry)
+    jobs = scheduler.from_table(await self.bus.read_table()).jobs
+    return jobs[run].worker if run in jobs else None
 
   async def drain(self, run):
     """Let the real worker coroutines finish the commands visible in their Redis streams."""
@@ -100,8 +116,11 @@ class TestNode(NodeDaemon):
         await asyncio.sleep(0.001)
     return self.running.get(worker)
 
-  async def aclose(self):
-    await self.close(graceful=False)
+  async def aclose(self, graceful=False):
+    if self.pumping:
+      self.pumping.cancel()
+      await asyncio.gather(self.pumping, return_exceptions=True)
+    await self.close(graceful)
     if task := self.sweeping:
       task.cancel()
       await asyncio.gather(task, return_exceptions=True)
