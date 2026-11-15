@@ -77,7 +77,7 @@ class TestNodeDaemon(RedisTest):
     await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
     await self.create(run, "tiny", node)
     engine = await node.worker_for(run)
-    await self.until(lambda: not node.held, node)
+    await self.until(lambda: not node.state["turns"], node)
     node.driver.cancel()
     await asyncio.gather(node.driver, return_exceptions=True)
     await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
@@ -138,12 +138,12 @@ class TestNodeDaemon(RedisTest):
     self.background(scheduler.run(self.bus))
     await self.create("a", base, node)
     engine = (await self.bus.read_table())["claims"]["a"]["engine"]
-    await self.until(lambda: engine not in node.held and node.state["observations"][engine]["pid"], node)
+    await self.until(lambda: not node.state["turns"] and node.state["observations"][engine]["pid"], node)
     holder = node.state["observations"][engine]["pid"]
     os.killpg(holder, signal.SIGSTOP)
     try:
       await self.bus.submit_command("a", Op.OPTIM_STEP, b'{"adam_params":{}}')
-      await self.until(lambda: engine in node.held, node)
+      await self.until(lambda: any(turn["engine"] == engine for turn in node.state["turns"].values()), node)
       request = await self.bus.submit_command(
         "b", Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
       )
@@ -155,7 +155,7 @@ class TestNodeDaemon(RedisTest):
       with contextlib.suppress(ProcessLookupError):
         os.killpg(holder, signal.SIGCONT)
     await self.reply(request, node)
-    self.assertNotIn(engine, node.held)
+    self.assertNotIn(engine, {turn["engine"] for turn in node.state["turns"].values()})
 
   async def test_an_idle_process_death_is_detected_and_initial_state_reconstructed(self):
     require_unix()
@@ -168,7 +168,7 @@ class TestNodeDaemon(RedisTest):
     self.background(scheduler.run(self.bus))
     await self.create(run, base, node)
     engine = (await self.bus.read_table())["claims"][run]["engine"]
-    await self.until(lambda: engine not in node.held and node.state["observations"][engine]["pid"], node)
+    await self.until(lambda: not node.state["turns"] and node.state["observations"][engine]["pid"], node)
     first = node.state["observations"][engine]["pid"]
     os.killpg(first, signal.SIGKILL)
     await self.until(lambda: node.state["claims"].get(run, {}).get("engine") not in (None, engine), node)

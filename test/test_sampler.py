@@ -159,7 +159,7 @@ class TestSampler(RedisTest):
     self.assertFalse(reply.ok)
     self.assertIn("engine boot failed", json.loads(reply.body)["error"])
     async with asyncio.timeout(5):
-      while node.held:
+      while node.state["turns"]:
         await asyncio.sleep(0.01)
     self.assertIsNone(node.samplers[await node.worker_for("first")].running)
     self.assertEqual(closed, [True])

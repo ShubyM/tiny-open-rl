@@ -68,6 +68,9 @@ class Sampler:
     self.loading = asyncio.Lock()
     self.inflight, self.adapters = {}, {}
 
+  async def call(self, method: str, *args):
+    return await getattr(self, method)(*args)
+
   @property
   def proc(self):
     return getattr(self.running, "server", None)
@@ -83,7 +86,7 @@ class Sampler:
           await self.close()
           raise
 
-  async def execute(self, cmd: Cmd, run: dict | None, checkpoint: tuple[str, str] | None) -> Reply:
+  async def execute(self, cmd: Cmd, run: dict | None, checkpoint: tuple[str, str] | None) -> tuple[Reply, dict]:
     self.inflight[cmd.request_id] = (cmd.run, asyncio.current_task())
     try:
       if run is None:
@@ -97,13 +100,13 @@ class Sampler:
           await self.running.load_checkpoint(name, path)
           self.adapters[cmd.run] = name
       out = await self.running.sample(job, name, cmd.request_id)
-      return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, out))
+      return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, out)), {}
     except Exception as e:
-      return Reply.error(e)
+      return Reply.error(e), {}
     finally:
       self.inflight.pop(cmd.request_id, None)
 
-  async def cancel_run(self, run: str) -> None:
+  async def drop(self, run: str) -> None:
     active = {k: t for k, (r, t) in self.inflight.items() if r == run}
     try:
       if self.running and active:
@@ -115,6 +118,14 @@ class Sampler:
     async with self.loading:
       if (name := self.adapters.pop(run, None)) and name not in self.adapters.values():
         await self.running.unload_checkpoint(name)
+
+  async def retain(self, runs) -> None:
+    for run in (self.adapters.keys() | {r for r, _ in self.inflight.values()}) - set(runs):
+      await self.drop(run)
+
+  async def export(self, run: str, record: dict, parked: tuple[str, str] | None = None) -> None:
+    """A sampling job already pins its immutable checkpoint; there is no mutable state to export."""
+    return None
 
   async def resume(self) -> None:
     if self.running:

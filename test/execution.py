@@ -47,6 +47,8 @@ class TestNode(NodeDaemon):
   async def tick(self):
     async with self.ticking:
       await super().tick()
+      old = await self.bus.read_table()
+      await scheduler.commit(self.bus, old, scheduler.decide(old))
 
   def open_trainer(self, worker, run, env):
     process = InlineProcess(Trainer(Model(self.default_model), self.store))
@@ -58,11 +60,6 @@ class TestNode(NodeDaemon):
     sampler.engine_type = self.engine_type
     self.samplers[worker] = sampler
     return sampler
-
-  async def read_state(self):
-    old = await self.bus.read_table()
-    await scheduler.commit(self.bus, old, scheduler.decide(old))
-    return await self.bus.read_table()
 
   async def sync(self):
     await self.tick()
@@ -77,7 +74,7 @@ class TestNode(NodeDaemon):
 
   async def worker_for(self, run):
     await self.tick()
-    return self.state["claims"].get(run, {}).get("engine")
+    return (await self.bus.read_table())["claims"].get(run, {}).get("engine")
 
   async def drain(self, run):
     async with asyncio.timeout(30):

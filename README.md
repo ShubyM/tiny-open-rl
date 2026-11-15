@@ -64,6 +64,10 @@ block a prepared sibling. The turn token is the Redis consumer identity. Every r
 engine lease and pending command together. Heartbeats and lease renewal continue during model operations.
 There is no desired membership, residency acknowledgment, worker revision or job generation to reconcile.
 
+In the node, `serve_engine` owns the process and prepared inputs; `run_turn` owns one grant's execution and service
+accounting. Trainer and sampler handles accept the same commands. Checkpoint uploads, SAVE completion and collection
+run in the storage registry, independently of engine lifetime.
+
 A trainer is a synchronous model process behind a private Unix socket. Only request bytes, replies and checkpoint
 references cross it. Model tensors, optimizer state and checkpoint I/O stay in the trainer. Multi-GPU trainers use
 torchrun and FSDP; all ranks park, resume and exit together. Parking uses PyTorch tensor transfers to host memory;

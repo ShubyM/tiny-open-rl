@@ -351,22 +351,21 @@ active grant on a physical GPU. Trainer and sampler sessions share their logical
 GPU-time service. Exclusive accounts retain dedicated capacity; their trainers and owned samplers can alternate on
 it. Exclusive admission waits if every compatible bundle has another account's live cache binding.
 
-1. A worker coroutine owns its model handle, command queue and preparation task. Sampling commands join the ready
-   queue only after session metadata and checkpoint preparation succeed. Downloads run off the event loop and can
-   overlap startup or execution. Missing sessions and failed downloads receive fenced error replies without waiting
-   for a GPU grant.
-2. The node checks the grant's owner, revision and entire bundle before activation, then reports the GPUs held before
-   asynchronous startup. Independent workers run on disjoint bundles. Heartbeats and lease renewal continue while
-   model operations run.
+1. Each engine coroutine owns a process and preparation tasks for its claimed jobs. Downloads run off the event loop
+   while other jobs execute. Completed preparation makes a job ready for a turn; failed preparation produces a fenced
+   error reply when that job receives its turn.
+2. The node validates the exact turn, engine and entire bundle before startup. Independent engines run on disjoint
+   bundles. Heartbeats and lease renewal continue while model operations run. Physical occupancy comes from the
+   fleet's outstanding turns; the node keeps no second occupancy table.
 3. The fleet orders ready accounts by service. A waiting gang protects its full bundle against lower-ranked refills
    while old grants finish. `TURN` (200,000) is a token-cost allowance, checked between commands or sampling waves;
    an indivisible command can exceed the remaining allowance. A LoRA sampling wave has up to `SAMPLE_RUNS` sessions.
-4. On revocation the node parks trainer tensors through native PyTorch host transfers or sleeps the engine. The fleet
-   retains the physical allocation until the matching owner/revision acknowledges release, or cleanup confirms exit.
-   A failed wake also retains its allocation until cleanup finishes.
+4. Each turn resumes the model, executes its bounded work, parks trainer tensors or sleeps the sampler, and settles
+   its GPU service. Failure closes the process before releasing the turn. Engine cleanup also retires issued turns
+   that it never activated, after confirmed exit; lease expiry alone never releases capacity.
 
 A live process keeps its GPU bundle across park/resume. Moving a job to another bundle or node uses checkpoint
-handoff to a new worker; it does not retarget a live CUDA process. Redis stores desired grants and owner observations,
+handoff to a new engine; it does not retarget a live CUDA process. Redis stores claims, immutable turns and observations,
 which `GET /api/v1/scheduling` exposes directly. The node only reports execution state and enforces grants.
 
 Historical measurements on an H100: parking 16 GB took 0.60 s, resuming 0.64 s, and 725–781 MiB stayed on the GPU (529 MiB of

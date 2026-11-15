@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 
 from tinyrl.bus import Bus, key
-from tinyrl.storage.store import Store
+from tinyrl.storage.store import Store, manifest
+
+SWEEP_S, SWEEP_GRACE_S = 60, 600
 
 
 class Registry:
@@ -64,6 +67,21 @@ class Registry:
 
   async def expired_checkpoints(self) -> list[str]:
     return [u.decode() for u in await self.r.zrangebyscore(key("expiry"), 0, time.time())]
+
+  async def maintain(self, store: Store, interval: float) -> None:
+    """Finish captured SAVEs independently of trainer lifetime, and collect unreferenced versions."""
+    swept = 0.0
+    while True:
+      for request, cp in (await self.bus.pending_saves()).items():
+        with contextlib.suppress(OSError):
+          if manifest(store.folder(cp["version"])):
+            await asyncio.to_thread(store.upload_version, cp["uri"], cp["version"])
+          if await asyncio.to_thread(store.is_durable, cp["uri"], cp["version"]):
+            await self.bus.finish_save(request, cp)
+      if time.time() - swept > SWEEP_S:
+        await self.sweep(store, SWEEP_GRACE_S)
+        swept = time.time()
+      await asyncio.sleep(interval)
 
   async def sweep(self, store: Store, grace: float) -> None:
     versions = [k async for k in self.r.scan_iter(match=key("ver", "*"))]
