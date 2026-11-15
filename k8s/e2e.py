@@ -115,7 +115,7 @@ def check_processes(placed: dict, workers: dict, procs: dict, owners: list[str])
     while children := {pid for pid, (parent, _, _) in ps.items() if parent in owned} - owned:
       owned.update(children)
     # torchrun ranks may have separate process groups; restored vLLM copies have their own PID namespace.
-    names = ("tinyrl.workers.trainer", "tinyrl.workers.snapshot", "vllm serve", "VLLM::")
+    names = ("tinyrl.workers.trainer", "vllm serve", "VLLM::")
     extra = {
       pid: args
       for pid, (_, group, args) in ps.items()

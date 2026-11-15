@@ -123,17 +123,21 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
 
-  async def open_sampler(base_model: str | None, model_path: str | None, session_id: str = "") -> str:
+  async def open_sampler(
+    base_model: str | None, model_path: str | None, session_id: str = "", pending: bool = False
+  ) -> str:
+    version = None
     if model_path:
       if not model_path.startswith("tinker://"):
         raise ValueError(f"bad model_path {model_path}")
       uri = checkpoint_uri("x", "sampler_weights", model_path)
       train_run = uri.removeprefix("tinker://").split("/", 1)[0]
       train = await bus.get_run(train_run) or {}
-      if train.get("base"):
+      if pending:
         base, lora = train["base"], train["rank"] > 0
       else:
-        meta = store.read_meta(uri)
+        version = await registry.version(uri)
+        meta = await asyncio.to_thread(store.read_meta, uri, version)
         base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
       if not base:
         raise ValueError("could not resolve base_model")
@@ -145,20 +149,18 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     exclusive = bool(train.get("exclusive")) if train_run else False
     gpus = await asyncio.to_thread(estimator.gpus, base, "vllm")
     sid = f"samp-{uuid.uuid4().hex[:12]}"
-    await bus.create_run(Run(sid, "", base, int(lora), session_id, uri, {}, exclusive, Role.SAMPLER, train_run, gpus))
+    await bus.create_run(
+      Run(sid, "", base, int(lora), session_id, uri, {}, exclusive, Role.SAMPLER, train_run, gpus, version)
+    )
     return sid
 
   # ***** service *****
 
   @api.get("/api/v1/scheduling")
   async def scheduling():
-    """The cluster's assignment, with each worker's GPUs and process from its node's last heartbeat."""
+    """Fleet grants and the independently observed process state."""
     table = await bus.read_table()
     state = dataclasses.asdict(scheduler.from_table(table))
-    for node, info in table["nodes"].items():
-      for worker, local in info.get("workers", {}).items():
-        if state["workers"].get(worker, {}).get("node") == node:
-          state["workers"][worker] |= local
     return {"nodes": {n: v["gpus"] for n, v in table["nodes"].items()}, "state": state}
 
   @api.get("/api/v1/healthz")
@@ -202,10 +204,9 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
 
-    if req.session_id and req.model_seq_id is not None:
-      run = f"{req.session_id}-{req.model_seq_id}"
-    else:
-      run = str(uuid.uuid4())
+    run = (
+      f"{req.session_id}-{req.model_seq_id}" if req.session_id and req.model_seq_id is not None else str(uuid.uuid4())
+    )
 
     base = req.base_model
     gpus = int(metadata.get("openrl.gpus") or (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")))
@@ -219,13 +220,12 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     if run is None:
       raise HTTPException(404, f"no model {req.model_id}")
 
-    # the SDK reads LoRA shaped metadata, even for a full fine-tune
     return {
       "type": "get_info",
       "model_id": req.model_id,
       "model_name": run["base"],
-      "is_lora": True,
-      "lora_rank": run["rank"] or 16,
+      "is_lora": run["rank"] > 0,
+      "lora_rank": run["rank"] or None,
       "model_data": {"model_name": run["base"], "tokenizer_id": run["base"]},
     }
 
@@ -252,16 +252,12 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def optim_step(req: OptimStepRequest):
     return await submit(req.model_id, Op.OPTIM_STEP, {"adam_params": req.adam_params}, req.seq_id)
 
-  async def save(req: SaveRequest, op: Op, kind: str):
-    seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else req.seq_id
-    name = req.path or f"step-{seq if seq is not None else time.time_ns()}"
-    kept = req.ttl_seconds if req.ttl_seconds is not None else CKPT_TTL or None
-    args = {"uri": checkpoint_uri(req.model_id, kind, name), "ttl_seconds": ttl(kept)}
-    return await submit(req.model_id, op, args, req.seq_id)
-
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
   async def save_weights(req: SaveRequest):
-    return await save(req, Op.SAVE_WEIGHTS, "weights")
+    name = req.path or f"step-{req.seq_id if req.seq_id is not None else time.time_ns()}"
+    kept = req.ttl_seconds if req.ttl_seconds is not None else CKPT_TTL or None
+    args = {"uri": checkpoint_uri(req.model_id, "weights", name), "ttl_seconds": ttl(kept)}
+    return await submit(req.model_id, Op.SAVE_WEIGHTS, args, req.seq_id)
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveRequest):
@@ -280,13 +276,17 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     kept = req.ttl_seconds if req.ttl_seconds is not None or owned else CKPT_TTL or None
     args = {"uri": uri, "ttl_seconds": ttl(kept)}
     if owned:
-      args |= {"sampling_session_id": await open_sampler(train["base"], uri, train.get("session", "")), "owned": True}
+      args |= {
+        "sampling_session_id": await open_sampler(train["base"], uri, train.get("session", ""), True),
+        "owned": True,
+      }
     return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
 
   @api.post("/api/v1/load_weights")
   async def load_weights(req: LoadRequest):
     uri = checkpoint_uri(req.model_id, "weights", req.path)
-    return await submit(req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer}, req.seq_id)
+    args = {"uri": uri, "optimizer": req.optimizer, "version": await registry.version(uri)}
+    return await submit(req.model_id, Op.LOAD_WEIGHTS, args, req.seq_id)
 
   @api.post("/api/v1/delete_model")
   async def delete_model(req: ModelRequest):
@@ -421,8 +421,6 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       for name, n in counters.items():
         name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
         lines.append(f'tinyrl_{name}_total{{worker="{worker}",run="{run}"}} {n}')
-    for node, beat in (await bus.live_nodes(details=True)).items():
-      lines.append(f'tinyrl_node_loop_lag_seconds{{node="{node}"}} {beat.get("lag", 0.0)}')
     return PlainTextResponse("\n".join(lines) + "\n")
 
   return api

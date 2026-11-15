@@ -1,5 +1,5 @@
 import asyncio
-import dataclasses
+import json
 import os
 import subprocess
 import tempfile
@@ -10,8 +10,9 @@ import uuid
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from tinyrl.bus import Bus, connect
+from tinyrl.bus import Bus, connect, key, write_checkpoint
 from tinyrl.storage.registry import Registry
+from tinyrl.storage.store import split_version
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -68,6 +69,16 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     self.registry = Registry(self.bus)
     await self.bus.r.flushall()
 
+  async def seed_checkpoint(self, uri, size=0, ttl=None, owned=False, *, version):
+    """Seed an existing checkpoint before a scenario; runtime publication is tested through write_reply."""
+    p = self.bus.r.pipeline()
+    p.set(
+      key("ver", split_version(version)[0]),
+      json.dumps({"uri": uri, "version": version, "time": time.time(), "state": "live"}),
+    )
+    write_checkpoint(p, {"uri": uri, "size": size, "ttl": ttl, "owned": owned, "version": version})
+    await p.execute()
+
   async def worker(self, run: str) -> str:
     """The run's worker, once every new run is assigned the way the scheduler assigns it."""
     await assign_new_runs(self.bus)
@@ -85,12 +96,7 @@ async def assign_new_runs(bus) -> None:
   from tinyrl.control import scheduler
 
   s = scheduler.from_table(await bus.read_table())
-  new, changes = scheduler.decide(s)
-  runs = {body["run"]: body["worker"] for kind, body in changes if kind == "assigned"}
-  new_workers = {
-    w: {"spec": dataclasses.asdict(new.workers[w].spec), "node": None} for w in set(runs.values()) - s.workers.keys()
-  }
-  await bus.write_table(runs, new_workers, [], new.workers_made, [])
+  await scheduler.commit(bus, s, scheduler.decide(s))
 
 
 class FakeEngine:
@@ -99,6 +105,7 @@ class FakeEngine:
   def __init__(self):
     self.loaded: set[str] = set()
     self.lora = True
+    self.active = {}
 
   @classmethod
   async def start(cls, base: str, lora: bool, env: dict[str, str] | None = None) -> "FakeEngine":
@@ -109,6 +116,16 @@ class FakeEngine:
   async def load_checkpoint(self, name: str, path: str) -> None:
     self.loaded = self.loaded | {name} if self.lora else {name}
 
+  async def unload_checkpoint(self, name: str) -> None:
+    if self.lora:
+      self.loaded.discard(name)
+
+  async def abort(self, request_ids: list[str]) -> None:
+    tasks = [self.active[r] for r in request_ids if r in self.active]
+    for task in tasks:
+      task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
   async def sleep(self) -> None:
     pass
 
@@ -116,12 +133,17 @@ class FakeEngine:
     pass
 
   async def close(self) -> None:
-    pass
+    await self.abort(list(self.active))
 
-  async def sample(self, job: dict, name: str | None):
+  async def sample(self, job: dict, name: str | None, request_id: str):
     from tinyrl.workers.sampler import Out, Seq
 
-    tokens = [(job["prompt"][-1] + 1 + i) % 32 for i in range(job["max_tokens"])]
-    top = [{t: -1.0, 0: -2.0} for t in tokens]
-    seqs = [Seq(tokens, [-1.0] * len(tokens), top, False) for _ in range(job["num_samples"])]
-    return Out(seqs, [None] + [{t: -1.0, 0: -2.0} for t in job["prompt"][1:]])
+    self.active[request_id] = asyncio.current_task()
+    try:
+      await asyncio.sleep(0)
+      tokens = [(job["prompt"][-1] + 1 + i) % 32 for i in range(job["max_tokens"])]
+      top = [{t: -1.0, 0: -2.0} for t in tokens]
+      seqs = [Seq(tokens, [-1.0] * len(tokens), top, False) for _ in range(job["num_samples"])]
+      return Out(seqs, [None] + [{t: -1.0, 0: -2.0} for t in job["prompt"][1:]])
+    finally:
+      self.active.pop(request_id, None)

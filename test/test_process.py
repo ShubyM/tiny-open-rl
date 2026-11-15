@@ -12,10 +12,10 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from tinyrl.control.process import Process, launch, reap, target_pid
+from tinyrl.control.process import Process, reap
 
 SERVER = """
-import os, sys, time
+import os, subprocess, sys, threading, time
 from tinyrl.control.process import serve
 
 def handle(method, *args):
@@ -23,7 +23,11 @@ def handle(method, *args):
   if method == 'fail': raise ValueError('rejected command')
   if method == 'exit': os._exit(17)
   if method == 'wait':
-    with open(args[0], 'w') as f: f.write('waiting')
+    def launch():
+      child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
+      with open(args[0], 'w') as f: f.write(str(child.pid))
+      time.sleep(60)
+    threading.Thread(target=launch).start()
     time.sleep(60)
 
 serve(sys.argv[1], handle)
@@ -87,67 +91,24 @@ class TestProcess(unittest.IsolatedAsyncioTestCase):
     marker = f"{self.child.folder.name}/waiting"
     call = asyncio.create_task(self.child.call("wait", marker))
     await wait_for_file(marker)
+    with open(marker) as f:
+      descendant = os.pidfd_open(int(f.read()))
+    self.addCleanup(os.close, descendant)
     call.cancel()
     with self.assertRaises(asyncio.CancelledError):
       await call
     with self.assertRaisesRegex(RuntimeError, "closed"):
       await self.child.call("echo", "after cancellation")
     await asyncio.wait_for(self.child.close(), 5)
+    self.assertTrue(select.select([descendant], [], [], 0)[0], "detached descendant survived close")
     self.assertIsNotNone(self.child.proc.poll())
     self.assertFalse(os.path.exists(self.child.folder.name))
 
 
 class TestProcessOwnership(unittest.TestCase):
-  def test_only_a_checkpointable_target_omits_its_parent_death_signal(self):
-    cmd = """
-import ctypes, time
-sig = ctypes.c_int()
-if ctypes.CDLL(None).prctl(2, ctypes.byref(sig)) != 0: raise OSError('PR_GET_PDEATHSIG failed')
-print(sig.value, flush=True)
-time.sleep(60)
-"""
-    for checkpointable in (False, True):
-      with self.subTest(checkpointable=checkpointable):
-        proc = launch(
-          [sys.executable, "-c", cmd],
-          dict(os.environ),
-          checkpointable=checkpointable,
-          stdout=subprocess.PIPE,
-          bufsize=0,
-        )
-        try:
-          self.assertEqual(int(read_line(proc)), 0 if checkpointable else signal.SIGKILL)
-        finally:
-          reap(proc)
-          proc.wait()
-          proc.stdout.close()
-
-  def test_target_pid_is_the_command_not_its_supervisor(self):
-    proc = launch(
-      [sys.executable, "-c", "import os,time; print(os.getpid(),flush=True); time.sleep(60)"],
-      dict(os.environ),
-      stdout=subprocess.PIPE,
-      bufsize=0,
-    )
-    try:
-      command_pid = int(read_line(proc))
-      if not os.path.exists(f"/proc/{proc.pid}/task/{proc.pid}/children"):
-        self.skipTest("this runtime's virtual PIDs are absent from /proc")
-      self.assertEqual(target_pid(proc), command_pid)
-      self.assertNotEqual(command_pid, proc.pid)
-    finally:
-      reap(proc)
-      proc.wait()
-      proc.stdout.close()
-
   def test_parent_death_cleans_the_group_and_detached_ranks(self):
-    cases = [
-      (checkpointable, detached, delayed)
-      for checkpointable in (False, True)
-      for detached, delayed in ((False, False), (True, False), (True, True))
-    ]
-    for checkpointable, detached, delayed in cases:
-      with self.subTest(checkpointable=checkpointable, detached=detached, delayed=delayed):
+    for detached, delayed in ((False, False), (True, False), (True, True)):
+      with self.subTest(detached=detached, delayed=delayed):
         rank_code = f"""
 import os, time
 if {delayed!r}:
@@ -167,7 +128,7 @@ time.sleep(60)
         owner_code = f"""
 import os, sys, time
 from tinyrl.control.process import launch
-proc = launch([sys.executable,'-c',{target_code!r}], dict(os.environ), checkpointable={checkpointable!r})
+proc = launch([sys.executable,'-c',{target_code!r}], dict(os.environ))
 print('owner',proc.pid,flush=True)
 time.sleep(60)
 """

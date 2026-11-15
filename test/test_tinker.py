@@ -9,7 +9,10 @@ import time
 import unittest
 import urllib.request
 
+import redis
+
 from test.helpers import start_redis, tiny
+from test.test_process import require_unix
 
 EXAMPLE = pathlib.Path(__file__).parent.parent / "examples" / "tinker_sdk.py"
 
@@ -34,6 +37,7 @@ class TestTinkerSDK(unittest.TestCase):
   """The real Tinker SDK trains through redis, the gateway and a trainer, each its own process."""
 
   def test_the_tinker_sdk_trains_through_tinyrl(self):
+    require_unix()
     tmp = tempfile.mkdtemp()
     base = f"{tmp}/tiny"
     tiny().save_pretrained(base)  # a base model on disk, loaded the way any other is
@@ -63,15 +67,14 @@ class TestTinkerSDK(unittest.TestCase):
       self.assertEqual(out.returncode, 0, out.stderr[-3000:])
 
       model_id = out.stdout.split("model ")[1].split()[0]
-      # the node daemon uploads the node's saves to CKPT behind, under a version that _latest points at last, so wait for it
-      final = f"{tmp}/ckpt/{model_id}/sampler_weights/final"
+      with redis.Redis(unix_socket_path=f"{tmp}/redis.sock") as r:
+        saved = json.loads(r.hget(f"tinyrl:ckpt:{model_id}", "sampler_weights/final"))
+      version = saved["version"].split("@", 1)[0]
       for _ in range(300):
-        if os.path.exists(f"{final}/_latest"):
+        if os.path.exists(f"{tmp}/ckpt/{version}.json"):
           break
         time.sleep(0.1)
-      with open(f"{final}/_latest") as f:
-        version = json.load(f)["version"]
-      self.assertTrue(os.path.exists(f"{final}/{version}/adapter_model.safetensors"))
+      self.assertTrue(os.path.exists(f"{tmp}/ckpt/{version}/adapter_model.safetensors"))
     finally:
       for proc in procs:
         proc.terminate()

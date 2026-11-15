@@ -1,10 +1,10 @@
 import asyncio
 import contextlib
+import fcntl
 import json
 import os
 import signal
 import tempfile
-import threading
 import unittest
 
 import torch
@@ -16,7 +16,7 @@ from test.test_sampler import JOB
 from tinyrl.bus import Op, Role, Run
 from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import NodeDaemon
-from tinyrl.storage.store import Store
+from tinyrl.storage.store import Store, file_lock
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -77,59 +77,6 @@ class TestNodeDaemon(RedisTest):
       self.node(store=Store(f"{folder}/local"))
       self.assertTrue(os.path.isdir(f"{folder}/cache") and os.path.isdir(f"{folder}/local"))
 
-  async def test_a_backlogged_run_yields_to_a_ready_sibling(self):
-    node, a, b = self.node(), new_id(), new_id()
-    creates = {}
-    for run in (a, b):
-      await self.bus.create_run(Run(run, "worker", "tiny", 4, lora=LORA))
-      creates[run] = await self.bus.submit_command(
-        run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
-      )
-    for _ in range(12):
-      await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
-    await node.add("worker")
-    child = node.processes["worker"]
-    self.assertTrue((await self.bus.wait_for_reply(creates[b], 5)).ok)
-    self.assertLessEqual((await self.bus.get_run(a))["steps"], 4)
-    self.assertGreater((await self.bus.queued_and_in_flight(a))["queued"], 0)
-    await node.drain(a)
-    self.assertEqual((await self.bus.get_run(a))["steps"], 12)
-    self.assertIs(node.processes["worker"], child)
-
-  async def test_a_slow_checkpoint_read_does_not_block_ready_work_or_gpu_handoff(self):
-    with tempfile.TemporaryDirectory() as folder:
-      writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
-      node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
-      release, read = threading.Event(), node.store.local_folder
-
-      def slow_read(*args):  # a big copy still running
-        release.wait()
-        return read(*args)
-
-      node.store.local_folder = slow_read
-      uri = "tinker://training/sampler_weights/slow"
-      version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
-      await self.registry.register_checkpoint(uri, 0, version=version)
-      await self.bus.create_run(Run("slow", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
-      await self.bus.create_run(Run("ready", "sampler", "tiny", 4, role=Role.SAMPLER))
-      resident = await node.add("sampler")
-      slow = await self.bus.submit_command("slow", Op.SAMPLE, json.dumps(JOB).encode())
-      try:
-        ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
-        await self.reply(ready, node)
-        await self.bus.create_run(Run("other", "other", "tiny", 4, role=Role.SAMPLER))
-        contender = await node.add("other", gpus=[0])
-        request = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
-        await self.reply(request, node)
-        self.assertIsNone(resident.served)
-        self.assertIsNotNone(contender.served)
-        self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
-        self.assertEqual(await self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
-      finally:
-        await asyncio.to_thread(writer.upload_pending_saves)
-        release.set()
-      await self.reply(slow, node)
-
   async def test_a_checkpoint_whose_node_left_before_it_uploaded_fails_fast(self):
     with tempfile.TemporaryDirectory() as folder:
       writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
@@ -137,7 +84,7 @@ class TestNodeDaemon(RedisTest):
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       uri = "tinker://training/sampler_weights/lost"
       version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
-      await self.registry.register_checkpoint(uri, 0, version=version)
+      await self.seed_checkpoint(uri, 0, version=version)
       await self.bus.create_run(Run("lost", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       await node.add("sampler")
       request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
@@ -146,62 +93,78 @@ class TestNodeDaemon(RedisTest):
       self.assertFalse(waiting.result().ok)
       self.assertIn("has not landed, and 127.0.0.1:9 failed to copy", waiting.result().body.decode())
 
+  async def test_staging_one_job_does_not_block_a_ready_sibling(self):
+    node = self.node()
+    uri = "tinker://training/sampler_weights/slow"
+    version = node.store.put(uri, {}, {"base": "tiny", "lora": True})
+    await self.seed_checkpoint(uri, 0, version=version)
+    await self.bus.create_run(Run("slow", "sampler", "tiny", 4, role=Role.SAMPLER, model_path=uri, version=version))
+    await self.bus.create_run(Run("ready", "sampler", "tiny", 4, role=Role.SAMPLER))
+    with file_lock(node.store.folder(version), fcntl.LOCK_EX):
+      slow = await self.bus.submit_command("slow", Op.SAMPLE, json.dumps(JOB).encode())
+      ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
+      await self.reply(ready, node)
+      self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
+      self.assertEqual((await self.bus.queued_and_in_flight("slow"))["queued"], 1)
+    await self.reply(slow, node)
+
   async def test_admission_waits_for_the_previous_model_process_to_park(self):
     require_unix()
     node = self.node(real=True)
     base = f"{node.store.root}/base"
     tiny().save_pretrained(base)
-    a, b = new_id(), new_id()
-    for run, worker in ((a, "a"), (b, "b")):
-      await self.bus.create_run(Run(run, worker, base, 4, lora=LORA))
-    await node.announce_node()
+    for run in ("a", "b"):
+      await self.bus.create_run(Run(run, run, base, 4, lora=LORA))
+    await node.tick()
     self.background(scheduler.run(self.bus))
-    await self.create(a, base, node)
-    holder = node.running["a"]
-    os.killpg(holder.pid, signal.SIGSTOP)
+    await self.create("a", base, node)
+    holder = node.running["a"]["pid"]
+    await self.until(lambda: node.running["a"]["released"], node)
+    os.killpg(holder, signal.SIGSTOP)
     try:
+      await self.bus.submit_command("a", Op.OPTIM_STEP, b'{"adam_params":{}}')
+      await self.until(lambda: not node.running["a"]["released"], node)
       request = await self.bus.submit_command(
-        b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
+        "b", Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
       )
-      await self.until(lambda: "b" in node.running and node.running["b"].ticket > 0, node)
-      self.assertIsNotNone(holder.served)
-      self.assertIsNone(node.running["b"].served)
-      self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})
-      heartbeat = (await self.bus.live_nodes(details=True))[node.id]["until"]
+      await self.until(lambda: "b" in node.running and node.running["b"]["ready"], node)
+      self.assertIsNone(node.running["b"]["pid"])
+      self.assertIsNone(await self.bus.wait_for_reply(request, 0))
+      heartbeat = (await self.bus.read_table())["nodes"][node.id]["until"]
       await node.tick()
-      self.assertGreater((await self.bus.live_nodes(details=True))[node.id]["until"], heartbeat)
+      self.assertGreater((await self.bus.read_table())["nodes"][node.id]["until"], heartbeat)
     finally:
       with contextlib.suppress(ProcessLookupError):
-        os.killpg(holder.pid, signal.SIGCONT)
+        os.killpg(holder, signal.SIGCONT)
     await self.reply(request, node)
-    self.assertIsNone(holder.served)
+    self.assertTrue(node.running["a"]["released"])
 
-  async def test_real_model_process_serves_moves_and_restarts(self):
+  async def test_an_idle_process_death_is_detected_and_initial_state_reconstructed(self):
     require_unix()
-    node = self.node(gpus=2, real=True)
+    node = self.node(real=True)
     base = f"{node.store.root}/base"
     tiny().save_pretrained(base)
     run = new_id()
     await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
-    await node.announce_node()
+    await node.tick()
     self.background(scheduler.run(self.bus))
     await self.create(run, base, node)
-    first = node.running["worker"].pid
-    node.state.workers["worker"].gpus = (1,)
+    first = node.running["worker"]["pid"]
+    await self.until(lambda: node.running["worker"]["released"], node)
+    os.killpg(first, signal.SIGKILL)
+    await self.until(lambda: "worker" not in node.running or node.running["worker"]["pid"] != first, node)
     request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
     await self.reply(request, node)
-    self.assertEqual(node.running["worker"].pid, first)
-    self.assertEqual(node.running["worker"].gpus, (1,))
-    os.killpg(first, signal.SIGKILL)
-    await self.until(lambda: "worker" in node.running and node.running["worker"].pid != first, node)
-    await self.create(run, base, node)
+    self.assertNotEqual(node.running["worker"]["pid"], first)
 
   async def test_the_node_uploads_what_its_model_saved(self):
     with tempfile.TemporaryDirectory() as folder:
       store = Store(f"file://{folder}/bucket", cache=f"{folder}/cache")
-      store.put("tinker://r/weights/w", {"w": torch.ones(2)})
+      uri = "tinker://r/weights/w"
+      version = store.put(uri, {"w": torch.ones(2)})
       node = self.node(store=store)
-      await self.until(lambda: store.list_checkpoints() == ["tinker://r/weights/w"], node)
+      await self.until(lambda: store.is_durable(uri, version), node)
+      self.assertTrue(store.is_durable(uri, version))
 
 
 if __name__ == "__main__":

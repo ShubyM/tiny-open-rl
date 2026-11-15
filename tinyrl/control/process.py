@@ -7,12 +7,12 @@ import contextlib
 import ctypes
 import os
 import pickle
+import select
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
-import time
 
 
 def die_with_parent(sig: int = signal.SIGKILL) -> None:
@@ -27,10 +27,10 @@ def die_with_parent(sig: int = signal.SIGKILL) -> None:
     os.kill(os.getpid(), sig)
 
 
-def launch(cmd: list[str], env: dict[str, str], *, checkpointable: bool = False, **kwargs) -> subprocess.Popen:
-  """Own the command's group until it exits. A checkpointable target omits the parent-death signal CRIU would save."""
+def launch(cmd: list[str], env: dict[str, str], **kwargs) -> subprocess.Popen:
+  """Own the command's process group, including when its parent dies."""
   return subprocess.Popen(
-    [sys.executable, "-m", __name__, *(["--checkpointable"] if checkpointable else []), *cmd],
+    [sys.executable, "-m", __name__, *cmd],
     env={**env, "TINYRL_PARENT_PID": str(os.getpid())},
     start_new_session=True,
     **kwargs,
@@ -42,26 +42,50 @@ def reap(proc: subprocess.Popen) -> None:
     os.killpg(proc.pid, signal.SIGKILL)
 
 
-def target_pid(proc: subprocess.Popen) -> int:
-  """The actual command PID, for CRIU. Its supervisor is not part of the saved tree."""
-  while proc.poll() is None:
-    with contextlib.suppress(FileNotFoundError):
-      with open(f"/proc/{proc.pid}/task/{proc.pid}/children") as f:
-        if children := f.read().split():
-          return int(children[0])
-    time.sleep(0.01)
-  raise RuntimeError(f"process exited with {proc.returncode}")
+async def close_process(proc: subprocess.Popen) -> None:
+  """Capture descendants before killing their parents, and confirm every captured process has exited."""
+
+  async def finish():
+    tree, handles, unverified = [proc.pid], [], []
+    try:
+      for pid in tree:
+        try:
+          fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+          continue
+        handles.append(fd)
+        try:
+          for tid in os.listdir(f"/proc/{pid}/task"):
+            with open(f"/proc/{pid}/task/{tid}/children") as f:
+              tree.extend(int(p) for p in f.read().split() if int(p) not in tree)
+        except OSError:
+          if not select.select([fd], [], [], 0)[0]:
+            unverified.append(pid)
+      reap(proc)
+      for fd in handles:
+        with contextlib.suppress(ProcessLookupError):
+          signal.pidfd_send_signal(fd, signal.SIGKILL)
+      while any(not select.select([fd], [], [], 0)[0] for fd in handles) or proc.poll() is None:
+        await asyncio.sleep(0.01)
+      if unverified:
+        raise RuntimeError(f"could not inspect descendants of {unverified}; process release is unverified")
+    finally:
+      for fd in handles:
+        os.close(fd)
+
+  if not hasattr(proc, "_tinyrl_close"):
+    proc._tinyrl_close = asyncio.create_task(finish())
+  await asyncio.shield(proc._tinyrl_close)
 
 
-def supervise(cmd: list[str], checkpointable: bool = False) -> None:
+def supervise(cmd: list[str]) -> None:
   signal.signal(signal.SIGUSR1, lambda *_: os.killpg(0, signal.SIGKILL))
   die_with_parent(signal.SIGUSR1)
   os.environ["TINYRL_PARENT_PID"] = str(os.getpid())
   # This fresh, single-threaded supervisor is the only place we fork before setting parent-death state and exec.
   child = os.fork()
   if child == 0:
-    if not checkpointable:
-      die_with_parent()
+    die_with_parent()
     os.environ["TINYRL_PARENT_PID"] = str(os.getpid())
     os.execvp(cmd[0], cmd)
 
@@ -134,15 +158,12 @@ class Process:
   async def close(self) -> None:
     if self.closed:
       return
+    await close_process(self.proc)
     if self.writer:
       self.writer.close()
-    reap(self.proc)
-    while self.proc.poll() is None:
-      await asyncio.sleep(0.01)
     self.folder.cleanup()
     self.closed = True
 
 
 if __name__ == "__main__":
-  checkpointable = sys.argv[1:2] == ["--checkpointable"]
-  supervise(sys.argv[2:] if checkpointable else sys.argv[1:], checkpointable)
+  supervise(sys.argv[1:])

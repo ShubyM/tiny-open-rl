@@ -66,6 +66,7 @@ class Sampler:
     self.base, self.lora = base, lora
     self.running = None
     self.loading = asyncio.Lock()
+    self.inflight, self.adapters = {}, {}
 
   @property
   def proc(self):
@@ -78,6 +79,7 @@ class Sampler:
         self.running = await self.engine_type.start(self.base, self.lora, self.env)
 
   async def execute(self, cmd: Cmd, run: dict | None, checkpoint: tuple[str, str] | None) -> Reply:
+    self.inflight[cmd.request_id] = (cmd.run, asyncio.current_task())
     try:
       if run is None:
         raise ValueError(f"no sampling session {cmd.run}")
@@ -88,11 +90,28 @@ class Sampler:
           path, version = checkpoint
           name = hashlib.sha256(f"{uri}\0{version}".encode()).hexdigest()
           await self.running.load_checkpoint(name, path)
-      return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, await self.running.sample(job, name)))
+          self.adapters[cmd.run] = name
+      out = await self.running.sample(job, name, cmd.request_id)
+      return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, out))
     except Exception as e:
       return Reply.error(e)
+    finally:
+      self.inflight.pop(cmd.request_id, None)
 
-  async def resume(self, gpu: int | None = None) -> None:
+  async def cancel_run(self, run: str) -> None:
+    active = {k: t for k, (r, t) in self.inflight.items() if r == run}
+    try:
+      if self.running and active:
+        await self.running.abort(list(active))
+    finally:
+      for task in active.values():
+        task.cancel()
+      await asyncio.gather(*active.values(), return_exceptions=True)
+    async with self.loading:
+      if (name := self.adapters.pop(run, None)) and name not in self.adapters.values():
+        await self.running.unload_checkpoint(name)
+
+  async def resume(self) -> None:
     if self.running:
       await self.running.wake()
 

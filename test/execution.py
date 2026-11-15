@@ -2,7 +2,7 @@
 
 import asyncio
 
-from test.helpers import FakeEngine, assign_new_runs, tiny
+from test.helpers import FakeEngine, tiny
 from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.workers.model import Model
@@ -35,8 +35,18 @@ class TestNode(NodeDaemon):
   def __init__(self, bus, store=None, gpus=8, node="test-node", model=tiny, engine=FakeEngine, gpu_mib=0):
     super().__init__(bus, gpus=gpus, node=node, gpu_mib=gpu_mib, store=store)
     self.default_model, self.engine_type = model, engine
-    self.processes, self.samplers, self.pinned = {}, {}, set()
-    self.state.nodes[self.id] = (gpus, gpu_mib * 2**20)
+    self.processes, self.samplers = {}, {}
+    self.ticking = asyncio.Lock()
+    self.driver = asyncio.create_task(self.drive())
+
+  async def drive(self):
+    while True:
+      await self.tick()
+      await asyncio.sleep(0.001)
+
+  async def tick(self):
+    async with self.ticking:
+      await super().tick()
 
   def open_trainer(self, worker, env):
     process = InlineProcess(Trainer(Model(self.default_model), self.store))
@@ -50,58 +60,42 @@ class TestNode(NodeDaemon):
     return sampler
 
   async def read_state(self):
-    """The table, with the workers a test placed here itself, since no scheduler places them."""
-    state = scheduler.from_table(await self.bus.read_table())
-    state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))  # live before its first heartbeat
-    for worker in self.pinned & state.workers.keys():
-      state.workers[worker].node = self.id
-    return scheduler.keep_chosen_gpus(state, self.state)
+    old = scheduler.from_table(await self.bus.read_table())
+    await scheduler.commit(self.bus, old, scheduler.decide(old))
+    return scheduler.from_table(await self.bus.read_table())
 
   async def sync(self):
-    self.state = await self.read_state()
+    await self.tick()
 
   async def add(self, worker, gpus=None):
-    self.pinned.add(worker)
-    await self.sync()
-    self.dispatch()
-    desired = self.state.workers[worker]
-    if gpus is not None:
-      desired.gpus = tuple(gpus)
-    scheduler.place_gpus(self.state, self.id, self.running)
-    if worker in self.running:
-      return self.running[worker]
-    task = self.tasks.get(worker) or self.start(worker)
-    async with asyncio.timeout(5):
-      while worker not in self.running:
-        if task.done():
-          task.result()
-          raise AssertionError(f"could not acquire {worker}")
-        await asyncio.sleep(0.001)
-    return self.running[worker]
-
-  async def worker_for(self, run):
-    await assign_new_runs(self.bus)
-    await self.sync()
-    return r.worker if (r := self.state.jobs.get(run)) else None
-
-  async def drain(self, run):
-    """Let the real worker coroutines finish the commands visible in their Redis streams."""
-    if (worker := await self.worker_for(run)) is None:
-      return None  # a live worker may already have completed the run's DELETE_MODEL
-    await self.add(worker)
-    async with asyncio.timeout(15):
+    async with asyncio.timeout(10):
       while True:
         await self.tick()
+        if (w := self.state.workers.get(worker)) and w.owner and worker in self.running:
+          return self.running[worker]
+        await asyncio.sleep(0.001)
+
+  async def worker_for(self, run):
+    await self.tick()
+    return j.worker if (j := self.state.jobs.get(run)) else None
+
+  async def drain(self, run):
+    async with asyncio.timeout(30):
+      while True:
+        await self.tick()
+        if not (worker := await self.worker_for(run)):
+          return None
         queues = await asyncio.gather(
           *(self.bus.queued_and_in_flight(r) for r in scheduler.jobs_of(self.state, worker))
         )
         if not any(q.get("queued") or q.get("in_flight") for q in queues):
-          break
+          return self.running.get(worker)
         await asyncio.sleep(0.001)
-    return self.running.get(worker)
+
+  async def close(self, graceful=True):
+    self.driver.cancel()
+    await asyncio.gather(self.driver, return_exceptions=True)
+    await super().close(graceful)
 
   async def aclose(self):
     await self.close(graceful=False)
-    if task := self.sweeping:
-      task.cancel()
-      await asyncio.gather(task, return_exceptions=True)

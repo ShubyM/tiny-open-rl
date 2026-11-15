@@ -1,16 +1,22 @@
 # tinyrl on Kubernetes
 
-**Current implementation.** The cluster scheduler groups runs and places workers on nodes. Each node daemon owns
-worker leases, command preparation, GPU reservations and process lifetime. Each worker runs in one coroutine with its
-executor and ready queue local to that lifetime. GPU admission uses the node's actual reservations and waiting order;
-state changes wake waiting coroutines directly. Trainers are synchronous model processes; sampling controllers run
-in the node and drive isolated engines. Only cluster assignments use the event log. Portable checkpoints, multi-node
-placement, single-node FSDP, host parking, background uploads and node-loss recovery are built.
+**Current implementation.** The fleet scheduler groups runs, places workers and grants exact GPU bundles with bounded
+token allowances. A trainer and its sampling sessions share logical-account service accounting. Each node owns worker
+leases, input preparation, grant execution and process lifetime; it reports readiness, residency and release to Redis.
+One engine can hold a physical GPU at a time. Multi-GPU training stays within one node, and a live process keeps its
+GPU bundle when parked and resumed. Portable complete checkpoints, explicit target migration, peer cache reads,
+background uploads and node-loss recovery are built. The scheduler polls Redis records; there is no Redis event log.
 See the [README](../README.md) and [node_daemon.py](../tinyrl/control/node_daemon.py) for the running system.
 
-**Roadmap below.** Live run migration between healthy nodes, adaptive worker sharding, `/dev/shm` + peer Store tiers,
-Spot notification handling and autoscaling remain proposals. The topology, key layouts and implementation sketches
-below describe that broader design; they are not a specification of the current Redis schema or process ownership.
+**Rollout.** Stop old nodes gracefully, then start the gateway, scheduler and nodes together against a fresh Redis
+database or instance through `REDIS_URL`. The `tinyrl:` record format has changed; old assignments and checkpoint
+records are not migrated. Keep this refactor a draft until target-GPU startup, park/resume, full training handoff,
+mixed-user throughput and process-tree cleanup are measured. It replaces CRIU startup, cross-engine GPU packing and
+custom model host slabs with native vLLM startup, fleet turns and PyTorch tensor transfers.
+
+**Roadmap below.** Automatic load-driven migration, adaptive worker sharding, RDMA transfers, Spot notification handling
+and autoscaling remain proposals. Sections describing those policies, proposed Store APIs, code-size projections and
+comparisons with open-rl are historical design notes, not descriptions of the deployed control plane.
 Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
 
 ## The idea
@@ -70,12 +76,12 @@ The table starts with current execution ownership and marks the proposed extensi
 | Piece | Runs as | Code | Does |
 |---|---|---|---|
 | gateway | Deployment | [gateway.py](../tinyrl/api/gateway.py) | records run requirements, translates Tinker calls into commands and uses logical `tinker://` URIs. Proposed: `queue_state: "paused_capacity"` while capacity is unavailable. |
-| scheduler | Deployment, 1 replica | [scheduler.py](../tinyrl/control/scheduler.py) | assigns runs to workers and workers to live nodes through the cluster log. Proposed: utilization-driven migration, consolidation and creation/deletion of burst node daemon pods. |
-| node daemon | one DaemonSet pod per GPU node, holding all its GPUs | [node_daemon.py](../tinyrl/control/node_daemon.py) | runs one coroutine per worker, from serving through draining claimed work, checkpointing and cleanup. GPU reservations remain held through park/cleanup acknowledgment. Proposed: burst pods, `/dev/shm` peer serving and Spot notification handling. |
-| trainer | a synchronous process or torchrun rank group in a node daemon pod | [trainer.py](../tinyrl/workers/trainer.py) | executes model and checkpoint operations over private local IPC; the node consumes queues and publishes fenced results. Proposed: live run migration through the additional Store tiers. |
-| sampler | a controller in the node plus isolated engine processes | [sampler.py](../tinyrl/workers/sampler.py) | executes prepared sampling waves and drives the engine's load, sample, sleep and wake calls; the node prepares checkpoint files before commands become ready. Proposed: direct weight streaming from the peer Store tier. |
-| store | library in model processes and node daemons | [store.py](../tinyrl/storage/store.py) | safetensors, local caches and background bucket uploads. Proposed: `put`, `get`, `drop` across `/dev/shm`, peer network and durable storage. |
-| Redis | StatefulSet, AOF on | [bus.py](../tinyrl/bus.py) | commands, replies, worker leases, checkpoint metadata, node heartbeats and cluster assignments. Proposed: immutable checkpoint `ref`s and peer blob locations. |
+| scheduler | Deployment, 1 replica | [scheduler.py](../tinyrl/control/scheduler.py) | groups jobs, places workers, accounts service and commits physical grants. Proposed: utilization-driven migration, consolidation and burst pod management. |
+| node daemon | one DaemonSet pod per GPU node, holding all its GPUs | [node_daemon.py](../tinyrl/control/node_daemon.py) | prepares commands, executes fleet grants and acknowledges park/cleanup; owns process leases and peer cache serving. Proposed: Spot notification handling. |
+| trainer | a synchronous process or torchrun rank group in a node daemon pod | [trainer.py](../tinyrl/workers/trainer.py) | executes model operations and complete checkpoint export/restore over private local IPC; the node publishes fenced results. |
+| sampler | a controller in the node plus isolated engine processes | [sampler.py](../tinyrl/workers/sampler.py) | executes prepared sampling waves and drives engine load, sample, abort, sleep and wake calls. |
+| store | library in model processes and node daemons | [store.py](../tinyrl/storage/store.py) | immutable safetensors versions, pinned cache reads, peer copies and background bucket uploads. Proposed: RDMA and storage-placement policies. |
+| Redis | StatefulSet, AOF on | [bus.py](../tinyrl/bus.py) | commands, replies, leases, checkpoint references, desired grants, owner observations and account service. |
 
 Kubernetes sees a gateway, a scheduler, Redis and one node daemon pod per GPU node (each mounting `emptyDir: {medium: Memory}`
 at `/dev/shm`, since Kubernetes otherwise caps `/dev/shm` at 64 MiB). Every process on a node shares that one `/dev/shm`,
@@ -86,61 +92,55 @@ keeps a new node's node daemon from waiting on the full image pull.
 
 ## State in Redis
 
-Everything [bus.py](../tinyrl/bus.py) has today stays. The scheduler, node daemons and samplers reach this state only through
-`Bus` methods (`nodes()`, `units()`, `place()`, `request_release()`), never through keys, so the store behind `Bus` can
-change without touching scheduling. What's new, and who writes it:
+The scheduler reads a coherent table, computes a new assignment and commits changes under its scheduler lease.
+`scheduler.commit` owns that transaction; [bus.py](../tinyrl/bus.py) owns command, reply and checkpoint transactions.
 
 | Key | Type | Written by | Read by |
 |---|---|---|---|
-| `worker` in `tinyrl:run:<run>`, and `tinyrl:worker:<worker>` | the run's worker, and each worker's runs | **whoever holds the run**: the scheduler while the run is in no worker, its worker's trainer while it's in one | trainers, scheduler |
-| `release_to` in `tinyrl:run:<run>` | a request: move the run to this worker, or to `""` (none) | scheduler (or node daemon on Spot drain); the trainer clears it when done | the run's trainer |
-| `parked` in `tinyrl:run:<run>` | immutable `ref` of the run's state in the store while between workers | the trainer that releases it, and the one that restores and drops it | trainers |
-| `tinyrl:ckpt:<run>` | hash `{<kind>/<name>: ref}` mapping `tinker://` URIs to immutable `ref`s | `Bus.write_reply`, under the worker's lease | trainers, samplers |
-| `tinyrl:loc:<ref>` | string with TTL: peer address of a node daemon holding `<ref>` in `/dev/shm` | the node daemon that staged `<ref>` | any trainer or sampler calling `store.get` |
-| `tinyrl:owner:<worker>` | string with a 10 s TTL: the lease | the trainer that holds it | trainers, scheduler, gateway |
-| `tinyrl:node:<id>` | hash `{gpus, gpu_bytes, host_bytes, gpu_model, tier, addr, draining}` with a 30 s TTL; `tier` is `reserved` or `burst`, from a node label | that node daemon | scheduler, store |
-| `tinyrl:events` | stream: a trace of runs and nodes coming and going, `run_created`, `run_deleted`, `node_up`, and the scheduler's decisions, `assigned`, `placed`, `unplaced`. Nothing is decided from it | the gateway and node daemons append facts; the scheduler appends decisions | traces; the scheduler wakes on it |
-| `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | counters (built): calls run, time queued, time running | `Bus.write_reply`, under the worker's lease | scheduler, `GET /metrics` |
-| `gpu_bytes`, `host_bytes` in `tinyrl:run:<run>` | measured state size, so a move's cost is known | the run's trainer | scheduler |
+| `worker` and `state` in `tinyrl:run:<run>` | assignment, generation, mutation boundary, working/durable versions and optional target node | scheduler for assignment/generation; fenced command transactions for progress and versions | nodes, scheduler |
+| `tinyrl:workers` | desired node, physical bundle, owner, revision, members and token ceilings | scheduler | nodes, scheduler |
+| `tinyrl:obs` | actual residency, readiness, cumulative usage, served cost and release/closed acknowledgments | the node holding each worker lease | scheduler |
+| `tinyrl:owner:<worker>` | execution lease, 10 s by default | node daemon | nodes, scheduler, fenced transactions |
+| `tinyrl:owner:scheduler` | fleet scheduler lease | scheduler | assignment transaction |
+| `tinyrl:nodes` | node heartbeat records with GPU count, rate and expiry | node daemons | scheduler, gateway |
+| `tinyrl:service`, `tinyrl:settled` | logical-account service, settled owner counters and fairness floor | scheduler | scheduler, scheduling endpoint |
+| `tinyrl:ckpt:<run>`, `tinyrl:ver:<version>`, `tinyrl:refs` | checkpoint aliases, immutable version metadata and live references | fenced command/registry transactions | nodes, registry, storage cleanup |
+| `cmds`, `wait_ms`, `busy_ms` in `tinyrl:run:<run>` | completed commands and timing counters | `Bus.write_reply` | `GET /metrics`, run diagnostics |
 
-A run's membership has one writer at a time, and the writer changes hands with the run. The scheduler can only put a run
-into a worker while it's in none (checked in the same WATCH/MULTI/EXEC transaction that writes it), and only the trainer holding a run can take
-it out, under that worker's lease. So two parties never both think they own a run.
+A planned handoff removes the job from desired residency. The old owner exports state and acknowledges absence;
+only then does the scheduler advance that job's generation and change its worker. An old owner or generation cannot
+publish a late reply. Physical GPU reuse also requires the current owner's matching release acknowledgment.
 
 ## A run's life
 
 ```mermaid
 sequenceDiagram
-  participant C as client
   participant G as gateway
   participant R as Redis
   participant S as scheduler
   participant A as node daemon
-  participant T as trainer
   participant ST as store
-  C->>G: create_model
-  G->>R: create the run with no worker, XADD create_model
-  S->>R: queued work, no worker: assign to a worker with room, or make a worker
-  S->>A: place a new worker on GPUs with room, or create a burst node daemon pod
-  A->>T: start a trainer for the worker
-  T->>R: SET owner:worker NX PX 10000, fail what a dead owner left
-  T->>R: XREADGROUP, run create_model, finish
-  C->>G: retrieve_future, "paused_capacity" until a trainer owns the run's worker
-  Note over T,ST: time-slicing: T gives its GPU back between batches when the scheduler revokes its turn, parking its state to /dev/shm
-  C->>G: save_weights_for_sampler
-  T->>ST: store.put(weights(run), durable=False) -> ref
-  T->>R: fenced finish publishes tinker://.../sampler_weights/step-k -> ref
-  Note over ST: any sampler replica anywhere calls store.get(ref) and updates vLLM in place
-  S->>R: moves on separate GPUs each tick (relieve, consolidate, idle, or Spot drain): set release_to = target_pool (or "")
-  T->>ST: between batches: store.put(state(run), durable=True) -> ref
-  T->>R: under old worker's lease: move run, set parked = ref, clear release_to
-  Note over T,ST: next trainer anywhere calls store.get(ref), restores, clears parked, drop(ref)
+  G->>R: Create run and queue commands
+  S->>R: Assign worker, node and job generation
+  A->>R: Claim worker lease, report prepared jobs
+  S->>R: Grant physical bundle and token ceilings
+  A->>R: Fence activation, claim bounded commands
+  Note over A,ST: Trainer or engine executes under the node's grant
+  A->>ST: Publish immutable checkpoint version
+  A->>R: Commit fenced reply and checkpoint boundary
+  G->>R: Retrieve the same future on every retry
+  S->>R: Request target migration through desired residency
+  A->>ST: Export complete state under a GPU grant
+  A->>R: Publish working version and residency absence
+  S->>R: Advance job generation, assign destination
+  Note over A,ST: Destination restores a reachable version and checks its boundary
 ```
 
 ## The store: a trainer can resume anywhere
 
-Today [`Store`](../tinyrl/storage/store.py) writes named `safetensors` bundles (`Model.training_state` and `Model.sampler_weights`) to a local
-`CKPT` directory. Mounting `CKPT` on shared NFS does not scale across nodes. In open-rl's two-job 8B full fine-tune
+Current [`Store`](../tinyrl/storage/store.py) publishes immutable local versions, serves peer copies and uploads to a
+bucket-backed `CKPT`. The tier APIs and bandwidth targets below are historical design proposals; see the README for
+the current working/durable contract. In open-rl's earlier two-job 8B full fine-tune
 benchmark (`docs/fft/fft.md` §9), writing sampler weights (`save_pretrained` + `torch.save`) to shared NFS took **74 to 88
 seconds of every 130-second RL step**, leaving GPUs idle for three fifths of the job.
 
@@ -363,36 +363,37 @@ taking turns if it has to, and the loop spreads it onto burst nodes once they're
 first placement doesn't have to be the final one. The scheduler also asks for burst nodes when utilization has stayed
 above `TARGET_UTIL` for a while, before work queues.
 
-## Taking turns on a node daemon's GPUs
+## Fleet grants on a node's GPUs
 
-**Current local policy.** Workers with known memory budgets may hold a GPU together when they fit. Otherwise the node
-uses the order workers become ready and a turn of `TURN` tokens served (200,000). The node
-coordinates GPU reservations directly; each worker coroutine owns its execution state, and the cluster scheduler
-handles run and node assignment.
+**Current policy.** The fleet scheduler chooses exact GPU bundles and bounded per-job grants. Only one engine holds an
+active grant on a physical GPU. Trainer and sampler sessions share their logical training account's normalized
+GPU-time service. Exclusive accounts retain dedicated capacity; their trainers and owned samplers can alternate on
+it. Exclusive admission waits if every compatible bundle has another account's live cache binding.
 
 1. A worker coroutine owns its model handle, command queue and preparation task. Sampling commands join the ready
    queue only after session metadata and checkpoint preparation succeed. Downloads run off the event loop and can
    overlap startup or execution. Missing sessions and failed downloads receive fenced error replies without waiting
    for a GPU grant.
-2. The worker reserves all its GPUs before waking the model. If admission is blocked, it waits on the node's change
-   event and checks again when notified. Preparation completion uses that same event. Independent workers continue
-   on their own GPUs; node heartbeats and worker lease renewal continue while model operations run.
-3. An idle holder yields to a waiter, and a busy holder yields at a command or sampling-wave boundary once its turn of tokens is served.
-   A wave has up to three sessions for a LoRA engine or one session for a full fine-tune engine.
-4. The node orders a trainer to park its tensors on pinned host memory, or an engine to sleep. The reservation remains
-   held until that operation acknowledges, or until the whole process group has exited during cleanup. A failed wake
-   also keeps its reservation until cleanup finishes.
+2. The node checks the grant's owner, revision and entire bundle before activation, then reports the GPUs held before
+   asynchronous startup. Independent workers run on disjoint bundles. Heartbeats and lease renewal continue while
+   model operations run.
+3. The fleet orders ready accounts by service. A waiting gang protects its full bundle against lower-ranked refills
+   while old grants finish. `TURN` (200,000) is a token-cost allowance, checked between commands or sampling waves;
+   an indivisible command can exceed the remaining allowance. A LoRA sampling wave has up to `SAMPLE_RUNS` sessions.
+4. On revocation the node parks trainer tensors through native PyTorch host transfers or sleeps the engine. The fleet
+   retains the physical allocation until the matching owner/revision acknowledges release, or cleanup confirms exit.
+   A failed wake also retains its allocation until cleanup finishes.
 
-A local LoRA move retains the model process. Its old allocation must park before the next reservation can use its new
-GPUs. A slow checkpoint download does not prevent an otherwise idle worker from yielding to ready work. Current local
-placement and reservations appear in node heartbeats and the scheduling endpoint as diagnostic snapshots. Redis retains
-cluster assignments; there is no local turn event protocol to replay.
+A live process keeps its GPU bundle across park/resume. Moving a job to another bundle or node uses checkpoint
+handoff to a new worker; it does not retarget a live CUDA process. Redis stores desired grants and owner observations,
+which `GET /api/v1/scheduling` exposes directly. The node only reports execution state and enforces grants.
 
-Measured on an H100: parking 16 GB takes 0.60 s, resuming takes 0.64 s, and 725–781 MiB stay on the GPU (529 MiB of
+Historical measurements on an H100: parking 16 GB took 0.60 s, resuming 0.64 s, and 725–781 MiB stayed on the GPU (529 MiB of
 CUDA context, about 210 MiB of cuBLAS, and allocator slack). vLLM's level 1 sleep leaves 808 MiB on an L4. That leftover
-caps how many processes one GPU can host, at about 0.8 GB each.
+limits how many parked processes one GPU can host. Remeasure latency and residual memory after the native-transfer
+change; the removed packing heuristics do not establish a safe cache count.
 
-The remaining idle-run and storage-tier behaviors below are roadmap proposals, rather than the current local policy.
+The remaining idle-run and storage-tier behaviors below are roadmap proposals, rather than the current fleet policy.
 
 **LoRA workers park like any other, and so do their runs.** An active LoRA worker stays resident while it has queued work; an
 idle 8B LoRA base parks 16.4 GB of bf16 to `/dev/shm` in 0.62 s. A run inside a busy worker that sits idle for 30 minutes
@@ -414,7 +415,10 @@ here only for RDMA NICs, if GKE multi-networking doesn't already cover them.
 
 ## Estimator
 
-No model-size tables. Before a run's first placement, the estimator reads its exact byte requirement using `huggingface_hub.get_safetensors_metadata` (without downloading) for base weights, and building the LoRA config on the `meta` device to count adapter parameters. [trainer.py](../tinyrl/workers/trainer.py) keeps fp32 master weights, so a full fine-tune holds 16 bytes per parameter at peak (weights, gradients and two AdamW moments). A LoRA worker holds base bytes plus 16 per adapter parameter of each run. Samplers hold base bytes plus one maximum-length KV sequence. Overhead is fixed at 0.75 GB per process.
+The current estimator uses hub safetensors metadata for a default full-training or sampler width, with an 80 GiB/GPU
+assumption and a fixed context allowance. It does not construct a LoRA metamodel or update estimates from live node
+memory. These are sizing heuristics; `openrl.gpus` overrides training width. The parameter-count measurements below
+are historical, and the live-memory feedback policy following them remains a proposal.
 
 Measured on an H100, 1 run each:
 
@@ -433,12 +437,13 @@ The node takes each worker's Redis lease before opening its executor. A keeper t
 model operations, and the worker checks ownership before dispatch. Training updates with an uncertain outcome are
 failed rather than replayed. The model process has no Redis client, lease timer or global event cursor.
 
-`Bus.write_reply` commits replies, acknowledgments and counters in a WATCH/MULTI/EXEC transaction on the owner key;
-parked checkpoint pointers use the same ownership fence. A lease can be recovered after expiry only if no intervening
-owner served the worker. When ownership is lost, the node kills and reaps the old group and discards its result.
+`Bus.write_reply` commits replies, acknowledgments and counters under the execution-owner lease and job generation;
+working/durable checkpoint pointers use the same fence. An expired lease is not revived. A replacement claims a new
+execution identity, waits for scheduler binding and reclaims abandoned work. When ownership is lost, the old node
+kills and reaps its group and discards its result.
 
-Before a worker begins serving commands, and periodically between batches, the node uses
-`XAUTOCLAIM` to fail abandoned commands. Peeking leaves queued commands unclaimed.
+When a worker takes responsibility for a job generation, the node uses `XAUTOCLAIM` to fail uncertain training
+commands or reclaim sampling/completed checkpoint uploads. Peeking leaves queued commands unclaimed.
 This also reconciles a stream read whose Redis claim succeeded but whose response was lost. SDK retries reuse the
 original queued request and future through ingress deduplication.
 
@@ -448,12 +453,15 @@ a grace period. When it expires, the node aborts unfinished work, waits for proc
 flushes pending uploads. `DRAIN_S` does not bound total shutdown time; a pod's termination grace must also allow for
 cleanup and uploads.
 
-`test/test_lease.py` exercises real paused-node takeover and SIGTERM checkpoint publication.
-`test/test_trainer.py` verifies exact restore of weights,
-optimizer state and pending gradients. The proposed immutable-ref transactions and storage tiers elsewhere in this
-document are additional work, not guarantees of the current registry implementation.
+`test/test_lease.py` exercises owner/generation fencing and publication races with real Redis.
+`test/test_trainer.py` verifies restore of weights, optimizer state, pending gradients and RNG state.
+The historical autoscaling and resharding sketches elsewhere in this document are additional work.
 
-## When things fail
+## Historical failure-model notes
+
+The table below belongs to the broader autoscaling proposal. Current recovery is checkpoint-boundary checked: an
+unreachable working version may fall back to a durable one, but acknowledged mutations newer than that boundary
+require explicit recovery. A stopped scheduler also stops issuing fresh grants; existing grants are bounded.
 
 | Failure | What happens | What's lost |
 |---|---|---|
@@ -468,7 +476,10 @@ document are additional work, not guarantees of the current registry implementat
 
 ## Samplers
 
-A sampler (`tinyrl/workers/sampler.py`) is any inference engine behind six calls. vLLM is the first engine, not a requirement.
+Current samplers start ordinary vLLM processes on their first fleet grant and use vLLM's native `VLLM_CACHE_ROOT`.
+`VLLM_ARGS` supplies engine options; no CRIU, pre-imported process snapshot or tinyrl GPU-memory shim is used.
+See the README for the actual engine interface. The interface sketch, delta-sync proposals and measurements below
+are historical design notes, not startup instructions or performance guarantees for this revision.
 
 ```python
 class Engine(Protocol):
@@ -493,15 +504,15 @@ class Engine(Protocol):
 - **LoRA adapters move whole.** An adapter is 35–184 MB, so a delta saves little. `store.get(ref)` fetches it into
   `/dev/shm/tinyrl/<ref>` for the engine's adapter loader (vLLM's `LoRARequest`), evicting least recently used adapters
   when local slots fill up.
-- **Startup.** Measured with Qwen2.5-7B on an L4 (vLLM 0.32): 190 s fully cold, 58 s with weights local and the compile
+- **Historical startup measurements.** With Qwen2.5-7B on an L4 (vLLM 0.32): 190 s fully cold, 58 s with weights local and the compile
   cache warm, and 26.6 s from a process that had already imported vLLM, with weights in `/dev/shm` and 8 CUDA graph sizes
-  instead of 51. A sleeping engine wakes in 1.6 s. So each node keeps one sleeping engine for each config it has served,
-  at about 0.8 GB of GPU memory each, and a new config takes the 26.6 s path.
-- **GPU sharing.** The sampler takes the node daemon's GPU lease like any process, and `sleep` / `wake` park it. For RL, sleeping
+  instead of 51. A sleeping engine woke in 1.6 s. The current ordinary-startup path must be benchmarked again; the
+  26.6 s pre-imported-process result does not describe its cold startup.
+- **GPU sharing.** Current samplers execute fleet grants, and `sleep` / `wake` park them between turns. For RL, sleeping
   without keeping the stale weights (vLLM level 2) and then `load`ing the new ones may beat a level 1 wake. That hasn't
   been measured yet.
 
-## Code
+## Historical code-size projections
 
 | File | Lines | Change |
 |---|---:|---|
@@ -516,7 +527,7 @@ class Engine(Protocol):
 
 With [wire.py](../tinyrl/api/wire.py), [sampler.py](../tinyrl/workers/sampler.py), [helpers.py](../tinyrl/helpers.py), and [`__init__.py`](../tinyrl/__init__.py), see [`README.md`](../README.md) for current line counts.
 
-## Testing
+## Historical test plan
 
 Against a real `redis-server`, real subprocesses, `/dev/shm`, loopback peer HTTP, and tiny CPU models, with no cluster needed:
 
@@ -532,7 +543,7 @@ On a real GKE GPU cluster, done: VRAM left after an app-level park and after vLL
 do: cross-node throughput over gVNIC and TCPX/RDMA, delta weight sync, Spot VM evacuation within 30 s, and node
 autoscaling in both directions.
 
-## How this differs from open-rl
+## Historical comparison with open-rl
 
 open-rl keeps placement truth in Kubernetes CRDs and moves weights through a shared POSIX filesystem (`/mnt/shared`).
 tinyrl keeps control truth in Redis, moves weights through `Store` so any process can resume any run anywhere, and asks

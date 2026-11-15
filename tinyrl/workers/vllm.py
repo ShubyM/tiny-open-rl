@@ -4,23 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import glob
 import json
 import os
 import shlex
-import shutil
 import socket
-import struct
 import subprocess
-import sys
-import traceback
 
 import aiohttp
 
-from tinyrl.control.process import launch, reap, target_pid
+from tinyrl.control.process import close_process, launch
 from tinyrl.storage import models
+from tinyrl.storage.store import manifest
 from tinyrl.trace import span
-from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
 
 CUDAGRAPH_CONFIG = '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128,256]}'
@@ -34,15 +29,6 @@ def split_stop(stop: str | list | None) -> tuple[list[str], list[int]]:
 
 def by_id(logprobs: dict) -> dict[int, float]:
   return {int(k.removeprefix("token_id:")): v["logprob"] if isinstance(v, dict) else v for k, v in logprobs.items()}
-
-
-def session(url: str, connector: aiohttp.BaseConnector) -> aiohttp.ClientSession:
-  # aiohttp, not httpx: httpx's pool bookkeeping grows with the square of open connections, hundreds per sampler
-  return aiohttp.ClientSession(url, connector=connector, timeout=aiohttp.ClientTimeout(total=None))
-
-
-def unix_client(sock: str) -> aiohttp.ClientSession:
-  return session("http://vllm", aiohttp.UnixConnector(path=sock, limit=0, keepalive_timeout=2))
 
 
 def parse(body: bytes) -> Out:
@@ -60,16 +46,11 @@ def parse(body: bytes) -> Out:
 
 
 class VLLM:
-  def __init__(
-    self,
-    url: str,
-    base: str,
-    lora: bool,
-    server: subprocess.Popen | None = None,
-    client: aiohttp.ClientSession | None = None,
-  ):
+  def __init__(self, url: str, base: str, lora: bool, server: subprocess.Popen | None = None):
     # vLLM closes an idle connection after 5 s, so reuse one for less than that
-    self.http = client or session(url, aiohttp.TCPConnector(limit=0, keepalive_timeout=2))
+    self.http = aiohttp.ClientSession(
+      url, connector=aiohttp.TCPConnector(limit=0, keepalive_timeout=2), timeout=aiohttp.ClientTimeout(total=None)
+    )
     self.base = base
     self.lora = lora
     self.server = server
@@ -88,7 +69,7 @@ class VLLM:
     env = {
       "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",  # its FlashAttention 4 kernels compile at each start unless cached
       "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": os.path.expanduser("~/.cache/flash-attention-cute"),
-      **{k: v for k, v in options.items() if k not in {"TINYRL_GPU_MEM", "TINYRL_KV_BYTES", "TINYRL_WARM_SAMPLER"}},
+      **options,
       "VLLM_SERVER_DEV_MODE": "1",
       "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
     }
@@ -99,82 +80,14 @@ class VLLM:
       extra += ["--compilation-config", CUDAGRAPH_CONFIG]
     if not any(a == "--kernel-config" or a.startswith("--kernel-config=") for a in extra):
       extra += ["--kernel-config", KERNEL_CONFIG]
-    if memory := options.get("TINYRL_GPU_MEM"):
-      extra += ["--gpu-memory-utilization", memory]
-    if (kv := options.get("TINYRL_KV_BYTES")) and not any(
-      a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra
-    ):
-      extra += ["--kv-cache-memory-bytes", kv]
-    flags += extra
-
-    def serve(*listen: str) -> list[str]:
-      return ["vllm", "serve", path, "--served-model-name", base, *listen, *flags]
-
-    async def boot() -> VLLM:
-      with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-      server = launch(serve("--host", "127.0.0.1", "--port", str(port)), env=env)
-      return await cls(f"http://127.0.0.1:{port}", base, lora, server).ready()
-
-    # a multi-GPU server's NCCL communicators must be suspended before a snapshot, which isn't done yet
-    if not (snapshots := options.get("TINYRL_SNAPSHOTS")) or tp > 1:
-      return await boot()
-
-    folder = os.path.join(snapshots, await asyncio.to_thread(snapshot.key, serve(), visible))
-    if os.path.isdir(folder):
-      try:
-        return await cls.restore(folder, base, lora, env)
-      except Exception:
-        print(f"the snapshot in {folder} did not restore, so vLLM boots", file=sys.stderr, flush=True)
-        traceback.print_exc()
-        shutil.rmtree(folder, ignore_errors=True)
-    os.makedirs(snapshot.RUN, exist_ok=True)
-    name = f"{snapshot.RUN}/{os.urandom(4).hex()}"
-    saving = (
-      env | snapshot.ENV | {"PYTHONPATH": os.pathsep.join([snapshot.site(), *filter(None, [env.get("PYTHONPATH")])])}
+    with socket.socket() as s:
+      s.bind(("127.0.0.1", 0))
+      port = s.getsockname()[1]
+    server = launch(
+      ["vllm", "serve", path, "--served-model-name", base, "--host", "127.0.0.1", "--port", str(port), *flags, *extra],
+      env=env,
     )
-    # CRIU saves the target's parent-death signal, so omit it: restore -d exits before the restored server.
-    # The supervisor stays outside the snapshot and still owns the source group until it exits.
-    with open(f"{name}.log", "ab") as log:
-      server = launch(
-        serve("--uds", f"{name}.sock"),
-        env=saving,
-        checkpointable=True,
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-      )
-    engine = await cls("http://vllm", base, lora, server, unix_client(f"{name}.sock")).ready()
-    try:
-      await engine.post("/sleep", params={"level": 2})
-      await engine.http.close()  # a connection into the server would reach outside the snapshot
-      await asyncio.to_thread(snapshot.save, await asyncio.to_thread(target_pid, server), folder, name, visible)
-      await asyncio.to_thread(server.wait)
-      return await cls.restore(folder, base, lora, env)
-    except Exception:
-      print(f"vLLM could not be saved to {folder} and restored, so it boots again", file=sys.stderr, flush=True)
-      traceback.print_exc()
-      await engine.close()
-      return await boot()
-    finally:
-      await engine.close()
-
-  @classmethod
-  async def restore(cls, folder: str, base: str, lora: bool, env: dict[str, str]) -> VLLM:
-    """Restore a snapshot of vLLM asleep at level 2, then wake it with its weights read again from the model files."""
-    namespaces, sock = await snapshot.restore(folder, env.get("CUDA_VISIBLE_DEVICES", "0"), env)
-    engine = cls("http://vllm", base, lora, namespaces, unix_client(sock))
-    try:
-      await engine.ready()
-      await engine.post("/wake_up", params={"tags": "weights"})
-      await engine.post("/collective_rpc", json={"method": "reload_weights"})
-      await engine.post("/wake_up", params={"tags": "kv_cache"})
-      await engine.post("/reset_prefix_cache")
-      return engine
-    except BaseException:
-      await engine.close()
-      raise
+    return await cls(f"http://127.0.0.1:{port}", base, lora, server).ready()
 
   async def ready(self) -> VLLM:
     try:
@@ -192,8 +105,7 @@ class VLLM:
   async def close(self) -> None:
     try:
       if self.server:
-        reap(self.server)
-        await asyncio.to_thread(self.server.wait)
+        await close_process(self.server)
         self.server = None
     finally:
       await self.http.close()
@@ -213,15 +125,9 @@ class VLLM:
   async def load_checkpoint(self, name: str, path: str) -> None:
     if name in self.loaded:
       return
-    if not self.lora and self.clean and os.path.isdir(path):
-      files = sorted(glob.glob(f"{path}/*.safetensors"))
-      if files:
-        with open(files[0], "rb") as f:
-          n = struct.unpack("<Q", f.read(8))[0]
-          meta = json.loads(json.loads(f.read(n)).get("__metadata__", {}).get("meta", "{}"))
-        if meta.get("untouched"):
-          self.loaded = {name}
-          return
+    if not self.lora and self.clean and (m := manifest(path)) and m["meta"].get("untouched"):
+      self.loaded = {name}
+      return
     if self.lora:
       await self.post("/v1/load_lora_adapter", json={"lora_name": name, "lora_path": path})
       self.loaded.add(name)
@@ -231,17 +137,27 @@ class VLLM:
       self.clean = False
       self.loaded = {name}
 
+  async def unload_checkpoint(self, name: str) -> None:
+    if self.lora and name in self.loaded:
+      await self.post("/v1/unload_lora_adapter", json={"lora_name": name})
+      self.loaded.discard(name)
+
+  async def abort(self, request_ids: list[str]) -> None:
+    if request_ids:
+      await self.post("/abort_requests", json={"request_ids": [f"cmpl-{r}-0" for r in request_ids]})
+
   async def sleep(self) -> None:
-    await self.post("/sleep", params={"level": 1})
+    await self.post("/sleep", params={"level": 1, "mode": "wait"})
 
   async def wake(self) -> None:
     await self.post("/wake_up")
 
-  async def sample(self, job: dict, name: str | None) -> Out:
+  async def sample(self, job: dict, name: str | None, request_id: str) -> Out:
     strs, ids = split_stop(job["stop"])
     scored = job["prompt_logprobs"] or job["topk_prompt"] > 0
     req = {
       "model": name if self.lora and name else self.base,
+      "request_id": request_id,
       "prompt": job["prompt"],
       "n": job["num_samples"],
       "max_tokens": job["max_tokens"],

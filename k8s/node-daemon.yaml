@@ -27,9 +27,7 @@ spec:
         - {name: GPUS, value: "1"}
         - {name: MODEL_CACHE, value: /models/tinyrl}
         - {name: HF_HOME, value: /models/hf}
-        - {name: TINYRL_SNAPSHOTS, value: /dev/shm/tinyrl-snapshots}
-        # samplers restore vLLM from CRIU snapshots, which needs the namespaces, ptrace and mounts of a privileged container
-        securityContext: {privileged: true}
+        - {name: VLLM_CACHE_ROOT, value: /models/vllm-cache}
         resources:
           limits: {nvidia.com/gpu: 1}
         volumeMounts:
