@@ -85,7 +85,9 @@ def assign(s: Assignment, job: str, worker: str) -> None:
 
 
 def jobs_of(s: Assignment, worker: str) -> list[str]:
-  return [r for r, x in s.jobs.items() if x.worker == worker]
+  w = s.workers.get(worker)
+  shared = w is not None and w.spec.role == Role.SAMPLER
+  return [r for r, x in s.jobs.items() if x.worker == worker or (shared and not x.worker and x.spec == w.spec)]
 
 
 # ***** workers *****

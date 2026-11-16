@@ -5,7 +5,7 @@ import time
 import unittest
 
 from test.helpers import RedisTest, new_id, start_redis
-from tinyrl.bus import GROUP, Bus, Cmd, Op, Reply, Run, connect, key
+from tinyrl.bus import GROUP, Bus, Cmd, Op, Reply, Role, Run, connect, key
 
 
 def ok(**body) -> Reply:
@@ -15,11 +15,13 @@ def ok(**body) -> Reply:
 class TestBus(RedisTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
-    await self.bus.take_lease("p", "w0")  # only a worker's owner can answer for it
+    await self.bus.renew_lease("w0")
 
-  async def new_run(self, worker: str = "p", session: str = "") -> str:
+  async def new_run(self, worker: str = "p", session: str = "", owner: str = "w0") -> str:
     run_id = new_id()
     await self.bus.create_run(Run(id=run_id, worker=worker, base="base", rank=8, session=session))
+    if owner:
+      self.assertTrue(await self.bus.take_ownership(run_id, owner))
     return run_id
 
   async def test_a_command_goes_through_the_stream_and_its_reply_comes_back(self):
@@ -30,7 +32,7 @@ class TestBus(RedisTest):
     self.assertEqual((cmd.run, cmd.op, cmd.body, cmd.request_id), (run_id, Op.OPTIM_STEP, b'{"lr": 1}', request_id))
     self.assertIsNone(await self.bus.wait_for_reply(request_id, 0))
 
-    await self.bus.write_reply(cmd, ok(type="optim_step"), "p", "w0")
+    await self.bus.write_reply(cmd, ok(type="optim_step"), "w0")
     self.assertEqual(await self.bus.wait_for_reply(request_id, 0), ok(type="optim_step"))
     self.assertEqual(await self.bus.take_commands([run_id], "w0", block_ms=10), [])
 
@@ -45,7 +47,7 @@ class TestBus(RedisTest):
     waiters = [asyncio.create_task(self.bus.wait_for_reply(request_id, 5)) for _ in range(3)]
     await asyncio.sleep(0.05)
     start = time.perf_counter()
-    await self.bus.write_reply(cmd, ok(n=1), "p", "w0")
+    await self.bus.write_reply(cmd, ok(n=1), "w0")
 
     self.assertEqual(await asyncio.gather(*waiters), [ok(n=1)] * 3)
     self.assertLess(time.perf_counter() - start, 0.5)
@@ -63,7 +65,7 @@ class TestBus(RedisTest):
 
     async def answer_late():
       await asyncio.sleep(5.5)  # past redis-py's default socket timeout, but well inside retrieve_future's 30s
-      await self.bus.write_reply(cmd, ok(n=1), "p", "w0")
+      await self.bus.write_reply(cmd, ok(n=1), "w0")
 
     answering = asyncio.create_task(answer_late())
     self.assertEqual(await self.bus.wait_for_reply(request_id, 10), ok(n=1))
@@ -91,7 +93,7 @@ class TestBus(RedisTest):
     run_id = await self.new_run()
     await self.bus.delete_run(run_id, "p")
     self.assertIsNone(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b""))
-    self.assertFalse(await self.bus.r.exists(key("worker", "p")))
+    self.assertFalse(await self.bus.r.exists(key("owner", run_id)))
     self.assertEqual(await self.bus.queued_and_in_flight(run_id), {"live": False})
     self.assertFalse(await self.bus.r.exists(key("q", run_id)))
 
@@ -100,13 +102,12 @@ class TestBus(RedisTest):
     owned, saved = [f"tinker://{run}/{path}" for path in ("sampler_weights/session", "weights/save")]
     for uri in (owned, saved):
       await self.registry.register_checkpoint(uri, 1, ttl=60, owned=uri == owned)
-    await self.bus.set_parked_checkpoint(run, owned, "p", "w0")
     request = await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
     [cmd] = await self.bus.take_commands([run], "w0", count=1)
-    publishing = asyncio.create_task(self.bus.write_reply(cmd, ok(), "p", "w0"))
+    publishing = asyncio.create_task(self.bus.write_reply(cmd, ok(), "w0"))
     try:
       self.assertEqual(await self.bus.wait_for_reply(request, 5), ok())
-      self.assertFalse(await self.bus.r.exists(key("q", run), key("parked", run)))
+      self.assertFalse(await self.bus.r.exists(key("q", run), key("owner", run)))
       self.assertFalse(await self.bus.r.sismember(key("runs"), run))
       self.assertIsNone(await self.registry.get_checkpoint(owned))
       self.assertIsNotNone(await self.registry.get_checkpoint(saved))
@@ -129,7 +130,7 @@ class TestBus(RedisTest):
       (in_flight["request_id"], in_flight["trainer"], in_flight["deliveries"]), (request_ids[0], "w0", 1)
     )
 
-    await self.bus.write_reply(cmd, ok(), "p", "w0")
+    await self.bus.write_reply(cmd, ok(), "w0")
     self.assertEqual(await self.bus.queued_and_in_flight(run_id), {"live": True, "queued": 2, "in_flight": []})
 
   async def test_peeking_returns_each_unclaimed_head_without_taking_it(self):
@@ -160,9 +161,10 @@ class TestBus(RedisTest):
       await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"")
 
     taken = await self.bus.take_commands([run_id], "w0", block_ms=10)
-    await self.bus.release_lease("p", "w0")
-    self.assertTrue(await self.bus.take_lease("p", "new"))
-    await self.bus.fail_stranded_commands([run_id], "p", "new")
+    await self.bus.release_lease("w0")
+    await self.bus.renew_lease("new")
+    self.assertTrue(await self.bus.take_ownership(run_id, "new"))
+    await self.bus.fail_stranded_commands([run_id], "new")
     for cmd in taken:
       reply = await self.bus.wait_for_reply(cmd.request_id, 0)
       self.assertFalse(reply.ok)
@@ -171,7 +173,7 @@ class TestBus(RedisTest):
       self.assertIn(cmd.op, json.loads(reply.body)["error"])
     self.assertEqual(await self.bus.queued_and_in_flight(run_id), {"live": True, "queued": 0, "in_flight": []})
     self.assertEqual(await self.bus.take_commands([run_id], "new", block_ms=10), [])
-    await self.bus.fail_stranded_commands([run_id], "p", "new")
+    await self.bus.fail_stranded_commands([run_id], "new")
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 2)
 
   async def test_failing_stranded_commands_leaves_fresh_claims_alone(self):
@@ -181,68 +183,117 @@ class TestBus(RedisTest):
     old, fresh = await self.bus.take_commands([run_id], "dead", block_ms=10)
     await self.bus.r.xclaim(key("q", run_id), GROUP, "dead", 0, [old.entry_id], idle=60_000)
 
-    await self.bus.fail_stranded_commands([run_id], "p", "w0", min_idle_ms=30_000)
+    await self.bus.fail_stranded_commands([run_id], "w0", min_idle_ms=30_000)
     self.assertFalse((await self.bus.wait_for_reply(old.request_id, 0)).ok)
     self.assertIsNone(await self.bus.wait_for_reply(fresh.request_id, 0))
     [pending] = (await self.bus.queued_and_in_flight(run_id))["in_flight"]
     self.assertEqual((pending["request_id"], pending["trainer"], pending["deliveries"]), (fresh.request_id, "dead", 1))
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 1)
 
-  async def test_a_stale_owner_cannot_fail_stranded_commands(self):
+  async def test_a_process_that_gave_a_run_up_cannot_fail_its_stranded_commands(self):
     run_id = await self.new_run()
     request_id = await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"")
     await self.bus.take_commands([run_id], "w0", block_ms=10)
-    await self.bus.release_lease("p", "w0")
-    self.assertTrue(await self.bus.take_lease("p", "new"))
+    self.assertTrue(await self.bus.hand_off(run_id, "w0"))
+    await self.bus.renew_lease("new")
+    self.assertTrue(await self.bus.take_ownership(run_id, "new"))
 
-    await self.bus.fail_stranded_commands([run_id], "p", "w0")
+    await self.bus.fail_stranded_commands([run_id], "w0")
     self.assertIsNone(await self.bus.wait_for_reply(request_id, 0))
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 0)
     self.assertEqual(len((await self.bus.queued_and_in_flight(run_id))["in_flight"]), 1)
 
-    await self.bus.fail_stranded_commands([run_id], "p", "new")
+    await self.bus.fail_stranded_commands([run_id], "new")
     self.assertFalse((await self.bus.wait_for_reply(request_id, 0)).ok)
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 1)
 
-  async def test_an_owner_can_recover_a_lease_that_expired_untaken(self):
-    await self.bus.r.pexpire(key("owner", "p"), 0)
-    self.assertFalse(await self.bus.renew_lease("p", "w0"))
-    self.assertTrue(await self.bus.take_lease("p", "w0", recover=True))
-    self.assertEqual(await self.bus.lease_owner("p"), "w0")
-    self.assertEqual(await self.bus.r.pttl(key("last_owner", "p")), -1)
+  async def test_take_ownership_reclaims_from_expired_lease_unless_holder_renewed_first(self):
+    run_id = await self.new_run()
+    request_id = await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"")
+    [cmd] = await self.bus.take_commands([run_id], "w0", block_ms=10)
+    self.assertFalse(await self.bus.take_ownership(run_id, "new"))  # w0's lease is live
 
-  async def test_concurrent_lease_takes_have_one_winner_and_matching_history(self):
-    await self.bus.release_lease("p", "w0")
-    owners = ["first", "second"]
-    taken = await asyncio.gather(*(self.bus.take_lease("p", owner) for owner in owners))
+    await self.bus.r.pexpire(key("lease", "w0"), 0)  # w0 paused past its lease,
+    await self.bus.renew_lease("w0")  # and renewed before anyone took the run,
+    self.assertFalse(await self.bus.take_ownership(run_id, "new"))  # so w0 lost nothing
+    self.assertEqual(await self.bus.run_owner(run_id), "w0")
+
+    await self.bus.r.pexpire(key("lease", "w0"), 0)
+    for c in ("a", "b"):
+      await self.bus.renew_lease(c)
+    taken = await asyncio.gather(*(self.bus.take_ownership(run_id, c) for c in ("a", "b")))
     self.assertEqual(sum(taken), 1)
-    winner = owners[taken.index(True)]
-    self.assertEqual(await self.bus.lease_owner("p"), winner)
-    self.assertEqual(await self.bus.r.get(key("last_owner", "p")), winner.encode())
+    await self.bus.renew_lease("w0")  # back too late: the run is no longer w0's
+    self.assertFalse(await self.bus.write_reply(cmd, ok(), "w0"))
+    self.assertIsNone(await self.bus.wait_for_reply(request_id, 0))
 
-  async def test_recovery_rejects_an_owner_after_another_owner_has_come_and_gone(self):
-    await self.bus.r.pexpire(key("owner", "p"), 0)
-    self.assertTrue(await self.bus.take_lease("p", "next"))
-    await self.bus.release_lease("p", "next")
-    self.assertFalse(await self.bus.take_lease("p", "w0", recover=True))
-
-  async def test_only_the_workers_owner_can_answer_for_it(self):
+  async def test_a_run_has_one_owner_and_only_it_can_answer(self):
     run_id = await self.new_run()
     request_id = await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"")
     [cmd] = await self.bus.take_commands([run_id], "w0", block_ms=10)
 
-    self.assertFalse(await self.bus.take_lease("p", "zombie"))  # w0 holds the lease
-    self.assertFalse(await self.bus.renew_lease("p", "zombie"))
-    self.assertFalse(await self.bus.write_reply(cmd, ok(by="zombie"), "p", "zombie"))
+    self.assertFalse(await self.bus.take_ownership(run_id, "zombie"))
+    self.assertFalse(await self.bus.write_reply(cmd, ok(by="zombie"), "zombie"))
+    self.assertFalse(await self.bus.hand_off(run_id, "zombie"))
     self.assertIsNone(await self.bus.wait_for_reply(request_id, 0))
 
-    self.assertTrue(await self.bus.write_reply(cmd, ok(by="w0"), "p", "w0"))
+    self.assertTrue(await self.bus.write_reply(cmd, ok(by="w0"), "w0"))
     self.assertEqual(await self.bus.wait_for_reply(request_id, 0), ok(by="w0"))
 
-    await self.bus.release_lease("p", "zombie")  # not its lease, so this does nothing
-    self.assertTrue(await self.bus.renew_lease("p", "w0"))
-    await self.bus.release_lease("p", "w0")
-    self.assertTrue(await self.bus.take_lease("p", "next"))
+    self.assertTrue(await self.bus.hand_off(run_id, "w0"))
+    for c in ("a", "b"):
+      await self.bus.renew_lease(c)
+    taken = await asyncio.gather(*(self.bus.take_ownership(run_id, owner) for owner in ("a", "b")))
+    self.assertEqual(sum(taken), 1)
+
+  async def test_a_run_keeps_a_checkpoint_only_while_it_restores_the_run_exactly(self):
+    run_id = await self.new_run()
+    requests = [await self.bus.submit_command(run_id, op, b"{}") for op in (Op.SAVE_WEIGHTS, Op.OPTIM_STEP)]
+    save, step = await self.bus.take_commands([run_id], "w0", count=2)
+    saved = {"uri": "tinker://r/weights/a", "version": None}
+    self.assertTrue(await self.bus.write_reply(save, ok(), "w0", checkpoint=saved))
+    run = await self.bus.get_run(run_id)
+    self.assertEqual((run.get("acked"), run["checkpoint"]), (None, saved))
+
+    self.assertTrue(await self.bus.write_reply(step, ok(), "w0", started=time.time(), mutated=True))
+    run = await self.bus.get_run(run_id)
+    self.assertEqual((run["acked"], run.get("checkpoint")), (requests[1].split("/")[1], None))
+
+    parked = {"uri": "tinker://r/parked/1", "version": "v"}
+    self.assertTrue(await self.bus.hand_off(run_id, "w0", parked))
+    run = await self.bus.get_run(run_id)
+    self.assertEqual((run["acked"], run["checkpoint"]), (requests[1].split("/")[1], parked))
+    self.assertIsNone(await self.bus.run_owner(run_id))
+
+  async def test_stateless_sample_replies_are_fenced_by_lease_and_concurrent_reclaim_partitions_cleanly(self):
+    sid = new_id()
+    await self.bus.create_run(Run(id=sid, worker="", base="base", rank=4, role=Role.SAMPLER))
+    requests = [await self.bus.submit_command(sid, Op.SAMPLE, f"{i}".encode()) for i in range(5)]
+    await self.bus.renew_lease("s1")
+    taken = await self.bus.take_commands([sid], "s1", count=5)
+    self.assertEqual(len(taken), 5)
+
+    await self.bus.release_lease("s1")  # s1 died with 5 prompts in flight
+    self.assertFalse(await self.bus.write_reply(taken[0], ok(by="s1"), "s1"))
+    self.assertIsNone(await self.bus.wait_for_reply(requests[0], 0))
+
+    [head] = await self.bus.peek_commands([sid], reclaim=True)
+    self.assertEqual(head.request_id, requests[0])
+
+    reapers = ("s2", "s3", "s4")
+    for r in reapers:
+      await self.bus.renew_lease(r)
+    batches = await asyncio.gather(*(self.bus.take_commands([sid], r, count=2, reclaim=True) for r in reapers))
+    reclaimed = [cmd.request_id for batch in batches for cmd in batch]
+    self.assertEqual(sorted(reclaimed), sorted(requests))  # every prompt reclaimed once, zero duplicates
+    consumers = {c["name"].decode() for c in await self.bus.r.xinfo_consumers(key("q", sid), GROUP)}
+    self.assertNotIn("s1", consumers)
+
+    winner, cmd0 = next((r, c) for r, batch in zip(reapers, batches) for c in batch if c.request_id == requests[0])
+    self.assertTrue(await self.bus.write_reply(cmd0, ok(by=winner), winner))
+    await self.bus.renew_lease("s1")  # even if s1 came back with a fresh lease, write-once reply fences it out
+    self.assertFalse(await self.bus.write_reply(taken[0], ok(by="s1"), "s1"))
+    self.assertEqual(await self.bus.wait_for_reply(requests[0], 0), ok(by=winner))
 
   async def test_a_dead_node_daemon_stops_counting(self):
     await self.bus.node_heartbeat("node-a", 2)

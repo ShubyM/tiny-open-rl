@@ -1,12 +1,13 @@
-"""One node owns its worker leases, ready commands and GPU reservations. Children only execute model operations.
+"""One node owns its worker processes, ready commands and GPU reservations. Children only execute model operations.
 
-The daemon ticks: it heartbeats, reads the cluster's table, and starts a task for each worker placed here. A task is one Lifetime. It takes the worker's lease and starts its model process, and then each step of its loop
+The daemon ticks: it heartbeats, reads the cluster's table, and starts a task for each worker placed here. A task is one Lifetime. It renews its process lease and starts its model process, and then each step of its loop
 
+  syncs      training run ownership: hands off runs moved elsewhere and takes unowned runs placed here
   peeks      at each run's next command, without claiming it, and prepares its inputs
   turns      off the GPUs when another worker's turn has come, and onto them when its own has
   executes   one bounded batch: it claims the least-served runs' commands, runs them on the model and replies
 
-When the worker leaves this node a trainer saves each run for the next one, and the GPUs and the lease are given up only after the process has parked or exited.
+When a trainer leaves a run or stops, it exports each owned run for the next owner, and the GPUs and the lease are given up only after the process has parked or exited.
 """
 
 from __future__ import annotations
@@ -166,7 +167,7 @@ class NodeDaemon:
 
 
 class Lifetime:
-  """One worker on this node, from taking its lease to giving it up: its model process, its ready commands, and its turns on the GPUs."""
+  """One worker process on this node, from renewing its lease to releasing it: its model process, owned runs, ready commands, and GPU turns."""
 
   def __init__(self, node: NodeDaemon, worker: str):
     self.node, self.bus, self.registry, self.store, self.worker = node, node.bus, node.registry, node.store, worker
@@ -174,6 +175,7 @@ class Lifetime:
     self.task, self.owner = asyncio.current_task(), f"{node.id}-{os.urandom(8).hex()}"
     self.sampling = self.r.spec.role == Role.SAMPLER
     self.model = self.guard = self.closing = None
+    self.owned: set[str] = set()
     self.renewed, self.swept = time.monotonic(), 0.0
     # each run's next unclaimed command, the task preparing each one's inputs, and the peek that looks for them
     self.heads, self.prepared, self.reader = [], {}, None
@@ -185,9 +187,10 @@ class Lifetime:
     try:
       if not await self.open():
         return
-      # Each step observes ready heads, yields when necessary, and executes one bounded batch.
+      # Each step syncs run ownership, observes ready heads, yields when necessary, and executes one bounded batch.
       while self.wanted():
         changed = node.changed
+        await self.sync_runs()
         self.collect()
         ready, failed = self.ready()
         if failed:  # answered at once, without the GPUs
@@ -204,9 +207,13 @@ class Lifetime:
         else:
           if self.reader is None:
             self.read(IDLE_MS / 1000 if self.heads else 0)
-          await changed.wait()
+          if not self.sampling and (set(self.jobs()) - self.owned):
+            with contextlib.suppress(TimeoutError):
+              await asyncio.wait_for(changed.wait(), IDLE_MS / 1000)
+          else:
+            await changed.wait()
         await self.fail_stranded()
-      await self.save_runs()
+      await self.hand_off_runs(sorted(self.owned))
     finally:
       r.ticket = 0
       died = self.model is not None and (p := self.model.proc) is not None and p.poll() is not None
@@ -234,16 +241,14 @@ class Lifetime:
       and (w.gpus == self.r.gpus or movable(self.r, self.node.gpus))
     )
 
-  # ***** its lease and its process *****
+  # ***** its lease, owned training runs, and process *****
 
   async def open(self) -> bool:
-    """Take the worker's lease, fail what its last owner left in flight, and start its process. False if another node owns the worker, or this one is stopping."""
+    """Renew this process's lease and start its model child. False if this node is stopping."""
     node, r, worker = self.node, self.r, self.worker
-    if not await self.bus.take_lease(worker, self.owner):
+    if node.draining:
       return False
-    await self.bus.fail_stranded_commands(self.jobs(), worker, self.owner, 0)
-    if not await self.bus.renew_lease(worker, self.owner) or node.draining:
-      return False
+    await self.alive()
     node.running[worker] = r
     env = {**scheduler.settings(r.spec, node.gpus, node.gpu_mib * 2**20), **os.environ}
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(node.gpus) if movable(r, node.gpus) else r.gpus))
@@ -257,26 +262,20 @@ class Lifetime:
     self.read()
     return True
 
-  async def owned(self) -> None:
-    """Renew the lease, or take it back if it ran out and no other node served the worker since. Raises if it is lost."""
+  async def alive(self) -> None:
+    """Renew this process's lease."""
     before = time.monotonic()
-    if not (
-      await self.bus.renew_lease(self.worker, self.owner)
-      or (not self.closing and await self.bus.take_lease(self.worker, self.owner, recover=True))
-    ):
-      if not self.closing and asyncio.current_task() is not self.task and not self.task.cancelling():
-        self.task.cancel()
-      raise RuntimeError(f"lost worker {self.worker}")
+    await self.bus.renew_lease(self.owner)
     self.renewed = before
 
   async def keepalive(self) -> None:
-    """Renew the lease through long model operations, and stop the worker when it cannot go on: this node lost touch with Redis, the process died, or the lease could not be renewed for as long as it lasts."""
+    """Renew the lease through long model operations, and stop the worker when this node lost touch with Redis, the process died, or the lease could not be renewed for as long as it lasts."""
     while True:
       await asyncio.sleep(LEASE_MS / 4000)
       if not self.closing and not self.node.draining and time.monotonic() - self.node.heartbeat >= LEASE_MS / 1000:
         break
       try:
-        await self.owned()
+        await self.alive()
         if not self.closing and (p := self.model.proc) and p.poll() is not None:
           break
       except Exception:
@@ -284,12 +283,29 @@ class Lifetime:
           break
     self.task.cancel()
 
+  async def sync_runs(self) -> None:
+    """For a trainer, hand off runs reassigned elsewhere and take unowned runs assigned here."""
+    if self.sampling:
+      return
+    jobs = self.jobs()
+    if leaving := sorted(self.owned - set(jobs)):
+      await self.hand_off_runs(leaving)
+    added = False
+    for run in jobs:
+      if run not in self.owned and await self.bus.take_ownership(run, self.owner):
+        await self.model.call("drop", run)
+        await self.bus.fail_stranded_commands([run], self.owner, 0)
+        self.owned.add(run)
+        added = True
+    if added and self.reader is None:
+      self.read()
+
   async def fail_stranded(self) -> None:
-    """Every few seconds, fail the commands an earlier owner of the worker left in flight."""
-    if time.monotonic() - self.swept >= STRANDED_MS / 1000:
+    """Every few seconds, fail commands an earlier trainer left in flight on runs we own."""
+    if not self.sampling and self.owned and time.monotonic() - self.swept >= STRANDED_MS / 1000:
       self.swept = time.monotonic()
-      await self.owned()
-      await self.bus.fail_stranded_commands(self.jobs(), self.worker, self.owner, 0)
+      await self.alive()
+      await self.bus.fail_stranded_commands(sorted(self.owned), self.owner, 0)
 
   # ***** its ready commands *****
 
@@ -300,7 +316,7 @@ class Lifetime:
 
   async def peek(self, delay: float) -> list[Cmd]:
     await asyncio.sleep(delay)
-    commands = await self.bus.peek_commands(self.jobs(), IDLE_MS)
+    commands = await self.bus.peek_commands(self.jobs(), IDLE_MS, reclaim=self.sampling)
     for cmd in commands:
       if cmd.request_id not in self.prepared:
         preparing = self.prepared[cmd.request_id] = asyncio.create_task(self.prepare(cmd))
@@ -333,8 +349,12 @@ class Lifetime:
       self.service = {c.run: self.service.get(c.run, self.virtual) for c in self.heads}
 
   def ready(self) -> tuple[list[Cmd], list[Cmd]]:
-    """The heads whose inputs are prepared, and the heads whose preparation failed."""
-    done = [c for c in self.heads if c.request_id in self.prepared and self.prepared[c.request_id].done()]
+    """The heads whose inputs are prepared and which this process may execute, split into ok and failed."""
+    done = [
+      c
+      for c in self.heads
+      if (self.sampling or c.run in self.owned) and c.request_id in self.prepared and self.prepared[c.request_id].done()
+    ]
     failed = [c for c in done if isinstance(self.prepared[c.request_id].result(), Exception)]
     return [c for c in done if c not in failed], failed
 
@@ -380,7 +400,7 @@ class Lifetime:
     """Bring the process onto the GPUs it has just reserved. If it cannot start, a waiting client is told why."""
     r = self.r
     try:
-      await self.owned()
+      await self.alive()
       with span("node.resume"):
         if not self.sampling:
           await self.model.call("resume", r.gpus[0] if movable(r, self.node.gpus) else None)
@@ -391,10 +411,10 @@ class Lifetime:
             r.pid = self.model.proc.pid if self.model.proc else None
     except Exception as e:
       # A boot failure still answers waiting clients. Keep its reservation until close acknowledges.
-      await self.owned()
-      for cmd in await self.bus.take_commands(self.jobs(), self.owner, 1):
-        if not await self.bus.write_reply(cmd, Reply.error(e), self.worker, self.owner):
-          raise RuntimeError(f"lost worker {self.worker}") from e
+      await self.alive()
+      targets = self.jobs() if self.sampling else sorted(self.owned)
+      for cmd in await self.bus.take_commands(targets, self.owner, 1, reclaim=self.sampling):
+        await self.bus.write_reply(cmd, Reply.error(e), self.owner)
       raise
 
   # ***** executing *****
@@ -406,11 +426,12 @@ class Lifetime:
     failed = all(isinstance(value, Exception) for value in inputs.values())
     cmds = await self.claim(runs, SAMPLE_COMMANDS if self.sampling and not failed else 1)
     if not cmds:
-      return
+      return None
     if self.sampling:
       async with asyncio.TaskGroup() as group:
         for cmd in cmds:
           group.create_task(self.answer(cmd, inputs[cmd.run]))
+      reply = None
     else:
       cmd = cmds[0]
       if cmd.run != self.last_run or self.turn_commands >= RUN_COMMANDS:
@@ -418,7 +439,7 @@ class Lifetime:
       self.turn_commands += 1
       reply = await self.answer(cmd, inputs[cmd.run])
     self.charge(cmds)
-    return cmds[0] if not self.sampling and reply.ok else None
+    return cmds[0] if not self.sampling and reply and reply.ok else None
 
   def choose(self, candidates: list[Cmd]) -> list[str]:
     """The runs served next: those served the fewest tokens, after the run a trainer is staying with."""
@@ -434,47 +455,56 @@ class Lifetime:
     if self.reader:
       self.reader.cancel()
       await asyncio.gather(self.reader, return_exceptions=True)
-    await self.owned()
+    await self.alive()
     with span("node.claim"):
-      cmds = await self.bus.take_commands(runs, self.owner, count)
+      cmds = await self.bus.take_commands(runs, self.owner, count, reclaim=self.sampling)
     self.read()
     self.heads = [c for c in self.heads if c.run not in runs]
-    await self.owned()
+    await self.alive()
     return cmds
 
-  async def answer(self, cmd: Cmd, inputs) -> Reply:
+  async def answer(self, cmd: Cmd, inputs) -> Reply | None:
     before = time.time()
+    effects, last = {}, None
     with span("node.execute"):
       if isinstance(inputs, Exception):
         reply = Reply.error(inputs)
       elif self.sampling:
-        await self.owned()
+        await self.alive()
         reply = await self.model.execute(cmd, *inputs)
       else:
-        reply = await self.train(cmd, inputs[0])
+        reply, effects, last = await self.train(cmd)
     with span("node.publish"):
-      if not await self.bus.write_reply(cmd, reply, self.worker, self.owner, started=before):
-        raise RuntimeError(f"lost worker {self.worker}")
+      mutated = effects.get("mutated", False)
+      checkpoint = effects.get("checkpoint") if reply.ok else None
+      if not await self.bus.write_reply(cmd, reply, self.owner, started=before, mutated=mutated, checkpoint=checkpoint):
+        if self.sampling:
+          if not await self.bus.lease_live(self.owner):
+            raise RuntimeError(f"lost lease {self.owner}")
+          return None
+        self.owned.discard(cmd.run)
+        return None
+    if (mutated or checkpoint) and last and "/parked/" in last["uri"]:
+      await self.registry.unregister_checkpoints(last["uri"])
+    if cmd.op == Op.DELETE_MODEL and reply.ok:
+      self.owned.discard(cmd.run)
     if DEBUG:
       print(f"{self.worker} {cmd.request_id} {cmd.op:24s} {(time.time() - before) * 1000:9.2f} ms")
     return reply
 
-  async def train(self, cmd: Cmd, run: dict | None) -> Reply:
-    """Run a trainer's command. A run the last trainer parked is restored first, and then its parked checkpoint is let go."""
-    parked, version = await self.bus.parked_checkpoint(cmd.run), None
+  async def train(self, cmd: Cmd) -> tuple[Reply, dict, dict | None]:
+    """Run a trainer's command from the run's authoritative row."""
+    run = await self.bus.get_run(cmd.run)
+    last, version = run.get("checkpoint") if run else None, None
     if cmd.op == Op.LOAD_WEIGHTS:
       version = await self.registry.version(json.loads(cmd.body)["uri"])
-    saved = (parked, await self.registry.version(parked)) if parked else None
-    await self.owned()  # metadata awaits may have outlived our ownership
+    saved = (last["uri"], last["version"]) if last else None
+    await self.alive()
     reply, effects = await self.model.call("execute", cmd, run, saved, version)
-    await self.owned()
-    if checkpoint := effects.get("saved"):
-      await self.registry.register_checkpoint(**checkpoint)
-    if restored := effects.get("restored"):
-      if not await self.bus.set_parked_checkpoint(cmd.run, None, self.worker, self.owner):
-        raise RuntimeError(f"lost worker {self.worker}")
-      await self.registry.unregister_checkpoints(restored)
-    return reply
+    await self.alive()
+    if made := effects.get("saved"):
+      await self.registry.register_checkpoint(**made)
+    return reply, effects, last
 
   def charge(self, cmds: list[Cmd]) -> None:
     """Count a batch's tokens against its runs and this GPU turn, and raise the floor to the least-served run with work."""
@@ -486,14 +516,16 @@ class Lifetime:
     active = {c.run for c in [*ready, *failed, *cmds]}
     self.virtual = max(self.virtual, min(self.service[run] for run in active))
 
-  # ***** stopping *****
+  # ***** handing off runs and stopping *****
 
-  async def save_runs(self) -> None:
-    """A trainer that stops saves each run it holds, for the next trainer to restore. Preparation never claimed work, so nothing is in flight."""
+  async def hand_off_runs(self, runs: list[str]) -> None:
+    """Export and release each owned training run so its next owner restores without loss."""
     node, r = self.node, self.r
-    if self.sampling:
+    if self.sampling or not runs:
       return
-    if len(r.gpus) > 1 and r.served is None:  # a wide trainer saves through all its ranks, so it needs its GPUs
+    rows = {run: await self.bus.get_run(run) for run in runs}
+    dirty = {run for run, row in rows.items() if row and row.get("acked") and not row.get("checkpoint")}
+    if len(r.gpus) > 1 and r.served is None and dirty:  # a wide trainer saves through all its ranks, on its GPUs
       with span("node.wait_gpu"):
         while True:
           changed = node.changed
@@ -501,16 +533,20 @@ class Lifetime:
             break
           await changed.wait()
       await self.resume()
-    await self.owned()
-    for saved in await self.model.call("park_all"):
-      await self.owned()
-      run = saved.pop("run")
-      await self.registry.register_checkpoint(**saved)
-      if not await self.bus.set_parked_checkpoint(run, saved["uri"], self.worker, self.owner):
-        raise RuntimeError(f"lost worker {self.worker}")
+    await self.alive()
+    for run, row in rows.items():
+      saved = await self.model.call("export", run) if run in dirty else None
+      await self.alive()
+      if saved:
+        await self.registry.register_checkpoint(**saved)
+      ckpt = {"uri": saved["uri"], "version": saved["version"]} if saved else None
+      if row is not None and not await self.bus.hand_off(run, self.owner, ckpt) and saved:
+        await self.registry.unregister_checkpoints(saved["uri"])
+      await self.model.call("drop", run)
+      self.owned.discard(run)
 
   async def cleanup(self, died: bool) -> None:
-    """Close the process, and only then give up its GPUs and its lease. A process that `died` took a command with it, which is failed."""
+    """Close the process, and only then give up its GPUs and its lease. A trainer that `died` fails what it took; a dead sampler's prompts are reclaimed and re-run by peers."""
     node, worker = self.node, self.worker
     for future in [self.reader, *self.prepared.values()]:
       if future:
@@ -530,11 +566,12 @@ class Lifetime:
     if self.guard:
       self.guard.cancel()
       await asyncio.gather(self.guard, return_exceptions=True)
-    if await self.bus.lease_owner(worker) == self.owner:
-      if died:
-        await self.bus.take_commands(self.jobs(), self.owner, 1)
-      await self.bus.fail_stranded_commands(self.jobs(), worker, self.owner, 0)
-    await self.bus.release_lease(worker, self.owner)
+    if not self.sampling:
+      for run in sorted(self.owned):
+        if died:
+          await self.bus.take_commands([run], self.owner, 1)
+        await self.bus.fail_stranded_commands([run], self.owner, 0)
+    await self.bus.release_lease(self.owner)
 
 
 if __name__ == "__main__":

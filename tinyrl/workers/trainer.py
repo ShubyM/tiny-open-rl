@@ -69,27 +69,28 @@ class Trainer:
   def execute(
     self, cmd: Cmd, run: dict | None = None, parked: tuple[str, str | None] | None = None, version: str | None = None
   ) -> tuple[Reply, dict]:
+    """Run a command, first restoring its run from `parked` if this process doesn't hold it. The effects tell the node what to record: `saved`, a checkpoint to register; `mutated`, that the command changed the run's state; and `checkpoint`, where the state it now has is saved."""
     with span("trainer.execute"):
       effects, created = {}, False
       try:
         if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
           if cmd.op == Op.DELETE_MODEL:
             return ok({"type": cmd.op, "model_id": cmd.run}), effects
-          if not parked and cmd.op != Op.LOAD_WEIGHTS:
-            raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
           if run is None:
             raise KeyError(f"no training run {cmd.run}")
+          if not parked and cmd.op != Op.LOAD_WEIGHTS and run.get("acked"):
+            raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
           self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
-          created = True
-          if parked:
+          created = cmd.op == Op.LOAD_WEIGHTS or bool(parked)
+          if parked and cmd.op != Op.LOAD_WEIGHTS:  # a load replaces the run's whole state, whatever became of its save
             self.load_run(cmd.run, *parked, optimizer=True, gradients=True)
-            effects["restored"] = parked[0]
             created = False  # recovery succeeded, even if the command that follows is rejected
 
         if cmd.op == Op.FORWARD_BACKWARD:
           req = wire.parse(cmd.body)
           fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
           logprobs, metrics = self.call_model("forward_backward", *fb)
+          effects["mutated"] = not req.forward_only
           return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), effects
 
         args = json.loads(cmd.body)
@@ -97,6 +98,7 @@ class Trainer:
           case Op.CREATE_MODEL:
             self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
           case Op.OPTIM_STEP:
+            effects["mutated"] = True
             metrics = self.call_model("optim_step", cmd.run, args["adam_params"])
             return ok({"type": cmd.op, "metrics": metrics}), effects
           case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
@@ -107,8 +109,13 @@ class Trainer:
               args.get("ttl_seconds"),
               args.get("owned", False),
             )
+            if cmd.op == Op.SAVE_WEIGHTS and not args.get("ttl_seconds"):
+              effects["checkpoint"] = {"uri": args["uri"], "version": effects["saved"]["version"]}
           case Op.LOAD_WEIGHTS:
             self.load_run(cmd.run, args["uri"], version, optimizer=args["optimizer"], gradients=False)
+            effects["mutated"] = True
+            if args["optimizer"]:  # the whole state came from it, so it restores this run as it is now
+              effects["checkpoint"] = {"uri": args["uri"], "version": version}
           case Op.DELETE_MODEL:
             self.call_model("delete_run", cmd.run)
           case _:
@@ -121,13 +128,19 @@ class Trainer:
       except Exception as e:
         if created:  # a failed restore must not leave a fresh model serving requests as recovered state
           self.call_model("delete_run", cmd.run)
+        # a forward_backward that failed after it began discarded the run's accumulated gradients
+        effects["mutated"] = effects.get("mutated", False) or cmd.run in self.model.needs_recovery
         return Reply.error(e), effects
 
-  def park_all(self) -> list[dict]:
-    return [
-      {"run": run, **self.save(run, f"tinker://{run}/parked/{time.time_ns()}", owned=True)}
-      for run in list(self.model.params)
-    ]
+  def export(self, run: str) -> dict | None:
+    """Save a run's whole state for its next owner, under a name of its own. None if this process doesn't hold it."""
+    if run in self.model.params:
+      return self.save(run, f"tinker://{run}/parked/{time.time_ns()}", owned=True)
+
+  def drop(self, run: str) -> None:
+    """Forget a run, so that its owner starts again from its row."""
+    if run in self.model.params:
+      self.call_model("delete_run", run)
 
   def park(self) -> None:
     self.call_model("park_on_host")

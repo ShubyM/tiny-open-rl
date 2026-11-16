@@ -100,8 +100,8 @@ class TestNode(NodeDaemon):
         await asyncio.sleep(0.001)
     return self.running.get(worker)
 
-  async def aclose(self):
-    await self.close(graceful=False)
+  async def aclose(self, graceful=False):
+    await self.close(graceful=graceful)
     if task := self.sweeping:
       task.cancel()
       await asyncio.gather(task, return_exceptions=True)

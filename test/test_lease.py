@@ -79,7 +79,7 @@ class TestLease(RedisTest):
     scheduling = asyncio.create_task(scheduler.run(self.bus))
     self.tasks.append(scheduling)
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
-    old_owner = await self.bus.lease_owner("worker")
+    old_owner = await self.bus.run_owner(run)
     [first_node] = await self.bus.live_nodes()
     second = self.daemon()
 
@@ -88,7 +88,7 @@ class TestLease(RedisTest):
 
     await self.until(both_up)
     await asyncio.sleep(1.5 * LEASE_MS / 1000)
-    self.assertEqual(await self.bus.lease_owner("worker"), old_owner)
+    self.assertEqual(await self.bus.run_owner(run), old_owner)
     self.assertEqual(len(await self.bus.r.xinfo_consumers(key("q", run), GROUP)), 1)
 
     async def reported():
@@ -111,8 +111,7 @@ class TestLease(RedisTest):
       expected = await self.bus.wait_for_reply(request, 30)
       self.assertFalse(expected.ok)
       self.assertIn("lost the worker", json.loads(expected.body)["error"])
-      new_owner = await self.bus.lease_owner("worker")
-      self.assertNotEqual(new_owner, old_owner)
+      self.assertNotIn(await self.bus.run_owner(run), (None, old_owner))
     finally:
       first.send_signal(signal.SIGCONT)
       with contextlib.suppress(ProcessLookupError):
@@ -139,15 +138,15 @@ class TestLease(RedisTest):
     proc = self.daemon()
     self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
+    self.assertTrue((await self.call(run, Op.OPTIM_STEP, {"adam_params": {}})).ok)
     proc.terminate()
     self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
-    uri = await self.bus.parked_checkpoint(run)
-    self.assertIsNotNone(uri)
+    uri = (await self.bus.get_run(run))["checkpoint"]["uri"]
     tensors, meta = self.store.get(uri)
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])
     self.assertIsNotNone(await self.registry.get_checkpoint(uri))
-    self.assertIsNone(await self.bus.lease_owner("worker"))
+    self.assertEqual(await self.bus.r.keys(key("owner", "*")) + await self.bus.r.keys(key("lease", "*")), [])
 
 
 if __name__ == "__main__":

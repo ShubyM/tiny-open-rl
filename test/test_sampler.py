@@ -192,7 +192,7 @@ class TestSampler(RedisTest):
       self.assertIsInstance(error, RuntimeError)
       self.assertIsNone(sampler.running)
       self.assertIsNone(reservation.served)
-      self.assertIsNone(await self.bus.lease_owner("sampler"))
+      self.assertEqual(await self.bus.r.keys(key("lease", "*")), [])
       self.assertIsNone(await self.bus.wait_for_reply(future, 0))
       self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
     finally:
@@ -318,6 +318,76 @@ class TestSampler(RedisTest):
     self.assertGreater(queued[0], 0, "ready work waited for the whole invalid backlog")
     self.assertFalse((await self.bus.wait_for_reply(requests[-1], 5)).ok)
     self.assertEqual(int(await self.bus.r.hget(key("run", "broken"), "failed")), len(requests))
+
+  async def test_multiple_samplers_concurrently_drain_one_unpinned_session(self):
+    from tinyrl.control import node_daemon, scheduler
+
+    await self.bus.create_run(Run("shared", "", "base", 4, role=Role.SAMPLER))
+    spec = {"role": "sampler", "base": "base", "lora": True, "exclusive": False, "train_run": None, "gpus": 1}
+    await self.bus.write_table(
+      {}, {"s-a": {"spec": spec, "node": None}, "s-b": {"spec": spec, "node": None}}, [], 2, []
+    )
+    seen, both_busy = set(), asyncio.Event()
+
+    class SharedEngine(FakeEngine):
+      async def sample(self, job, name):
+        seen.add(id(self))
+        if len(seen) >= 2:
+          both_busy.set()
+        await asyncio.wait_for(both_busy.wait(), 5)
+        return await super().sample(job, name)
+
+    node = self.node(gpus=2, engine=SharedEngine)
+    with mock.patch.object(node_daemon, "SAMPLE_COMMANDS", 2):
+      requests = [await self.bus.submit_command("shared", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(6)]
+      await node.add("s-a", gpus=[0])
+      await node.add("s-b", gpus=[1])
+      self.pump(node)
+      self.assertEqual(scheduler.jobs_of(node.state, "s-a"), ["shared"])
+      self.assertEqual(scheduler.jobs_of(node.state, "s-b"), ["shared"])
+      replies = [await self.bus.wait_for_reply(req, 5) for req in requests]
+    self.assertTrue(all(r and r.ok for r in replies))
+    self.assertEqual(len(seen), 2)
+
+  async def test_surviving_sampler_reclaims_and_reruns_prompts_when_a_peer_dies_mid_sample(self):
+    await self.bus.create_run(Run("shared", "", "base", 4, role=Role.SAMPLER))
+    spec = {"role": "sampler", "base": "base", "lora": True, "exclusive": False, "train_run": None, "gpus": 1}
+    await self.bus.write_table(
+      {}, {"s-dead": {"spec": spec, "node": None}, "s-live": {"spec": spec, "node": None}}, [], 2, []
+    )
+    claimed = asyncio.Event()
+
+    class HangingFirstEngine(FakeEngine):
+      first = True
+
+      async def sample(self, job, name):
+        if HangingFirstEngine.first:
+          claimed.set()
+          await asyncio.Future()  # hangs until s-dead is killed
+        return await super().sample(job, name)
+
+    node = self.node(gpus=2, engine=HangingFirstEngine)
+    requests = [
+      await self.bus.submit_command("shared", Op.SAMPLE, json.dumps(JOB | {"prompt": [i]}).encode())
+      for i in range(1, 5)
+    ]
+    await node.add("s-dead", gpus=[0])
+    self.pump(node)
+    await asyncio.wait_for(claimed.wait(), 5)
+    self.assertEqual(len((await self.bus.queued_and_in_flight("shared"))["in_flight"]), 4)
+
+    HangingFirstEngine.first = False
+    node.pinned.discard("s-dead")
+    node.tasks["s-dead"].cancel()
+    await asyncio.gather(node.tasks["s-dead"], return_exceptions=True)
+    await node.add("s-live", gpus=[1])
+
+    for i, req in enumerate(requests, start=1):
+      reply = await self.bus.wait_for_reply(req, 5)
+      self.assertIsNotNone(reply)
+      self.assertTrue(reply.ok, reply.body)
+      self.assertEqual(wire.sample_json(reply.body)["sequences"][0]["tokens"][0], (i + 1) % 32)
+    self.assertEqual(await self.bus.queued_and_in_flight("shared"), {"live": True, "queued": 0, "in_flight": []})
 
 
 if __name__ == "__main__":

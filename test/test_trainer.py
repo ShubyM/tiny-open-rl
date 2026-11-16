@@ -14,6 +14,7 @@ import tinyrl.workers.model
 from test.execution import TestNode
 from test.helpers import RedisTest, new_id, tiny
 from test.test_api import proto_body
+from tinyrl import bus
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Run
 from tinyrl.storage.store import Store
@@ -302,6 +303,10 @@ class TestTrainer(RedisTest):
   async def finish_worker(self, worker):
     await self.until(lambda: worker not in self.node.running)
 
+  async def kill_worker(self, worker):
+    self.node.tasks[worker].cancel()
+    await self.finish_worker(worker)
+
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
     await self.bus.create_run(Run(run, run, "tiny", 0))
@@ -310,7 +315,7 @@ class TestTrainer(RedisTest):
     child = self.node.processes[run]
     await self.finish_worker(run)
     self.assertTrue(child.closed)
-    self.assertIsNone(await self.bus.lease_owner(run))
+    self.assertEqual(await self.bus.r.keys(bus.key("lease", "*")) + await self.bus.r.keys(bus.key("owner", "*")), [])
 
   async def test_graceful_replacement_registers_and_restores_weights_optimizer_and_pending_gradients(self):
     self.node.gpus = 2
@@ -330,8 +335,7 @@ class TestTrainer(RedisTest):
       desired.node, desired.gpus = None, ()  # the parked wide worker must regain its actual GPUs to checkpoint
       self.node.notify()
       await self.finish_worker(f"p-{rank}")
-      parked = await self.bus.parked_checkpoint(run)
-      self.assertIsNotNone(parked)
+      parked = (await self.bus.get_run(run))["checkpoint"]["uri"]
       self.assertIsNotNone(await self.registry.get_checkpoint(parked))
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
       await self.node.drain(run)  # recovery succeeds even when the following command is rejected
@@ -341,18 +345,74 @@ class TestTrainer(RedisTest):
         await self.node.drain(r)
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
-      self.assertIsNone(await self.bus.parked_checkpoint(run))
+      self.assertNotIn("checkpoint", await self.bus.get_run(run))
       self.assertIsNone(await self.registry.get_checkpoint(parked))  # recovery cannot replay old state after a crash
+
+  async def test_a_single_lora_run_hands_off_live_without_interrupting_its_sibling(self):
+    self.node.gpus = 2
+    self.node.state.nodes[self.node.id] = (2, 0)
+    moving, staying, ctrl = new_id(), new_id(), new_id()
+    create = (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA})
+    for r, worker in ((moving, "w1"), (staying, "w1"), (ctrl, "ctrl")):
+      await self.bus.create_run(Run(r, worker, "tiny", 4, lora=LORA))
+      await self.submit(r, create)
+      await self.submit(
+        r, (Op.FORWARD_BACKWARD, proto_body(r)), (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})
+      )
+      await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # uncommitted gradients on both moving and staying
+      await self.node.drain(r)
+    w1_process = self.node.processes["w1"]
+    spec = {"role": "trainer", "base": "tiny", "lora": True, "exclusive": False, "train_run": None, "gpus": 1}
+    await self.bus.write_table({moving: "w2"}, {"w2": {"spec": spec, "node": None}}, [], 1, [])
+    await self.node.tick()
+    async with asyncio.timeout(5):
+      while await self.bus.run_owner(moving) is not None or moving in self.model("w1").params:
+        await self.node.tick()
+        await asyncio.sleep(0.01)
+    self.assertIs(self.node.processes["w1"], w1_process)  # w1 stayed up and kept its sibling run
+    self.assertIn(staying, self.model("w1").params)
+    for r in (moving, staying, ctrl):
+      [req] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
+      await self.node.drain(r)
+      self.assertTrue((await self.bus.wait_for_reply(req, 1)).ok)
+    self.assertTrue(same(self.model("ctrl").params[ctrl], self.model("w2").params[moving]))
+    self.assertTrue(same(self.model("ctrl").params[ctrl], self.model("w1").params[staying]))
+
+  async def test_a_drained_nodes_run_resumes_exactly_on_another_node(self):
+    folder = tempfile.mkdtemp()
+    a, b = (TestNode(self.bus, Store(f"file://{folder}/bucket", cache=f"{folder}/{n}"), node=n) for n in "ab")
+    self.addAsyncCleanup(b.aclose)
+    run, ctrl = new_id(), new_id()
+    create = (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA})
+    step = (Op.FORWARD_BACKWARD, proto_body(run)), (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    await self.submit(run, create, *step, step[0])  # it leaves with gradients it has not applied
+    await a.drain(run)
+    await a.aclose(graceful=True)
+    await self.bus.r.hdel(bus.key("nodes"), "a")
+    parked = (await self.bus.get_run(run))["checkpoint"]
+    self.assertIn("@", parked["version"])  # saved on node a, which no longer serves it
+
+    [moved] = await self.submit(run, step[1])
+    await b.drain(run)
+    self.assertTrue((await self.bus.wait_for_reply(moved, 1)).ok)
+    await self.bus.create_run(Run(ctrl, "ctrl", "tiny", 4, lora=LORA))
+    await self.submit(ctrl, create, *step, *step)
+    await b.drain(ctrl)
+    self.assertTrue(same(b.processes["ctrl"].trainer.model.params[ctrl], b.processes["p"].trainer.model.params[run]))
+    self.assertIsNone(await self.registry.get_checkpoint(parked["uri"]))
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     run, uri = new_id(), "tinker://saved/weights/step-1"
     await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
     await self.submit(
-      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
+      run,
+      (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}),
+      (Op.SAVE_WEIGHTS, {"uri": uri}),
+      (Op.OPTIM_STEP, {"adam_params": {}}),  # the step its save doesn't have
     )
     await self.node.drain(run)
-    self.node.tasks["p"].cancel()  # a lost process has no park checkpoint
-    await self.finish_worker("p")
+    await self.kill_worker("p")  # a lost process hands nothing off
     ids = await self.submit(
       run,
       (Op.OPTIM_STEP, {"adam_params": {}}),
@@ -365,6 +425,37 @@ class TestTrainer(RedisTest):
     replies = [await self.bus.wait_for_reply(request_id, 1) for request_id in ids]
     self.assertEqual([reply.ok for reply in replies], [False, False, False, True, True])
     self.assertIn("lost its unsaved steps", json.loads(replies[0].body)["error"])
+
+  async def test_a_run_whose_save_is_gone_fails_until_it_loads_another(self):
+    run, kept, gone = new_id(), "tinker://saved/weights/kept", "tinker://saved/weights/gone"
+    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    create = (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA})
+    await self.submit(run, create, (Op.SAVE_WEIGHTS, {"uri": kept}), (Op.SAVE_WEIGHTS, {"uri": gone}))
+    await self.node.drain(run)
+    self.store.delete(gone)  # the save its row names, deleted by its user
+    await self.kill_worker("p")
+    step = (Op.OPTIM_STEP, {"adam_params": {}})
+    ids = await self.submit(run, step, (Op.LOAD_WEIGHTS, {"uri": kept, "optimizer": False}), step)
+    await self.node.drain(run)
+    replies = [await self.bus.wait_for_reply(request_id, 1) for request_id in ids]
+    self.assertEqual([reply.ok for reply in replies], [False, True, True])
+
+  async def test_a_run_whose_process_died_resumes_from_a_save_it_has_not_changed_since(self):
+    run, ctrl, uri = new_id(), new_id(), "tinker://saved/weights/step-1"
+    step = (Op.FORWARD_BACKWARD, proto_body(run)), (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}})
+    for r, worker in ((run, "p"), (ctrl, "ctrl")):
+      await self.bus.create_run(Run(r, worker, "tiny", 4, lora=LORA))
+      await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), *step)
+    await self.submit(run, (Op.SAVE_WEIGHTS, {"uri": uri}), (Op.FORWARD_BACKWARD, proto_body(run, loss_fn="unknown")))
+    await self.node.drain(run)
+    await self.node.drain(ctrl)
+    self.assertEqual((await self.bus.get_run(run))["checkpoint"]["uri"], uri)  # a rejected call changed nothing
+    await self.kill_worker("p")
+    for r in (run, ctrl):
+      requests = await self.submit(r, *step)
+      await self.node.drain(r)
+      self.assertTrue(all([(await self.bus.wait_for_reply(request, 1)).ok for request in requests]))
+    self.assertTrue(same(self.model("ctrl").params[ctrl], self.model("p").params[run]))
 
 
 class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
