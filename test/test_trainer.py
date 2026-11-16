@@ -456,7 +456,6 @@ class TestCheckpointNames(unittest.TestCase):
         "num_key_value_heads": 1,
         "head_dim": 16,
         "vocab_size": 128,
-        "num_kv_shared_layers": 1,
         "layer_types": ["sliding_attention", "full_attention"],
         "hidden_size_per_layer_input": 0,
       },
