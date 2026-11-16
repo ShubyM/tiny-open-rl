@@ -19,6 +19,7 @@ and surviving samplers reclaim and re-run prompts left pending by a sampler whos
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -331,35 +332,28 @@ class Bus:
     """For each run, the stream consumers holding pending entries whose process lease is gone."""
     if not runs:
       return {}
-    p = self.r.pipeline(transaction=False)
+    p, per_run, names = self.r.pipeline(transaction=False), {}, set()
     for run in runs:
       p.xinfo_consumers(key("q", run), GROUP)
-    per_run, names = {}, set()
     for run, info in zip(runs, await p.execute(raise_on_error=False)):
       if isinstance(info, Exception):
         if "NOGROUP" not in str(info) and "no such key" not in str(info):
           raise info
-        continue
-      holders = [c["name"].decode() for c in info if c["pending"] > 0]
-      if holders:
-        per_run[run] = holders
-        names.update(holders)
+      elif holders := [c["name"].decode() for c in info if c["pending"] > 0]:
+        per_run[run], names = holders, names | set(holders)
     if not names:
       return {}
-    ordered = sorted(names)
-    p = self.r.pipeline(transaction=False)
+    ordered, lp = sorted(names), self.r.pipeline(transaction=False)
     for name in ordered:
-      p.exists(key("lease", name))
-    dead = {name for name, live in zip(ordered, await p.execute()) if not live}
-    return {
-      run: [n for n in holders if n in dead] for run, holders in per_run.items() if any(n in dead for n in holders)
-    }
+      lp.exists(key("lease", name))
+    dead = {name for name, live in zip(ordered, await lp.execute()) if not live}
+    return {r: [n for n in h if n in dead] for r, h in per_run.items() if dead.intersection(h)}
 
   async def reclaim_from_dead(self, run: str, dead: str, owner: str, count: int) -> list[Cmd]:
     """Atomically move up to `count` pending entries from `dead` to `owner` if `dead`'s lease is still gone."""
     stream, lease_key, reap_key = key("q", run), key("lease", dead), key("reap", run)
     while True:
-      try:
+      with contextlib.suppress(redis.WatchError):
         async with self.r.pipeline(transaction=True) as p:
           await p.watch(lease_key, reap_key)
           if await p.exists(lease_key):
@@ -380,29 +374,20 @@ class Bus:
           p.xclaim(stream, GROUP, owner, 0, [e["message_id"] for e in pending])
           if len(pending) < count:
             p.xgroup_delconsumer(stream, GROUP, dead)
-          res = await p.execute()
-          claimed = res[2]
-          return [parse_cmd(run, *entry) for entry in claimed if entry]
-      except redis.WatchError:
-        continue
+          return [parse_cmd(run, *entry) for entry in (await p.execute())[2] if entry]
 
   async def peek_commands(self, runs: list[str], block_ms: int = 0, reclaim: bool = False) -> list[Cmd]:
     """Unclaimed heads (and dead-sampler pending heads when `reclaim` is True), in arrival order."""
     heads: dict[str, Cmd] = {}
     if reclaim:
       for run, dead_list in (await self.dead_consumers(runs)).items():
-        try:
-          pending = await self.r.xpending_range(
+        with contextlib.suppress(redis.ResponseError):
+          if pend := await self.r.xpending_range(
             key("q", run), GROUP, min="-", max="+", count=1, consumername=dead_list[0]
-          )
-        except redis.ResponseError:
-          continue
-        if pending and (
-          entries := await self.r.xrange(
-            key("q", run), min=pending[0]["message_id"], max=pending[0]["message_id"], count=1
-          )
-        ):
-          heads[run] = parse_cmd(run, *entries[0])
+          ):
+            mid = pend[0]["message_id"]
+            if entries := await self.r.xrange(key("q", run), min=mid, max=mid, count=1):
+              heads[run] = parse_cmd(run, *entries[0])
 
     rest = [r for r in runs if r not in heads]
     p = self.r.pipeline(transaction=False)
@@ -543,29 +528,25 @@ class Bus:
     """Become a training run's owner if it has none, or if its previous owner's lease ran out."""
     owner_key = key("owner", run_id)
     while True:
-      try:
+      with contextlib.suppress(redis.WatchError):
         async with self.r.pipeline(transaction=True) as p:
           await p.watch(owner_key)
-          current = await p.get(owner_key)
-          if current == owner.encode():
+          if (current := await p.get(owner_key)) == owner.encode():
             return True
           if current is not None:
-            lease_key = key("lease", current.decode())
-            await p.watch(lease_key)
+            await p.watch(lease_key := key("lease", current.decode()))
             if await p.exists(lease_key):
               return False
           p.multi()
           p.set(owner_key, owner)
           await p.execute()
           return True
-      except redis.WatchError:
-        continue
 
   async def hand_off(self, run_id: str, owner: str, checkpoint: dict | None = None) -> bool:
     """Give up a training run if `owner` owns it, recording `checkpoint` for the next owner to restore."""
     owner_key = key("owner", run_id)
     while True:
-      try:
+      with contextlib.suppress(redis.WatchError):
         async with self.r.pipeline(transaction=True) as p:
           await p.watch(owner_key)
           if await p.get(owner_key) != owner.encode():
@@ -576,8 +557,6 @@ class Bus:
           p.delete(owner_key)
           await p.execute()
           return True
-      except redis.WatchError:
-        continue
 
   async def run_owner(self, run_id: str) -> str | None:
     owner = await self.r.get(key("owner", run_id))
@@ -598,51 +577,26 @@ class Bus:
 
   # ***** shared per-account virtual time *****
 
-  async def _lift_account(self, account: str, floor: int) -> int:
-    vkey = key("vtime", account)
+  async def _raise(self, k: str, floor: int, ex: int | None = None) -> int:
     while True:
-      try:
+      with contextlib.suppress(redis.WatchError):
         async with self.r.pipeline(transaction=True) as p:
-          await p.watch(vkey)
-          cur = int(await p.get(vkey) or 0)
-          if cur >= floor:
+          await p.watch(k)
+          if (cur := int(await p.get(k) or 0)) >= floor:
             return cur
           p.multi()
-          p.set(vkey, floor, ex=SESSION_TTL)
+          p.set(k, floor, ex=ex)
           await p.execute()
           return floor
-      except redis.WatchError:
-        continue
-
-  async def _advance_floor(self, floor: int) -> None:
-    fkey = key("floor")
-    while True:
-      try:
-        async with self.r.pipeline(transaction=True) as p:
-          await p.watch(fkey)
-          if int(await p.get(fkey) or 0) >= floor:
-            return
-          p.multi()
-          p.set(fkey, floor)
-          await p.execute()
-          return
-      except redis.WatchError:
-        continue
 
   async def sync_vtime(self, owner: str, accounts: list[str], extra: list[str] = ()) -> dict[str, int]:
     """Publish `owner`'s ready accounts, lift any idle returners to the cluster floor, and return their virtual times."""
-    rkey = key("ready")
-    p = self.r.pipeline(transaction=True)
-    if accounts:
-      p.hset(rkey, owner, json.dumps(accounts))
-    else:
-      p.hdel(rkey, owner)
+    rkey, p = key("ready"), self.r.pipeline(transaction=True)
+    p.hset(rkey, owner, json.dumps(accounts)) if accounts else p.hdel(rkey, owner)
     p.hgetall(rkey)
     p.get(key("floor"))
     _, raw_ready, raw_floor = await p.execute()
-
-    holders = sorted(k.decode() for k in raw_ready)
-    live = set()
+    holders, live = sorted(k.decode() for k in raw_ready), set()
     if holders:
       lp = self.r.pipeline(transaction=False)
       for h in holders:
@@ -650,20 +604,15 @@ class Bus:
       live = {h for h, ok in zip(holders, await lp.execute()) if ok}
       if dead := [h for h in holders if h not in live]:
         await self.r.hdel(rkey, *dead)
-
-    active = {a for h in live for a in json.loads(raw_ready[h.encode()])} | set(accounts) | set(extra)
-    if not active:
+    if not (ordered := sorted({a for h in live for a in json.loads(raw_ready[h.encode()])} | {*accounts, *extra})):
       return {}
-    ordered = sorted(active)
-    vals = await self.r.mget(*(key("vtime", a) for a in ordered))
-    vtimes = {a: int(v or 0) for a, v in zip(ordered, vals)}
-    cur_floor = int(raw_floor or 0)
+    vtimes = {a: int(v or 0) for a, v in zip(ordered, await self.r.mget(*(key("vtime", a) for a in ordered)))}
+    floor = int(raw_floor or 0)
     for a in accounts:
-      if vtimes[a] < cur_floor:
-        vtimes[a] = await self._lift_account(a, cur_floor)
-    new_floor = max(cur_floor, min(vtimes.values()))
-    if new_floor > cur_floor:
-      await self._advance_floor(new_floor)
+      if vtimes[a] < floor:
+        vtimes[a] = await self._raise(key("vtime", a), floor, SESSION_TTL)
+    if (new_floor := max(floor, min(vtimes.values()))) > floor:
+      await self._raise(key("floor"), new_floor)
     return {a: vtimes[a] for a in accounts}
 
   # ***** nodes *****

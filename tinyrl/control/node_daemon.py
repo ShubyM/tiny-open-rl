@@ -345,18 +345,18 @@ class Lifetime:
       self._prune_prepared()
 
   def _prune_prepared(self) -> None:
-    current = {c.request_id for c in self.heads}
-    for request in list(self.prepared):
-      if request not in current:
-        self.prepared.pop(request).cancel()
+    for req in set(self.prepared) - {c.request_id for c in self.heads}:
+      self.prepared.pop(req).cancel()
+
+  async def _stop_reader(self) -> None:
+    if self.reader:
+      self.reader.cancel()
+      await asyncio.gather(self.reader, return_exceptions=True)
+      self.reader = None
 
   async def refresh(self) -> None:
     """Poll non-blockingly for heads queued behind a finished batch, waiting briefly for fast metadata reads."""
-    if self.reader:
-      if not self.reader.done():
-        self.reader.cancel()
-      await asyncio.gather(self.reader, return_exceptions=True)
-      self.reader = None
+    await self._stop_reader()
     self.heads = await self.peek(0, block_ms=0)
     self._prune_prepared()
     if pending := [t for t in self.prepared.values() if not t.done()]:
@@ -461,11 +461,8 @@ class Lifetime:
       if self.r.served is not None:
         self.r.served += sum(max(1, c.cost) for c in cmds)
       await self.refresh()
-      next_ready, _ = self.ready()
-      ready_accts = sorted({self.account(c) for c in next_ready})
-      batch_accts = sorted(
-        {account_of(inputs[c.run][0] if isinstance(inputs[c.run], tuple) else None, c.run) for c in cmds}
-      )
+      ready_accts = sorted({self.account(c) for c in self.ready()[0]})
+      batch_accts = [account_of(inputs[c.run][0] if isinstance(inputs[c.run], tuple) else None, c.run) for c in cmds]
       await self.bus.sync_vtime(self.owner, ready_accts, extra=batch_accts)
       self.had_ready = bool(ready_accts)
     return cmds[0] if not self.sampling and reply and reply.ok else None
@@ -479,9 +476,7 @@ class Lifetime:
   async def claim(self, runs: list[str], count: int) -> list[Cmd]:
     """Take up to `count` commands of each run from its stream, and look for the heads behind them."""
     # Discard a peek that could finish with pre-claim cursors. The next read starts after the claim.
-    if self.reader:
-      self.reader.cancel()
-      await asyncio.gather(self.reader, return_exceptions=True)
+    await self._stop_reader()
     await self.alive()
     with span("node.claim"):
       cmds = await self.bus.take_commands(runs, self.owner, count, reclaim=self.sampling)

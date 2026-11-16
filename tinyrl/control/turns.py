@@ -92,11 +92,11 @@ def choose_gpus(s: Assignment, node: str, name: str, avoid: tuple[int, ...] = ()
 
 def someone_waits(running, name: str) -> bool:
   """Whether a waiting worker on overlapping GPUs has smaller (vtime, name), or `name` is idle and anyone waits."""
-  me = running[name]
+  me, gpus = running[name], set(running[name].gpus)
   waiters = [
     (x.vtime, n)
     for n, x in running.items()
-    if n != name and x.served is None and x.vtime is not None and set(x.gpus) & set(me.gpus)
+    if n != name and x.served is None and x.vtime is not None and gpus & set(x.gpus)
   ]
   return bool(waiters) and (me.vtime is None or min(waiters) < (me.vtime, name))
 
@@ -106,12 +106,8 @@ def can_run(s: Assignment, node: str, running, name: str) -> bool:
   r = running[name]
   if r.vtime is None or r.served is not None or not r.gpus or node not in s.nodes:
     return False
-  ahead = [
-    x
-    for n, x in running.items()
-    if n != name and (x.served is not None or (x.vtime is not None and (x.vtime, n) < (r.vtime, name)))
-  ]
-  return not any(set(x.gpus) & set(r.gpus) for x in ahead)
+  overlap = [(n, x) for n, x in running.items() if n != name and set(x.gpus) & set(r.gpus)]
+  return not any(x.served is not None or (x.vtime is not None and (x.vtime, n) < (r.vtime, name)) for n, x in overlap)
 
 
 # ***** which of a worker's runs is served next *****
