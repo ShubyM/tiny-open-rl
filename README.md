@@ -44,7 +44,7 @@ the event loop and overlaps startup and execution. A slow download does not bloc
 otherwise idle worker from yielding its GPU. Executable commands are claimed only after GPU admission, one bounded batch
 at a time. A preparation error claims and answers its failed head without waiting for a GPU.
 
-Within a shared engine, `scheduler.select_runs` chooses the ready runs served the fewest tokens, after any sampler save,
+Within a shared engine, `turns.select_runs` chooses the ready runs served the fewest tokens, after any sampler save,
 which a sampler is waiting on. A trainer may continue its current run for up to `RUN_COMMANDS` commands while its next
 command is queued, before choosing by service again. The same model process stays resident when switching runs. This is
 fairness between ready runs in one engine; GPU admission uses its own waiting order and does not establish a global
@@ -159,7 +159,8 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 ## Reading the code
 
 Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains the streams. Then read [gateway.py](tinyrl/api/gateway.py)
-to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/scheduler.py) for placement, GPU admission and ready-run selection,
+to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/scheduler.py) for how the cluster places workers on nodes,
+[turns.py](tinyrl/control/turns.py) for how a node chooses GPUs, turns and the next run,
 and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU handoff,
 [store.py](tinyrl/storage/store.py) to see how checkpoints are stored, and [trainer.py](tinyrl/workers/trainer.py) and
 [model.py](tinyrl/workers/model.py) to see how a command runs on the model.
@@ -169,7 +170,8 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 | [tinyrl/bus.py](tinyrl/bus.py) | runs, sessions, command streams, fenced replies and leases |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy arrays |
-| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | cluster assignment, local GPU placement and admission rules |
+| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | the cluster's assignment: runs to workers, workers to nodes |
+| [tinyrl/control/turns.py](tinyrl/control/turns.py) | a node's own decisions: its workers' GPUs, their turns, and the run served next |
 | [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | worker lifetimes, leases, ready work, GPU reservations and recovery |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | private model IPC and parent-owned process groups |
 | [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | model memory and GPU-width estimates |

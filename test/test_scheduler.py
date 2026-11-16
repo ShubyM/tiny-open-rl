@@ -4,18 +4,8 @@ import random
 import unittest
 
 from tinyrl.bus import Cmd, Ev, Op, Role
-from tinyrl.control.scheduler import (
-  Assignment,
-  Job,
-  Worker,
-  WorkerSpec,
-  can_run,
-  decide,
-  from_table,
-  memory_budget,
-  place_gpus,
-  select_runs,
-)
+from tinyrl.control.scheduler import Assignment, Job, Worker, WorkerSpec, decide, from_table, memory_budget
+from tinyrl.control.turns import can_run, place_gpus, select_runs
 
 GIB, MIB = 2**30, 2**20
 

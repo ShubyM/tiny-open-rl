@@ -23,7 +23,7 @@ import sys
 import time
 
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Ev, Op, Reply, Role
-from tinyrl.control import scheduler
+from tinyrl.control import scheduler, turns
 from tinyrl.control.process import Process
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.storage.registry import Registry
@@ -116,7 +116,7 @@ class NodeDaemon:
       elif self.id not in self.state.nodes and not task.cancelling():
         task.cancel()
     before = {n: w.gpus for n, w in self.state.workers.items()}
-    scheduler.place_gpus(self.state, self.id, self.running)
+    turns.place_gpus(self.state, self.id, self.running)
     if before != {n: w.gpus for n, w in self.state.workers.items()}:
       self.notify()
 
@@ -142,7 +142,7 @@ class NodeDaemon:
 
   async def read_state(self) -> scheduler.Assignment:
     """The cluster's table, with the GPUs this node chose for its workers, which the table doesn't hold."""
-    return scheduler.keep_chosen_gpus(scheduler.from_table(await self.bus.read_table()), self.state)
+    return turns.keep_chosen_gpus(scheduler.from_table(await self.bus.read_table()), self.state)
 
   def notify(self) -> None:
     """Wake every worker's loop: something they decide from has changed."""
@@ -348,7 +348,7 @@ class Lifetime:
         node.serial += 1
         r.ticket = node.serial
       node.notify()
-    if scheduler.can_run(node.state, node.id, node.running, self.worker):
+    if turns.can_run(node.state, node.id, node.running, self.worker):
       with span("node.grant_gpu"):
         r.served, r.ticket = 0, 0
       node.notify()
@@ -361,8 +361,8 @@ class Lifetime:
     gpus = node.state.workers[self.worker].gpus
     if (p := self.model.proc) and p.poll() is not None:
       raise RuntimeError(f"worker {self.worker} exited")
-    waiting = scheduler.someone_waits(node.running, r.gpus)
-    if r.served is not None and (gpus != r.gpus or (waiting and (not has_work or r.served >= scheduler.TURN))):
+    waiting = turns.someone_waits(node.running, r.gpus)
+    if r.served is not None and (gpus != r.gpus or (waiting and (not has_work or r.served >= turns.TURN))):
       with span("node.park"):
         await self.model.park() if self.sampling else await self.model.call("park")
       r.served = None
@@ -426,7 +426,7 @@ class Lifetime:
       self.service[cmd.run] = max(self.service.get(cmd.run, self.virtual), self.virtual)
     stay = self.last_run if not self.sampling and self.turn_commands < RUN_COMMANDS else None
     width = SAMPLE_RUNS if self.sampling and self.r.spec.lora else 1
-    return scheduler.select_runs(candidates, self.service, width, stay)
+    return turns.select_runs(candidates, self.service, width, stay)
 
   async def claim(self, runs: list[str], count: int) -> list[Cmd]:
     """Take up to `count` commands of each run from its stream, and look for the heads behind them."""

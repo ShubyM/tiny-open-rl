@@ -11,7 +11,7 @@ from test.helpers import FakeEngine, RedisTest, tiny
 from tinyrl.api import wire
 from tinyrl.api.gateway import app
 from tinyrl.bus import Op, Role, Run, key
-from tinyrl.control import scheduler
+from tinyrl.control import turns
 from tinyrl.storage.store import Store
 from tinyrl.workers.sampler import Out, Seq, encode
 
@@ -286,7 +286,7 @@ class TestSampler(RedisTest):
     await node.add("busy", gpus=[0])
     waiting = await node.add("waiting", gpus=[0])
     self.pump(node)
-    with mock.patch.object(scheduler, "TURN", 1):
+    with mock.patch.object(turns, "TURN", 1):
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode())

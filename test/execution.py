@@ -3,7 +3,7 @@
 import asyncio
 
 from test.helpers import FakeEngine, assign_new_runs, tiny
-from tinyrl.control import scheduler
+from tinyrl.control import scheduler, turns
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.workers.model import Model
 from tinyrl.workers.trainer import Trainer
@@ -55,7 +55,7 @@ class TestNode(NodeDaemon):
     state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))  # live before its first heartbeat
     for worker in self.pinned & state.workers.keys():
       state.workers[worker].node = self.id
-    return scheduler.keep_chosen_gpus(state, self.state)
+    return turns.keep_chosen_gpus(state, self.state)
 
   async def sync(self):
     self.state = await self.read_state()
@@ -67,7 +67,7 @@ class TestNode(NodeDaemon):
     desired = self.state.workers[worker]
     if gpus is not None:
       desired.gpus = tuple(gpus)
-    scheduler.place_gpus(self.state, self.id, self.running)
+    turns.place_gpus(self.state, self.id, self.running)
     if worker in self.running:
       return self.running[worker]
     task = self.tasks.get(worker) or self.start(worker)
