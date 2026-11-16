@@ -256,7 +256,7 @@ class TestSampler(RedisTest):
     try:
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
-      await self.until(lambda: bool(waiting.ticket))
+      await self.until(lambda: waiting.vtime is not None)
       broken = await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode())
       reply = await self.bus.wait_for_reply(broken, 3)
       self.assertIsNotNone(reply, "a healthy head waiting for GPU must not hold up a preparation error")
@@ -290,7 +290,7 @@ class TestSampler(RedisTest):
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode())
-      await self.until(lambda: bool(waiting.ticket))
+      await self.until(lambda: waiting.vtime is not None)
       more = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [33]}).encode())
       await asyncio.sleep(0.5)  # so the holder has its next command ready when the first one ends
       finish.set()

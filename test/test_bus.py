@@ -5,7 +5,7 @@ import time
 import unittest
 
 from test.helpers import RedisTest, new_id, start_redis
-from tinyrl.bus import GROUP, Bus, Cmd, Op, Reply, Role, Run, connect, key
+from tinyrl.bus import GROUP, Bus, Cmd, Op, Reply, Role, Run, account_of, connect, key
 
 
 def ok(**body) -> Reply:
@@ -329,6 +329,34 @@ class TestBus(RedisTest):
     [cmd] = await self.bus.take_commands([gone, run_id], "o", block_ms=10)
     self.assertEqual((cmd.run, cmd.request_id), (run_id, request))
     self.assertEqual(await self.bus.take_commands([run_id], "o", block_ms=10), [])
+
+  async def test_shared_account_vtime_lifts_idle_returners_without_erasing_waiting_accounts(self):
+    self.assertEqual(account_of({"session": "sess", "train_run": "tr"}, "r"), "sess")
+    self.assertEqual(account_of({"session": "", "train_run": "tr"}, "r"), "tr")
+    self.assertEqual(account_of({"session": "", "train_run": None}, "r"), "r")
+    self.assertEqual(account_of(None, "r"), "r")
+
+    a = await self.new_run(session="acct-a")
+    for owner in ("w1", "w2"):
+      await self.bus.renew_lease(owner)
+    self.assertEqual(await self.bus.sync_vtime("w0", ["acct-a"]), {"acct-a": 0})
+    self.assertEqual(await self.bus.sync_vtime("w1", ["acct-b"]), {"acct-b": 0})
+
+    req = await self.bus.submit_command(a, Op.FORWARD_BACKWARD, b"{}", cost=500)
+    [cmd] = await self.bus.take_commands([a], "w0", count=1)
+    self.assertEqual(cmd.request_id, req)
+    self.assertTrue(await self.bus.write_reply(cmd, ok(), "w0", started=time.time(), account="acct-a"))
+
+    # acct-b is still waiting in tinyrl:ready at 0, so floor stays 0 even though acct-a reached 500
+    self.assertEqual(await self.bus.sync_vtime("w0", [], extra=["acct-a"]), {})
+    self.assertEqual(int(await self.bus.r.get(key("floor")) or 0), 0)
+    self.assertEqual(await self.bus.sync_vtime("w1", ["acct-b"]), {"acct-b": 0})
+
+    # once w1 finishes waiting (or releases its lease), floor advances to acct-a's 500, and idle acct-c lifts to 500
+    await self.bus.release_lease("w1")
+    self.assertEqual(await self.bus.sync_vtime("w0", ["acct-a"]), {"acct-a": 500})
+    self.assertEqual(int(await self.bus.r.get(key("floor")) or 0), 500)
+    self.assertEqual(await self.bus.sync_vtime("w2", ["acct-c"]), {"acct-c": 500})
 
 
 class TestRedisRestart(unittest.IsolatedAsyncioTestCase):

@@ -5,7 +5,7 @@ import unittest
 
 from tinyrl.bus import Cmd, Ev, Op, Role
 from tinyrl.control.scheduler import Assignment, Job, Worker, WorkerSpec, decide, from_table
-from tinyrl.control.turns import can_run, place_gpus, select_runs
+from tinyrl.control.turns import can_run, place_gpus, select_runs, someone_waits
 
 GIB = 2**30
 
@@ -48,7 +48,7 @@ class Local:
   """Direct placement and reservations, with the same small runtime fields the node owns."""
 
   def __init__(self, test, gpus=1, memory=80 * GIB):
-    self.test, self.s, self.running, self.ticket = test, Assignment(nodes={"n": (gpus, memory)}), {}, 0
+    self.test, self.s, self.running, self.clock = test, Assignment(nodes={"n": (gpus, memory)}), {}, 0
 
   def add(self, name, *, at=None, sampler=False, lora=False, exclusive=False, width=1):
     spec = WorkerSpec(Role.SAMPLER if sampler else Role.TRAINER, name, lora, exclusive, gpus=width)
@@ -67,25 +67,29 @@ class Local:
     self.s.workers.pop(name)
     self.place()
 
-  def request(self, name):
-    self.ticket += 1
-    self.running[name].ticket = self.ticket
+  def request(self, name, vtime=None):
+    if vtime is None:
+      self.clock += 1
+      vtime = self.clock
+    self.running[name].vtime = vtime
 
   def grants(self):
     granted = []
-    for name in sorted(self.running, key=lambda n: (self.running[n].ticket, n)):
+    ready = [n for n, r in self.running.items() if r.vtime is not None and r.served is None]
+    for name in sorted(ready, key=lambda n: (self.running[n].vtime, n)):
       if can_run(self.s, "n", self.running, name):
-        self.running[name].served, self.running[name].ticket = 0, 0
+        self.running[name].served = 0
         granted.append(name)
     self.check()
     return granted
+
+  def park(self, name):
+    self.running[name].served, self.running[name].vtime = None, None
 
   def check(self):
     for gpu in range(self.s.nodes["n"][0]):
       held = [r for r in self.running.values() if r.served is not None and gpu in r.gpus]
       self.test.assertLessEqual(len(held), 1)  # one process is on a GPU at a time
-    for r in self.running.values():
-      self.test.assertFalse(r.ticket and r.served is not None)
 
 
 class TestCluster(unittest.TestCase):
@@ -278,18 +282,30 @@ class TestReservations(unittest.TestCase):
       service[run] += 10 if run == "slow" else 1
     self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
 
-  def test_fifo_order_is_the_order_of_requests_not_worker_names(self):
+  def test_least_served_vtime_wins_gpu_turn_regardless_of_arrival_or_worker_name(self):
     p = Local(self)
     for name in ("a", "b", "c"):
       p.add(name)
-    for name in ("a", "c", "b"):
-      p.request(name)
+    p.request("a", vtime=300)
+    p.request("b", vtime=50)
+    p.request("c", vtime=150)
     order = []
     for _ in range(3):
       [name] = p.grants()
       order.append(name)
-      p.running[name].served = None
-    self.assertEqual(order, ["a", "c", "b"])
+      p.park(name)
+    self.assertEqual(order, ["b", "c", "a"])
+
+  def test_someone_waits_skips_self_handoff_until_a_waiter_has_smaller_vtime_or_holder_goes_idle(self):
+    p = Local(self)
+    holder, waiter = p.add("holder"), p.add("waiter")
+    holder.vtime, holder.served = 100, 250_000
+    waiter.vtime, waiter.served = 500, None
+    self.assertFalse(someone_waits(p.running, "holder"))  # holder is still less served than waiter: do not park!
+    holder.vtime = 600
+    self.assertTrue(someone_waits(p.running, "holder"))  # waiter now has smaller vtime: yield!
+    holder.vtime, waiter.vtime = None, 999_999
+    self.assertTrue(someone_waits(p.running, "holder"))  # idle holder yields to any waiter regardless of vtime
 
   def test_one_process_is_on_a_gpu_at_a_time(self):
     p = Local(self)
@@ -298,7 +314,7 @@ class TestReservations(unittest.TestCase):
       p.request(name)
     self.assertEqual(p.grants(), ["a"])
     self.assertEqual(p.grants(), [])
-    p.running["a"].served = None  # it parked
+    p.park("a")
     self.assertEqual(p.grants(), ["b"])
 
   def test_multi_gpu_reservation_is_atomic_and_cannot_be_bypassed_on_either_gpu(self):
@@ -311,9 +327,9 @@ class TestReservations(unittest.TestCase):
     self.assertEqual(p.grants(), ["holder"])
     self.assertIsNone(p.running["wide"].served)
     self.assertIsNone(p.running["later"].served)
-    p.running["holder"].served = None
+    p.park("holder")
     self.assertEqual(p.grants(), ["wide"])
-    p.running["wide"].served = None
+    p.park("wide")
     self.assertEqual(p.grants(), ["later"])
 
   def test_different_gpus_can_run_concurrently(self):
@@ -334,9 +350,9 @@ class TestReservations(unittest.TestCase):
         name = rng.choice(list(p.running))
         r = p.running[name]
         if r.served is not None:
-          r.served = None  # parking or process exit has completed
-        elif not r.ticket:
-          p.request(name)
+          p.park(name)
+        elif r.vtime is None:
+          p.request(name, vtime=rng.randrange(20))
         p.grants()
 
 

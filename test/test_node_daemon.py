@@ -6,6 +6,7 @@ import signal
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import torch
 
@@ -13,8 +14,8 @@ from test.execution import TestNode
 from test.helpers import RedisTest, new_id, tiny
 from test.test_process import require_unix
 from test.test_sampler import JOB
-from tinyrl.bus import Op, Role, Run
-from tinyrl.control import scheduler
+from tinyrl.bus import Op, Role, Run, key
+from tinyrl.control import node_daemon, scheduler, turns
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.storage.store import Store
 
@@ -163,7 +164,7 @@ class TestNodeDaemon(RedisTest):
       request = await self.bus.submit_command(
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
       )
-      await self.until(lambda: "b" in node.running and node.running["b"].ticket > 0, node)
+      await self.until(lambda: "b" in node.running and node.running["b"].vtime is not None, node)
       self.assertIsNotNone(holder.served)
       self.assertIsNone(node.running["b"].served)
       self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})
@@ -202,6 +203,80 @@ class TestNodeDaemon(RedisTest):
       store.put("tinker://r/weights/w", {"w": torch.ones(2)})
       node = self.node(store=store)
       await self.until(lambda: store.list_checkpoints() == ["tinker://r/weights/w"], node)
+
+  async def test_busy_holder_does_not_park_for_a_more_served_waiter_until_caught_up(self):
+    node = self.node(gpus=1)
+    for run, worker in (("more", "w-more"), ("less", "w-less")):
+      await self.bus.create_run(Run(run, worker, "tiny", 4, lora=LORA))
+      await node.add(worker, gpus=[0])
+      await self.create(run, "tiny", node)
+    await self.bus.r.set(key("vtime", "more"), 500)
+    await self.bus.r.set(key("vtime", "less"), 10)
+    parks = []
+    orig_park = node.processes["w-less"].trainer.park
+
+    def count_park():
+      parks.append(1)
+      return orig_park()
+
+    node.processes["w-less"].trainer.park = count_park
+    with mock.patch.object(turns, "TURN", 10):
+      # get w-less onto GPU 0 first, then queue w-more (vtime=500) alongside 3 commands of w-less (10 -> 310 < 500)
+      first = await self.bus.submit_command("less", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100)
+      await self.reply(first, node)
+      parks.clear()
+      less_reqs = [
+        await self.bus.submit_command("less", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100) for _ in range(3)
+      ]
+      more_req = await self.bus.submit_command("more", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10)
+      for req in less_reqs:
+        await self.reply(req, node)
+      self.assertEqual(len(parks), 0)  # zero wasted self-handoffs while w-less (vtime <= 410) < w-more (500)!
+      await self.reply(more_req, node)  # once w-less is idle, w-more takes the GPU
+
+  async def test_heavy_sampling_in_an_account_prioritizes_another_accounts_training(self):
+    node = self.node(gpus=2)
+    await self.bus.create_run(Run("train-a", "trainer", "tiny", 4, session="sess-a", lora=LORA))
+    await self.bus.create_run(Run("train-b", "trainer", "tiny", 4, session="sess-b", lora=LORA))
+    await self.bus.create_run(
+      Run("samp-a", "sampler", "tiny", 4, session="sess-a", role=Role.SAMPLER, train_run="train-a")
+    )
+    await node.add("trainer", gpus=[0])
+    await node.add("sampler", gpus=[1])
+    await self.create("train-a", "tiny", node)
+    await self.create("train-b", "tiny", node)
+
+    entered, release, order = asyncio.Event(), asyncio.Event(), []
+    orig_call = node.processes["trainer"].call
+
+    async def gated_call(method, *args):
+      if method == "execute":
+        cmd = args[0]
+        if cmd.op == Op.FORWARD_BACKWARD:
+          entered.set()
+          await release.wait()
+        elif cmd.op == Op.OPTIM_STEP:
+          order.append(cmd.run)
+      return await orig_call(method, *args)
+
+    node.processes["trainer"].call = gated_call
+    with mock.patch.object(node_daemon, "RUN_COMMANDS", 1):
+      gate = await self.bus.submit_command("train-b", Op.FORWARD_BACKWARD, b"", cost=1)
+      await self.until(entered.is_set, node)
+      reqs_a = [
+        await self.bus.submit_command("train-a", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100) for _ in range(3)
+      ]
+      reqs_b = [
+        await self.bus.submit_command("train-b", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100) for _ in range(3)
+      ]
+      # While trainer is mid-command (and background peek prepares train-a), sess-a burns 5,000 sample tokens.
+      samp_req = await self.bus.submit_command("samp-a", Op.SAMPLE, json.dumps(JOB).encode(), cost=5000)
+      await self.reply(samp_req, node)
+      release.set()
+      await self.bus.wait_for_reply(gate, 5)
+      for req in [*reqs_b, *reqs_a]:
+        await self.reply(req, node)
+    self.assertEqual(order, ["train-b", "train-b", "train-b", "train-a", "train-a", "train-a"])
 
 
 if __name__ == "__main__":

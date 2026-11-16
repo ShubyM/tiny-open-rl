@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 
-from tinyrl.bus import LEASE_MS, Bus, Cmd, Ev, Op, Reply, Role
+from tinyrl.bus import LEASE_MS, Bus, Cmd, Ev, Op, Reply, Role, account_of
 from tinyrl.control import scheduler, turns
 from tinyrl.control.process import Process
 from tinyrl.helpers import DEBUG, getenv
@@ -68,7 +68,7 @@ class NodeDaemon:
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.running: dict[str, scheduler.Worker] = {}  # the workers with a process here, and the GPUs each is on
     self.tasks: dict[str, asyncio.Task] = {}
-    self.state, self.serial = scheduler.Assignment(), 0  # serial: the last ticket given to a worker waiting for GPUs
+    self.state = scheduler.Assignment()
     self.changed, self.draining = asyncio.Event(), False
     self.heartbeat, self.lag = time.monotonic(), 0.0
     self.swept, self.sweeping = 0.0, None
@@ -179,8 +179,8 @@ class Lifetime:
     self.renewed, self.swept = time.monotonic(), 0.0
     # each run's next unclaimed command, the task preparing each one's inputs, and the peek that looks for them
     self.heads, self.prepared, self.reader = [], {}, None
-    # the tokens served to each run with a head, the floor a new head joins at, and the run a trainer is staying with
-    self.service, self.virtual, self.last_run, self.turn_commands = {}, 0, None, 0
+    # ready runs' shared account virtual times, whether this process is in tinyrl:ready, and trainer continuation state
+    self.vtimes, self.had_ready, self.last_run, self.turn_commands = {}, False, None, 0
 
   async def run(self) -> None:
     node, r = self.node, self.r
@@ -198,7 +198,7 @@ class Lifetime:
           ready, _ = self.ready()
           if not self.wanted():
             break
-        await self.turn(bool(ready) or (self.warm and self.model.running is None))
+        await self.turn(ready)
         if not self.wanted():
           break
         if ready and r.served is not None:
@@ -215,7 +215,7 @@ class Lifetime:
         await self.fail_stranded()
       await self.hand_off_runs(sorted(self.owned))
     finally:
-      r.ticket = 0
+      r.vtime = None
       died = self.model is not None and (p := self.model.proc) is not None and p.poll() is not None
       self.closing = asyncio.create_task(self.cleanup(died))
       node.notify()
@@ -314,9 +314,10 @@ class Lifetime:
     self.reader = asyncio.create_task(self.peek(delay))
     self.reader.add_done_callback(lambda _: self.node.notify())
 
-  async def peek(self, delay: float) -> list[Cmd]:
-    await asyncio.sleep(delay)
-    commands = await self.bus.peek_commands(self.jobs(), IDLE_MS, reclaim=self.sampling)
+  async def peek(self, delay: float, block_ms: int = IDLE_MS) -> list[Cmd]:
+    if delay:
+      await asyncio.sleep(delay)
+    commands = await self.bus.peek_commands(self.jobs(), block_ms, reclaim=self.sampling)
     for cmd in commands:
       if cmd.request_id not in self.prepared:
         preparing = self.prepared[cmd.request_id] = asyncio.create_task(self.prepare(cmd))
@@ -341,12 +342,30 @@ class Lifetime:
     """Take in a finished peek: these are the heads now, and a head that is gone needs no inputs."""
     if self.reader and self.reader.done():
       self.heads, self.reader = self.reader.result(), None
-      current = {c.request_id for c in self.heads}
-      for request in list(self.prepared):
-        if request not in current:
-          self.prepared.pop(request).cancel()
-      # Idle runs do not bank service credit; a new contender joins the active floor.
-      self.service = {c.run: self.service.get(c.run, self.virtual) for c in self.heads}
+      self._prune_prepared()
+
+  def _prune_prepared(self) -> None:
+    current = {c.request_id for c in self.heads}
+    for request in list(self.prepared):
+      if request not in current:
+        self.prepared.pop(request).cancel()
+
+  async def refresh(self) -> None:
+    """Poll non-blockingly for heads queued behind a finished batch, waiting briefly for fast metadata reads."""
+    if self.reader:
+      if not self.reader.done():
+        self.reader.cancel()
+      await asyncio.gather(self.reader, return_exceptions=True)
+      self.reader = None
+    self.heads = await self.peek(0, block_ms=0)
+    self._prune_prepared()
+    if pending := [t for t in self.prepared.values() if not t.done()]:
+      await asyncio.wait(pending, timeout=0.005)
+
+  def account(self, cmd: Cmd) -> str:
+    done = self.prepared.get(cmd.request_id)
+    run = done.result()[0] if done and done.done() and isinstance(done.result(), tuple) else None
+    return account_of(run, cmd.run)
 
   def ready(self) -> tuple[list[Cmd], list[Cmd]]:
     """The heads whose inputs are prepared and which this process may execute, split into ok and failed."""
@@ -361,28 +380,31 @@ class Lifetime:
   # ***** its turns on the GPUs *****
 
   def reserve(self) -> bool:
-    """Ask for its GPUs, and take them if its turn has come. It never blocks, so the loop keeps observing newly ready work and preparation errors."""
+    """Take its GPUs if its turn has come. It never blocks, so the loop keeps observing newly ready work and preparation errors."""
     node, r = self.node, self.r
-    if not r.ticket:
-      with span("node.request_gpu"):
-        node.serial += 1
-        r.ticket = node.serial
-      node.notify()
     if turns.can_run(node.state, node.id, node.running, self.worker):
       with span("node.grant_gpu"):
-        r.served, r.ticket = 0, 0
+        r.served = 0
       node.notify()
       return True
     return False
 
-  async def turn(self, has_work: bool) -> None:
-    """Leave the GPUs when it must, follow the node to the GPUs it chose, and take them when there is work and its turn has come."""
+  async def turn(self, ready: list[Cmd]) -> None:
+    """Sync ready accounts' virtual times, yield the GPUs only to a less-served waiter (or any waiter when idle), and take them when our turn comes."""
     node, r = self.node, self.r
     gpus = node.state.workers[self.worker].gpus
     if (p := self.model.proc) and p.poll() is not None:
       raise RuntimeError(f"worker {self.worker} exited")
-    waiting = turns.someone_waits(node.running, r.gpus)
-    if r.served is not None and (gpus != r.gpus or (waiting and (not has_work or r.served >= turns.TURN))):
+    accounts = sorted({self.account(c) for c in ready})
+    vtimes = await self.bus.sync_vtime(self.owner, accounts) if accounts or self.had_ready else {}
+    self.had_ready = bool(accounts)
+    self.vtimes = {c.run: vtimes[self.account(c)] for c in ready}
+    want = min(vtimes.values()) if vtimes else (0 if self.warm and self.model.running is None else None)
+    if r.vtime != want:
+      r.vtime = want
+      node.notify()
+    waiting = turns.someone_waits(node.running, self.worker)
+    if r.served is not None and (gpus != r.gpus or (waiting and (want is None or r.served >= turns.TURN))):
       with span("node.park"):
         await self.model.park() if self.sampling else await self.model.call("park")
       r.served = None
@@ -390,10 +412,7 @@ class Lifetime:
     if r.gpus != gpus:
       r.gpus = gpus
       node.notify()
-    if not has_work and r.ticket:
-      r.ticket = 0
-      node.notify()
-    if has_work and r.served is None and self.reserve():
+    if want is not None and r.served is None and self.reserve():
       await self.resume()
 
   async def resume(self) -> None:
@@ -438,16 +457,24 @@ class Lifetime:
         self.last_run, self.turn_commands = cmd.run, 0
       self.turn_commands += 1
       reply = await self.answer(cmd, inputs[cmd.run])
-    self.charge(cmds)
+    if not failed:
+      if self.r.served is not None:
+        self.r.served += sum(max(1, c.cost) for c in cmds)
+      await self.refresh()
+      next_ready, _ = self.ready()
+      ready_accts = sorted({self.account(c) for c in next_ready})
+      batch_accts = sorted(
+        {account_of(inputs[c.run][0] if isinstance(inputs[c.run], tuple) else None, c.run) for c in cmds}
+      )
+      await self.bus.sync_vtime(self.owner, ready_accts, extra=batch_accts)
+      self.had_ready = bool(ready_accts)
     return cmds[0] if not self.sampling and reply and reply.ok else None
 
   def choose(self, candidates: list[Cmd]) -> list[str]:
-    """The runs served next: those served the fewest tokens, after the run a trainer is staying with."""
-    for cmd in candidates:
-      self.service[cmd.run] = max(self.service.get(cmd.run, self.virtual), self.virtual)
+    """The runs served next: those whose accounts have the smallest virtual time, after the run a trainer stays with."""
     stay = self.last_run if not self.sampling and self.turn_commands < RUN_COMMANDS else None
     width = SAMPLE_RUNS if self.sampling and self.r.spec.lora else 1
-    return turns.select_runs(candidates, self.service, width, stay)
+    return turns.select_runs(candidates, self.vtimes, width, stay)
 
   async def claim(self, runs: list[str], count: int) -> list[Cmd]:
     """Take up to `count` commands of each run from its stream, and look for the heads behind them."""
@@ -475,9 +502,12 @@ class Lifetime:
       else:
         reply, effects, last = await self.train(cmd)
     with span("node.publish"):
+      acct = account_of(inputs[0] if isinstance(inputs, tuple) else None, cmd.run)
       mutated = effects.get("mutated", False)
       checkpoint = effects.get("checkpoint") if reply.ok else None
-      if not await self.bus.write_reply(cmd, reply, self.owner, started=before, mutated=mutated, checkpoint=checkpoint):
+      if not await self.bus.write_reply(
+        cmd, reply, self.owner, started=before, mutated=mutated, checkpoint=checkpoint, account=acct
+      ):
         if self.sampling:
           if not await self.bus.lease_live(self.owner):
             raise RuntimeError(f"lost lease {self.owner}")
@@ -506,16 +536,6 @@ class Lifetime:
       await self.registry.register_checkpoint(**made)
     return reply, effects, last
 
-  def charge(self, cmds: list[Cmd]) -> None:
-    """Count a batch's tokens against its runs and this GPU turn, and raise the floor to the least-served run with work."""
-    for cmd in cmds:
-      self.service[cmd.run] = self.service.get(cmd.run, 0) + cmd.cost
-    if self.r.served is not None:  # a head that failed to prepare is answered without the GPUs
-      self.r.served += sum(cmd.cost for cmd in cmds)
-    ready, failed = self.ready()
-    active = {c.run for c in [*ready, *failed, *cmds]}
-    self.virtual = max(self.virtual, min(self.service[run] for run in active))
-
   # ***** handing off runs and stopping *****
 
   async def hand_off_runs(self, runs: list[str]) -> None:
@@ -526,12 +546,15 @@ class Lifetime:
     rows = {run: await self.bus.get_run(run) for run in runs}
     dirty = {run for run, row in rows.items() if row and row.get("acked") and not row.get("checkpoint")}
     if len(r.gpus) > 1 and r.served is None and dirty:  # a wide trainer saves through all its ranks, on its GPUs
+      r.vtime = -1
+      node.notify()
       with span("node.wait_gpu"):
         while True:
           changed = node.changed
           if self.reserve():
             break
           await changed.wait()
+      r.vtime = None
       await self.resume()
     await self.alive()
     for run, row in rows.items():

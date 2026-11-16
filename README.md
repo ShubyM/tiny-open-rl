@@ -44,14 +44,14 @@ the event loop and overlaps startup and execution. A slow download does not bloc
 otherwise idle worker from yielding its GPU. Executable commands are claimed only after GPU admission, one bounded batch
 at a time. A preparation error claims and answers its failed head without waiting for a GPU.
 
-Within a shared engine, `turns.select_runs` chooses the ready runs served the fewest tokens, after any sampler save,
-which a sampler is waiting on. A trainer may continue its current run for up to `RUN_COMMANDS` commands while its next
-command is queued, before choosing by service again. The same model process stays resident when switching runs. This is
-fairness between ready runs in one engine; GPU admission uses its own waiting order and does not establish a global
-per-user share.
+Within a shared engine, `turns.select_runs` chooses ready runs by their accounts' shared virtual time, after any sampler
+save, which a sampler is waiting on. A trainer may continue its current run for up to `RUN_COMMANDS` commands while its
+next command is queued, before choosing by virtual time again. The same model process stays resident when switching runs.
+Every training run and sampling session charges the same Redis virtual-time account (`session`, falling back to
+`train_run` or `run_id`), ordering both run selection inside a worker and GPU turns across workers.
 Each command carries its cost, set when it is queued: the tokens a `forward_backward` trains on, a sample's prompt plus
-the most tokens it may generate, and 1 for anything else. A newly ready run joins the active service floor, so waiting
-on input preparation does not accumulate catch-up credit.
+the most tokens it may generate, and 1 for anything else. An idle account returning with new work lifts to the active
+virtual-time floor, so idle gaps never bank catch-up credit.
 
 The node keeps actual process placements, waiting order and GPU reservations outside the replayed cluster assignment
 log. Preparation completion and scheduling changes wake workers through the same node change event. Workers on
@@ -68,9 +68,10 @@ can select another engine implementing async `start(base, lora, env)`, `load_che
 `sleep()`, `wake()` and `close()`. Settings are per engine; loading an already loaded checkpoint name must be idempotent,
 and `close()` must wait for its processes to exit. Checkpoint names include both the URI and its version.
 
-The node reserves every GPU of a worker together, honoring ticket order on each GPU. One process is on a GPU
-at a time, and workers that share a GPU take turns. An idle holder yields to a waiter, and a busy holder yields
-once it has served `TURN` tokens (200,000) since it was granted. Training yields between commands; sampling yields
+The node reserves every GPU of a worker together, ordering contenders on each GPU by their ready accounts' least virtual
+time. One process is on a GPU at a time, and workers that share a GPU take turns. An idle holder yields to any waiter,
+and a busy holder yields once it has served `TURN` tokens (200,000) and a waiter with smaller virtual time needs one of
+its GPUs. Training yields between commands; sampling yields
 between waves of up to `SAMPLE_RUNS` LoRA sessions or one full fine-tune session, with at most `SAMPLE_COMMANDS` commands
 per session. This GPU turn is separate from a run's continuation budget. The reservation starts before wake and remains
 held until parking acknowledges or the entire process group has exited. A trainer's

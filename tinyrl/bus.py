@@ -8,6 +8,9 @@ Keys that guard correctness:
   tinyrl:owner:<run>      The one process holding a training run's live state; fences training replies and handoffs.
   tinyrl:run:<run>        Record, counters, and exact recovery state (`acked` stream id and `checkpoint` ref).
   tinyrl:reap:<run>       Monotonic counter watched when samplers reclaim pending prompts from a dead process's lease.
+  tinyrl:vtime:<account>  Shared virtual time (tokens served) charged across an account's trainers and samplers.
+  tinyrl:floor            Monotonic cluster virtual-time floor that idle accounts lift to on return.
+  tinyrl:ready            Live worker processes' ready account sets, holding `tinyrl:floor` at the least-served waiter.
 
 Sampling sessions have no single owner: any live sampler of matching spec pulls from tinyrl:q:<session> via XREADGROUP,
 and surviving samplers reclaim and re-run prompts left pending by a sampler whose lease expired.
@@ -39,6 +42,11 @@ COUNTERS = ("steps", "failed", "cmds", "busy_ms", "wait_ms")
 
 def key(*parts: str) -> str:
   return ":".join(("tinyrl", *parts))
+
+
+def account_of(run: dict | None, run_id: str) -> str:
+  """The fairness account a job charges: its client session, or a sampling session's training run, or itself."""
+  return (run and (run.get("session") or run.get("train_run"))) or run_id
 
 
 class Op(StrEnum):
@@ -457,6 +465,7 @@ class Bus:
     started: float | None = None,
     mutated: bool = False,
     checkpoint: dict | None = None,
+    account: str = "",
   ) -> bool:
     """Write a command's reply, acknowledge the command, and count it, all at once.
 
@@ -488,6 +497,10 @@ class Bus:
           p.xdel(stream, cmd.entry_id)
           for name, n in added.items():
             p.hincrby(row, name, n)
+          if started is not None:
+            vkey = key("vtime", account or cmd.run)
+            p.incrby(vkey, max(1, cmd.cost))
+            p.expire(vkey, SESSION_TTL)
           if mutated:
             p.hset(row, "acked", cmd.entry_id)
             p.hdel(row, "checkpoint")
@@ -575,10 +588,83 @@ class Bus:
     await self.r.set(key("lease", owner), 1, px=LEASE_MS)
 
   async def release_lease(self, owner: str) -> None:
-    await self.r.delete(key("lease", owner))
+    p = self.r.pipeline(transaction=True)
+    p.delete(key("lease", owner))
+    p.hdel(key("ready"), owner)
+    await p.execute()
 
   async def lease_live(self, owner: str) -> bool:
     return bool(await self.r.exists(key("lease", owner)))
+
+  # ***** shared per-account virtual time *****
+
+  async def _lift_account(self, account: str, floor: int) -> int:
+    vkey = key("vtime", account)
+    while True:
+      try:
+        async with self.r.pipeline(transaction=True) as p:
+          await p.watch(vkey)
+          cur = int(await p.get(vkey) or 0)
+          if cur >= floor:
+            return cur
+          p.multi()
+          p.set(vkey, floor, ex=SESSION_TTL)
+          await p.execute()
+          return floor
+      except redis.WatchError:
+        continue
+
+  async def _advance_floor(self, floor: int) -> None:
+    fkey = key("floor")
+    while True:
+      try:
+        async with self.r.pipeline(transaction=True) as p:
+          await p.watch(fkey)
+          if int(await p.get(fkey) or 0) >= floor:
+            return
+          p.multi()
+          p.set(fkey, floor)
+          await p.execute()
+          return
+      except redis.WatchError:
+        continue
+
+  async def sync_vtime(self, owner: str, accounts: list[str], extra: list[str] = ()) -> dict[str, int]:
+    """Publish `owner`'s ready accounts, lift any idle returners to the cluster floor, and return their virtual times."""
+    rkey = key("ready")
+    p = self.r.pipeline(transaction=True)
+    if accounts:
+      p.hset(rkey, owner, json.dumps(accounts))
+    else:
+      p.hdel(rkey, owner)
+    p.hgetall(rkey)
+    p.get(key("floor"))
+    _, raw_ready, raw_floor = await p.execute()
+
+    holders = sorted(k.decode() for k in raw_ready)
+    live = set()
+    if holders:
+      lp = self.r.pipeline(transaction=False)
+      for h in holders:
+        lp.exists(key("lease", h))
+      live = {h for h, ok in zip(holders, await lp.execute()) if ok}
+      if dead := [h for h in holders if h not in live]:
+        await self.r.hdel(rkey, *dead)
+
+    active = {a for h in live for a in json.loads(raw_ready[h.encode()])} | set(accounts) | set(extra)
+    if not active:
+      return {}
+    ordered = sorted(active)
+    vals = await self.r.mget(*(key("vtime", a) for a in ordered))
+    vtimes = {a: int(v or 0) for a, v in zip(ordered, vals)}
+    cur_floor = int(raw_floor or 0)
+    for a in accounts:
+      if vtimes[a] < cur_floor:
+        vtimes[a] = await self._lift_account(a, cur_floor)
+    new_floor = max(cur_floor, min(vtimes.values()))
+    if new_floor > cur_floor:
+      await self._advance_floor(new_floor)
+    return {a: vtimes[a] for a in accounts}
 
   # ***** nodes *****
 

@@ -90,16 +90,27 @@ def choose_gpus(s: Assignment, node: str, name: str, avoid: tuple[int, ...] = ()
 # ***** whose turn it is on them *****
 
 
-def someone_waits(running, gpus: tuple[int, ...]) -> bool:
-  return any(r.ticket > 0 and any(g in r.gpus for g in gpus) for r in running.values())
+def someone_waits(running, name: str) -> bool:
+  """Whether a waiting worker on overlapping GPUs has smaller (vtime, name), or `name` is idle and anyone waits."""
+  me = running[name]
+  waiters = [
+    (x.vtime, n)
+    for n, x in running.items()
+    if n != name and x.served is None and x.vtime is not None and set(x.gpus) & set(me.gpus)
+  ]
+  return bool(waiters) and (me.vtime is None or min(waiters) < (me.vtime, name))
 
 
 def can_run(s: Assignment, node: str, running, name: str) -> bool:
-  """Whether a waiting worker may take its GPUs, all together: no process is on any of them, and no earlier ticket wants one. One process is on a GPU at a time, and a process still draining after unplacement counts."""
+  """Whether a waiting worker may take its GPUs, all together: no process is on any of them, and no smaller (vtime, name) wants one."""
   r = running[name]
-  if r.ticket <= 0 or r.served is not None or not r.gpus or node not in s.nodes:
+  if r.vtime is None or r.served is not None or not r.gpus or node not in s.nodes:
     return False
-  ahead = [x for n, x in running.items() if x.served is not None or (x.ticket > 0 and (x.ticket, n) < (r.ticket, name))]
+  ahead = [
+    x
+    for n, x in running.items()
+    if n != name and (x.served is not None or (x.vtime is not None and (x.vtime, n) < (r.vtime, name)))
+  ]
   return not any(set(x.gpus) & set(r.gpus) for x in ahead)
 
 
@@ -107,9 +118,7 @@ def can_run(s: Assignment, node: str, running, name: str) -> bool:
 
 
 def select_runs(heads: list[Cmd], service: dict[str, float], width: int, prefer: str | None = None) -> list[str]:
-  """Choose ready heads by the tokens each run has been served, not a global tenant share.
-  The caller bounds preferred continuations. New runs join the active service floor.
-  """
+  """Choose ready heads by their accounts' virtual time, after any preferred continuation or sampler save."""
   if width < 1:
     raise ValueError("batch width must be positive")
   ready = {}

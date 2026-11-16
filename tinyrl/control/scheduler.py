@@ -44,7 +44,7 @@ class Worker:
   node: str | None = None  # None until it is placed
   gpus: tuple[int, ...] = ()  # desired GPUs, chosen by the node; a running process may still be on its old ones
   # The node's local copy records actual GPUs and reservations; cluster assignments leave these fields empty.
-  ticket: int = 0
+  vtime: int | None = None  # least virtual time among its ready accounts, None when it needs no GPUs
   served: int | None = None  # tokens it has served on its GPUs this turn, None while it is parked
   pid: int | None = None
 
