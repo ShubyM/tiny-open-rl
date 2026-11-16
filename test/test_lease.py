@@ -10,7 +10,7 @@ import unittest
 
 from test.helpers import RedisTest, new_id, tiny
 from test.test_process import require_unix
-from tinyrl.bus import GROUP, Op, Reply, Run, key
+from tinyrl.bus import GROUP, Op, Reply, Run, key, unpack_snap
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 
@@ -69,17 +69,17 @@ class TestLease(RedisTest):
     self.assertIsNotNone(reply)
     return reply
 
-  async def test_a_paused_daemon_cannot_answer_after_another_node_takes_its_worker(self):
+  async def test_a_paused_daemon_cannot_answer_after_another_node_takes_its_run(self):
     require_unix()
     base = f"{self.folder.name}/base"
     tiny().save_pretrained(base)
     run = new_id()
-    await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
+    await self.bus.create_run(Run(run, base, 4, lora=LORA))
     first = self.daemon()
-    scheduling = asyncio.create_task(scheduler.run(self.bus))
-    self.tasks.append(scheduling)
+    self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
-    old_owner = await self.bus.lease_owner("worker")
+    old_owner = (await self.bus.get_run(run))["owner"]
+    proc_name = old_owner.split("@", 1)[0]
     [first_node] = await self.bus.live_nodes()
     second = self.daemon()
 
@@ -88,12 +88,12 @@ class TestLease(RedisTest):
 
     await self.until(both_up)
     await asyncio.sleep(1.5 * LEASE_MS / 1000)
-    self.assertEqual(await self.bus.lease_owner("worker"), old_owner)
+    self.assertEqual((await self.bus.get_run(run))["owner"], old_owner)
     self.assertEqual(len(await self.bus.r.xinfo_consumers(key("q", run), GROUP)), 1)
 
     async def reported():
       node = (await self.bus.live_nodes(details=True)).get(first_node, {})
-      return node.get("workers", {}).get("worker", {}).get("pid")
+      return node.get("pids", {}).get(proc_name)
 
     await self.until(reported)
     model_pid = await reported()
@@ -110,8 +110,8 @@ class TestLease(RedisTest):
       await self.bus.r.hdel(key("nodes"), first_node)  # its heartbeat ran out
       expected = await self.bus.wait_for_reply(request, 30)
       self.assertFalse(expected.ok)
-      self.assertIn("lost the worker", json.loads(expected.body)["error"])
-      new_owner = await self.bus.lease_owner("worker")
+      self.assertIn("lost ownership", json.loads(expected.body)["error"])
+      new_owner = (await self.bus.get_run(run))["owner"]
       self.assertNotEqual(new_owner, old_owner)
     finally:
       first.send_signal(signal.SIGCONT)
@@ -120,34 +120,34 @@ class TestLease(RedisTest):
 
     async def first_reaped():
       nodes = await self.bus.live_nodes(details=True)
-      return first_node in nodes and not nodes[first_node]["workers"]
+      return first_node in nodes and not nodes[first_node]["pids"] and not nodes[first_node]["on"]
 
     await self.until(first_reaped)
     self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
     self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
     other = new_id()
-    await self.bus.create_run(Run(other, "worker", base, 4, lora=LORA))
+    await self.bus.create_run(Run(other, base, 4, lora=LORA))
     self.assertTrue((await self.call(other, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
     self.assertIsNone(second.poll())
 
-  async def test_sigterm_parks_runs_before_the_node_releases_ownership(self):
+  async def test_sigterm_detaches_runs_before_the_node_releases_ownership(self):
     require_unix()
     base = f"{self.folder.name}/base"
     tiny().save_pretrained(base)
     run = new_id()
-    await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
+    await self.bus.create_run(Run(run, base, 4, lora=LORA))
     proc = self.daemon()
     self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
     proc.terminate()
     self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
-    uri = await self.bus.parked_checkpoint(run)
-    self.assertIsNotNone(uri)
-    tensors, meta = self.store.get(uri)
+    info = await self.bus.get_run(run)
+    self.assertIsNone(info.get("owner"))
+    uri, version = unpack_snap(info["snap"])
+    tensors, meta = self.store.get(uri, version)
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])
     self.assertIsNotNone(await self.registry.get_checkpoint(uri))
-    self.assertIsNone(await self.bus.lease_owner("worker"))
 
 
 if __name__ == "__main__":

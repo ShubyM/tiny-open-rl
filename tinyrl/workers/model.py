@@ -459,6 +459,8 @@ class Model:
   def park_on_host(self) -> None:
     """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume_on_gpu() undoes it."""
     self.move_tensors(self.gpu_tensors(), "cpu")
+    if dist.is_initialized():
+      dist.barrier()  # every rank has freed its GPU before rank 0 tells the node
     self.parked = True
 
   def resume_on_gpu(self) -> None:
@@ -476,5 +478,6 @@ class Model:
       if torch.cuda.is_available():
         torch.cuda.empty_cache()
     del self.params[run]
-    self.pinned.clear()
     self.optimizers.pop(run, None)
+    for k in set(self.pinned) - {id(x) for x in self.gpu_tensors()}:
+      del self.pinned[k]

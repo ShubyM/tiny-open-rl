@@ -299,26 +299,25 @@ class TestTrainer(RedisTest):
         self.node.dispatch()
         await asyncio.sleep(0.01)
 
-  async def finish_worker(self, worker):
-    await self.until(lambda: worker not in self.node.running)
+  async def finish_worker(self, proc):
+    await self.until(lambda: proc not in self.node.lives)
 
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
-    await self.bus.create_run(Run(run, run, "tiny", 0))
+    await self.bus.create_run(Run(run, "tiny", 0))
     await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
-    await self.node.add(run)
+    await self.node.bind(run, run)
     child = self.node.processes[run]
     await self.finish_worker(run)
     self.assertTrue(child.closed)
-    self.assertIsNone(await self.bus.lease_owner(run))
+    self.assertIsNone((await self.bus.get_run(run)).get("owner"))
 
   async def test_graceful_replacement_registers_and_restores_weights_optimizer_and_pending_gradients(self):
-    self.node.gpus = 2
-    self.node.state.nodes[self.node.id] = (2, 0)
     for rank, lora, width in ((4, LORA, 2), (0, {}, 1)):
       ctrl, run = new_id(), new_id()
-      for r, worker in ((run, f"p-{rank}"), (ctrl, f"ctrl-{rank}")):
-        await self.bus.create_run(Run(r, worker, "tiny", rank, lora=lora, gpus=width))
+      for r, proc in ((run, f"p-{rank}"), (ctrl, f"ctrl-{rank}")):
+        await self.bus.create_run(Run(r, "tiny", rank, lora=lora, gpus=width))
+        await self.node.bind(proc, r)
         await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))
         for _ in range(2):
           await self.submit(
@@ -326,32 +325,34 @@ class TestTrainer(RedisTest):
           )
         await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
         await self.node.drain(r)
-      desired = self.node.state.workers[f"p-{rank}"]
-      desired.node, desired.gpus = None, ()  # the parked wide worker must regain its actual GPUs to checkpoint
-      self.node.notify()
+      self.node.drop_local(f"p-{rank}")  # detaches dirty run to store before releasing owner
       await self.finish_worker(f"p-{rank}")
-      parked = await self.bus.parked_checkpoint(run)
-      self.assertIsNotNone(parked)
+      info = await self.bus.get_run(run)
+      self.assertIsNone(info.get("owner"))
+      parked = info["snap"].partition("\n")[0]
       self.assertIsNotNone(await self.registry.get_checkpoint(parked))
+      # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
-      await self.node.drain(run)  # recovery succeeds even when the following command is rejected
+      await self.node.drain(run)
       self.assertFalse((await self.bus.wait_for_reply(invalid, 1)).ok)
+      self.assertEqual((await self.bus.get_run(run))["snap"].partition("\n")[0], parked)
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
-      self.assertIsNone(await self.bus.parked_checkpoint(run))
+      self.assertIsNone((await self.bus.get_run(run)).get("snap"))
       self.assertIsNone(await self.registry.get_checkpoint(parked))  # recovery cannot replay old state after a crash
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     run, uri = new_id(), "tinker://saved/weights/step-1"
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
+    await self.node.bind("p", run)
     await self.submit(
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
     )
     await self.node.drain(run)
-    self.node.tasks["p"].cancel()  # a lost process has no park checkpoint
+    self.node.tasks["p"].cancel()  # a lost process has no detached snapshot
     await self.finish_worker("p")
     ids = await self.submit(
       run,

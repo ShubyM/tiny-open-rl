@@ -143,23 +143,31 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       base, lora, uri, train_run = base_model, True, None, None
 
     exclusive = bool(train.get("exclusive")) if train_run else False
+    sess_meta = ((await bus.get_session(session_id)) or {}).get("metadata", {}) if session_id else {}
+    account = str((train.get("account") if train_run else None) or sess_meta.get("openrl.account") or "")
     gpus = await asyncio.to_thread(estimator.gpus, base, "vllm")
     sid = f"samp-{uuid.uuid4().hex[:12]}"
-    await bus.create_run(Run(sid, "", base, int(lora), session_id, uri, {}, exclusive, Role.SAMPLER, train_run, gpus))
+    await bus.create_run(
+      Run(sid, base, int(lora), session_id, uri, {}, exclusive, Role.SAMPLER, train_run, gpus, account)
+    )
     return sid
 
   # ***** service *****
 
   @api.get("/api/v1/scheduling")
   async def scheduling():
-    """The cluster's assignment, with each worker's GPUs and process from its node's last heartbeat."""
-    table = await bus.read_table()
-    state = dataclasses.asdict(scheduler.from_table(table))
-    for node, info in table["nodes"].items():
-      for worker, local in info.get("workers", {}).items():
-        if state["workers"].get(worker, {}).get("node") == node:
-          state["workers"][worker] |= local
-    return {"nodes": {n: v["gpus"] for n, v in table["nodes"].items()}, "state": state}
+    """The cluster's plan, account lags, and each process's actual GPUs and PID from its node's last heartbeat."""
+    raw = await bus.read_state()
+    state = dataclasses.asdict(scheduler.from_state(raw))
+    state.pop("preparing", None)
+    for node, info in raw["nodes"].items():
+      for proc, pid in info.get("pids", {}).items():
+        if state["procs"].get(proc, {}).get("node") == node:
+          state["procs"][proc]["pid"] = pid
+      for proc, gpus in info.get("on", {}).items():
+        if state["procs"].get(proc, {}).get("node") == node:
+          state["procs"][proc]["actual_gpus"] = gpus
+    return {"nodes": {n: v["gpus"] for n, v in raw["nodes"].items()}, "state": state}
 
   @api.get("/api/v1/healthz")
   async def healthz():
@@ -207,10 +215,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     else:
       run = str(uuid.uuid4())
 
-    base = req.base_model
+    base, account = req.base_model, str(metadata.get("openrl.account") or "")
     gpus = int(metadata.get("openrl.gpus") or (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")))
     if not await bus.get_run(run):
-      await bus.create_run(Run(run, "", base, rank, req.session_id, None, lora, exclusive, gpus=gpus))
+      await bus.create_run(Run(run, base, rank, req.session_id, None, lora, exclusive, gpus=gpus, account=account))
     return await submit(run, Op.CREATE_MODEL, {"base_model": base, "rank": rank, "lora": lora}, req.model_seq_id)
 
   @api.post("/api/v1/get_info")
@@ -404,7 +412,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     run = await bus.get_run(run_id)
     if run is None:
       raise HTTPException(404, f"no model {run_id}")
-    return {**run, **await bus.queued_and_in_flight(run_id)}
+    plan = json.loads(raw) if (raw := await bus.r.get(key("plan"))) else {}
+    procs = plan.get("home", {}).get(run_id, [])
+    extra = {"procs": procs, **({"worker": procs[0]} if procs else {})}
+    return {**run, **extra, **await bus.queued_and_in_flight(run_id)}
 
   @api.get("/api/v1/sessions/{session_id}")
   async def session_info(session_id: str):
@@ -415,12 +426,14 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.get("/metrics")
   async def metrics():
-    """Every run's counters for Prometheus. README.md has the queries for utilization, queueing delay and fairness."""
+    """Every run's counters, account service and node loop lag for Prometheus."""
     lines = []
-    for (worker, run), counters in (await bus.run_counters()).items():
+    for (proc, run), counters in (await bus.run_counters()).items():
       for name, n in counters.items():
         name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
-        lines.append(f'tinyrl_{name}_total{{worker="{worker}",run="{run}"}} {n}')
+        lines.append(f'tinyrl_{name}_total{{worker="{proc}",run="{run}"}} {n}')
+    for account, total in sorted((await bus.r.hgetall(key("service"))).items()):
+      lines.append(f'tinyrl_account_service_total{{account="{account.decode()}"}} {float(total)}')
     for node, beat in (await bus.live_nodes(details=True)).items():
       lines.append(f'tinyrl_node_loop_lag_seconds{{node="{node}"}} {beat.get("lag", 0.0)}')
     return PlainTextResponse("\n".join(lines) + "\n")

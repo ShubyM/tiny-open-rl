@@ -1,5 +1,4 @@
 import asyncio
-import dataclasses
 import os
 import subprocess
 import tempfile
@@ -61,6 +60,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   def tearDownClass(cls):
     if cls.proc:
       cls.proc.terminate()
+      cls.proc.wait()
 
   async def asyncSetUp(self):
     self.renewal_tasks = []
@@ -69,9 +69,9 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     await self.bus.r.flushall()
 
   async def worker(self, run: str) -> str:
-    """The run's worker, once every new run is assigned the way the scheduler assigns it."""
-    await assign_new_runs(self.bus)
-    return (await self.bus.get_run(run))["worker"]
+    """The run's primary process, once every new run is assigned the way the scheduler assigns it."""
+    plan = await assign_new_runs(self.bus)
+    return plan["home"][run][0]
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
@@ -80,17 +80,25 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     await self.bus.r.aclose()
 
 
-async def assign_new_runs(bus) -> None:
-  """Assign new runs the way the scheduler would, without placing anything."""
+async def assign_new_runs(bus) -> dict:
+  """Assign new runs the way the scheduler would, without placing them onto unannounced test nodes."""
   from tinyrl.control import scheduler
 
-  s = scheduler.from_table(await bus.read_table())
-  new, changes = scheduler.decide(s)
-  runs = {body["run"]: body["worker"] for kind, body in changes if kind == "assigned"}
-  new_workers = {
-    w: {"spec": dataclasses.asdict(new.workers[w].spec), "node": None} for w in set(runs.values()) - s.workers.keys()
+  raw = await bus.read_state()
+  new, changes = scheduler.step(scheduler.from_state(raw | {"nodes": {}}))
+  plan = raw.get("plan") or {}
+  procs = {
+    **plan.get("procs", {}),
+    **{n: v for n, v in scheduler.to_plan(new)["procs"].items() if n not in plan.get("procs", {})},
   }
-  await bus.write_table(runs, new_workers, [], new.workers_made, [])
+  home = {
+    **{r: ps for r, ps in plan.get("home", {}).items() if r in new.jobs},
+    **{b["run"]: [b["proc"]] for k, b in changes if k == "assigned"},
+  }
+  merged = {**plan, "made": max(plan.get("made", 0), new.made), "procs": procs, "home": home}
+  if merged != plan:
+    await bus.write_plan(merged, [c for c in changes if c[0] == "assigned"])
+  return merged
 
 
 class FakeEngine:

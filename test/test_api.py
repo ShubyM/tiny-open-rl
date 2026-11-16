@@ -200,7 +200,7 @@ class TestAPI(RedisTest):
     full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
     exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})
 
-    workers = [(await self.bus.get_run(run_id))["worker"] for run_id in (shared, also_shared, full, exclusive)]
+    workers = [await self.worker(run_id) for run_id in (shared, also_shared, full, exclusive)]
     self.assertEqual(workers[0], workers[1])
     self.assertEqual(len(set(workers)), 3)
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
@@ -213,7 +213,7 @@ class TestAPI(RedisTest):
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
     await self.node.sync()
-    self.assertEqual(scheduler.jobs_of(self.node.state, await self.worker(full)), [full])
+    self.assertEqual(self.node.state.runs(await self.worker(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -401,9 +401,9 @@ class TestAPI(RedisTest):
     await self.bus.append_event("node_up", node="node-1", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     worker = await self.worker(run_id)
-    data = await self.scheduling_until(lambda d: d["state"]["workers"].get(worker, {}).get("node"))
-    self.assertEqual(data["state"]["workers"][worker]["node"], "node-1")
-    sampler = data["state"]["workers"][await self.worker(samp_id)]
+    data = await self.scheduling_until(lambda d: d["state"]["procs"].get(worker, {}).get("node"))
+    self.assertEqual(data["state"]["procs"][worker]["node"], "node-1")
+    sampler = data["state"]["procs"][await self.worker(samp_id)]
     self.assertEqual(
       sampler["spec"],
       {"role": "sampler", "base": "tiny", "lora": True, "exclusive": True, "train_run": excl_id, "gpus": 1},
@@ -412,7 +412,7 @@ class TestAPI(RedisTest):
 
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
-    data = await self.scheduling_until(lambda d: worker not in d["state"]["workers"])
+    data = await self.scheduling_until(lambda d: worker not in d["state"]["procs"])
     self.assertNotIn(run_id, data["state"]["jobs"])
 
   async def scheduling_until(self, done, tries: int = 100) -> dict:
@@ -449,10 +449,10 @@ class TestAPI(RedisTest):
     await self.bus.node_heartbeat("n8", 8)
     await self.bus.append_event("node_up", node="n8", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    await self.scheduling_until(lambda d: d["state"]["workers"].get(sampler, {}).get("node"))
+    await self.scheduling_until(lambda d: d["state"]["procs"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)
-    await self.scheduling_until(lambda d: sampler not in d["state"]["workers"])
+    await self.scheduling_until(lambda d: sampler not in d["state"]["procs"])
 
 
 if __name__ == "__main__":

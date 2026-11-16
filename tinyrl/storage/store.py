@@ -160,6 +160,7 @@ class Store:
     self.upload_pending_saves()
     if self.server:  # the bucket has every save now
       self.server.shutdown()
+      self.server.server_close()
 
   # ***** put *****
 
