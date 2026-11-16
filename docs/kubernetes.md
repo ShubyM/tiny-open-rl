@@ -365,7 +365,7 @@ above `TARGET_UTIL` for a while, before work queues.
 
 ## Taking turns on a node daemon's GPUs
 
-**Current local policy.** Workers with known memory budgets may hold a GPU together when they fit. Otherwise the node
+**Current local policy.** One process is on a GPU at a time. Workers that share a GPU take turns: the node
 uses the order workers become ready and a turn of `TURN` tokens served (200,000). The node
 coordinates GPU reservations directly; each worker coroutine owns its execution state, and the cluster scheduler
 handles run and node assignment.
@@ -545,7 +545,7 @@ Kubernetes only for GPU pods.
 | What gets placed | a Pod + DRA `ResourceClaim` per worker process | a worker or sampler process onto a node daemon Pod with plain `nvidia.com/gpu` |
 | LoRA capacity | one worker per base model (`instance` hardcoded to 0) | elastic workers per base; runs hop between workers in about 0.1 s through `Store` |
 | Placement | ~2,700-line Go controller (`Workload` + `ClaimLedger` CRDs, kube-scheduler probes, CAS seat booking, 2-min wedge grace), binpack or spread | ~150-line Python loop over run counters and heartbeats, one `TARGET_UTIL` setting |
-| Sharing a GPU | host-network time-slicer DaemonSet; pods `ACQUIRE`/`RELEASE` around batches, one resident per claim | a Redis lease per node daemon; processes stay co-resident when they fit and park themselves when they don't |
+| Sharing a GPU | host-network time-slicer DaemonSet; pods `ACQUIRE`/`RELEASE` around batches, one resident per claim | a Redis lease per node daemon; one process is on a GPU at a time, and the others park |
 | Getting state off GPU | two ways: privileged host-PID `cuda-checkpoint` DaemonSet + custom FFT sleep/wake | one: `store.put` and `store.get`, used for time-slicing, sampler sync, resizing, Spot drain and checkpoints |
 | LoRA workers | exclusive: always resident, never share a GPU | park and migrate through `Store` like any other worker |
 | One owner & fencing | cooperative agreement across CRD status, ledger seat, assignment ID and env vars; NFS writes unfenced | Redis lease per worker; WATCH transaction fences every reply, checkpoint `ref` publish, and run handoff |

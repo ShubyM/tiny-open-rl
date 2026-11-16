@@ -68,8 +68,8 @@ can select another engine implementing async `start(base, lora, env)`, `load_che
 `sleep()`, `wake()` and `close()`. Settings are per engine; loading an already loaded checkpoint name must be idempotent,
 and `close()` must wait for its processes to exit. Checkpoint names include both the URI and its version.
 
-The node reserves every GPU of a worker together, honoring ticket order on each GPU. Workers with known memory
-budgets can share when they fit; others take turns. An idle holder yields to a waiter, and a busy holder yields
+The node reserves every GPU of a worker together, honoring ticket order on each GPU. One process is on a GPU
+at a time, and workers that share a GPU take turns. An idle holder yields to a waiter, and a busy holder yields
 once it has served `TURN` tokens (200,000) since it was granted. Training yields between commands; sampling yields
 between waves of up to `SAMPLE_RUNS` LoRA sessions or one full fine-tune session, with at most `SAMPLE_COMMANDS` commands
 per session. This GPU turn is separate from a run's continuation budget. The reservation starts before wake and remains

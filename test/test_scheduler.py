@@ -4,10 +4,10 @@ import random
 import unittest
 
 from tinyrl.bus import Cmd, Ev, Op, Role
-from tinyrl.control.scheduler import Assignment, Job, Worker, WorkerSpec, decide, from_table, memory_budget
+from tinyrl.control.scheduler import Assignment, Job, Worker, WorkerSpec, decide, from_table
 from tinyrl.control.turns import can_run, place_gpus, select_runs
 
-GIB, MIB = 2**30, 2**20
+GIB = 2**30
 
 
 class Cluster:
@@ -83,10 +83,7 @@ class Local:
   def check(self):
     for gpu in range(self.s.nodes["n"][0]):
       held = [r for r in self.running.values() if r.served is not None and gpu in r.gpus]
-      if len(held) > 1:
-        sizes = [memory_budget(self.s, r.spec, "n") for r in held]
-        self.test.assertTrue(all(sizes))
-        self.test.assertLessEqual(sum(sizes), self.s.nodes["n"][1])
+      self.test.assertLessEqual(len(held), 1)  # one process is on a GPU at a time
     for r in self.running.values():
       self.test.assertFalse(r.ticket and r.served is not None)
 
@@ -152,16 +149,16 @@ class TestCluster(unittest.TestCase):
     sampler = c.run("sample", role="sampler", train_run="t")
     self.assertEqual([c.s.workers[w].node for w in (lora, sampler)], ["c", "b"])  # the GPU t kept went to its sampler
 
-  def test_samplers_packed_by_memory_leave_room_near_their_trainer(self):
+  def test_a_second_sampler_stays_near_its_trainer_when_no_node_has_an_empty_gpu(self):
     c = Cluster()
-    c.node("a", 2, memory=81559 * MIB)
+    c.node("a", 2)
     c.node("b", 8)
     t = c.run("t")
     others = [c.run(f"r{i}") for i in range(4)]
     self.assertEqual([c.s.workers[w].node for w in [t, *others]], ["a", "b", "b", "b", "b"])
     q = c.run("q", role="sampler", train_run="t")
     g = c.run("g", role="sampler", train_run="t", base="b")
-    self.assertEqual([c.s.workers[w].node for w in (q, g)], ["a", "a"])  # two full fine-tune samplers pack one GPU
+    self.assertEqual([c.s.workers[w].node for w in (q, g)], ["a", "a"])  # where they take turns on one GPU
 
   def test_lost_node_workers_are_reassigned_and_forget_their_desired_gpus(self):
     c = Cluster()
@@ -228,15 +225,15 @@ class TestPlacement(unittest.TestCase):
       p.add(n, lora=True)
     self.assertEqual([p.s.workers[n].gpus for n in ("a", "b", "c")], [(0,), (1,), (2,)])
 
-  def test_shared_fft_samplers_pack_their_memory_budgets(self):
-    p = Local(self, 8, memory=81559 * MIB)
+  def test_samplers_take_empty_gpus_while_available(self):
+    p = Local(self, 8)
     for name in ("q", "g"):
       p.add(name, sampler=True)
     p.add("lora", sampler=True, lora=True)
     p.add("exclusive", sampler=True, exclusive=True)
     self.assertEqual(
       {n: w.gpus for n, w in p.s.workers.items()},
-      {"q": (0,), "g": (0,), "lora": (1,), "exclusive": (2,)},
+      {"q": (0,), "g": (1,), "lora": (2,), "exclusive": (3,)},
     )
 
   def test_exclusive_workers_are_alone_and_others_stay_off_their_gpu(self):
@@ -294,27 +291,15 @@ class TestReservations(unittest.TestCase):
       p.running[name].served = None
     self.assertEqual(order, ["a", "c", "b"])
 
-  def test_workers_with_known_budgets_share_but_unknown_budgets_wait(self):
+  def test_one_process_is_on_a_gpu_at_a_time(self):
     p = Local(self)
-    for name in ("a", "b", "c"):
-      p.add(name, sampler=True)
-      p.request(name)
-    p.add("trainer")
-    p.request("trainer")
-    self.assertEqual(p.grants(), ["a", "b"])
-    p.running["a"].served = None
-    self.assertEqual(p.grants(), ["c"])
-    p.running["b"].served = None
-    self.assertEqual(p.grants(), [])
-    p.running["c"].served = None
-    self.assertEqual(p.grants(), ["trainer"])
-
-  def test_unknown_gpu_memory_never_allows_concurrent_reservations(self):
-    p = Local(self, memory=0)
     for name in ("a", "b"):
       p.add(name, sampler=True)
       p.request(name)
     self.assertEqual(p.grants(), ["a"])
+    self.assertEqual(p.grants(), [])
+    p.running["a"].served = None  # it parked
+    self.assertEqual(p.grants(), ["b"])
 
   def test_multi_gpu_reservation_is_atomic_and_cannot_be_bypassed_on_either_gpu(self):
     p = Local(self, 2)

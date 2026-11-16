@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from tinyrl.bus import Cmd, Op, Role
-from tinyrl.control.scheduler import Assignment, Worker, fits, jobs_of, memory_budget
+from tinyrl.control.scheduler import Assignment, Worker, jobs_of
 from tinyrl.helpers import getenv
 
 TURN = getenv("TURN", 200_000)  # tokens a busy holder serves on its GPUs while others wait
@@ -38,7 +38,7 @@ def place_gpus(s: Assignment, node: str, running) -> None:
 
 def spread_trainers(s: Assignment, node: str, running) -> None:
   """Spread trainers after departures: one that takes turns on a crowded GPU moves to an empty one. A GPU is empty only after its old process has left it."""
-  gpus, gpu_bytes = s.nodes[node]
+  gpus = s.nodes[node][0]
   occupied = {g for r in running.values() for g in r.gpus}
   while True:
     there = {g: [n for n, w in s.workers.items() if w.node == node and g in w.gpus] for g in range(gpus)}
@@ -46,7 +46,7 @@ def spread_trainers(s: Assignment, node: str, running) -> None:
     movable = {
       g: [n for n in names if takes_turns(s.workers[n]) and len(s.workers[n].gpus) == 1]
       for g, names in there.items()
-      if len(names) > 1 and not fits([memory_budget(s, s.workers[n].spec, node) for n in names], gpu_bytes)
+      if len(names) > 1
     }
     if not empty or not (crowded := [g for g, names in movable.items() if names]):
       return
@@ -63,34 +63,27 @@ def takes_turns(w: Worker) -> bool:
 
 
 def choose_gpus(s: Assignment, node: str, name: str, avoid: tuple[int, ...] = ()) -> tuple[tuple[int, ...], list[str]]:
-  """Choose GPUs and trainers to move aside. Pack known memory budgets, keep exclusive workers alone, and otherwise take turns on the GPUs with the fewest workers. A sampler moves trainers rather than sharing with them when there is room."""
-  gpus, gpu_bytes = s.nodes[node]
-  me, width, memory = s.workers[name], s.workers[name].spec.gpus, memory_budget(s, s.workers[name].spec, node)
+  """Choose GPUs and trainers to move aside. Take empty GPUs first, keep exclusive workers alone, and otherwise take turns on the GPUs with the fewest workers. A sampler moves trainers rather than sharing with them when there is room."""
+  gpus = s.nodes[node][0]
+  me, width = s.workers[name], s.workers[name].spec.gpus
   there = {
     g: [(n, w) for n, w in s.workers.items() if n != name and w.node == node and g in w.gpus] for g in range(gpus)
   }
 
-  def fits_on(g: int) -> bool:
-    others = [w for _, w in there[g]]
-    ok = not me.spec.exclusive and not any(w.spec.exclusive for w in others)
-    return not others or (ok and fits([memory_budget(s, w.spec, node) for w in others] + [memory], gpu_bytes))
-
-  def trainers_only(g: int) -> bool:
-    return bool(there[g]) and all(takes_turns(w) and w.spec.gpus <= gpus - width for _, w in there[g])
-
   def clear(g: int) -> bool:
-    return fits_on(g) or trainers_only(g)
+    """Whether it could have the GPU to itself: it is empty, or holds only trainers with somewhere else to go."""
+    return all(takes_turns(w) and w.spec.gpus <= gpus - width for _, w in there[g])
 
   options = [g for g in range(gpus) if g not in avoid]
-  if len(fitting := [g for g in options if fits_on(g)]) >= width:
-    return tuple(sorted(fitting, key=lambda g: (bool(there[g]) != bool(memory), g))[:width]), []
+  if len(empty := [g for g in options if not there[g]]) >= width:
+    return tuple(empty[:width]), []
   if takes_turns(me) or len(options) <= width:  # with no spare GPUs there is nowhere to move to
     return tuple(sorted(options, key=lambda g: (not clear(g), len(there[g]), g))[:width]), []
   # as few moves as it can, LoRA trainers first, since a full fine-tune saves its weights and AdamW state far slower
   lora = {g: all(w.spec.lora for _, w in there[g]) for g in options}
-  moves = {g: 0 if fits_on(g) else sum(w.spec.gpus for _, w in there[g]) for g in options}
+  moves = {g: sum(w.spec.gpus for _, w in there[g]) for g in options}
   chosen = tuple(sorted(options, key=lambda g: (not clear(g), moves[g], not lora[g], g))[:width])
-  aside = sorted({n for g in chosen if not fits_on(g) for n, _ in there[g]})
+  aside = sorted({n for g in chosen for n, _ in there[g]})
   return chosen, aside if all(map(clear, chosen)) else []
 
 
@@ -102,17 +95,12 @@ def someone_waits(running, gpus: tuple[int, ...]) -> bool:
 
 
 def can_run(s: Assignment, node: str, running, name: str) -> bool:
-  """Reserve all actual GPUs together, in ticket order on each GPU, including processes still draining after unplacement."""
+  """Whether a waiting worker may take its GPUs, all together: no process is on any of them, and no earlier ticket wants one. One process is on a GPU at a time, and a process still draining after unplacement counts."""
   r = running[name]
   if r.ticket <= 0 or r.served is not None or not r.gpus or node not in s.nodes:
     return False
-  for gpu in r.gpus:
-    if any(x.ticket > 0 and (x.ticket, n) < (r.ticket, name) and gpu in x.gpus for n, x in running.items()):
-      return False
-    memory = [memory_budget(s, x.spec, node) for x in running.values() if x.served is not None and gpu in x.gpus]
-    if not fits([*memory, memory_budget(s, r.spec, node)], s.nodes[node][1]):
-      return False
-  return True
+  ahead = [x for n, x in running.items() if x.served is not None or (x.ticket > 0 and (x.ticket, n) < (r.ticket, name))]
+  return not any(set(x.gpus) & set(r.gpus) for x in ahead)
 
 
 # ***** which of a worker's runs is served next *****

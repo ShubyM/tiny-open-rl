@@ -106,22 +106,9 @@ def settings(spec: WorkerSpec, gpus: int, gpu_bytes: int) -> dict[str, str]:
     return env
   if gpus >= 2:  # samplers have GPUs of their own, so they start their engine before the first command
     env["TINYRL_WARM_SAMPLER"] = "1"
-  if gpu_bytes >= 64 * 2**30 and not spec.lora and not spec.exclusive and spec.gpus == 1:
-    env.update(TINYRL_GPU_MEM="0.42", TINYRL_KV_BYTES=str(16 * 1024**3))
-  elif gpu_bytes >= 64 * 2**30:
+  if gpu_bytes >= 64 * 2**30:
     env["TINYRL_KV_BYTES"] = str(24 * 1024**3)
   return env
-
-
-def memory_budget(s: Assignment, spec: WorkerSpec, node: str | None) -> int:
-  """Bytes a worker's process may use on each of its GPUs on a node, 0 if it isn't limited and so takes a GPU alone."""
-  gpus, gpu_bytes = s.nodes.get(node, (0, 0))
-  return int(float(settings(spec, gpus, gpu_bytes).get("TINYRL_GPU_MEM", 0)) * gpu_bytes)
-
-
-def fits(memory: list[int], gpu_bytes: int) -> bool:
-  """Whether workers with these memory budgets can share a GPU. Every budget has to be known, and 0 means unknown."""
-  return len(memory) == 1 or (gpu_bytes > 0 and all(memory) and sum(memory) <= gpu_bytes)
 
 
 # ***** decide *****
@@ -160,29 +147,10 @@ def future_sampler(spec: WorkerSpec) -> WorkerSpec | None:
 
 
 def has_room(s: Assignment, node: str, *new: WorkerSpec, owed: set[str] = frozenset()) -> bool:
-  """Whether workers of these specs could start on the node now: on empty GPUs, or packed by memory next to others. A trainer owed a sampler keeps a GPU for it."""
-  gpus, gpu_bytes = s.nodes[node]
-  held: list[list[WorkerSpec]] = []  # what each GPU holds, packed first-fit the way choose_gpus() packs
-
-  def put(spec: WorkerSpec) -> bool:
-    for specs in held:
-      if (
-        not spec.exclusive
-        and not any(x.exclusive for x in specs)
-        and fits([memory_budget(s, x, node) for x in [*specs, spec]], gpu_bytes)
-      ):
-        specs.append(spec)
-        return True
-    if len(held) < gpus:
-      held.append([spec])
-      return True
-    return False
-
-  for name, w in s.workers.items():
-    for spec in [w.spec, future_sampler(w.spec)] if name in owed else [w.spec]:
-      for _ in range(spec.gpus if w.node == node else 0):
-        put(spec)  # past the GPUs, trainers take turns
-  return all(put(spec) for spec in new for _ in range(spec.gpus))
+  """Whether workers of these specs could start on the node now, each on empty GPUs. A trainer owed a sampler keeps a GPU for it."""
+  there = [(name, w.spec) for name, w in s.workers.items() if w.node == node]
+  taken = sum(spec.gpus + (future_sampler(spec).gpus if name in owed else 0) for name, spec in there)
+  return taken + sum(spec.gpus for spec in new) <= s.nodes[node][0]
 
 
 def prefer(options: list, test) -> list:
