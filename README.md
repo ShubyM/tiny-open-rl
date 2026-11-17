@@ -106,8 +106,9 @@ to finish. Its full GPU block must fit outside exclusive reservations.
 
 Each save writes an immutable safetensors directory at `CKPT/objects/<version>`. The trainer commits the version
 and its logical `tinker://` name together in Redis under its ownership token. A late writer can finish its own
-directory, but readers of the name still load the version published by the current owner. New deployments use
-this versioned layout; checkpoints from the older named-directory layout require migration before upgrading.
+directory, but readers of the name still load the version published by the current owner. There is no
+migration from the older named-directory layout: its checkpoints are neither read nor collected, so delete them and
+start from an empty `CKPT` and an empty Redis.
 
 Use a shared folder for local storage or a bucket URL such as `gs://...`. Bucket saves first land in the writer's
 `CKPT_CACHE`. Other nodes can fetch that exact version from the writer while the upload is pending. The uploader
