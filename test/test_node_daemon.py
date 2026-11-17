@@ -217,27 +217,36 @@ class TestNodeDaemon(RedisTest):
       await self.create(run, "tiny", node)
     await self.bus.r.set(key("vtime", "more"), 500)
     await self.bus.r.set(key("vtime", "less"), 10)
-    parks = []
+    parks, order, entered, release = [], [], asyncio.Event(), asyncio.Event()
     orig_park = node.processes["w-less"].trainer.park
+    node.processes["w-less"].trainer.park = lambda: (parks.append(1), orig_park())[1]
+    for worker in ("w-less", "w-more"):
+      orig_call = node.processes[worker].call
 
-    def count_park():
-      parks.append(1)
-      return orig_park()
+      async def tracked(method, *args, orig=orig_call):
+        if method == "execute":
+          if args[0].op == Op.FORWARD_BACKWARD:
+            entered.set()
+            await release.wait()
+          elif args[0].op == Op.OPTIM_STEP:
+            order.append(args[0].run)
+        return await orig(method, *args)
 
-    node.processes["w-less"].trainer.park = count_park
+      node.processes[worker].call = tracked
     with mock.patch.object(turns, "TURN", 10):
-      # get w-less onto GPU 0 first, then queue w-more (vtime=500) alongside 3 commands of w-less (10 -> 310 < 500)
-      first = await self.bus.submit_command("less", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100)
-      await self.reply(first, node)
-      parks.clear()
+      first = await self.bus.submit_command("less", Op.FORWARD_BACKWARD, b"", cost=100)
+      await self.until(entered.is_set, node)
       less_reqs = [
         await self.bus.submit_command("less", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100) for _ in range(3)
       ]
       more_req = await self.bus.submit_command("more", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10)
-      for req in less_reqs:
+      await self.until(lambda: node.running["w-more"].vtime == 500, node)
+      parks.clear()
+      release.set()
+      for req in [first, *less_reqs, more_req]:
         await self.reply(req, node)
-      self.assertEqual(len(parks), 0)  # zero wasted self-handoffs while w-less (vtime <= 410) < w-more (500)!
-      await self.reply(more_req, node)  # once w-less is idle, w-more takes the GPU
+      self.assertEqual(order, ["less", "less", "less", "more"])
+      self.assertEqual(len(parks), 1)  # 0 parks across 3 >TURN steps while w-less < w-more; 1 park on idle handoff!
 
   async def test_heavy_sampling_in_an_account_prioritizes_another_accounts_training(self):
     node = self.node(gpus=2)
@@ -338,6 +347,7 @@ class TestNodeDaemon(RedisTest):
     await self.until(entered.is_set, node)
     more_a = [await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10) for _ in range(3)]
     step_c = await self.bus.submit_command(c, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10)
+    await asyncio.sleep(0.05)  # let background peek prepare both `more_a[0]` and `step_c` before releasing `fifth`
     release.set()
     await self.reply(fifth, node)
     await self.reply(step_c, node)
