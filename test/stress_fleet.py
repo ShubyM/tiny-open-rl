@@ -2,8 +2,8 @@
 
   SEED=3 CHAOS=1 python -m test.stress_fleet
 
-SEED picks the cluster and the workload. CHAOS=1 also cancels workers, kills model processes, and loses, drains and adds
-nodes while clients run. It is not part of the suite: run a range of seeds by hand.
+SEED picks the cluster and the workload. CHAOS=1 also cancels workers, kills model processes, loses, drains and adds
+nodes, and cuts nodes off from Redis while clients run. It is not part of the suite: run a range of seeds by hand.
 
 Every client is sequential, like the SDK. A second Model replays exactly what each client was told succeeded, and at the
 end each run's saved state must equal it: the system may fail a command, but it may not lose or invent an acknowledged
@@ -12,6 +12,7 @@ every run leaves no lease, owner, queue or write intent behind.
 """
 
 import asyncio
+import collections
 import copy
 import itertools
 import json
@@ -46,6 +47,16 @@ if (
   os.getenv("THREADS", "1") != "0"
 ):  # THREADS=0 leaves torch's default, which starves the machine when seeds run side by side
   torch.set_num_threads(int(os.getenv("THREADS", "1")))
+
+
+class Unreachable:
+  """A Redis that a node can no longer reach."""
+
+  def __getattr__(self, name):
+    def call(*args, **kwargs):
+      raise ConnectionError(f"redis is unreachable ({name})")
+
+    return call
 
 
 class Occupancy:
@@ -144,6 +155,7 @@ class Stress(RedisTest):
     self.nodes: dict[str, StressNode] = {}
     self.loops: dict[str, asyncio.Task] = {}
     self.violations, self.errors, self.problems, self.injected = [], [], [], []
+    self.cut: list[StressNode] = []
     self.calls = {"ok": 0, "failed": 0, "hung": 0}
     self.made = 0
 
@@ -154,6 +166,8 @@ class Stress(RedisTest):
     for node in self.nodes.values():
       await node.aclose()
       await node.bus.r.aclose()
+    for node in self.cut:
+      await asyncio.to_thread(node.store.close)
     await super().asyncTearDown()
 
   # ***** the cluster *****
@@ -184,6 +198,18 @@ class Stress(RedisTest):
     await self.bus.r.hdel(key("nodes"), name)
     await node.bus.r.aclose()
 
+  async def cut_node(self, name: str) -> None:
+    """The node loses Redis for good, mid-work: none of its replies, releases or lease drops arrive. Its leases and
+    heartbeat run out by themselves. Its store goes on uploading, so the saves it acknowledged are not lost."""
+    node = self.nodes.pop(name)
+    self.loops.pop(name).cancel()
+    await node.bus.r.aclose()
+    node.bus.r = node.registry.r = Unreachable()
+    for task in node.tasks.values():
+      task.cancel()
+    await asyncio.gather(*node.tasks.values(), return_exceptions=True)
+    self.cut.append(node)
+
   def start_scheduler(self) -> None:
     bus = Bus(connect(self.url))
     self.addAsyncCleanup(bus.r.aclose)
@@ -199,7 +225,7 @@ class Stress(RedisTest):
     while True:
       await asyncio.sleep(self.rng.uniform(0.3, 1.0))
       nodes = sorted(self.nodes)
-      action = self.rng.choice(["cancel", "crash", "crash", "lose", "drain", "add"])
+      action = self.rng.choice(["cancel", "crash", "crash", "lose", "drain", "cut", "add"])
       if action in ("cancel", "crash"):
         node = self.nodes[self.rng.choice(nodes)]
         if not (live := sorted(p for p, t in node.tasks.items() if not t.done())):
@@ -214,6 +240,10 @@ class Stress(RedisTest):
         name = self.rng.choice(nodes)
         self.injected.append(f"{action} {name}")
         await self.remove_node(name, graceful=action == "drain")
+      elif action == "cut" and len(nodes) > 1:
+        name = self.rng.choice(nodes)
+        self.injected.append(f"cut {name}")
+        await self.cut_node(name)
       elif action == "add" and len(nodes) < 3:
         self.injected.append("add")
         await self.add_node(self.rng.choice([1, 2]))
@@ -380,6 +410,9 @@ class Stress(RedisTest):
       mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 100),
       mock.patch("tinyrl.control.scheduler.REBALANCE_MS", 1000),
     ]
+    if CHAOS:  # so that a node cut off from Redis is given up on in seconds
+      patches += [mock.patch(f"tinyrl.{m}.LEASE_MS", 3000) for m in ("bus", "control.node_daemon")]
+      patches.append(mock.patch("tinyrl.bus.NODE_MS", 4000))
     for p in patches:
       p.start()
       self.addCleanup(p.stop)
@@ -438,7 +471,7 @@ class Stress(RedisTest):
     shares = {a: round(v / sum(service.values()), 2) for a, v in sorted(service.items())} if service else {}
     print(
       f"\nSEED={SEED} chaos={CHAOS} block={BLOCK} nodes={gpus} trainers={len(trainers)} samplers={len(samplers)} "
-      f"calls={self.calls} finished={len(self.finished)} abandoned={len(self.abandoned)} injected={len(self.injected)} "
+      f"calls={self.calls} finished={len(self.finished)} abandoned={len(self.abandoned)} injected={dict(collections.Counter(i.split()[0] for i in self.injected))} "
       f"elapsed={elapsed:.1f}s gpu_use={sum(service.values()) / 1000 / max(1e-9, elapsed * capacity):.2f} shares={shares}",
       file=sys.stderr,
     )
