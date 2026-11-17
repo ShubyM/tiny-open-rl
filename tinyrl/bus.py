@@ -18,6 +18,7 @@ import redis.asyncio as redis
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialBackoff
 
+from tinyrl.control.accounting import Charge
 from tinyrl.helpers import getenv
 
 GROUP = "trainer"
@@ -122,25 +123,23 @@ def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
   return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"], int(fields.get(b"cost", 1)))
 
 
-def finish_cmd(p, cmd: Cmd, reply: Reply, acct: str, t0: float | None, share: float = 1.0, write: bool = True) -> None:
+def finish_cmd(p, cmd: Cmd, reply: Reply, acct: str, charge: Charge | None) -> None:
   p.xack(key("q", cmd.run), GROUP, cmd.entry_id)
   p.xdel(key("q", cmd.run), cmd.entry_id)
-  if write:
-    fk = key("f", cmd.request_id)
-    p.xadd(
-      fk, {"ok": int(reply.ok), "content_type": reply.content_type, "body": reply.body}, maxlen=1, approximate=False
-    )
-    p.expire(fk, REPLY_TTL)
-    counts = {"failed": 1} if not reply.ok else {"steps": 1} if cmd.op == Op.OPTIM_STEP else {}
-    if t0 is not None:
-      ms = max(0.0, (time.time() - t0) * 1000.0)
-      counts |= {"cmds": 1, "wait_ms": max(0, int(t0 * 1000) - int(cmd.entry_id.split("-")[0])), "busy_ms": int(ms)}
-      if reply.ok:
-        counts["tokens"] = cmd.cost
-        if acct:
-          p.hincrbyfloat(key("service"), acct, max(1.0, ms) * share)
-    for name, n in counts.items():
-      p.hincrby(key("run", cmd.run), name, n)
+  fk = key("f", cmd.request_id)
+  fields = {"ok": int(reply.ok), "content_type": reply.content_type, "body": reply.body}
+  p.xadd(fk, fields, maxlen=1, approximate=False)
+  p.expire(fk, REPLY_TTL)
+  counts = {"failed": 1} if not reply.ok else {"steps": 1} if cmd.op == Op.OPTIM_STEP else {}
+  if charge:
+    wait_ms = max(0, charge.started_ms - int(cmd.entry_id.split("-")[0]))
+    counts.update(cmds=1, wait_ms=wait_ms, busy_ms=charge.busy_ms)
+    if reply.ok:
+      counts["tokens"] = cmd.cost
+    if acct and charge.gpu_ms:
+      p.hincrbyfloat(key("service"), acct, charge.gpu_ms)
+  for name, n in counts.items():
+    p.hincrby(key("run", cmd.run), name, n)
   wake(p)
 
 
@@ -151,6 +150,21 @@ def queue_delete(p, run_id: str) -> None:
   p.xadd(
     key("events"), {"kind": Ev.RUN_DELETED, "body": json.dumps({"run": run_id})}, maxlen=1_000_000, approximate=True
   )
+
+
+def queue_checkpoint(p, uri: str, size: int, ttl=None, owned=False, version=None) -> None:
+  """Queue a checkpoint's metadata and indexes in the same transaction as its publication."""
+  run, cid = uri.removeprefix("tinker://").split("/", 1)
+  kind, now = cid.split("/", 1)[0], time.time()
+  kind = {"weights": "training", "sampler_weights": "sampler"}.get(kind, kind)
+  info = {"checkpoint_id": cid, "checkpoint_type": kind, "time": now, "tinker_path": uri, "size_bytes": size}
+  expires = now + ttl if ttl else None
+  info.update(expires_at=expires, owned=owned, version=version)
+  p.setnx(key("ckpt_since"), now)
+  p.hset(key("ckpt", run), cid, json.dumps(info))
+  if kind != "parked":
+    p.zadd(key("ckpts"), {uri: now})
+  p.zadd(key("expiry"), {uri: expires}) if expires else p.zrem(key("expiry"), uri)
 
 
 def connect(url: str) -> redis.Redis:
@@ -167,9 +181,7 @@ class Bus:
       try:
         async with self.r.pipeline(transaction=True) as p:
           await p.watch(*keys)
-          if (out := await fn(p)) is None:
-            await p.unwatch()
-          return out
+          return await fn(p)
       except redis.WatchError:
         continue
 
@@ -244,22 +256,19 @@ class Bus:
     p = self.r.pipeline(transaction=False)
     for r in runs:
       p.hmget(key("run", r), "record", "owner", "pos", "snap")
-      p.xinfo_groups(key("q", r))
+      p.xlen(key("q", r))  # A commit deletes its entry, so this includes both queued and pending work.
     p.get(key("plan"))
     p.hgetall(key("service"))
-    raw = await p.execute(raise_on_error=False)
+    *rows, plan, service = await p.execute()
     out_runs, queues = {}, {}
-    for i, r in enumerate(runs):
-      f, groups = raw[2 * i], raw[2 * i + 1]
-      if isinstance(f, Exception) or not f[0]:
+    for r, f, backlog in zip(runs, rows[::2], rows[1::2]):
+      if not f[0]:
         continue
       info = {"record": json.loads(f[0]), "owner": f[1] and f[1].decode(), "pos": f[2] and f[2].decode()}
       out_runs[r] = info | {"snap": f[3] and f[3].decode()}
-      if not isinstance(groups, Exception) and (g := next((g for g in groups if g["name"] == GROUP.encode()), None)):
-        queues[r] = int(g.get("lag") or 0) + int(g.get("pending") or 0)
-    plan = json.loads(raw[-2]) if raw[-2] and not isinstance(raw[-2], Exception) else {}
-    service = {k.decode(): float(v) for k, v in (raw[-1].items() if isinstance(raw[-1], dict) else ())}
-    return {"nodes": nodes, "runs": out_runs, "queues": queues, "plan": plan, "service": service}
+      queues[r] = backlog
+    service = {k.decode(): float(v) for k, v in service.items()}
+    return {"nodes": nodes, "runs": out_runs, "queues": queues, "plan": json.loads(plan or "{}"), "service": service}
 
   async def write_plan(self, plan: dict, changes: list[tuple[Ev, dict]] = (), notify_nodes: bool = True) -> None:
     p = self.r.pipeline(transaction=True)
@@ -318,38 +327,74 @@ class Bus:
     await p.execute()
     return request_id
 
-  async def peek_commands(self, runs: list[str], block_ms: int = 0) -> list[Cmd]:
+  async def peek_commands(self, runs: list[str], block_ms: int = 0, idle_ms: int | None = None) -> list[Cmd]:
+    """Peek one head per run. Samplers may also prepare a pending entry old enough to reclaim."""
     p = self.r.pipeline(transaction=False)
     for r in runs:
       p.xinfo_groups(key("q", r))
     cursors = {}
+    pending = []
     for r, groups in zip(runs, await p.execute(raise_on_error=False)):
       if isinstance(groups, Exception):
         if "no such key" not in str(groups):
           raise groups
       elif g := next((g for g in groups if g["name"] == GROUP.encode()), None):
         cursors[key("q", r)] = g["last-delivered-id"]
+        if idle_ms is not None and g["pending"]:
+          pending.append(r)
     if not cursors:
       return await asyncio.sleep(block_ms / 1000) or []
-    got = await self.r.xread(cursors, count=1, block=block_ms or None)
-    cmds = [parse_cmd(s.decode().removeprefix(key("q", "")), *entries[0]) for s, entries in got]
+    cmds = [cmd for cmd in await asyncio.gather(*(self.pending_head(r, idle_ms) for r in pending)) if cmd]
+    for cmd in cmds:
+      del cursors[key("q", cmd.run)]
+    if cursors:
+      got = await self.r.xread(cursors, count=1, block=None if cmds else block_ms or None)
+      cmds.extend(parse_cmd(s.decode().removeprefix(key("q", "")), *entries[0]) for s, entries in got)
     return sorted(cmds, key=lambda c: (*map(int, c.entry_id.split("-")), c.run))
 
-  async def take_commands(self, runs: list[str], consumer: str, count: int = 16, block_ms: int = 0) -> list[Cmd]:
+  async def pending_head(self, run: str, idle_ms: int) -> Cmd | None:
+    queue, start = key("q", run), "-"
+    try:
+      while rows := await self.r.xpending_range(queue, GROUP, start, "+", count=1, idle=idle_ms):
+        eid = rows[0]["message_id"]
+        if entry := await self.r.xrange(queue, eid, eid):
+          return parse_cmd(run, *entry[0])
+        start = b"(" + eid  # Skip a pending ID whose entry has since been deleted.
+    except redis.ResponseError as e:
+      if "NOGROUP" not in str(e):
+        raise
+
+  async def take_commands(
+    self, runs: list[str], consumer: str, count: int = 16, block_ms: int = 0, idle_ms: int | None = None
+  ) -> list[Cmd]:
     p = self.r.pipeline(transaction=False)
     for r in runs:
-      p.xreadgroup(GROUP, consumer, {key("q", r): ">"}, count=count)
+      p.xreadgroup(GROUP, consumer, {key("q", r): ">"}, count=count, claim_min_idle_time=idle_ms)
     cmds = []
     for r, got in zip(runs, await p.execute(raise_on_error=False)):
       if isinstance(got, Exception):
         if "NOGROUP" not in str(got):
           raise got
       else:
-        cmds += [parse_cmd(r, eid, fields) for _, entries in got for eid, fields in entries]
+        cmds += [parse_cmd(r, eid, fields) for _, entries in got for eid, fields, *_ in entries]
     if not cmds and block_ms:
-      await self.peek_commands(runs, block_ms)
-      return await self.take_commands(runs, consumer, count)
+      await self.peek_commands(runs, block_ms, idle_ms)
+      return await self.take_commands(runs, consumer, count, idle_ms=idle_ms)
     return cmds
+
+  async def take_trainer_command(self, run: str, token: str) -> Cmd | None:
+    """Only the current epoch may move a new trainer command into the pending list."""
+    k, life = key("run", run), token.rsplit(":", 1)[0]
+
+    async def op(p):
+      if await p.hget(k, "owner") != token.encode():
+        raise RuntimeError(f"lost ownership of {run}")
+      p.multi()
+      p.xreadgroup(GROUP, life, {key("q", run): ">"}, count=1)
+      [got] = await p.execute()
+      return parse_cmd(run, *got[0][1][0]) if got else None
+
+    return await self.transact(op, k)
 
   # ***** single-writer ownership, detachment, stateless sample commit, and process leases *****
 
@@ -394,7 +439,9 @@ class Bus:
 
     return await self.transact(op, k, lk)
 
-  async def detach_run(self, run_id: str, token: str, pos: str | None, snap: str | None) -> bool:
+  async def detach_run(
+    self, run_id: str, token: str, pos: str | None, snap: str | None, checkpoint: dict | None = None
+  ) -> bool:
     """Release `run_id` and record its exact snapshot `snap` iff `token` still owns it at `pos`."""
     k = key("run", run_id)
 
@@ -403,6 +450,8 @@ class Bus:
       if owner != token.encode() or (cur and cur.decode()) != pos:
         return None
       p.multi()
+      if checkpoint:
+        queue_checkpoint(p, **checkpoint)
       p.hdel(k, "owner")
       p.hset(k, "snap", snap) if snap else p.hdel(k, "snap")
       wake(p)
@@ -410,7 +459,9 @@ class Bus:
 
     return bool(await self.transact(op, k))
 
-  async def commit_reply(self, cmd: Cmd, reply: Reply, token: str, acct="", mutates=False, t0=None, share=1.0):
+  async def commit_reply(
+    self, cmd: Cmd, reply: Reply, token: str, acct="", mutates=False, charge=None, checkpoint=None
+  ):
     """Atomically publish a trainer reply, bill `gpu_ms`, and advance `pos` (clearing `snap`) iff `token` owns it."""
     k, ck, deleting = key("run", cmd.run), key("ckpt", cmd.run), cmd.op == Op.DELETE_MODEL and reply.ok
 
@@ -418,10 +469,14 @@ class Bus:
       owner, old_snap = await p.hmget(k, "owner", "snap")
       if owner != token.encode():
         return None
+      if not await p.xrange(key("q", cmd.run), cmd.entry_id, cmd.entry_id):
+        return None
       ckpts = await p.hgetall(ck) if deleting else {}
       p.multi()
-      finish_cmd(p, cmd, reply, acct, t0, share)
-      if mutates and reply.ok and not deleting:
+      if checkpoint and reply.ok:
+        queue_checkpoint(p, **checkpoint)
+      finish_cmd(p, cmd, reply, acct, charge)
+      if mutates and not deleting:
         p.hset(k, "pos", cmd.entry_id)
         p.hdel(k, "snap")
       elif deleting:
@@ -432,44 +487,30 @@ class Bus:
           p.zrem(key("expiry"), uri)
         queue_delete(p, cmd.run)
       await p.execute()
-      return old_snap.decode() if old_snap and mutates and reply.ok and not deleting else ""
+      return old_snap.decode() if old_snap and mutates and not deleting else ""
 
-    res = await self.transact(op, k, *([ck] if deleting else []))
+    res = await self.transact(op, k, key("f", cmd.request_id), *([ck] if deleting else []))
     return (False, None) if res is None else (True, res or None)
 
-  async def commit_sample(self, cmd: Cmd, reply: Reply, account="", started=None, share=1.0) -> bool:
-    """Stateless reader commit: first replica writes `f:<request_id>` and bills `gpu_ms` once; duplicates only ack."""
+  async def commit_sample(self, cmd: Cmd, reply: Reply, account="", charge: Charge | None = None) -> bool:
+    """The winning replica removes the queue entry. A late duplicate stays fenced after the reply expires."""
     fk = key("f", cmd.request_id)
 
     async def op(p):
-      already = await p.xlen(fk)
+      if not await p.xrange(key("q", cmd.run), cmd.entry_id, cmd.entry_id):
+        return None
       p.multi()
-      finish_cmd(p, cmd, reply, account, started, share, write=not already)
+      finish_cmd(p, cmd, reply, account, charge)
       await p.execute()
-      return not already
+      return True
 
     return bool(await self.transact(op, fk))
 
   async def fail_stranded_commands(self, run_id: str, token: str, idle_ms: int = 0) -> None:
-    if await self.r.hget(key("run", run_id), "owner") != token.encode():
-      return
-    for cmd in await self.reclaim_commands([run_id], token.rsplit(":", 1)[0], idle_ms, 10000):
+    while cmd := await self.pending_head(run_id, idle_ms):
       err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {cmd.op}"))
       if not (await self.commit_reply(cmd, err, token))[0]:
         return
-
-  async def reclaim_commands(
-    self, runs: list[str], consumer: str, idle_ms: int = LEASE_MS, count: int = 64
-  ) -> list[Cmd]:
-    out = []
-    for r in runs:
-      try:
-        _, entries, _ = await self.r.xautoclaim(key("q", r), GROUP, consumer, min_idle_time=idle_ms, count=count)
-        out += [parse_cmd(r, eid, fields) for eid, fields in entries]
-      except redis.ResponseError as e:
-        if "NOGROUP" not in str(e):
-          raise
-    return out
 
   # ***** nodes, replies, events *****
 

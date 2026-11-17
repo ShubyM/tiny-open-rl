@@ -29,6 +29,12 @@ def counting(n: int, start: int = 0, **inputs) -> wire.Datum:
   return wire.Datum(tokens[:-1].astype(np.int32), {"target_tokens": tokens[1:].astype(np.int64), **inputs})
 
 
+def partial_backward_failure(run: str) -> bytes:
+  req = wire.parse(proto_body(run, n=60))  # second datum counts past the tiny model's vocabulary
+  req.data[0].CopyFrom(wire.parse(proto_body(run, n=2)).data[0])  # completes in its own, shorter pass
+  return req.SerializeToString()
+
+
 def train(model: Model, run: str, steps: int = 8, lr: float = 1e-2) -> list[float]:
   losses = []
   for _ in range(steps):
@@ -248,6 +254,29 @@ class TestModel(unittest.TestCase):
       self.assertTrue(all(p.grad is None for p in loaded.model.params[run].values()))
       self.assertTrue(loaded.model.optimizers[run].state)
 
+  def test_repeated_partial_failure_and_explicit_load_of_its_checkpoint(self):
+    with tempfile.TemporaryDirectory() as folder:
+      model, (run,) = lora_runs()
+      trainer = Trainer(model, Store(root=folder))
+      fail = Cmd(run, "1", Op.FORWARD_BACKWARD, partial_backward_failure(run))
+      for _ in range(2):
+        # Even with a warning already pending, another partial failure discards newly accumulated gradients.
+        model.forward_backward(run, [counting(2)], "cross_entropy", {}, False)
+        reply, effects = trainer.execute(fail)
+        self.assertFalse(reply.ok)
+        self.assertTrue(effects.get("mutated"))
+        self.assertTrue(all(p.grad is None for p in model.params[run].values()))
+        reply, effects = trainer.execute(Cmd(run, "2", Op.FORWARD_BACKWARD, proto_body(run, loss_fn="unknown")))
+        self.assertFalse(reply.ok)
+        self.assertFalse(effects.get("mutated"))
+
+      saved = trainer.save_run(run)
+      body = json.dumps({"uri": saved["uri"], "optimizer": True}).encode()
+      reply, _ = trainer.execute(Cmd(run, "3", Op.LOAD_WEIGHTS, body), version=saved["version"])
+      self.assertTrue(reply.ok, reply.body)
+      reply, _ = trainer.execute(Cmd(run, "4", Op.OPTIM_STEP, b'{"adam_params":{}}'))
+      self.assertTrue(reply.ok, reply.body)
+
   def test_sampler_weights_load_in_peft_and_transformers(self):
     store = Store(root=tempfile.mkdtemp())
     ids = torch.randint(0, 96, (2, 8))
@@ -343,6 +372,39 @@ class TestTrainer(RedisTest):
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
       self.assertIsNone((await self.bus.get_run(run)).get("snap"))
       self.assertIsNone(await self.registry.get_checkpoint(parked))  # recovery cannot replay old state after a crash
+
+  async def test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "tiny", 0))
+    await self.node.bind("p", run)
+    await self.submit(
+      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.FORWARD_BACKWARD, proto_body(run))
+    )
+    await self.node.drain(run)
+    self.assertTrue(any(p.grad is not None for p in self.model("p").params[run].values()))
+    expected = {k: p.detach().clone() for k, p in self.model("p").params[run].items()}
+    step = (Op.OPTIM_STEP, {"adam_params": {}})
+    for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
+      self.node.drop_local("p")
+      await self.finish_worker("p")
+      parked = (await self.bus.get_run(run))["snap"].partition("\n")[0]
+      [request] = await self.submit(run, command)
+      await self.node.drain(run)
+      reply = await self.bus.wait_for_reply(request, 1)
+      self.assertFalse(reply.ok)
+      if command == step:
+        self.assertIn("accumulated gradients were discarded", reply.body.decode())
+      info = await self.bus.get_run(run)
+      self.assertEqual(info["pos"], request.rsplit("/", 1)[1])
+      self.assertIsNone(info.get("snap"))
+      self.assertIsNone(await self.registry.get_checkpoint(parked))
+
+    self.node.drop_local("p")
+    await self.finish_worker("p")
+    [request] = await self.submit(run, step)
+    await self.node.drain(run)
+    self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
+    torch.testing.assert_close(self.model("p").params[run], expected, atol=0, rtol=0)
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     run, uri = new_id(), "tinker://saved/weights/step-1"

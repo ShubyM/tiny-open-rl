@@ -77,11 +77,17 @@ class State:
     return any(self.ready(r) for r in self.runs(proc))
 
   def account(self, run: str) -> str:
-    j = self.jobs[run]
-    return j.account or (self.account(j.train_run) if j.train_run in self.jobs else run)
+    if (job := self.jobs.get(run)) is None:
+      return run
+    return job.account or (self.account(job.train_run) if job.train_run in self.jobs else run)
 
   def lag_of(self, proc: str) -> float:
-    return max((self.lag.get(self.account(r), 0.0) for r in self.runs(proc) if self.ready(r)), default=0.0)
+    return max((self.ready_lag(r) for r in self.runs(proc) if self.ready(r)), default=0.0)
+
+  def ready_lag(self, run: str) -> float:
+    """The account's lag, less service completed since the planner's last update."""
+    account = self.account(run)
+    return self.lag.get(account, 0.0) - max(0.0, self.service.get(account, 0.0) - self.seen.get(account, 0.0))
 
   def used(self, node: str, skip: str = "") -> int:
     return sum(p.spec.gpus for n, p in self.procs.items() if n != skip and p.node == node)
@@ -90,12 +96,8 @@ class State:
     return sum(p.spec.gpus for n, p in self.procs.items() if n != skip and p.node == node and p.spec.exclusive)
 
   def busy_gpus(self, node: str, skip: str = "") -> int:
-    on = (
-      p.spec.gpus
-      for n, p in self.procs.items()
-      if n != skip and p.node == node and not p.spec.exclusive and self.busy(n)
-    )
-    return sum(on)
+    shared = (n for n, p in self.procs.items() if p.node == node and not p.spec.exclusive and n != skip)
+    return sum(self.procs[n].spec.gpus for n in shared if self.busy(n))
 
   def spare(self, node: str, skip: str = "") -> int:
     return self.nodes[node][0] - self.excl_used(node, skip) - self.busy_gpus(node, skip)
@@ -134,7 +136,7 @@ def from_state(raw: dict) -> State:
 
 
 def to_plan(s: State) -> dict:
-  procs = {n: {"spec": dataclasses.asdict(p.spec), "node": p.node} for n, p in s.procs.items()}
+  procs = {n: dataclasses.asdict(p) for n, p in s.procs.items()}
   plan = {"made": s.made, "procs": procs, "home": s.home, "lag": s.lag, "seen": s.seen}
   return plan | ({"weights": s.weights} if s.weights else {})
 
@@ -181,17 +183,23 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
   return {a: (v if a in active else min(0.0, v)) for a, v in lag.items() if a in active or v < -1e-9}, seen
 
 
-def select_runs(heads: list[Cmd], service: dict[str, float], width: int, prefer: str | None = None) -> list[str]:
+def select_runs(
+  state: State, heads: list[Cmd], service: dict[str, float], width: int, prefer: str | None = None
+) -> list[str]:
+  """Fill a wave from accounts tied for most owed service; apply run preferences only within that tier."""
   if width < 1:
     raise ValueError("batch width must be positive")
-  ready = dict(reversed([(c.run, c) for c in heads]))
-  floor = min((service[r] for r in ready if r in service), default=0.0)
+  ready = {cmd.run: cmd for cmd in reversed(heads)}
+  floor = min((service[run] for run in ready if run in service), default=0.0)
 
-  def rank(c: Cmd) -> tuple:
-    prio = (c.run != prefer, c.op != Op.SAVE_WEIGHTS_FOR_SAMPLER, service.get(c.run, floor))
-    return (*prio, *map(int, c.entry_id.split("-")), c.run)
+  def rank(cmd: Cmd) -> tuple:
+    arrival = tuple(map(int, cmd.entry_id.split("-")))
+    return cmd.run != prefer, cmd.op != Op.SAVE_WEIGHTS_FOR_SAMPLER, service.get(cmd.run, floor), arrival, cmd.run
 
-  return [c.run for c in sorted(ready.values(), key=rank)[:width]]
+  lag = {run: state.ready_lag(run) for run in ready}
+  highest = max(lag.values(), default=0.0)
+  eligible = (cmd for run, cmd in ready.items() if lag[run] == highest)
+  return [cmd.run for cmd in sorted(eligible, key=rank)[:width]]
 
 
 # ***** placement, elastic scaling, and cross-node rebalance *****
@@ -209,20 +217,15 @@ def choose_node(s: State, proc: str, only_spare: bool = False) -> tuple[str, boo
   samplers = [n for n, p in s.procs.items() if (p.node or n == proc) and p.spec.role == Role.SAMPLER]
   covered = {s.jobs[r].train_run for n in samplers for r in s.runs(n)}
 
-  def room(node: str, need: int) -> bool:
+  def placement_rank(node: str) -> tuple:
     unpaired = [n for n, p in s.procs.items() if p.node == node and p.spec.role == Role.TRAINER and not p.spec.lora]
     owed = sum(s.procs[n].spec.gpus for n in unpaired if not (covered & set(s.runs(n))))
-    return s.used(node, skip) + owed + need <= s.nodes[node][0]
+    used, capacity = s.used(node, skip), s.nodes[node][0]
+    free = capacity - used - owed
+    paired = spec.gpus * (2 if spec.role == Role.TRAINER and not spec.lora else 1)
+    return free < paired, free < spec.gpus, s.spare(node, skip) < spec.gpus, node not in near, used / capacity
 
-  pair = 2 * spec.gpus if spec.role == Role.TRAINER and not spec.lora else spec.gpus
-  preds = (room, pair), (room, spec.gpus)
-  for fn in (
-    *(lambda n, f=f, k=k: f(n, k) for f, k in preds),
-    lambda n: s.spare(n, skip) >= spec.gpus,
-    near.__contains__,
-  ):
-    nodes = [n for n in nodes if fn(n)] or nodes
-  node = min(nodes, key=lambda n: s.used(n, skip) / s.nodes[n][0])
+  node = min(nodes, key=placement_rank)
   return node, node in near
 
 

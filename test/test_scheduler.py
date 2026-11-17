@@ -9,13 +9,13 @@ from unittest import mock
 
 import torch
 
-from test.execution import TestNode
+from test.execution import InlineProcess, TestNode
 from test.helpers import FakeEngine, RedisTest, new_id, tiny
 from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
 from tinyrl.api import wire
-from tinyrl.bus import Bus, Cmd, Ev, Op, Role, Run, connect, key
+from tinyrl.bus import GROUP, LEASE_MS, Bus, Cmd, Ev, Op, Role, Run, connect, key
 from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import QUANTUM_MS, NodeDaemon, plan_gpus
 from tinyrl.control.scheduler import (
@@ -345,9 +345,25 @@ class TestLocalQuantum(unittest.TestCase):
     heads = [Cmd(run, "1-0", Op.FORWARD_BACKWARD, b"") for run in ("slow", "fast")]
     service = {"slow": 0.0, "fast": 0.0}
     for _ in range(11):
-      [run] = select_runs(heads, service, 1)
+      [run] = select_runs(State(), heads, service, 1)
       service[run] += 10 if run == "slow" else 1
     self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
+
+  def test_continuations_and_sampler_saves_do_not_override_account_lag(self):
+    cluster = Cluster()
+    cluster.run("current", account="alice")
+    cluster.run("save", account="alice")
+    cluster.run("waiting", account="bob")
+    state = cluster.s
+    state.lag = {"alice": 10, "bob": 5}
+    state.seen = {"alice": 100}
+    state.service = {"alice": 110}
+    heads = [
+      Cmd("current", "1-0", Op.OPTIM_STEP, b""),
+      Cmd("save", "2-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""),
+      Cmd("waiting", "3-0", Op.OPTIM_STEP, b""),
+    ]
+    self.assertEqual(select_runs(state, heads, {}, width=3, prefer="current"), ["waiting"])
 
   def test_claim_gpus_enforces_exclusivity_and_exact_gang_width(self):
     node = self.make_daemon(2)
@@ -727,6 +743,42 @@ class TestMultiNodeExecution(RedisTest):
     for r in (r1, r2):
       torch.testing.assert_close(self.live_params(r), ref.params[ctrl])
 
+  async def test_shared_trainer_splits_gpu_time_by_account_not_run_count(self):
+    node = await self.add_node("single-gpu")
+    accounts = {new_id(): account for account in ("alice", "alice", "alice", "bob")}
+    observed = {account: 0.0 for account in accounts.values()}
+    completed = []
+    original = InlineProcess.call
+
+    async def timed_call(process, method, *args):
+      if method != "execute" or args[0].op != Op.OPTIM_STEP:
+        return await original(process, method, *args)
+      run = args[0].run
+      start = time.monotonic()
+      await asyncio.sleep(0.012 if accounts[run] == "alice" else 0.004)
+      result = await original(process, method, *args)
+      observed[accounts[run]] += time.monotonic() - start
+      completed.append(run)
+      return result
+
+    self.start_scheduler()
+    for run, account in accounts.items():
+      await self.bus.create_run(Run(run, "tiny", 4, lora=LORA, account=account))
+      await self.run_cmd(run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode())
+    with mock.patch.object(InlineProcess, "call", timed_call):
+      backlog = self.bus.r.pipeline()
+      for run in accounts:
+        for _ in range(100):
+          backlog.xadd(key("q", run), {"op": Op.OPTIM_STEP, "body": b'{"adam_params":{}}'})
+      await backlog.execute()
+      async with asyncio.timeout(30):
+        while len(completed) < 80:
+          await asyncio.sleep(0.005)
+
+    self.assertEqual(len(node.processes), 1)
+    self.assertEqual(set(completed), set(accounts))
+    self.assertAlmostEqual(observed["alice"] / sum(observed.values()), 0.5, delta=0.1)
+
   async def test_lora_runs_split_onto_new_node_and_merge_back_with_exact_weights(self):
     opt = json.dumps({"adam_params": {"learning_rate": 1e-2}}).encode()
     await self.add_node("node-a", gpus=1)
@@ -813,21 +865,15 @@ class TestMultiNodeExecution(RedisTest):
 
     await self.until(scaled_in)
 
-    orig_reclaim = Bus.reclaim_commands
-    with mock.patch.object(
-      Bus, "reclaim_commands", lambda b, runs, c, idle_ms=10, count=64: orig_reclaim(b, runs, c, 10, count)
-    ):
-      stranded = await self.submit(sid, Op.SAMPLE, payload, cost=50)
-      claimed = await self.bus.take_commands([sid], "dead@gone-1", 1)
-      if claimed:
-        await asyncio.sleep(0.03)
-        kick = await self.submit(sid, Op.SAMPLE, payload, cost=50)
-        self.assertTrue((await self.bus.wait_for_reply(kick, 5)).ok)
-        self.assertTrue((await self.bus.wait_for_reply(stranded, 5)).ok)
-        self.assertEqual(int(await self.bus.r.hget(key("run", sid), "tokens")), (total_cmds + 2) * 50)
-      else:
-        self.assertTrue((await self.bus.wait_for_reply(stranded, 5)).ok)
-        self.assertEqual(int(await self.bus.r.hget(key("run", sid), "tokens")), (total_cmds + 1) * 50)
+    # Deliver the final sample to a crashed replica before a live replica can see it.
+    queue = key("q", sid)
+    p = self.bus.r.pipeline()
+    p.xadd(queue, {"op": Op.SAMPLE, "body": payload, "cost": 50})
+    p.xreadgroup(GROUP, "dead", {queue: ">"}, count=1)
+    eid, _ = await p.execute()
+    await self.bus.r.xclaim(queue, GROUP, "dead", 0, [eid], idle=LEASE_MS)
+    self.assertTrue((await self.bus.wait_for_reply(f"{sid}/{eid.decode()}", 5)).ok)
+    self.assertEqual((await self.bus.get_run(sid))["tokens"], (total_cmds + 1) * 50)
     self.assertGreater((await self.bus.read_state())["service"]["team-s"], svc_before)
 
   async def test_split_brain_plan_never_breaks_gpu_exclusivity_or_single_writer_safety(self):

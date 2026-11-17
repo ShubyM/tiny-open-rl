@@ -25,6 +25,7 @@ import time
 import urllib.request
 import uuid
 import weakref
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import fsspec
@@ -285,18 +286,19 @@ class Store:
 
   def record_latest_version(self, uri: str, version: str) -> None:
     """Record on this node which version of a checkpoint it saved last, for this node's other processes."""
-    os.makedirs(f"{self.cache}/latest", exist_ok=True)
-    tmp = f"{self.cache}/latest/.{uuid.uuid4().hex}"
-    with open(tmp, "w") as f:
-      f.write(version)
-    os.replace(tmp, f"{self.cache}/latest/{hashlib.sha256(uri.encode()).hexdigest()[:32]}")
+    pointer = self.version_pointer(uri)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    tmp = pointer.with_name(f".{uuid.uuid4().hex}")
+    tmp.write_text(version)
+    tmp.replace(pointer)
+
+  def version_pointer(self, uri: str) -> Path:
+    return Path(self.cache, "latest", hashlib.sha256(uri.encode()).hexdigest()[:32])
 
   def latest_version_here(self, uri: str) -> str | None:
-    pointer = f"{self.cache}/latest/{hashlib.sha256(uri.encode()).hexdigest()[:32]}"
-    if not os.path.exists(pointer):  # nothing saved on this node yet
-      return None
-    with open(pointer) as f:
-      return f.read()
+    with contextlib.suppress(FileNotFoundError):
+      return self.version_pointer(uri).read_text()
+    return None
 
   def upload_version(self, dest: str, version: str, names: list[str]) -> None:
     folder, rel = f"{self.cache}/{version}", dest[len(self.base) + 1 :]
@@ -360,11 +362,10 @@ class Store:
     info = self.latest(dest)
     if version and info.get("version") != version:
       raise ValueError(f"version {version} of {uri} has not landed" + (f", and {peer} failed to copy" if peer else ""))
-    if not info:
-      raise ValueError(f"no checkpoint at {uri}")
-    version, names = info["version"], info["files"]
+    names = info.get("files", ())
     if not any(n.endswith(".safetensors") for n in names):
       raise ValueError(f"no checkpoint at {uri}")
+    version = info["version"]
     src = f"{self.base}/{info['dir']}" if info.get("dir") else dest
     return self.cached_folder(version, lambda tmp: self.download_files(src, names, tmp)), version
 
@@ -399,21 +400,15 @@ class Store:
     parallel(lambda n: self.fs.get_file(f"{src}/{n}", f"{folder}/{n}"), names)
 
   def weight_files(self, uri: str, version: str | None = None) -> list[str]:
-    folder = self.local_folder(uri, version)[0]
-    if os.path.islink(folder):
-      folder = os.path.join(os.path.dirname(folder), os.readlink(folder))
+    folder = os.path.realpath(self.local_folder(uri, version)[0])
     return sorted(glob.glob(f"{folder}/*.safetensors"))
 
   @span("store.get")
   def get(self, uri: str, version: str | None = None) -> tuple[dict[str, torch.Tensor], dict]:
-    import safetensors
-
-    def load(path: str) -> dict[str, torch.Tensor]:
-      with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-        return {k: f.get_tensor(k) for k in f.keys()}
+    from safetensors.torch import load_file
 
     paths = self.weight_files(uri, version)
-    return {k: v for s in parallel(load, paths) for k, v in s.items()}, header(paths[0])
+    return {k: v for shard in parallel(load_file, paths) for k, v in shard.items()}, header(paths[0])
 
   def read_meta(self, uri: str) -> dict:
     return header(self.weight_files(uri)[0])

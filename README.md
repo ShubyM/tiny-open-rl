@@ -44,14 +44,13 @@ the event loop and overlaps startup and execution. A slow download does not bloc
 otherwise idle worker from yielding its GPU. Executable commands are claimed only after GPU admission, one bounded batch
 at a time. A preparation error claims and answers its failed head without waiting for a GPU.
 
-Within a shared engine, `turns.select_runs` chooses the ready runs served the fewest tokens, after any sampler save,
-which a sampler is waiting on. A trainer may continue its current run for up to `RUN_COMMANDS` commands while its next
-command is queued, before choosing by service again. The same model process stays resident when switching runs. This is
-fairness between ready runs in one engine; GPU admission uses its own waiting order and does not establish a global
-per-user share.
-Each command carries its cost, set when it is queued: the tokens a `forward_backward` trains on, a sample's prompt plus
-the most tokens it may generate, and 1 for anything else. A newly ready run joins the active service floor, so waiting
-on input preparation does not accumulate catch-up credit.
+Under contention, the planner divides available GPU time among backlogged accounts according to their weights and
+demand. Both the node and its shared trainers select the ready account owed the most service. Starting more LoRA
+runs on the same base does not buy an account more turns. Among equally owed accounts, a trainer can continue its
+current run for up to `RUN_COMMANDS` commands, then prioritizes sampler saves and the runs served the fewest GPU-ms.
+Sampling can batch multiple ready runs at the same priority. Each interval of a wave is split among the requests still
+executing: for two requests finishing at 100 and 900 ms on one GPU, the charges are 50 and 850 GPU-ms.
+Token estimates are still reported as run counters, but do not determine service.
 
 The node keeps actual process placements, waiting order and GPU reservations outside the replayed cluster assignment
 log. Preparation completion and scheduling changes wake workers through the same node change event. Workers on
@@ -68,9 +67,9 @@ can select another engine implementing async `start(base, lora, env)`, `load_che
 `sleep()`, `wake()` and `close()`. Settings are per engine; loading an already loaded checkpoint name must be idempotent,
 and `close()` must wait for its processes to exit. Checkpoint names include both the URI and its version.
 
-The node reserves every GPU of a worker together, honoring ticket order on each GPU. One process is on a GPU
-at a time, and workers that share a GPU take turns. An idle holder yields to a waiter, and a busy holder yields
-once it has served `TURN` tokens (200,000) since it was granted. Training yields between commands; sampling yields
+The node reserves every GPU of a worker together. An idle shared holder yields to a ready waiter. A busy holder
+gets a minimum wall-clock quantum, extended when parking and resuming are expensive. Once that quantum expires,
+the node can hand the GPUs to a ready process whose account is owed more service. Training yields between commands; sampling yields
 between waves of up to `SAMPLE_RUNS` LoRA sessions or one full fine-tune session, with at most `SAMPLE_COMMANDS` commands
 per session. This GPU turn is separate from a run's continuation budget. The reservation starts before wake and remains
 held until parking acknowledges or the entire process group has exited. A trainer's
@@ -89,7 +88,8 @@ services, stop the nodes gracefully and restart the scheduler and node daemons t
 | Variable | Default | Controls |
 |---|---|---|
 | `RUN_COMMANDS` | 4 | Commands in a preferred trainer continuation |
-| `TURN` | 200000 | Tokens in a GPU turn while another worker waits, checked between commands or waves |
+| `QUANTUM_MS` | 2000 | Minimum busy GPU turn, checked between commands or waves |
+| `SWITCH_BUDGET` | 0.1 | Target ratio of measured park and resume time to useful time in a turn |
 | `SAMPLE_RUNS` | 3 | LoRA sessions in a sampling wave; full fine-tunes use one |
 | `SAMPLE_COMMANDS` | 128 | Commands from each session in a wave |
 
@@ -160,8 +160,8 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 
 Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains the streams. Then read [gateway.py](tinyrl/api/gateway.py)
 to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/scheduler.py) for how the cluster places workers on nodes,
-[turns.py](tinyrl/control/turns.py) for how a node chooses GPUs, turns and the next run,
-and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU handoff,
+[accounting.py](tinyrl/control/accounting.py) for how concurrent model calls share GPU time,
+and [node_daemon.py](tinyrl/control/node_daemon.py) for local GPU selection, worker lifetimes and handoff,
 [store.py](tinyrl/storage/store.py) to see how checkpoints are stored, and [trainer.py](tinyrl/workers/trainer.py) and
 [model.py](tinyrl/workers/model.py) to see how a command runs on the model.
 
@@ -171,7 +171,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy arrays |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | the cluster's assignment: runs to workers, workers to nodes |
-| [tinyrl/control/turns.py](tinyrl/control/turns.py) | a node's own decisions: its workers' GPUs, their turns, and the run served next |
+| [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | monotonic GPU-time measurement across overlapping calls |
 | [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | worker lifetimes, leases, ready work, GPU reservations and recovery |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | private model IPC and parent-owned process groups |
 | [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | model memory and GPU-width estimates |
@@ -191,7 +191,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 
 Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `TURN`,
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM_MS`,
 `RUN_COMMANDS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `IDLE_MS`, `DRAIN_S`,
 `ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted), `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 

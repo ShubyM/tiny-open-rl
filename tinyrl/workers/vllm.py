@@ -93,16 +93,15 @@ class VLLM:
       "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
     }
     extra = shlex.split(options.get("VLLM_ARGS", ""))
-    if not any(
-      a == "--compilation-config" or a.startswith("--compilation-config=") or a.startswith("-O") for a in extra
-    ):
-      extra += ["--compilation-config", CUDAGRAPH_CONFIG]
-    if not any(a == "--kernel-config" or a.startswith("--kernel-config=") for a in extra):
-      extra += ["--kernel-config", KERNEL_CONFIG]
-    if (kv := options.get("TINYRL_KV_BYTES")) and not any(
-      a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra
-    ):
-      extra += ["--kv-cache-memory-bytes", kv]
+    supplied = {arg.partition("=")[0] for arg in extra}
+    if any(arg.startswith("-O") for arg in extra):
+      supplied.add("--compilation-config")
+    defaults = {"--compilation-config": CUDAGRAPH_CONFIG, "--kernel-config": KERNEL_CONFIG}
+    if kv := options.get("TINYRL_KV_BYTES"):
+      defaults["--kv-cache-memory-bytes"] = kv
+    for option, value in defaults.items():
+      if option not in supplied:
+        extra.extend((option, value))
     flags += extra
 
     def serve(*listen: str) -> list[str]:
@@ -240,13 +239,8 @@ class VLLM:
     scored = job["prompt_logprobs"] or job["topk_prompt"] > 0
     req = {
       "model": name if self.lora and name else self.base,
-      "prompt": job["prompt"],
+      **{k: job[k] for k in ("prompt", "max_tokens", "temperature", "top_k", "top_p", "seed")},
       "n": job["num_samples"],
-      "max_tokens": job["max_tokens"],
-      "temperature": job["temperature"],
-      "top_k": job["top_k"],
-      "top_p": job["top_p"],
-      "seed": job["seed"],
       "stop": strs,
       "stop_token_ids": ids,
       "logprobs": max(1, job["topk_sample"]),

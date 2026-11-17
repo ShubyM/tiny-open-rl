@@ -18,7 +18,9 @@ from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Reply
 from tinyrl.storage.store import Store, nbytes
 from tinyrl.trace import span
-from tinyrl.workers.model import Model
+from tinyrl.workers.model import GradientRecoveryError, Model
+
+RECOVERABLE_ERRORS = (ValueError, KeyError, GradientRecoveryError)
 
 
 def ok(body: dict) -> Reply:
@@ -28,7 +30,7 @@ def ok(body: dict) -> Reply:
 def serve_follower(model: Model) -> None:
   while True:
     dist.broadcast_object_list(msg := [None], src=0)
-    with contextlib.suppress(ValueError, KeyError):  # rejected the same way on every rank, before any collective
+    with contextlib.suppress(*RECOVERABLE_ERRORS):  # rejected the same way on every rank, before any collective
       getattr(model, msg[0][0])(*msg[0][1])
 
 
@@ -46,7 +48,7 @@ class Trainer:
         return getattr(self.model, method)(*args)
     except Exception as e:
       # The other ranks may be waiting in a collective this rank left; torchrun must restart them all.
-      if self.world_size > 1 and not isinstance(e, (ValueError, KeyError)):
+      if self.world_size > 1 and not isinstance(e, RECOVERABLE_ERRORS):
         os._exit(1)
       raise
 
@@ -55,13 +57,8 @@ class Trainer:
   ) -> dict:
     tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
     version = self.store.put(uri, tensors, meta)
-    return {
-      "uri": uri,
-      "size": sum(map(nbytes, tensors.values())),
-      "ttl": ttl_seconds,
-      "owned": owned,
-      "version": version,
-    }
+    size = sum(map(nbytes, tensors.values()))
+    return {"uri": uri, "size": size, "ttl": ttl_seconds, "owned": owned, "version": version}
 
   def load_run(self, run: str, uri: str, version: str | None, optimizer: bool, gradients: bool) -> None:
     self.call_model("restore_run", run, *self.store.get(uri, version), optimizer, gradients)
@@ -71,6 +68,7 @@ class Trainer:
   ) -> tuple[Reply, dict]:
     with span("trainer.execute"):
       effects, created = {}, False
+      revision = None
       try:
         if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
           if cmd.op == Op.DELETE_MODEL:
@@ -85,34 +83,27 @@ class Trainer:
             self.load_run(cmd.run, *snap, optimizer=True, gradients=True)
             created = False  # recovery succeeded, even if the command that follows is rejected
 
+        revision = self.model.state_revision  # restoring the parked state itself leaves its snapshot valid
         if cmd.op == Op.FORWARD_BACKWARD:
           req = wire.parse(cmd.body)
           fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
           logprobs, metrics = self.call_model("forward_backward", *fb)
-          if not req.forward_only:
-            effects["mutated"] = True
           return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), effects
 
         args = json.loads(cmd.body)
         match cmd.op:
           case Op.CREATE_MODEL:
             self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
-            effects["mutated"] = True
           case Op.OPTIM_STEP:
             metrics = self.call_model("optim_step", cmd.run, args["adam_params"])
-            effects["mutated"] = True
             return ok({"type": cmd.op, "metrics": metrics}), effects
           case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
+            sampler = cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER
             effects["saved"] = self.save(
-              cmd.run,
-              args["uri"],
-              cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER,
-              args.get("ttl_seconds"),
-              args.get("owned", False),
+              cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False)
             )
           case Op.LOAD_WEIGHTS:
             self.load_run(cmd.run, args["uri"], version, optimizer=args["optimizer"], gradients=False)
-            effects["mutated"] = True
           case Op.DELETE_MODEL:
             self.drop_run(cmd.run)
           case _:
@@ -127,12 +118,12 @@ class Trainer:
           self.drop_run(cmd.run)
         return Reply.error(e), effects
       finally:
-        effects["loaded"] = cmd.run in self.model.params
+        loaded = cmd.run in self.model.params
+        effects.update(loaded=loaded, mutated=loaded and revision is not None and self.model.state_revision != revision)
 
   def save_run(self, run: str) -> dict | None:
-    if run not in self.model.params:
-      return None
-    return self.save(run, f"tinker://{run}/parked/{time.time_ns()}", owned=True)
+    if run in self.model.params:
+      return self.save(run, f"tinker://{run}/parked/{time.time_ns()}", owned=True)
 
   def drop_run(self, run: str) -> None:
     if run in self.model.params:

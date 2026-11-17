@@ -13,7 +13,7 @@ from test.execution import TestNode
 from test.helpers import RedisTest, new_id, tiny
 from test.test_process import require_unix
 from test.test_sampler import JOB
-from tinyrl.bus import Op, Role, Run
+from tinyrl.bus import GROUP, LEASE_MS, Op, Role, Run, key
 from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.storage.store import Store
@@ -143,12 +143,43 @@ class TestNodeDaemon(RedisTest):
       version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
       await self.registry.register_checkpoint(uri, 0, version=version)
       await self.bus.create_run(Run("lost", "tiny", 4, role=Role.SAMPLER, model_path=uri))
-      await node.bind("sampler", "lost")
       request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
+      [cmd] = await self.bus.take_commands(["lost"], "dead", 1)
+      await self.bus.r.xclaim(key("q", "lost"), GROUP, "dead", 0, [cmd.entry_id], idle=LEASE_MS)
+      await node.bind("sampler", "lost")
       waiting = self.background(self.bus.wait_for_reply(request, 10))
       await self.until(waiting.done, node)
       self.assertFalse(waiting.result().ok)
       self.assertIn("has not landed, and 127.0.0.1:9 failed to copy", waiting.result().body.decode())
+
+  async def test_dead_trainer_cleanup_fails_only_the_command_it_claimed(self):
+    node, run = self.node(), new_id()
+    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
+    life = await node.bind("worker", run)
+    await self.create(run, "tiny", node)
+    child = node.processes["worker"]
+    entered, stopped = asyncio.Event(), asyncio.Event()
+    call = child.call
+
+    async def die_during_execute(method, *args):
+      if method == "execute":
+        entered.set()
+        await stopped.wait()
+        child.kill()
+      return await call(method, *args)
+
+    child.call = die_during_execute
+    first = await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}")
+    await asyncio.wait_for(entered.wait(), 5)
+    next_request = await self.bus.submit_command(run, Op.CREATE_MODEL, b'{"base_model":"tiny","rank":4,"lora":{}}')
+    stopped.set()
+    try:
+      await asyncio.wait_for(life.task, 5)
+    except* EOFError:
+      pass  # A task group may wrap the child's disconnect.
+    self.assertFalse((await self.bus.wait_for_reply(first, 0)).ok)
+    self.assertEqual(await self.bus.queued_and_in_flight(run), {"live": True, "queued": 1, "in_flight": []})
+    await self.reply(next_request, node)
 
   async def test_admission_waits_for_the_previous_model_process_to_park(self):
     require_unix()
@@ -200,15 +231,14 @@ class TestNodeDaemon(RedisTest):
     proc = node.state.home[run][0]
     first = node.lives[proc].model.proc.pid
     # When GPU 0 is busy (draining/occupied), the 1-GPU trainer hops to GPU 1 without restarting its subprocess.
-    node.draining_gpus.add(0)
-    node.notify()
+    await node.claim_after_drain("checkpoint", (0,))
     try:
       request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
       await self.reply(request, node)
       self.assertEqual(node.lives[proc].model.proc.pid, first)
       self.assertEqual(node.on[node.lives[proc].life], (1,))
     finally:
-      node.draining_gpus.clear()
+      node.release_gpus("checkpoint")
     os.killpg(first, signal.SIGKILL)
     await self.until(lambda: proc in node.lives and node.lives[proc].model.proc.pid != first, node)
     await self.create(run, base, node)
