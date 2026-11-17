@@ -145,9 +145,7 @@ class Trainer:
   def park(self) -> None:
     self.call_model("park_on_host")
 
-  def resume(self, gpu: int | None = None) -> None:
-    if gpu is not None and torch.cuda.is_available():
-      torch.cuda.set_device(gpu)
+  def resume(self) -> None:
     self.call_model("resume_on_gpu")
 
 

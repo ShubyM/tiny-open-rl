@@ -70,8 +70,11 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
   async def worker(self, run: str) -> str:
     """The run's worker, once every new run is assigned the way the scheduler assigns it."""
+    from tinyrl.control import scheduler
+
     await assign_new_runs(self.bus)
-    return (await self.bus.get_run(run))["worker"]
+    state = scheduler.from_table(await self.bus.read_table())
+    return next(n for n in state.workers if run in scheduler.jobs_of(state, n))
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
@@ -81,16 +84,19 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
 
 async def assign_new_runs(bus) -> None:
-  """Assign new runs the way the scheduler would, without placing anything."""
+  """Assign new runs (and create unpinned samplers' workers) the way the scheduler would, without placing anything."""
   from tinyrl.control import scheduler
 
   s = scheduler.from_table(await bus.read_table())
+  s.nodes.clear()
   new, changes = scheduler.decide(s)
   runs = {body["run"]: body["worker"] for kind, body in changes if kind == "assigned"}
   new_workers = {
-    w: {"spec": dataclasses.asdict(new.workers[w].spec), "node": None} for w in set(runs.values()) - s.workers.keys()
+    w: {"spec": dataclasses.asdict(new.workers[w].spec), "node": None, "gpus": []}
+    for w in new.workers.keys() - s.workers.keys()
   }
-  await bus.write_table(runs, new_workers, [], new.workers_made, [])
+  if runs or new_workers or new.workers_made != s.workers_made:
+    await bus.write_table(runs, new_workers, [], new.workers_made, [])
 
 
 class FakeEngine:

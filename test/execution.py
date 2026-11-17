@@ -1,9 +1,10 @@
 """Real node control with a synchronous CPU model in place of the local socket process."""
 
 import asyncio
+import dataclasses
 
 from test.helpers import FakeEngine, assign_new_runs, tiny
-from tinyrl.control import scheduler, turns
+from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.workers.model import Model
 from tinyrl.workers.trainer import Trainer
@@ -35,7 +36,7 @@ class TestNode(NodeDaemon):
   def __init__(self, bus, store=None, gpus=8, node="test-node", model=tiny, engine=FakeEngine, gpu_mib=0):
     super().__init__(bus, gpus=gpus, node=node, gpu_mib=gpu_mib, store=store)
     self.default_model, self.engine_type = model, engine
-    self.processes, self.samplers, self.pinned = {}, {}, set()
+    self.processes, self.samplers, self.pinned = {}, {}, {}
     self.state.nodes[self.id] = (gpus, gpu_mib * 2**20)
 
   def open_trainer(self, worker, env):
@@ -53,21 +54,25 @@ class TestNode(NodeDaemon):
     """The table, with the workers a test placed here itself, since no scheduler places them."""
     state = scheduler.from_table(await self.bus.read_table())
     state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))  # live before its first heartbeat
-    for worker in self.pinned & state.workers.keys():
-      state.workers[worker].node = self.id
-    return turns.keep_chosen_gpus(state, self.state)
+    for worker, gpus in self.pinned.items():
+      if worker in state.workers:
+        state.workers[worker].node, state.workers[worker].gpus = self.id, gpus
+    return state
 
   async def sync(self):
     self.state = await self.read_state()
 
   async def add(self, worker, gpus=None):
-    self.pinned.add(worker)
     await self.sync()
     self.dispatch()
-    desired = self.state.workers[worker]
     if gpus is not None:
-      desired.gpus = tuple(gpus)
-    turns.place_gpus(self.state, self.id, self.running)
+      self.pinned[worker] = tuple(gpus)
+    elif worker not in self.pinned:
+      only_here = dataclasses.replace(self.state, nodes={self.id: self.state.nodes[self.id]})
+      fit = scheduler.best_placement(only_here, worker, {})
+      self.pinned[worker] = fit[2] if fit is not None else tuple(range(self.state.workers[worker].spec.gpus))
+    desired = self.state.workers[worker]
+    desired.node, desired.gpus = self.id, self.pinned[worker]
     if worker in self.running:
       return self.running[worker]
     task = self.tasks.get(worker) or self.start(worker)
@@ -82,7 +87,7 @@ class TestNode(NodeDaemon):
   async def worker_for(self, run):
     await assign_new_runs(self.bus)
     await self.sync()
-    return r.worker if (r := self.state.jobs.get(run)) else None
+    return next((n for n in self.state.workers if run in scheduler.jobs_of(self.state, n)), None)
 
   async def drain(self, run):
     """Let the real worker coroutines finish the commands visible in their Redis streams."""

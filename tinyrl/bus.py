@@ -242,28 +242,28 @@ class Bus:
   # ***** the cluster's assignment *****
 
   async def read_table(self) -> dict:
-    """What the scheduler places from, read together: live nodes, each job's record and worker, and each worker's spec and node."""
+    """What the scheduler places from, read together: live nodes, each job's record, worker and backlog, and each worker's spec, node and GPUs."""
     nodes, runs = await self.live_nodes(details=True), sorted(r.decode() for r in await self.r.smembers(key("runs")))
-    p = self.r.pipeline(transaction=True)
+    p, out_runs, backlog = self.r.pipeline(transaction=False), {}, {}
     for run in runs:
       p.hmget(key("run", run), "record", "worker")
+      p.xinfo_groups(key("q", run))
     p.hgetall(key("workers"))
     p.get(key("workers_made"))
-    *records, workers, workers_made = await p.execute()
-    return {
-      "nodes": nodes,
-      "runs": {r: (json.loads(rec), w and w.decode()) for r, (rec, w) in zip(runs, records) if rec},
-      "workers": {k.decode(): json.loads(v) for k, v in workers.items()},
-      "workers_made": int(workers_made or 0),
-    }
+    raw = await p.execute(raise_on_error=False)
+    for r, row, groups in zip(runs, raw[0:-2:2], raw[1:-2:2]):
+      if not isinstance(row, Exception) and row and row[0]:
+        out_runs[r] = (json.loads(row[0]), row[1] and row[1].decode())
+        if not isinstance(groups, Exception) and (g := next((x for x in groups if x["name"] == GROUP.encode()), None)):
+          backlog[r] = int(g.get("lag") or 0) + int(g.get("pending") or 0)
+    workers = {k.decode(): json.loads(v) for k, v in raw[-2].items()}
+    return {"nodes": nodes, "runs": out_runs, "backlog": backlog, "workers": workers, "workers_made": int(raw[-1] or 0)}
 
-  async def write_table(
-    self, assigned: dict[str, str], workers: dict[str, dict], gone: list[str], workers_made: int, changes: list
-  ) -> None:
+  async def write_table(self, assigned: dict, workers: dict, gone: list, workers_made: int, changes: list) -> None:
     """The scheduler's new assignment, and a trace entry for each change, at once. Only the scheduler writes it."""
     p = self.r.pipeline(transaction=True)
     for run, worker in assigned.items():
-      p.hset(key("run", run), "worker", worker)
+      p.hset(key("run", run), "worker", worker) if worker else p.hdel(key("run", run), "worker")
     if workers:
       p.hset(key("workers"), mapping={n: json.dumps(w) for n, w in workers.items()})
     if gone:
@@ -295,11 +295,9 @@ class Bus:
     p = self.r.pipeline()
     for run_id in runs:
       p.hgetall(key("run", run_id))
-    return {
-      (f.get(b"worker", b"sampler").decode(), run_id): {c: int(f.get(c.encode(), 0)) for c in COUNTERS}
-      for run_id, f in zip(runs, await p.execute())
-      if f and (b"worker" in f or json.loads(f[b"record"]).get("role") == Role.SAMPLER)
-    }
+    rows = zip(runs, await p.execute())
+    ok = [(r, f) for r, f in rows if f and (b"worker" in f or json.loads(f[b"record"]).get("role") == Role.SAMPLER)]
+    return {(f.get(b"worker", b"sampler").decode(), r): {c: int(f.get(c.encode(), 0)) for c in COUNTERS} for r, f in ok}
 
   async def delete_run(self, run_id: str, worker: str) -> None:
     """Take a deleted run out of its worker and delete its stream, in one transaction."""
@@ -330,20 +328,18 @@ class Bus:
 
   async def dead_consumers(self, runs: list[str]) -> dict[str, list[str]]:
     """For each run, the stream consumers holding pending entries whose process lease is gone."""
-    if not runs:
-      return {}
-    p, per_run, names = self.r.pipeline(transaction=False), {}, set()
+    p, per_run = self.r.pipeline(transaction=False), {}
     for run in runs:
       p.xinfo_consumers(key("q", run), GROUP)
-    for run, info in zip(runs, await p.execute(raise_on_error=False)):
+    for run, info in zip(runs, await p.execute(raise_on_error=False)) if runs else ():
       if isinstance(info, Exception):
         if "NOGROUP" not in str(info) and "no such key" not in str(info):
           raise info
       elif holders := [c["name"].decode() for c in info if c["pending"] > 0]:
-        per_run[run], names = holders, names | set(holders)
-    if not names:
+        per_run[run] = holders
+    if not (ordered := sorted({n for h in per_run.values() for n in h})):
       return {}
-    ordered, lp = sorted(names), self.r.pipeline(transaction=False)
+    lp = self.r.pipeline(transaction=False)
     for name in ordered:
       lp.exists(key("lease", name))
     dead = {name for name, live in zip(ordered, await lp.execute()) if not live}
@@ -359,22 +355,20 @@ class Bus:
           if await p.exists(lease_key):
             return []
           try:
-            pending = await p.xpending_range(stream, GROUP, min="-", max="+", count=count, consumername=dead)
+            pending = await p.xpending_range(stream, GROUP, "-", "+", count, dead)
           except redis.ResponseError as e:
             if "NOGROUP" in str(e):
               return []
             raise
           p.multi()
-          if not pending:
-            p.xgroup_delconsumer(stream, GROUP, dead)
-            await p.execute()
-            return []
-          p.incr(reap_key)
-          p.expire(reap_key, 60)
-          p.xclaim(stream, GROUP, owner, 0, [e["message_id"] for e in pending])
+          if pending:
+            p.incr(reap_key)
+            p.expire(reap_key, 60)
+            p.xclaim(stream, GROUP, owner, 0, [e["message_id"] for e in pending])
           if len(pending) < count:
             p.xgroup_delconsumer(stream, GROUP, dead)
-          return [parse_cmd(run, *entry) for entry in (await p.execute())[2] if entry]
+          res = await p.execute()
+          return [parse_cmd(run, *entry) for entry in res[2] if entry] if pending else []
 
   async def peek_commands(self, runs: list[str], block_ms: int = 0, reclaim: bool = False) -> list[Cmd]:
     """Unclaimed heads (and dead-sampler pending heads when `reclaim` is True), in arrival order."""
@@ -382,9 +376,7 @@ class Bus:
     if reclaim:
       for run, dead_list in (await self.dead_consumers(runs)).items():
         with contextlib.suppress(redis.ResponseError):
-          if pend := await self.r.xpending_range(
-            key("q", run), GROUP, min="-", max="+", count=1, consumername=dead_list[0]
-          ):
+          if pend := await self.r.xpending_range(key("q", run), GROUP, "-", "+", 1, dead_list[0]):
             mid = pend[0]["message_id"]
             if entries := await self.r.xrange(key("q", run), min=mid, max=mid, count=1):
               heads[run] = parse_cmd(run, *entries[0])
@@ -398,8 +390,7 @@ class Bus:
       if isinstance(groups, Exception):
         if "no such key" not in str(groups):
           raise groups
-        continue
-      if group := next((g for g in groups if g["name"] == GROUP.encode()), None):
+      elif group := next((g for g in groups if g["name"] == GROUP.encode()), None):
         cursors[key("q", run)] = group["last-delivered-id"]
     if not cursors and not heads:
       await asyncio.sleep(block_ms / 1000)
@@ -412,9 +403,7 @@ class Bus:
         heads[run] = parse_cmd(run, *entries[0])
     return sorted(heads.values(), key=lambda c: (*map(int, c.entry_id.split("-")), c.run))
 
-  async def take_commands(
-    self, runs: list[str], owner: str, count: int = 16, block_ms: int = 0, reclaim: bool = False
-  ) -> list[Cmd]:
+  async def take_commands(self, runs: list, owner: str, count=16, block_ms=0, reclaim=False) -> list[Cmd]:
     """Claim only the selected work, reclaiming dead-sampler prompts first when `reclaim` is True."""
     cmds, need = [], dict.fromkeys(runs, count)
     if reclaim:
@@ -435,22 +424,15 @@ class Bus:
         if isinstance(got, Exception):
           if "NOGROUP" not in str(got):
             raise got
-          continue
-        cmds += [parse_cmd(run, entry_id, fields) for _, entries in got for entry_id, fields in entries]
+        else:
+          cmds += [parse_cmd(run, entry_id, fields) for _, entries in got for entry_id, fields in entries]
     if not cmds and block_ms:
       await self.peek_commands(runs, block_ms, reclaim=reclaim)
       return await self.take_commands(runs, owner, count, reclaim=reclaim)
     return cmds
 
   async def write_reply(
-    self,
-    cmd: Cmd,
-    reply: Reply,
-    owner: str,
-    started: float | None = None,
-    mutated: bool = False,
-    checkpoint: dict | None = None,
-    account: str = "",
+    self, cmd: Cmd, reply: Reply, owner: str, started=None, mutated=False, checkpoint=None, account=""
   ) -> bool:
     """Write a command's reply, acknowledge the command, and count it, all at once.
 
@@ -461,7 +443,7 @@ class Bus:
     row, stream, owner_key = key("run", cmd.run), key("q", cmd.run), key("owner", cmd.run)
     lease_key, reply_key, registry = key("lease", owner), key("f", cmd.request_id), key("ckpt", cmd.run)
     while True:
-      try:
+      with contextlib.suppress(redis.WatchError):
         async with self.r.pipeline(transaction=True) as p:
           if cmd.op == Op.SAMPLE:
             await p.watch(lease_key, reply_key)
@@ -483,8 +465,7 @@ class Bus:
           for name, n in added.items():
             p.hincrby(row, name, n)
           if started is not None:
-            vkey = key("vtime", account or cmd.run)
-            p.incrby(vkey, max(1, cmd.cost))
+            p.incrby(vkey := key("vtime", account or cmd.run), max(1, cmd.cost))
             p.expire(vkey, SESSION_TTL)
           if mutated:
             p.hset(row, "acked", cmd.entry_id)
@@ -495,17 +476,14 @@ class Bus:
             # Completion includes deletion; a client observing its reply sees no owned checkpoint or live queue.
             for cid, data in checkpoints.items():
               if json.loads(data)["owned"]:
-                uri = f"tinker://{cmd.run}/{cid.decode()}"
                 p.hdel(registry, cid)
-                p.zrem(key("ckpts"), uri)
+                p.zrem(key("ckpts"), uri := f"tinker://{cmd.run}/{cid.decode()}")
                 p.zrem(key("expiry"), uri)
             p.srem(key("runs"), cmd.run)
             p.delete(stream, owner_key, key("reap", cmd.run))
             trace(p, Ev.RUN_DELETED, run=cmd.run)
           await p.execute()
           return True
-      except redis.WatchError:
-        continue
 
   async def fail_stranded_commands(self, runs: list[str], owner: str, min_idle_ms: int = 0) -> None:
     """Fail the commands of training runs `owner` owns that have been in flight for at least min_idle_ms, on any trainer."""

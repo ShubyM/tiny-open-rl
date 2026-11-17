@@ -377,7 +377,7 @@ class TestSampler(RedisTest):
     self.assertEqual(len((await self.bus.queued_and_in_flight("shared"))["in_flight"]), 4)
 
     HangingFirstEngine.first = False
-    node.pinned.discard("s-dead")
+    node.pinned.pop("s-dead", None)
     node.tasks["s-dead"].cancel()
     await asyncio.gather(node.tasks["s-dead"], return_exceptions=True)
     await node.add("s-live", gpus=[1])

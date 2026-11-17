@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import signal
@@ -185,16 +186,20 @@ class TestNodeDaemon(RedisTest):
     run = new_id()
     await self.bus.create_run(Run(run, "worker", base, 4, lora=LORA))
     await node.announce_node()
-    self.background(scheduler.run(self.bus))
+    sched = self.background(scheduler.run(self.bus))
     await self.create(run, base, node)
     first = node.running["worker"].pid
-    node.state.workers["worker"].gpus = (1,)
+    sched.cancel()
+    await asyncio.gather(sched, return_exceptions=True)
+    spec = dataclasses.asdict(node.state.workers["worker"].spec)
+    await self.bus.write_table({}, {"worker": {"spec": spec, "node": node.id, "gpus": [1]}}, [], 1, [])
     request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
     await self.reply(request, node)
-    self.assertEqual(node.running["worker"].pid, first)
+    second = node.running["worker"].pid
+    self.assertNotEqual(second, first)
     self.assertEqual(node.running["worker"].gpus, (1,))
-    os.killpg(first, signal.SIGKILL)
-    await self.until(lambda: "worker" in node.running and node.running["worker"].pid != first, node)
+    os.killpg(second, signal.SIGKILL)
+    await self.until(lambda: "worker" in node.running and node.running["worker"].pid != second, node)
     await self.create(run, base, node)
 
   async def test_the_node_uploads_what_its_model_saved(self):
@@ -277,6 +282,87 @@ class TestNodeDaemon(RedisTest):
       for req in [*reqs_b, *reqs_a]:
         await self.reply(req, node)
     self.assertEqual(order, ["train-b", "train-b", "train-b", "train-a", "train-a", "train-a"])
+
+  async def test_scheduler_elastically_scales_samplers_out_into_empty_gpus_and_shrinks_for_new_jobs(self):
+    from test.helpers import FakeEngine
+
+    seen, gate = set(), asyncio.Event()
+
+    class ElasticEngine(FakeEngine):
+      async def sample(self, job, name):
+        seen.add(id(self))
+        if len(seen) >= 2:
+          gate.set()
+        await asyncio.wait_for(gate.wait(), 5)
+        return await super().sample(job, name)
+
+    node = TestNode(self.bus, gpus=2, node="node", engine=ElasticEngine)
+    self.nodes.append(node)
+    await node.announce_node()
+    with mock.patch.object(scheduler, "PROMPTS_PER_SAMPLER", 2), mock.patch.object(node_daemon, "SAMPLE_COMMANDS", 2):
+      self.background(scheduler.run(self.bus))
+      await self.bus.create_run(Run("samp", "", "tiny", 4, role=Role.SAMPLER))
+      reqs = [await self.bus.submit_command("samp", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(6)]
+      for req in reqs:
+        await self.reply(req, node)
+      self.assertEqual(len(seen), 2)
+      # Both sampler replicas stay warm on GPUs 0 and 1 until a new training run needs a GPU.
+      self.assertEqual(sum(1 for w in node.state.workers.values() if w.spec.role == Role.SAMPLER), 2)
+      train = new_id()
+      await self.bus.create_run(Run(train, "", "tiny", 4, lora=LORA))
+      await self.create(train, "tiny", node)
+      self.assertEqual(sum(1 for w in node.state.workers.values() if w.spec.role == Role.SAMPLER), 1)
+      self.assertEqual(len({w.gpus for w in node.state.workers.values()}), 2)
+
+  async def test_overtime_run_yields_immediately_and_quantum_collapses_gpu_switches(self):
+    node, a, c = self.node(gpus=1), new_id(), new_id()
+    for r in (a, c):
+      await self.bus.create_run(Run(r, "worker", "tiny", 4, lora=LORA))
+    await node.add("worker", gpus=[0])
+    await self.create(c, "tiny", node)
+    await self.create(a, "tiny", node)
+    for _ in range(3):  # bring `a` to turn_commands == 4 (RUN_COMMANDS)
+      await self.reply(await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10), node)
+    entered, release = asyncio.Event(), asyncio.Event()
+    orig_call = node.processes["worker"].call
+
+    async def gated_call(method, *args):
+      if method == "execute" and args[0].op == Op.FORWARD_BACKWARD:
+        entered.set()
+        await release.wait()
+      return await orig_call(method, *args)
+
+    node.processes["worker"].call = gated_call
+    # 5th consecutive command on `a` is in OVERTIME; it must NOT reset turn_commands to 1!
+    fifth = await self.bus.submit_command(a, Op.FORWARD_BACKWARD, b"", cost=10)
+    await self.until(entered.is_set, node)
+    more_a = [await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10) for _ in range(3)]
+    step_c = await self.bus.submit_command(c, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10)
+    release.set()
+    await self.reply(fifth, node)
+    await self.reply(step_c, node)
+    self.assertEqual((await self.bus.get_run(a))["steps"], 3)  # `c` ran immediately without waiting 3 extra steps!
+    for req in more_a:
+      await self.reply(req, node)
+
+    # Quantum switch collapsing on a shared GPU: 6x100-cost bursts with TURN=300 switch <= 4 times, not 12.
+    parks = []
+    for run, w in (("q1", "wq1"), ("q2", "wq2")):
+      await self.bus.create_run(Run(run, w, "tiny", 4, lora=LORA))
+      await node.add(w, gpus=[0])
+      await self.create(run, "tiny", node)
+      orig_park = node.processes[w].trainer.park
+      node.processes[w].trainer.park = lambda p=orig_park: (parks.append(1), p())[1]
+    parks.clear()
+    with mock.patch.object(turns, "TURN", 300):
+      reqs = [
+        await self.bus.submit_command(r, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100)
+        for _ in range(6)
+        for r in ("q1", "q2")
+      ]
+      for req in reqs:
+        await self.reply(req, node)
+    self.assertLessEqual(len(parks), 5)
 
 
 if __name__ == "__main__":

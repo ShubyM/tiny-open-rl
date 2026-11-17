@@ -34,9 +34,10 @@ kind share a sampler, and an exclusive run's sessions share a sampler of their o
 (`user_metadata={"openrl.fine_tuning_type": "full"}`) or an exclusive run (`"openrl.exclusive": "true"`) gets a worker of
 its own. Worker names encode nothing.
 
-Run one node daemon per GPU machine (`GPUS`, default 1) and one cluster scheduler. The scheduler places workers on
-nodes with the fewest workers per GPU, keeps full fine-tune samplers near their trainers, and moves work off dead nodes.
-Each node owns its workers' Redis leases and command streams, chooses their GPUs, and runs the local fairness policy.
+Run one node daemon per GPU machine (`GPUS`, default 1) and one cluster scheduler. The scheduler owns `(node, gpus)` for
+every worker and `worker` for every training run, minimizing a congestion + locality potential `Phi` with move hysteresis
+`H`, scaling shared LoRA trainers and stateless samplers across empty GPUs when backlogged, and shrinking extra replicas
+when another job needs a GPU. Each node owns its workers' process leases, run ownership handoffs, and GPU turns.
 
 Each worker runs in one coroutine. It peeks at each run's unclaimed command head and prepares its inputs independently.
 Sampling heads become ready after their session metadata and checkpoint files are available. Checkpoint I/O runs off
@@ -59,8 +60,8 @@ independent GPUs run concurrently. Node heartbeats and each worker's lease renew
 
 A trainer is a synchronous model process. The node sends request bytes over a private Unix socket and receives reply
 bytes and checkpoint metadata. Model tensors, optimizer state and checkpoint I/O stay in the trainer. Multi-GPU
-trainers use torchrun and FSDP; the whole rank group parks, resumes and exits together. A single-GPU LoRA trainer can
-move between a node's GPUs without restarting its model.
+trainers use torchrun and FSDP; the whole rank group parks, resumes and exits together. Each worker process stays on
+the fixed `(node, gpus)` assigned to it; rebalancing hands dirty training runs off cleanly to the replacement.
 
 Sampling controllers run in the node's event loop and drive isolated vLLM engine processes. On multi-GPU nodes the
 node queues a warm startup at placement; on one GPU it starts the engine for the first request. `ENGINE=module:Class`

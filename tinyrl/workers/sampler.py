@@ -92,7 +92,7 @@ class Sampler:
     except Exception as e:
       return Reply.error(e)
 
-  async def resume(self, gpu: int | None = None) -> None:
+  async def resume(self) -> None:
     if self.running:
       await self.running.wake()
 
