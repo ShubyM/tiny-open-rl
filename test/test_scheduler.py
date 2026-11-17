@@ -740,8 +740,14 @@ class TestMultiNodeExecution(RedisTest):
       ref.forward_backward(ctrl, [counting(n, 0), counting(n, 40)], "cross_entropy", {}, False)
       if step_after:
         ref.optim_step(ctrl, {"learning_rate": 1e-2})
+    expected, _ = ref.training_state(ctrl)
     for r in (r1, r2):
-      torch.testing.assert_close(self.live_params(r), ref.params[ctrl])
+      # A newly assigned owner can still be waiting to load its checkpoint. Read through the normal command path.
+      uri = f"tinker://{r}/weights/after-rebalance"
+      await self.run_cmd(r, Op.SAVE_WEIGHTS, json.dumps({"uri": uri}).encode())
+      version = await self.registry.version(uri)
+      actual, _ = await asyncio.to_thread(self.nodes[0].store.get, uri, version)
+      torch.testing.assert_close(actual, expected)
 
   async def test_shared_trainer_splits_gpu_time_by_account_not_run_count(self):
     node = await self.add_node("single-gpu")
