@@ -831,7 +831,9 @@ class TestMultiNodeExecution(RedisTest):
 
     self.assertEqual(len(node.processes), 1)
     self.assertEqual(set(completed), set(accounts))
-    self.assertAlmostEqual(observed["alice"] / sum(observed.values()), 0.5, delta=0.1)
+    # Splitting by run count would give alice 0.9. The window is 80 commands of real time, so one stalled call
+    # near its end, which the scheduler would repay afterwards, can move the split well past 0.6.
+    self.assertAlmostEqual(observed["alice"] / sum(observed.values()), 0.5, delta=0.2)
 
   async def test_lora_runs_split_onto_new_node_and_merge_back_with_exact_weights(self):
     opt = json.dumps({"adam_params": {"learning_rate": 1e-2}}).encode()
