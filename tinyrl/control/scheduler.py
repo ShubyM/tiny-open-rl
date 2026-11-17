@@ -184,7 +184,7 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
 
 
 def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width: int) -> list[str]:
-  """Choose the least-served ready runs from the accounts owed the most GPU time."""
+  """Choose up to `width` ready runs: accounts owed the most GPU time first, then their least-served runs."""
   if width < 1:
     raise ValueError("batch width must be positive")
   ready = {cmd.run: cmd for cmd in reversed(heads)}
@@ -192,12 +192,9 @@ def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width
 
   def rank(cmd: Cmd) -> tuple:
     arrival = tuple(map(int, cmd.entry_id.split("-")))
-    return service.get(cmd.run, floor), arrival, cmd.run
+    return -state.ready_lag(cmd.run), service.get(cmd.run, floor), arrival, cmd.run
 
-  lag = {run: state.ready_lag(run) for run in ready}
-  highest = max(lag.values(), default=0.0)
-  eligible = (cmd for run, cmd in ready.items() if lag[run] == highest)
-  return [cmd.run for cmd in sorted(eligible, key=rank)[:width]]
+  return [cmd.run for cmd in sorted(ready.values(), key=rank)[:width]]
 
 
 # ***** placement, elastic scaling, and cross-node rebalance *****

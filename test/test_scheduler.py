@@ -363,7 +363,9 @@ class TestLocalQuantum(unittest.TestCase):
       Cmd("save", "2-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""),
       Cmd("waiting", "3-0", Op.OPTIM_STEP, b""),
     ]
-    self.assertEqual(select_runs(state, heads, {"waiting": 1000}, width=3), ["waiting"])
+    self.assertEqual(select_runs(state, heads, {"waiting": 1000}, width=1), ["waiting"])
+    # A wave has room for three runs, so the account owed less fills the rest of it.
+    self.assertEqual(select_runs(state, heads, {"waiting": 1000}, width=3), ["waiting", "current", "save"])
 
   def test_continuous_sampler_saves_share_a_trainer_with_training_work(self):
     cluster = Cluster()
