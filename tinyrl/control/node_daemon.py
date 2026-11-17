@@ -435,7 +435,7 @@ class Lifetime:
 
   async def claim(self, runs: list[str], count: int) -> list[Cmd]:
     if self.sampling:
-      return await self.bus.take_commands(runs, self.life, count, idle_ms=LEASE_MS)
+      return await self.bus.take_commands(runs, self.life, count, reclaim=True)
     cmds = []
     for run in runs:
       if cmd := await self.bus.take_trainer_command(run, self.owned[run][0]):
@@ -455,7 +455,7 @@ class Lifetime:
   async def peek(self, delay: float) -> list[Cmd]:
     await asyncio.sleep(delay)
     while True:
-      cmds = await self.bus.peek_commands(self.streams(), IDLE_MS, idle_ms=LEASE_MS if self.sampling else None)
+      cmds = await self.bus.peek_commands(self.streams(), IDLE_MS, reclaim=self.sampling)
       # Refresh known heads even when another replica drained them. Otherwise keep reading during model execution.
       if cmds or self.heads:
         break

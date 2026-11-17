@@ -303,6 +303,22 @@ class TestBus(RedisTest):
     self.assertEqual(await self.bus.get_run(sid), run)
     self.assertEqual((await self.bus.read_state())["service"]["bob"], service)
 
+  async def test_a_sample_in_flight_is_reclaimed_only_from_a_dead_replica(self):
+    session = await self.new_run(role=Role.SAMPLER)
+    requests = [await self.bus.submit_command(session, Op.SAMPLE, b"{}") for _ in range(2)]
+    taken = await self.bus.take_commands([session], "w0", reclaim=True)
+    self.assertEqual([cmd.request_id for cmd in taken], requests)
+    # However long a sample runs, another replica leaves it alone while its replica holds a lease.
+    await self.bus.r.xclaim(key("q", session), GROUP, "w0", 0, [cmd.entry_id for cmd in taken], idle=3_600_000)
+    self.assertEqual(await self.bus.take_commands([session], "other", reclaim=True), [])
+    self.assertEqual(await self.bus.peek_commands([session], reclaim=True), [])
+
+    await self.bus.drop_lease("w0")  # its process died
+    [head] = await self.bus.peek_commands([session], reclaim=True)
+    self.assertEqual(head.request_id, requests[0])
+    reclaimed = await self.bus.take_commands([session], "other", reclaim=True)
+    self.assertEqual([cmd.request_id for cmd in reclaimed], requests)
+
   async def test_a_dead_node_daemon_stops_counting(self):
     await self.bus.node_heartbeat("node-a", 2)
     await self.bus.r.hset("tinyrl:nodes", "node-b", '{"gpus": 8, "until": 0}')

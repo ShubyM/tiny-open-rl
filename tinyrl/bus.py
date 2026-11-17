@@ -328,8 +328,8 @@ class Bus:
     await p.execute()
     return request_id
 
-  async def peek_commands(self, runs: list[str], block_ms: int = 0, idle_ms: int | None = None) -> list[Cmd]:
-    """Peek one head per run. Samplers may also prepare a pending entry old enough to reclaim."""
+  async def peek_commands(self, runs: list[str], block_ms: int = 0, reclaim: bool = False) -> list[Cmd]:
+    """Peek one head per run. Samplers may also prepare a pending entry a dead replica left behind."""
     p = self.r.pipeline(transaction=False)
     for r in runs:
       p.xinfo_groups(key("q", r))
@@ -341,11 +341,11 @@ class Bus:
           raise groups
       elif g := next((g for g in groups if g["name"] == GROUP.encode()), None):
         cursors[key("q", r)] = g["last-delivered-id"]
-        if idle_ms is not None and g["pending"]:
+        if reclaim and g["pending"]:
           pending.append(r)
     if not cursors:
       return await asyncio.sleep(block_ms / 1000) or []
-    cmds = [cmd for cmd in await asyncio.gather(*(self.pending_head(r, idle_ms) for r in pending)) if cmd]
+    cmds = [cmd for cmd in await asyncio.gather(*(self.abandoned_head(r) for r in pending)) if cmd]
     for cmd in cmds:
       del cursors[key("q", cmd.run)]
     if cursors:
@@ -365,22 +365,49 @@ class Bus:
       if "NOGROUP" not in str(e):
         raise
 
+  async def abandoned(self, run: str) -> list[bytes]:
+    """The pending entries whose consumer holds no lease, oldest first: its process died with them in flight. A sample
+    still running on a live replica is never one of them, however long it takes."""
+    try:
+      rows = await self.r.xpending_range(key("q", run), GROUP, "-", "+", count=1000)
+    except redis.ResponseError as e:
+      if "NOGROUP" not in str(e):
+        raise
+      return []
+    holders = sorted({row["consumer"] for row in rows})
+    p = self.r.pipeline(transaction=False)
+    for holder in holders:
+      p.exists(key("lease", holder.decode()))
+    dead = {holder for holder, live in zip(holders, await p.execute()) if not live}
+    return [row["message_id"] for row in rows if row["consumer"] in dead]
+
+  async def abandoned_head(self, run: str) -> Cmd | None:
+    for eid in await self.abandoned(run):
+      if entry := await self.r.xrange(key("q", run), eid, eid):  # else a commit has since deleted it
+        return parse_cmd(run, *entry[0])
+
   async def take_commands(
-    self, runs: list[str], consumer: str, count: int = 16, block_ms: int = 0, idle_ms: int | None = None
+    self, runs: list[str], consumer: str, count: int = 16, block_ms: int = 0, reclaim: bool = False
   ) -> list[Cmd]:
+    """Claim up to `count` new commands of each run. With `reclaim`, first those a dead replica left in flight."""
+    cmds = []
+    for r in runs if reclaim else ():
+      if ids := (await self.abandoned(r))[:count]:
+        # Idle for a second, so two live replicas reclaiming at once don't take the same entries from each other.
+        got = await self.r.xclaim(key("q", r), GROUP, consumer, 1000, ids)
+        cmds += [parse_cmd(r, eid, fields) for eid, fields in got if fields]
     p = self.r.pipeline(transaction=False)
     for r in runs:
-      p.xreadgroup(GROUP, consumer, {key("q", r): ">"}, count=count, claim_min_idle_time=idle_ms)
-    cmds = []
+      p.xreadgroup(GROUP, consumer, {key("q", r): ">"}, count=count)
     for r, got in zip(runs, await p.execute(raise_on_error=False)):
       if isinstance(got, Exception):
         if "NOGROUP" not in str(got):
           raise got
       else:
-        cmds += [parse_cmd(r, eid, fields) for _, entries in got for eid, fields, *_ in entries]
+        cmds += [parse_cmd(r, eid, fields) for _, entries in got for eid, fields in entries]
     if not cmds and block_ms:
-      await self.peek_commands(runs, block_ms, idle_ms)
-      return await self.take_commands(runs, consumer, count, idle_ms=idle_ms)
+      await self.peek_commands(runs, block_ms, reclaim)
+      return await self.take_commands(runs, consumer, count, reclaim=reclaim)
     return cmds
 
   async def take_trainer_command(self, run: str, token: str) -> Cmd | None:
