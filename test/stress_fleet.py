@@ -5,10 +5,10 @@
 SEED picks the cluster and the workload. CHAOS=1 also cancels workers, kills model processes, loses, drains and adds
 nodes, and cuts nodes off from Redis while clients run. It is not part of the suite: run a range of seeds by hand.
 
-Every client is sequential, like the SDK. A second Model replays exactly what each client was told succeeded, and at the
-end each run's saved state must equal it: the system may fail a command, but it may not lose or invent an acknowledged
-one. It also checks that every command gets a reply, that no two processes are ever on one GPU, and that deleting
-every run leaves no lease, owner, queue or write intent behind.
+Half of each client's training cycles are pipelined, like the SDK's futures. A second Model replays exactly what each
+client was told succeeded, and at the end each run's saved state must equal it: the system may fail a command, but it
+may not lose or invent an acknowledged one. It also checks that every command gets a reply, that no two processes are
+ever on one GPU, and that deleting every run leaves no lease, owner, queue or write intent behind.
 """
 
 import asyncio
@@ -156,7 +156,7 @@ class Stress(RedisTest):
     self.loops: dict[str, asyncio.Task] = {}
     self.violations, self.errors, self.problems, self.injected = [], [], [], []
     self.cut: list[StressNode] = []
-    self.calls = {"ok": 0, "failed": 0, "hung": 0}
+    self.calls_made = {"ok": 0, "failed": 0, "hung": 0}
     self.made = 0
 
   async def asyncTearDown(self):
@@ -251,7 +251,14 @@ class Stress(RedisTest):
   # ***** clients *****
 
   async def call(self, run: str, op: Op, body: bytes, cost: int = 100):
-    request = await self.bus.submit_command(run, op, body, cost=cost)
+    return (await self.calls(run, [(op, body)], cost))[0]
+
+  async def calls(self, run: str, cmds: list[tuple[Op, bytes]], cost: int = 100) -> list:
+    """Submit every command in order, then wait for all the replies, like a client that pipelines futures."""
+    requests = [await self.bus.submit_command(run, op, body, cost=cost) for op, body in cmds]
+    return await asyncio.gather(*(self.reply(run, op, request) for (op, _), request in zip(cmds, requests)))
+
+  async def reply(self, run: str, op: Op, request: str | None):
     if request is None:
       self.problems.append(f"{run}: could not submit {op}")
       return None
@@ -262,7 +269,7 @@ class Stress(RedisTest):
       self.problems.append(
         f"{run}: {op} {request} had no reply in {WAIT:.0f} s, and {'one' if late else 'none'} after {3 * WAIT:.0f} s"
       )
-    self.calls["hung" if reply is None else "ok" if reply.ok else "failed"] += 1
+    self.calls_made["hung" if reply is None else "ok" if reply.ok else "failed"] += 1
     return reply
 
   async def dump(self, run: str, request: str) -> None:
@@ -335,21 +342,26 @@ class Stress(RedisTest):
       return
     step = 0
     while step < STEPS:
-      n = rng.randrange(6, 12)
-      reply = await self.call(run, Op.FORWARD_BACKWARD, proto_body(run, n))
-      if reply is None:
+      # One training cycle: one or two gradient batches and the step that applies them.
+      sizes = [rng.randrange(6, 12) for _ in range(rng.choice([1, 1, 2]))]
+      cycle = [(Op.FORWARD_BACKWARD, proto_body(run, n)) for n in sizes] + [(Op.OPTIM_STEP, OPT)]
+      if rng.random() < 0.5:
+        replies = await self.calls(run, cycle)
+      else:
+        replies = []
+        for op, body in cycle:
+          replies.append(await self.call(run, op, body))
+          if replies[-1] is None or not replies[-1].ok:
+            break
+      if any(r is None for r in replies):
         return
-      if reply.ok:
-        ref.forward_backward(run, [counting(n, 0), counting(n, 40)], "cross_entropy", {}, False)
-        reply = await self.call(run, Op.OPTIM_STEP, OPT)
-        if reply is None:
-          return
-        if reply.ok:
-          ref.optim_step(run, {"learning_rate": 1e-2})
-      if not reply.ok:
+      if not all(r.ok for r in replies):
         if not await recover():
           return
         continue
+      for n in sizes:
+        ref.forward_backward(run, [counting(n, 0), counting(n, 40)], "cross_entropy", {}, False)
+      ref.optim_step(run, {"learning_rate": 1e-2})
       step += 1
       if rng.random() < 0.3 and not await save(f"s{step}") and not await recover():
         return
@@ -471,7 +483,7 @@ class Stress(RedisTest):
     shares = {a: round(v / sum(service.values()), 2) for a, v in sorted(service.items())} if service else {}
     print(
       f"\nSEED={SEED} chaos={CHAOS} block={BLOCK} nodes={gpus} trainers={len(trainers)} samplers={len(samplers)} "
-      f"calls={self.calls} finished={len(self.finished)} abandoned={len(self.abandoned)} injected={dict(collections.Counter(i.split()[0] for i in self.injected))} "
+      f"calls={self.calls_made} finished={len(self.finished)} abandoned={len(self.abandoned)} injected={dict(collections.Counter(i.split()[0] for i in self.injected))} "
       f"elapsed={elapsed:.1f}s gpu_use={sum(service.values()) / 1000 / max(1e-9, elapsed * capacity):.2f} shares={shares}",
       file=sys.stderr,
     )
