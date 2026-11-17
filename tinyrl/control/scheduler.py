@@ -179,7 +179,7 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
     for a in set(lag) - set(rates):
       wa = max(1e-9, float(w.get(a, 1.0)))
       lag[a] = min(0.0, lag[a] + work * wa / (live_w + wa))
-  active = {a for a, d in demand.items() if d > 0}
+  active = {a for a in accts if demand.get(a, 0.0) > 0 or deltas[a] > 0}
   return {a: (v if a in active else min(0.0, v)) for a, v in lag.items() if a in active or v < -1e-9}, seen
 
 

@@ -120,6 +120,13 @@ class Event:
   body: dict
 
 
+def cycle_len(ops: list[Op]) -> int:
+  n = next((i for i, op in enumerate(ops) if op != Op.FORWARD_BACKWARD), len(ops))
+  end = n < len(ops) and ops[n] == Op.OPTIM_STEP
+  n += end + (end and n + 1 < len(ops) and ops[n + 1] == Op.SAVE_WEIGHTS_FOR_SAMPLER)
+  return max(1, n) if ops and ops[0] in (Op.FORWARD_BACKWARD, Op.OPTIM_STEP) else int(bool(ops))
+
+
 def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
   return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"], int(fields.get(b"cost", 1)))
 
@@ -410,19 +417,26 @@ class Bus:
       return await self.take_commands(runs, consumer, count, reclaim=reclaim)
     return cmds
 
-  async def take_trainer_command(self, run: str, token: str) -> Cmd | None:
-    """Only the current epoch may move a new trainer command into the pending list."""
-    k, life = key("run", run), token.rsplit(":", 1)[0]
+  async def take_trainer_cycle(self, run: str, token: str, limit: int = 8) -> list[Cmd]:
+    """Only the current epoch may move up to one logical training cycle into the pending list."""
+    k, q, life = key("run", run), key("q", run), token.rsplit(":", 1)[0]
 
     async def op(p):
       if await p.hget(k, "owner") != token.encode():
         raise RuntimeError(f"lost ownership of {run}")
+      groups = await p.xinfo_groups(q) if limit > 1 else ()
+      last = next((g["last-delivered-id"] for g in groups if g["name"] == GROUP.encode()), b"0-0")
+      ahead = await p.xrange(q, b"(" + last, b"+", count=limit) if limit > 1 else ()
+      if not (n := cycle_len([Op(f[b"op"].decode()) for _, f in ahead]) if limit > 1 else 1):
+        return []
       p.multi()
-      p.xreadgroup(GROUP, life, {key("q", run): ">"}, count=1)
-      [got] = await p.execute()
-      return parse_cmd(run, *got[0][1][0]) if got else None
+      p.xreadgroup(GROUP, life, {q: ">"}, count=n)
+      return [parse_cmd(run, *e) for _, es in (await p.execute())[0] for e in es]
 
     return await self.transact(op, k)
+
+  async def take_trainer_command(self, run: str, token: str) -> Cmd | None:
+    return (await self.take_trainer_cycle(run, token, 1) or [None])[0]
 
   # ***** single-writer ownership, detachment, stateless sample commit, and process leases *****
 

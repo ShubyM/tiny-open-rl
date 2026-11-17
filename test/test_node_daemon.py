@@ -292,6 +292,32 @@ class TestNodeDaemon(RedisTest):
       node = self.node(store=store)
       await self.until(lambda: store.fs.exists(f"{store.base}/objects/{version.partition('@')[0]}/manifest.json"), node)
 
+  async def test_synchronous_clock_cycles_hold_quantum_across_step_gaps_without_parking(self):
+    node = self.node(gpus=1)
+    await node.announce_node()
+    self.background(scheduler.run(self.bus))
+    a, b = new_id(), new_id()
+    await self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
+    await self.bus.create_run(Run(b, "tiny-b", 4, account="acct-b", lora=LORA))
+    await self.create(a, "tiny", node)
+    await self.create(b, "tiny", node)
+    parks = []
+    for w in node.processes.values():
+      orig = w.trainer.park
+      w.trainer.park = lambda p=orig: (parks.append(1), p())[1]
+    parks.clear()
+
+    # Waiter `b` queues work while `a` runs 4 synchronous SDK-style steps with a 15ms HTTP round-trip gap between steps.
+    req_b = await self.bus.submit_command(b, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    for _ in range(4):
+      fb = await self.bus.submit_command(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
+      opt = await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
+      await self.reply(fb, node)
+      await self.reply(opt, node)
+      await asyncio.sleep(0.015)
+    await self.reply(req_b, node)
+    self.assertLessEqual(len(parks), 2)  # `a` holds its quantum across all 4 step gaps instead of parking every step!
+
 
 if __name__ == "__main__":
   unittest.main()

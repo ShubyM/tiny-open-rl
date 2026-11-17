@@ -30,8 +30,9 @@ from tinyrl.trace import span
 from tinyrl.workers.sampler import Sampler
 
 GPUS, DRAIN_S, TICK, IDLE_MS = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK", 0.25), getenv("IDLE_MS", 150)
-QUANTUM_MS, SWITCH_BUDGET = getenv("QUANTUM_MS", 2000), float(getenv("SWITCH_BUDGET", 0.1))
-SAMPLE_RUNS = getenv("SAMPLE_RUNS", 3)
+QUANTUM_MS, MAX_QUANTUM_MS = getenv("QUANTUM_MS", 2000), getenv("MAX_QUANTUM_MS", 15000)
+CYCLE_COMMANDS, CYCLE_GRACE_MS = getenv("CYCLE_COMMANDS", 8), getenv("CYCLE_GRACE_MS", 100)
+SWITCH_BUDGET, SAMPLE_RUNS = float(getenv("SWITCH_BUDGET", 0.1)), getenv("SAMPLE_RUNS", 3)
 SAMPLE_COMMANDS, SWEEP_S, SWEEP_GRACE_S = getenv("SAMPLE_COMMANDS", 128), getenv("SWEEP_S", 60.0), 600
 
 
@@ -62,7 +63,8 @@ def plan_gpus(
   residents = {p: lf for p, lf in lives.items() if cur[p] and draining.isdisjoint(cur[p]) and lf.wanted()}
   ends = {p: lf.granted_at + lf.quantum for p, lf in residents.items() if lf.active and not want_excl}
   holding = {p: end for p, end in ends.items() if end > now}
-  keep = {p: cur[p] for p, lf in residents.items() if p in holding or lf.spec.exclusive}
+  closing = {p for p in ends if getattr(residents[p], "step_ready", False)}
+  keep = {p: cur[p] for p, lf in residents.items() if p in holding or p in closing or lf.spec.exclusive}
   taken, hold = set(draining).union(*keep.values()), set()
   excl = {g for p, block in keep.items() if lives[p].spec.exclusive for g in block}
   # 2. OVERTIME residents and ready waiters claim open blocks in priority order; prefer cur[p] or truly empty GPUs.
@@ -223,18 +225,15 @@ class Lifetime:
 
   def __init__(self, node: NodeDaemon, proc: str):
     self.node, self.bus, self.registry, self.store, self.proc = node, node.bus, node.registry, node.store, proc
-    self.spec = node.state.procs[proc].spec
-    self.sampling = self.spec.role == Role.SAMPLER
+    self.spec, self.sampling = (sp := node.state.procs[proc].spec), sp.role == Role.SAMPLER
     self.life = f"{proc}@{node.id}-{os.urandom(6).hex()}"
     self.task = self.model = self.guard = self.closing = self.reader = None
     self.bound_gpus, self.warm, self.active = (), False, False
     self.granted_at, self.quantum, self.park_s, self.gpu_ms = 0.0, QUANTUM_MS / 1000, 0.0, 0.0
     self.owned: dict[str, tuple[str, str | None, str | None]] = {}  # run -> (token, pos, snap)
-    self.loaded, self.loading = set(), set()
-    self.heads: list[Cmd] = []
-    self.prepared: dict[str, tuple[str, asyncio.Task]] = {}
-    self.service: dict[str, float] = {}
-    self.renewed, self.virtual = time.monotonic(), 0.0
+    self.loaded, self.loading, self.open_grads = set(), set(), set()
+    self.heads, self.prepared, self.service = [], {}, {}
+    self.renewed, self.virtual, self.idle_since, self.step_ready = time.monotonic(), 0.0, 0.0, False
 
   def streams(self) -> list[str]:
     return self.node.state.runs(self.proc) if self.sampling else sorted(self.owned)
@@ -270,6 +269,10 @@ class Lifetime:
           ready, _ = self.ready()
           if not self.wanted():
             break
+        if not ready:
+          await self.await_cycle()
+          ready, _ = self.ready()
+        self.step_ready = any(c.op == Op.OPTIM_STEP and c.run in self.open_grads for c in ready)
         await self.sync_gpus(bool(ready) or (self.warm and self.model is not None and self.model.running is None))
         if not self.wanted():
           break
@@ -370,6 +373,7 @@ class Lifetime:
         snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
     await self.bus.detach_run(run, token, pos, snap, checkpoint)
     self.owned.pop(run, None)
+    self.open_grads.discard(run)
     self.heads = [c for c in self.heads if c.run != run]
     for req in [req for req, (r, _) in self.prepared.items() if r == run]:
       self.prepared.pop(req)[1].cancel()
@@ -420,7 +424,8 @@ class Lifetime:
         else:
           await self.model.resume()
       self.granted_at = time.monotonic()
-      self.quantum = max(QUANTUM_MS / 1000, (self.park_s + (self.granted_at - t0)) / max(0.01, SWITCH_BUDGET))
+      sw = (self.park_s + self.granted_at - t0) / max(0.01, SWITCH_BUDGET) if self.park_s else 0.0
+      self.quantum = min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, sw))
       self.node.select_gpus(self.proc)
     except Exception as e:
       err = Reply.error(e)
@@ -436,11 +441,27 @@ class Lifetime:
   async def claim(self, runs: list[str], count: int) -> list[Cmd]:
     if self.sampling:
       return await self.bus.take_commands(runs, self.life, count, reclaim=True)
-    cmds = []
-    for run in runs:
-      if cmd := await self.bus.take_trainer_command(run, self.owned[run][0]):
-        cmds.append(cmd)
-    return cmds
+    return [c for r in runs for c in await self.bus.take_trainer_cycle(r, self.owned[r][0], count)]
+
+  async def await_cycle(self) -> None:
+    on = self.node.on
+    ws = [o for o in self.node.lives.values() if o is not self and o.active and o.wanted() and o.life not in on]
+    over = time.monotonic() >= self.granted_at + self.quantum and not self.open_grads
+    if self.sampling or self.life not in on or not ws or (over and max(w.priority() for w in ws) > self.priority()):
+      return
+    while (rem := self.idle_since + CYCLE_GRACE_MS / 1000 - time.monotonic()) > 0 and self.wanted():
+      if any(o.spec.exclusive and o.active and o.life not in on for o in self.node.lives.values()):
+        return
+      if self.reader is None:
+        self.read()
+      with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(self.reader), min(rem, 0.015))
+      await self.collect()
+      if self.heads:
+        if pending := [t for _, t in self.prepared.values() if not t.done()]:
+          await asyncio.wait(pending, timeout=0.02)
+        return
+    self.open_grads.clear()
 
   def read(self, delay: float = 0) -> None:
     self.reader = asyncio.create_task(self.peek(delay))
@@ -511,24 +532,25 @@ class Lifetime:
     width = SAMPLE_RUNS if self.sampling and self.spec.lora else 1
     runs = scheduler.select_runs(self.node.state, candidates, self.service, width)
     inputs = {c.run: self.prepared[c.request_id][1].result() for c in candidates if c.run in runs}
-    batch = self.sampling and any(not isinstance(v, Exception) for v in inputs.values())
+    bad = any(isinstance(v, Exception) for v in inputs.values())
     await self.stop_reader()
     await self.keep_lease()
     with span("node.claim"):
-      cmds = await self.claim(runs, SAMPLE_COMMANDS if batch else 1)
+      cmds = await self.claim(runs, SAMPLE_COMMANDS if self.sampling and not bad else (1 if bad else CYCLE_COMMANDS))
     self.heads = [c for c in self.heads if c.run not in runs]
     self.read()
     if not cmds:
       return None
-    wave = Wave(self.spec.gpus)
-    first, result = cmds[0], None
+    wave, result = Wave(self.spec.gpus), None
     if self.sampling:
       async with asyncio.TaskGroup() as group:
         for cmd in cmds:
           group.create_task(self.answer(cmd, inputs[cmd.run], wave))
     else:
-      if (await self.answer(first, inputs[first.run], wave)).ok:
-        result = first
+      for cmd in cmds:
+        if cmd.run in self.owned and (await self.answer(cmd, inputs[cmd.run], wave)).ok:
+          result = cmd
+    self.idle_since = time.monotonic() if not bad else self.idle_since
     r1, r2 = self.ready()
     self.virtual = max(self.virtual, min(self.service.get(c.run, self.virtual) for c in [*r1, *r2, *cmds]))
     return result
@@ -570,6 +592,7 @@ class Lifetime:
         billed, old = await self.bus.commit_reply(cmd, reply, token, acct, mutates, charge, effects.get("saved"))
         if not billed:
           self.owned.pop(cmd.run, None)
+          self.open_grads.discard(cmd.run)
           self.loaded.discard(cmd.run)
           raise RuntimeError(f"lost ownership of {cmd.run}")
         if cmd.op == Op.DELETE_MODEL and reply.ok:
@@ -578,6 +601,10 @@ class Lifetime:
           self.owned[cmd.run] = (token, cmd.entry_id, None)
           if old:
             await self.registry.unregister_checkpoints(unpack_snap(old)[0])
+        if cmd.op == Op.FORWARD_BACKWARD and reply.ok:
+          self.open_grads.update((cmd.run,) if mutates else ())
+        elif cmd.op in (Op.FORWARD_BACKWARD, Op.OPTIM_STEP, Op.CREATE_MODEL, Op.LOAD_WEIGHTS, Op.DELETE_MODEL):
+          self.open_grads.discard(cmd.run)
     if billed and charge.gpu_ms:
       self.service[cmd.run] = self.service.get(cmd.run, self.virtual) + charge.gpu_ms
       self.gpu_ms += charge.gpu_ms

@@ -578,6 +578,11 @@ class TestMultiNodeFairness(unittest.TestCase):
     lag, seen = update_lag(lag, seen, {"a": 250.0, "b": 50.0}, 1.0, {"a": 1.0, "b": 1.0})
     self.assertAlmostEqual(lag["a"], -100.0)
     self.assertAlmostEqual(lag["b"], 100.0)
+    # `finish_cmd` deletes `b`'s last queued entry (`demand["b"] == 0`) in the same tx that increments `service["b"]`:
+    # positive catch-up lag is conserved while `deltas["b"] > 0`, and clears only once `b` is truly idle (`deltas == 0`).
+    lag, seen = update_lag(lag, seen, {"a": 250.0, "b": 80.0}, 1.0, {"a": 1.0})
+    self.assertAlmostEqual(lag["a"], -85.0)
+    self.assertAlmostEqual(lag["b"], 85.0)
 
   def simulate(self, c: Cluster, steps: int, dt: float = 0.5, quantum: float = 1.0) -> int:
     """Co-simulate per-node `plan_gpus` (L1) and cluster `scheduler.step` (L2)."""
