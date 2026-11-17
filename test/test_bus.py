@@ -342,10 +342,10 @@ class TestBus(RedisTest):
     self.assertEqual(await self.bus.sync_vtime("w0", ["acct-a"]), {"acct-a": 0})
     self.assertEqual(await self.bus.sync_vtime("w1", ["acct-b"]), {"acct-b": 0})
 
-    req = await self.bus.submit_command(a, Op.FORWARD_BACKWARD, b"{}", cost=500)
+    req = await self.bus.submit_command(a, Op.FORWARD_BACKWARD, b"{}")
     [cmd] = await self.bus.take_commands([a], "w0", count=1)
     self.assertEqual(cmd.request_id, req)
-    self.assertTrue(await self.bus.write_reply(cmd, ok(), "w0", started=time.time(), account="acct-a"))
+    self.assertTrue(await self.bus.write_reply(cmd, ok(), "w0", started=time.time(), account="acct-a", gpu_ms=500))
 
     # acct-b is still waiting in tinyrl:ready at 0, so floor stays 0 even though acct-a reached 500
     self.assertEqual(await self.bus.sync_vtime("w0", [], extra=["acct-a"]), {})

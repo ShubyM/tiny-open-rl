@@ -50,9 +50,9 @@ save, which a sampler is waiting on. A trainer may continue its current run for 
 next command is queued, before choosing by virtual time again. The same model process stays resident when switching runs.
 Every training run and sampling session charges the same Redis virtual-time account (`session`, falling back to
 `train_run` or `run_id`), ordering both run selection inside a worker and GPU turns across workers.
-Each command carries its cost, set when it is queued: the tokens a `forward_backward` trains on, a sample's prompt plus
-the most tokens it may generate, and 1 for anything else. An idle account returning with new work lifts to the active
-virtual-time floor, so idle gaps never bank catch-up credit.
+Each executed command charges the GPU wall-clock milliseconds (`gpu_ms`) it occupied, measured monotonically on the
+node and scaled by GPU width (split across concurrent prompts in a sampling wave). An idle account returning with new
+work lifts to the active virtual-time floor, so idle gaps never bank catch-up credit.
 
 The node keeps actual process placements, waiting order and GPU reservations outside the replayed cluster assignment
 log. Preparation completion and scheduling changes wake workers through the same node change event. Workers on
@@ -71,7 +71,7 @@ and `close()` must wait for its processes to exit. Checkpoint names include both
 
 The node reserves every GPU of a worker together, ordering contenders on each GPU by their ready accounts' least virtual
 time. One process is on a GPU at a time, and workers that share a GPU take turns. An idle holder yields to any waiter,
-and a busy holder yields once it has served `TURN` tokens (200,000) and a waiter with smaller virtual time needs one of
+and a busy holder yields once it has served `TURN_MS` ms (10,000) on its GPUs and a waiter with smaller virtual time needs one of
 its GPUs. Training yields between commands; sampling yields
 between waves of up to `SAMPLE_RUNS` LoRA sessions or one full fine-tune session, with at most `SAMPLE_COMMANDS` commands
 per session. This GPU turn is separate from a run's continuation budget. The reservation starts before wake and remains
@@ -91,7 +91,7 @@ services, stop the nodes gracefully and restart the scheduler and node daemons t
 | Variable | Default | Controls |
 |---|---|---|
 | `RUN_COMMANDS` | 4 | Commands in a preferred trainer continuation |
-| `TURN` | 200000 | Tokens in a GPU turn while another worker waits, checked between commands or waves |
+| `TURN_MS` | 10000 | GPU wall-clock ms in a turn while a less-served worker waits, checked between commands or waves |
 | `SAMPLE_RUNS` | 3 | LoRA sessions in a sampling wave; full fine-tunes use one |
 | `SAMPLE_COMMANDS` | 128 | Commands from each session in a wave |
 
@@ -193,7 +193,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 
 Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
-GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `TURN`,
+GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `TURN_MS`,
 `RUN_COMMANDS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `IDLE_MS`, `DRAIN_S`,
 `ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted), `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 

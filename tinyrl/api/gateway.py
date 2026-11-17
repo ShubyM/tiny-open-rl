@@ -115,10 +115,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   api.add_exception_handler(ValueError, bad_request)
   api.add_exception_handler(KeyError, bad_request)
 
-  async def submit(run: str, op: Op, body: bytes | dict, seq_id: int | None = None, cost: int = 1) -> dict[str, str]:
+  async def submit(run: str, op: Op, body: bytes | dict, seq_id: int | None = None) -> dict[str, str]:
     if isinstance(body, dict):
       body = json.dumps(body).encode()
-    request_id = await bus.submit_command(run, op, body, seq_id, cost)
+    request_id = await bus.submit_command(run, op, body, seq_id)
     if request_id is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
@@ -236,17 +236,15 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     body = await request.body()
     if request.headers.get("content-type", "").startswith(wire.PROTO):
       parsed = wire.parse(body)
-      return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
+      return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None)
 
     data = json.loads(body)
-    body = wire.from_json(data)
-    return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"), wire.cost(wire.parse(body)))
+    return await submit(data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data), data.get("seq_id"))
 
   @api.post("/api/v1/forward")  # SDKs before 0.25
   async def forward(request: Request):
     data = await request.json()
-    body = wire.from_json(data, forward_only=True)
-    return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"), wire.cost(wire.parse(body)))
+    return await submit(data["model_id"], Op.FORWARD_BACKWARD, wire.from_json(data, True), data.get("seq_id"))
 
   @api.post("/api/v1/optim_step")
   async def optim_step(req: OptimStepRequest):
@@ -367,7 +365,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       "topk_sample": int(data.get("topk_sample_logprobs", 0)),
     }
 
-    res = await submit(sid, Op.SAMPLE, job, data.get("seq_id"), len(tokens) + num_samples * job["max_tokens"])
+    res = await submit(sid, Op.SAMPLE, job, data.get("seq_id"))
     return {
       "request_id": res["request_id"],
       "sample_sequence_ids": [f"{res['request_id']}:{i}" for i in range(num_samples)],

@@ -233,61 +233,77 @@ class TestNodeDaemon(RedisTest):
         return await orig(method, *args)
 
       node.processes[worker].call = tracked
-    with mock.patch.object(turns, "TURN", 10):
-      first = await self.bus.submit_command("less", Op.FORWARD_BACKWARD, b"", cost=100)
+    with mock.patch.object(turns, "TURN_MS", 1):
+      first = await self.bus.submit_command("less", Op.FORWARD_BACKWARD, b"")
       await self.until(entered.is_set, node)
-      less_reqs = [
-        await self.bus.submit_command("less", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100) for _ in range(3)
-      ]
-      more_req = await self.bus.submit_command("more", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10)
+      less_reqs = [await self.bus.submit_command("less", Op.OPTIM_STEP, b'{"adam_params":{}}') for _ in range(3)]
+      more_req = await self.bus.submit_command("more", Op.OPTIM_STEP, b'{"adam_params":{}}')
       await self.until(lambda: node.running["w-more"].vtime == 500, node)
       parks.clear()
       release.set()
       for req in [first, *less_reqs, more_req]:
         await self.reply(req, node)
       self.assertEqual(order, ["less", "less", "less", "more"])
-      self.assertEqual(len(parks), 1)  # 0 parks across 3 >TURN steps while w-less < w-more; 1 park on idle handoff!
+      self.assertEqual(len(parks), 1)  # 0 parks across 3 >TURN_MS steps while w-less < w-more; 1 park on idle handoff!
 
   async def test_heavy_sampling_in_an_account_prioritizes_another_accounts_training(self):
-    node = self.node(gpus=2)
+    from test.helpers import FakeEngine
+
+    class SlowSampler(FakeEngine):
+      async def sample(self, job, name):
+        await asyncio.sleep(0.25)
+        return await super().sample(job, name)
+
+    folder = tempfile.TemporaryDirectory()
+    self.addCleanup(folder.cleanup)
+    node = TestNode(self.bus, gpus=2, node="node", store=Store(root=folder.name), gpu_mib=0, engine=SlowSampler)
+    self.nodes.append(node)
+    await self.bus.create_run(Run("hold", "holder", "tiny", 4, session="sess-hold", lora=LORA))
     await self.bus.create_run(Run("train-a", "trainer", "tiny", 4, session="sess-a", lora=LORA))
     await self.bus.create_run(Run("train-b", "trainer", "tiny", 4, session="sess-b", lora=LORA))
     await self.bus.create_run(
       Run("samp-a", "sampler", "tiny", 4, session="sess-a", role=Role.SAMPLER, train_run="train-a")
     )
+    await node.add("holder", gpus=[0])
     await node.add("trainer", gpus=[0])
     await node.add("sampler", gpus=[1])
-    await self.create("train-a", "tiny", node)
-    await self.create("train-b", "tiny", node)
+    for r in ("hold", "train-a", "train-b"):
+      await self.create(r, "tiny", node)
 
     entered, release, order = asyncio.Event(), asyncio.Event(), []
-    orig_call = node.processes["trainer"].call
+    orig_hold = node.processes["holder"].call
+    orig_train = node.processes["trainer"].call
 
-    async def gated_call(method, *args):
-      if method == "execute":
-        cmd = args[0]
-        if cmd.op == Op.FORWARD_BACKWARD:
-          entered.set()
-          await release.wait()
-        elif cmd.op == Op.OPTIM_STEP:
-          order.append(cmd.run)
-      return await orig_call(method, *args)
+    async def gated_hold(method, *args):
+      if method == "execute" and args[0].op == Op.FORWARD_BACKWARD:
+        entered.set()
+        await release.wait()
+      return await orig_hold(method, *args)
 
-    node.processes["trainer"].call = gated_call
+    async def tracked_train(method, *args):
+      if method == "execute" and args[0].op == Op.OPTIM_STEP:
+        order.append(args[0].run)
+      return await orig_train(method, *args)
+
+    node.processes["holder"].call = gated_hold
+    node.processes["trainer"].call = tracked_train
     with mock.patch.object(node_daemon, "RUN_COMMANDS", 1):
-      gate = await self.bus.submit_command("train-b", Op.FORWARD_BACKWARD, b"", cost=1)
+      gate = await self.bus.submit_command("hold", Op.FORWARD_BACKWARD, b"")
       await self.until(entered.is_set, node)
-      reqs_a = [
-        await self.bus.submit_command("train-a", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100) for _ in range(3)
-      ]
-      reqs_b = [
-        await self.bus.submit_command("train-b", Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100) for _ in range(3)
-      ]
-      # While trainer is mid-command (and background peek prepares train-a), sess-a burns 5,000 sample tokens.
-      samp_req = await self.bus.submit_command("samp-a", Op.SAMPLE, json.dumps(JOB).encode(), cost=5000)
+      reqs_a = [await self.bus.submit_command("train-a", Op.OPTIM_STEP, b'{"adam_params":{}}') for _ in range(3)]
+      reqs_b = [await self.bus.submit_command("train-b", Op.OPTIM_STEP, b'{"adam_params":{}}') for _ in range(3)]
+
+      async def both_ready():
+        return any(json.loads(v) == ["sess-a", "sess-b"] for v in await self.bus.r.hvals(key("ready")))
+
+      while not await both_ready():
+        await node.tick()
+        await asyncio.sleep(0.01)
+      # While `trainer` waits off-GPU with both `train-a` and `train-b` prepared, `sess-a` burns ~250 ms on GPU 1.
+      samp_req = await self.bus.submit_command("samp-a", Op.SAMPLE, json.dumps(JOB).encode())
       await self.reply(samp_req, node)
       release.set()
-      await self.bus.wait_for_reply(gate, 5)
+      await self.reply(gate, node)
       for req in [*reqs_b, *reqs_a]:
         await self.reply(req, node)
     self.assertEqual(order, ["train-b", "train-b", "train-b", "train-a", "train-a", "train-a"])
@@ -331,7 +347,7 @@ class TestNodeDaemon(RedisTest):
     await self.create(c, "tiny", node)
     await self.create(a, "tiny", node)
     for _ in range(3):  # bring `a` to turn_commands == 4 (RUN_COMMANDS)
-      await self.reply(await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10), node)
+      await self.reply(await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}'), node)
     entered, release = asyncio.Event(), asyncio.Event()
     orig_call = node.processes["worker"].call
 
@@ -343,10 +359,10 @@ class TestNodeDaemon(RedisTest):
 
     node.processes["worker"].call = gated_call
     # 5th consecutive command on `a` is in OVERTIME; it must NOT reset turn_commands to 1!
-    fifth = await self.bus.submit_command(a, Op.FORWARD_BACKWARD, b"", cost=10)
+    fifth = await self.bus.submit_command(a, Op.FORWARD_BACKWARD, b"")
     await self.until(entered.is_set, node)
-    more_a = [await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10) for _ in range(3)]
-    step_c = await self.bus.submit_command(c, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=10)
+    more_a = [await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}') for _ in range(3)]
+    step_c = await self.bus.submit_command(c, Op.OPTIM_STEP, b'{"adam_params":{}}')
     await asyncio.sleep(0.05)  # let background peek prepare both `more_a[0]` and `step_c` before releasing `fifth`
     release.set()
     await self.reply(fifth, node)
@@ -355,7 +371,7 @@ class TestNodeDaemon(RedisTest):
     for req in more_a:
       await self.reply(req, node)
 
-    # Quantum switch collapsing on a shared GPU: 6x100-cost bursts with TURN=300 switch <= 4 times, not 12.
+    # Quantum switch collapsing on a shared GPU: 6x~30ms steps with TURN_MS=90 switch <= 5 times, not 12.
     parks = []
     for run, w in (("q1", "wq1"), ("q2", "wq2")):
       await self.bus.create_run(Run(run, w, "tiny", 4, lora=LORA))
@@ -363,15 +379,22 @@ class TestNodeDaemon(RedisTest):
       await self.create(run, "tiny", node)
       orig_park = node.processes[w].trainer.park
       node.processes[w].trainer.park = lambda p=orig_park: (parks.append(1), p())[1]
+      orig_wcall = node.processes[w].call
+
+      async def timed_call(method, *args, orig=orig_wcall):
+        if method == "execute":
+          await asyncio.sleep(0.02)
+        return await orig(method, *args)
+
+      node.processes[w].call = timed_call
     parks.clear()
-    with mock.patch.object(turns, "TURN", 300):
+    with mock.patch.object(turns, "TURN_MS", 90):
       reqs = [
-        await self.bus.submit_command(r, Op.OPTIM_STEP, b'{"adam_params":{}}', cost=100)
-        for _ in range(6)
-        for r in ("q1", "q2")
+        await self.bus.submit_command(r, Op.OPTIM_STEP, b'{"adam_params":{}}') for _ in range(6) for r in ("q1", "q2")
       ]
       for req in reqs:
         await self.reply(req, node)
+    self.assertGreaterEqual(len(parks), 2)
     self.assertLessEqual(len(parks), 5)
 
 

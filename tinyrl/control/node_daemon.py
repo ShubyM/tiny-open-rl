@@ -378,7 +378,7 @@ class Lifetime:
       r.vtime = want
       node.notify()
     waiting = turns.someone_waits(node.running, self.worker)
-    if r.served is not None and waiting and (want is None or r.served >= turns.TURN):
+    if r.served is not None and waiting and (want is None or r.served >= turns.TURN_MS):
       with span("node.park"):
         await self.model.park() if self.sampling else await self.model.call("park")
       r.served = None
@@ -417,10 +417,11 @@ class Lifetime:
     cmds = await self.claim(runs, SAMPLE_COMMANDS if self.sampling and not failed else 1)
     if not cmds:
       return None
+    t0 = time.monotonic()
     if self.sampling:
       async with asyncio.TaskGroup() as group:
         for cmd in cmds:
-          group.create_task(self.answer(cmd, inputs[cmd.run]))
+          group.create_task(self.answer(cmd, inputs[cmd.run], len(cmds)))
       reply = None
     else:
       cmd = cmds[0]
@@ -430,7 +431,7 @@ class Lifetime:
       reply = await self.answer(cmd, inputs[cmd.run])
     if not failed:
       if self.r.served is not None:
-        self.r.served += sum(max(1, c.cost) for c in cmds)
+        self.r.served += max(1, round((time.monotonic() - t0) * 1000))
       await self.refresh()
       ready_accts = sorted({self.account(c) for c in self.ready()[0]})
       batch_accts = [account_of(inputs[c.run][0] if isinstance(inputs[c.run], tuple) else None, c.run) for c in cmds]
@@ -456,9 +457,9 @@ class Lifetime:
     await self.alive()
     return cmds
 
-  async def answer(self, cmd: Cmd, inputs) -> Reply | None:
-    before = time.time()
-    effects, last = {}, None
+  async def answer(self, cmd: Cmd, inputs, width: int = 1) -> Reply | None:
+    before, t0 = time.time(), time.monotonic()
+    effects, last, gpu_ms = {}, None, 0
     with span("node.execute"):
       if isinstance(inputs, Exception):
         reply = Reply.error(inputs)
@@ -467,11 +468,13 @@ class Lifetime:
         reply = await self.model.execute(cmd, *inputs)
       else:
         reply, effects, last = await self.train(cmd)
+      if not isinstance(inputs, Exception):
+        gpu_ms = max(1, round((time.monotonic() - t0) * 1000 * max(1, len(self.r.gpus)) / width))
     with span("node.publish"):
       acct = account_of(inputs[0] if isinstance(inputs, tuple) else None, cmd.run)
       mutated = effects.get("mutated", False)
       checkpoint = effects.get("checkpoint") if reply.ok else None
-      if not await self.bus.write_reply(cmd, reply, self.owner, before, mutated, checkpoint, acct):
+      if not await self.bus.write_reply(cmd, reply, self.owner, before, mutated, checkpoint, acct, gpu_ms):
         if self.sampling and not await self.bus.lease_live(self.owner):
           raise RuntimeError(f"lost lease {self.owner}")
         self.owned.discard(cmd.run)

@@ -269,7 +269,7 @@ class TestSampler(RedisTest):
     self.assertTrue((await self.bus.wait_for_reply(holding, 5)).ok)
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
 
-  async def test_a_busy_holder_yields_its_gpu_after_its_turn_of_tokens(self):
+  async def test_a_busy_holder_yields_its_gpu_after_its_turn_of_gpu_time(self):
     for run, worker in (("busy", "busy"), ("ready", "waiting")):
       await self.bus.create_run(Run(run, worker, "base", 4, role=Role.SAMPLER))
     order, sampling, finish = [], asyncio.Event(), asyncio.Event()
@@ -286,7 +286,7 @@ class TestSampler(RedisTest):
     await node.add("busy", gpus=[0])
     waiting = await node.add("waiting", gpus=[0])
     self.pump(node)
-    with mock.patch.object(turns, "TURN", 1):
+    with mock.patch.object(turns, "TURN_MS", 1):
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode())

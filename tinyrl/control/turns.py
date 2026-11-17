@@ -7,7 +7,7 @@ from tinyrl.bus import Cmd, Op
 from tinyrl.control.scheduler import Assignment
 from tinyrl.helpers import getenv
 
-TURN = getenv("TURN", 200_000)  # tokens a busy holder serves on its GPUs before yielding to a less-served waiter
+TURN_MS = getenv("TURN_MS", 10_000)  # ms a busy holder serves on its GPUs before yielding to a less-served waiter
 
 
 def peers(running, name: str) -> list:

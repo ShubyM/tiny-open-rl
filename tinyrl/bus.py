@@ -8,7 +8,7 @@ Keys that guard correctness:
   tinyrl:owner:<run>      The one process holding a training run's live state; fences training replies and handoffs.
   tinyrl:run:<run>        Record, counters, and exact recovery state (`acked` stream id and `checkpoint` ref).
   tinyrl:reap:<run>       Monotonic counter watched when samplers reclaim pending prompts from a dead process's lease.
-  tinyrl:vtime:<account>  Shared virtual time (tokens served) charged across an account's trainers and samplers.
+  tinyrl:vtime:<account>  Shared virtual time (GPU-ms served) charged across an account's trainers and samplers.
   tinyrl:floor            Monotonic cluster virtual-time floor that idle accounts lift to on return.
   tinyrl:ready            Live worker processes' ready account sets, holding `tinyrl:floor` at the least-served waiter.
 
@@ -99,7 +99,6 @@ class Cmd:
   entry_id: str
   op: Op
   body: bytes
-  cost: int = 1  # the tokens it works on, which is what the node charges its run
 
   @property
   def request_id(self) -> str:
@@ -122,7 +121,7 @@ class Reply:
 
 
 def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
-  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"], int(fields.get(b"cost", 1)))
+  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"])
 
 
 def connect(url: str) -> redis.Redis:
@@ -309,15 +308,13 @@ class Bus:
 
   # ***** commands *****
 
-  async def submit_command(
-    self, run_id: str, op: Op, body: bytes, seq_id: int | None = None, cost: int = 1
-  ) -> str | None:
+  async def submit_command(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None) -> str | None:
     """Queue a command on a run's stream. Returns its request id, or None if there is no such run. A call retried with the same seq_id gets the first call's request id and is queued once."""
     if seq_id is not None and (first := await self.r.get(key("seq", run_id, str(seq_id)))):
       return first.decode()  # a retry, even of a deleted run's command, a pre-IDMP one, or one older than IDMP's window
     seq = [] if seq_id is None else ["IDMP", run_id, seq_id]  # and two racing retries still queue once
     # NOMKSTREAM: an unknown or deleted run has no stream, so the write fails instead of queueing work nobody will read
-    fields = ["op", op, "body", body, "cost", cost, *(["seq", seq_id] if seq else [])]
+    fields = ["op", op, "body", body, *(["seq", seq_id] if seq else [])]
     entry_id = await self.r.execute_command("XADD", key("q", run_id), "NOMKSTREAM", *seq, "*", *fields)
     if entry_id is None:
       return None
@@ -432,7 +429,7 @@ class Bus:
     return cmds
 
   async def write_reply(
-    self, cmd: Cmd, reply: Reply, owner: str, started=None, mutated=False, checkpoint=None, account=""
+    self, cmd: Cmd, reply: Reply, owner: str, started=None, mutated=False, checkpoint=None, account="", gpu_ms=0
   ) -> bool:
     """Write a command's reply, acknowledge the command, and count it, all at once.
 
@@ -464,8 +461,8 @@ class Bus:
           p.xdel(stream, cmd.entry_id)
           for name, n in added.items():
             p.hincrby(row, name, n)
-          if started is not None:
-            p.incrby(vkey := key("vtime", account or cmd.run), max(1, cmd.cost))
+          if gpu_ms > 0:
+            p.incrby(vkey := key("vtime", account or cmd.run), gpu_ms)
             p.expire(vkey, SESSION_TTL)
           if mutated:
             p.hset(row, "acked", cmd.entry_id)
