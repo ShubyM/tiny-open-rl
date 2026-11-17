@@ -145,7 +145,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       if train.get("base"):
         base, lora = train["base"], train["rank"] > 0
       else:
-        meta = store.read_meta(uri)
+        meta = await asyncio.to_thread(store.read_meta, await registry.version(uri))
         base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
       if not base:
         raise ValueError("could not resolve base_model")

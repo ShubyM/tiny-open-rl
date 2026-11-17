@@ -203,31 +203,29 @@ class TestModel(unittest.TestCase):
     store = Store(root=tempfile.mkdtemp())
     model, (a, b) = lora_runs(2)
     train(model, a, steps=3)
-    uri = f"tinker://{a}/weights/step-3"
-    store.put(uri, *model.training_state(a))
+    version = store.put(*model.training_state(a))
     saved_weights = [p.detach().clone() for p in model.params[a].values()]
     saved_optimizer = copy.deepcopy(model.optimizers[a].state_dict())
 
     train(model, a, steps=3)
-    model.restore_run(a, *store.get(uri), optimizer=True)
+    model.restore_run(a, *store.get(version), optimizer=True)
     self.assertTrue(same(saved_weights, model.params[a]))
     torch.testing.assert_close(model.optimizers[a].state_dict()["state"], saved_optimizer["state"])
 
-    model.restore_run(b, *store.get(uri), optimizer=False)  # a run can start from another run's checkpoint
+    model.restore_run(b, *store.get(version), optimizer=False)  # a run can start from another run's checkpoint
     self.assertTrue(same(saved_weights, model.params[b]))
 
   def test_loading_a_checkpoint_that_does_not_fit_fails(self):
     store = Store(root=tempfile.mkdtemp())
     model, (a,) = lora_runs()
-    uri = f"tinker://{a}/sampler_weights/step-0"
-    store.put(uri, *model.sampler_weights(a))
+    version = store.put(*model.sampler_weights(a))
 
     no_mlp = new_id()
     model.create_run(no_mlp, "tiny", 4, {**LORA, "train_mlp": False})
     with self.assertRaises(ValueError):
-      model.restore_run(no_mlp, *store.get(uri), optimizer=False)
+      model.restore_run(no_mlp, *store.get(version), optimizer=False)
     with self.assertRaises(ValueError):
-      model.restore_run(a, *store.get(uri), optimizer=True)  # it was saved without the optimizer
+      model.restore_run(a, *store.get(version), optimizer=True)  # it was saved without the optimizer
     with self.assertRaises(ValueError):
       store.get(f"tinker://{a}/weights/missing")
 
@@ -270,7 +268,7 @@ class TestModel(unittest.TestCase):
         self.assertFalse(reply.ok)
         self.assertFalse(effects.get("mutated"))
 
-      saved = trainer.save_run(run)
+      saved = trainer.save_run(run, new_id().replace("-", ""))
       body = json.dumps({"uri": saved["uri"], "optimizer": True}).encode()
       reply, _ = trainer.execute(Cmd(run, "3", Op.LOAD_WEIGHTS, body), version=saved["version"])
       self.assertTrue(reply.ok, reply.body)
@@ -283,8 +281,8 @@ class TestModel(unittest.TestCase):
 
     model, (lora_run,) = lora_runs()
     train(model, lora_run, steps=3)
-    store.put(f"tinker://{lora_run}/sampler_weights/final", *model.sampler_weights(lora_run))
-    lora_dir = store.path(f"tinker://{lora_run}/sampler_weights/final")
+    version = store.put(*model.sampler_weights(lora_run))
+    lora_dir, _ = store.local_folder(version)
     with torch.no_grad():
       torch.testing.assert_close(
         PeftModel.from_pretrained(tiny(), lora_dir).eval()(ids).logits,
@@ -294,8 +292,8 @@ class TestModel(unittest.TestCase):
     fft, fft_run = Model(tiny), new_id()
     fft.create_run(fft_run, "tiny", 0, {})
     train(fft, fft_run, steps=3)
-    store.put(f"tinker://{fft_run}/sampler_weights/final", *fft.sampler_weights(fft_run))
-    fft_dir = store.path(f"tinker://{fft_run}/sampler_weights/final")
+    version = store.put(*fft.sampler_weights(fft_run))
+    fft_dir, _ = store.local_folder(version)
     with torch.no_grad():
       torch.testing.assert_close(
         LlamaForCausalLM.from_pretrained(fft_dir).eval()(ids).logits,
@@ -448,6 +446,7 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
       args = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=2"]
       multi = Process([*args, "-m", "tinyrl.workers.trainer"], env)
       try:
+        saved_versions = []
         for run in (r1, r2):
           invalid = wire.parse(proto_body(run))
           invalid.loss_fn = "unknown"  # a rejected operation must leave every rank ready for the next collective
@@ -462,9 +461,13 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
           ]
           for i, (op, body) in enumerate(commands):
             cmd = Cmd(run, str(i), op, body if isinstance(body, bytes) else json.dumps(body).encode())
-            reply, _ = single.execute(cmd) if run == r1 else await asyncio.wait_for(multi.call("execute", cmd), 90)
+            reply, effects = (
+              single.execute(cmd) if run == r1 else await asyncio.wait_for(multi.call("execute", cmd), 90)
+            )
             self.assertEqual(reply.ok, i != 1, reply.body)
-        expected, actual = (store.get(f"tinker://{run}/sampler_weights/s1")[0] for run in (r1, r2))
+            if checkpoint := effects.get("saved"):
+              saved_versions.append(checkpoint["version"])
+        expected, actual = (store.get(v)[0] for v in saved_versions)
         self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")
         for name in expected:
           torch.testing.assert_close(actual[name], expected[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")

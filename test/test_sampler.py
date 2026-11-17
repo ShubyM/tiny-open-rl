@@ -141,7 +141,7 @@ class TestSampler(RedisTest):
     store = Store(tempfile.mkdtemp())
     for i in range(4):
       uri = f"tinker://r{i}/sampler_weights/s0"
-      store.put(uri, {}, {"base": "base", "lora": True, "config": {}})
+      await self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": True, "config": {}}))
       await self.bus.create_run(Run(f"s{i}", "base", 4, role=Role.SAMPLER, model_path=uri))
     active, peak, parallel = {}, 0, 0
 
@@ -171,7 +171,7 @@ class TestSampler(RedisTest):
   async def test_failed_boot_answers_waiting_heads_and_leaves_later_work_unclaimed(self):
     store = Store(tempfile.mkdtemp())
     uri = "tinker://r/sampler_weights/new"
-    store.put(uri, {}, {"base": "base", "lora": True, "config": {}})
+    await self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": True, "config": {}}))
     await self.bus.create_run(Run("first", "base", 4, role=Role.SAMPLER))
     await self.bus.create_run(Run("later", "base", 4, role=Role.SAMPLER, model_path=uri))
     booting, finish_boot = asyncio.Event(), asyncio.Event()
@@ -215,7 +215,7 @@ class TestSampler(RedisTest):
     store = Store(tempfile.mkdtemp())
     paths = {f"s{i}": f"tinker://r{i}/sampler_weights/s0" for i in (1, 2)}
     for run, uri in paths.items():
-      store.put(uri, {}, {"base": "base", "lora": False, "config": {}})
+      await self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": False, "config": {}}))
       await self.bus.create_run(Run(run, "base", 0, role=Role.SAMPLER, model_path=uri))
     case = self
 
@@ -236,7 +236,7 @@ class TestSampler(RedisTest):
     request = await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
     self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
     before = set(engine.loaded)
-    store.put(paths["s1"], {}, {"base": "base", "lora": False, "config": {}})
+    await self.seed_checkpoint(paths["s1"], 0, version=store.put({}, {"base": "base", "lora": False, "config": {}}))
     request = await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
     self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
     self.assertNotEqual(engine.loaded, before)

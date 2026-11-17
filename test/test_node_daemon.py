@@ -11,6 +11,7 @@ import torch
 
 from test.execution import TestNode
 from test.helpers import RedisTest, new_id, tiny
+from test.test_api import proto_body
 from test.test_process import require_unix
 from test.test_sampler import JOB
 from tinyrl.bus import GROUP, LEASE_MS, Op, Role, Run, key
@@ -110,8 +111,8 @@ class TestNodeDaemon(RedisTest):
 
       node.store.local_folder = slow_read
       uri = "tinker://training/sampler_weights/slow"
-      version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})
-      await self.registry.register_checkpoint(uri, 0, version=version)
+      version = writer.put({}, {"base": "tiny", "lora": True, "config": {}})
+      await self.seed_checkpoint(uri, 0, version=version)
       await self.bus.create_run(Run("slow", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       await self.bus.create_run(Run("ready", "tiny", 4, role=Role.SAMPLER))
       slow = await self.bus.submit_command("slow", Op.SAMPLE, json.dumps(JOB).encode())
@@ -140,8 +141,8 @@ class TestNodeDaemon(RedisTest):
       writer.peer = "127.0.0.1:9"  # a node that no longer answers
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       uri = "tinker://training/sampler_weights/lost"
-      version = writer.put(uri, {}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
-      await self.registry.register_checkpoint(uri, 0, version=version)
+      version = writer.put({}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
+      await self.seed_checkpoint(uri, 0, version=version)
       await self.bus.create_run(Run("lost", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
       [cmd] = await self.bus.take_commands(["lost"], "dead", 1)
@@ -151,6 +152,47 @@ class TestNodeDaemon(RedisTest):
       await self.until(waiting.done, node)
       self.assertFalse(waiting.result().ok)
       self.assertIn("has not landed, and 127.0.0.1:9 failed to copy", waiting.result().body.decode())
+
+  async def test_trainer_prepares_the_next_command_during_execution(self):
+    node, run = self.node(), new_id()
+    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
+    life = await node.bind("worker", run)
+    await self.create(run, "tiny", node)
+    child = node.processes["worker"]
+    entered, empty_read, release, prepared = (asyncio.Event() for _ in range(4))
+    call, peek, prepare = child.call, self.bus.peek_commands, life.prepare
+
+    async def hold_step(method, *args):
+      if method == "execute" and args[0].op == Op.OPTIM_STEP:
+        entered.set()
+        await release.wait()
+      return await call(method, *args)
+
+    async def observe_prepare(cmd):
+      inputs = await prepare(cmd)
+      if cmd.op == Op.FORWARD_BACKWARD:
+        prepared.set()
+      return inputs
+
+    async def observe_peek(*args, **kwargs):
+      heads = await peek(*args, **kwargs)
+      if entered.is_set() and not heads:
+        empty_read.set()
+      return heads
+
+    child.call, life.prepare, self.bus.peek_commands = hold_step, observe_prepare, observe_peek
+    first = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    try:
+      await asyncio.wait_for(entered.wait(), 5)
+      await asyncio.wait_for(empty_read.wait(), 5)
+      second = await self.bus.submit_command(run, Op.FORWARD_BACKWARD, proto_body(run, 6))
+      await asyncio.wait_for(prepared.wait(), 5)
+      state = await self.bus.queued_and_in_flight(run)
+      self.assertEqual((state["queued"], len(state["in_flight"])), (1, 1))
+    finally:
+      release.set()
+    for request in (first, second):
+      self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
 
   async def test_dead_trainer_cleanup_fails_only_the_command_it_claimed(self):
     node, run = self.node(), new_id()
@@ -246,9 +288,9 @@ class TestNodeDaemon(RedisTest):
   async def test_the_node_uploads_what_its_model_saved(self):
     with tempfile.TemporaryDirectory() as folder:
       store = Store(f"file://{folder}/bucket", cache=f"{folder}/cache")
-      store.put("tinker://r/weights/w", {"w": torch.ones(2)})
+      version = store.put({"w": torch.ones(2)})
       node = self.node(store=store)
-      await self.until(lambda: store.list_checkpoints() == ["tinker://r/weights/w"], node)
+      await self.until(lambda: store.fs.exists(f"{store.base}/objects/{version.partition('@')[0]}/manifest.json"), node)
 
 
 if __name__ == "__main__":

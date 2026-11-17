@@ -9,7 +9,6 @@ import contextlib
 import json
 import os
 import sys
-import time
 
 import torch
 import torch.distributed as dist
@@ -53,18 +52,24 @@ class Trainer:
       raise
 
   def save(
-    self, run: str, uri: str, sampler: bool = False, ttl_seconds: int | None = None, owned: bool = False
+    self,
+    run: str,
+    uri: str,
+    sampler: bool = False,
+    ttl_seconds: int | None = None,
+    owned: bool = False,
+    version: str | None = None,
   ) -> dict:
     tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
-    version = self.store.put(uri, tensors, meta)
+    version = self.store.put(tensors, meta, version=version)
     size = sum(map(nbytes, tensors.values()))
     return {"uri": uri, "size": size, "ttl": ttl_seconds, "owned": owned, "version": version}
 
-  def load_run(self, run: str, uri: str, version: str | None, optimizer: bool, gradients: bool) -> None:
-    self.call_model("restore_run", run, *self.store.get(uri, version), optimizer, gradients)
+  def load_run(self, run: str, version: str | None, optimizer: bool, gradients: bool) -> None:
+    self.call_model("restore_run", run, *self.store.get(version), optimizer, gradients)
 
   def execute(
-    self, cmd: Cmd, run: dict | None = None, snap: tuple[str, str | None] | None = None, version: str | None = None
+    self, cmd: Cmd, run: dict | None = None, snap: str | None = None, version: str | None = None
   ) -> tuple[Reply, dict]:
     with span("trainer.execute"):
       effects, created = {}, False
@@ -80,7 +85,7 @@ class Trainer:
           self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
           created = True
           if snap and cmd.op != Op.LOAD_WEIGHTS:
-            self.load_run(cmd.run, *snap, optimizer=True, gradients=True)
+            self.load_run(cmd.run, snap, optimizer=True, gradients=True)
             created = False  # recovery succeeded, even if the command that follows is rejected
 
         revision = self.model.state_revision  # restoring the parked state itself leaves its snapshot valid
@@ -100,10 +105,10 @@ class Trainer:
           case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
             sampler = cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER
             effects["saved"] = self.save(
-              cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False)
+              cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False), version
             )
           case Op.LOAD_WEIGHTS:
-            self.load_run(cmd.run, args["uri"], version, optimizer=args["optimizer"], gradients=False)
+            self.load_run(cmd.run, version, optimizer=args["optimizer"], gradients=False)
           case Op.DELETE_MODEL:
             self.drop_run(cmd.run)
           case _:
@@ -121,9 +126,9 @@ class Trainer:
         loaded = cmd.run in self.model.params
         effects.update(loaded=loaded, mutated=loaded and revision is not None and self.model.state_revision != revision)
 
-  def save_run(self, run: str) -> dict | None:
+  def save_run(self, run: str, version: str) -> dict | None:
     if run in self.model.params:
-      return self.save(run, f"tinker://{run}/parked/{time.time_ns()}", owned=True)
+      return self.save(run, f"tinker://{run}/parked/{version}", owned=True, version=version)
 
   def drop_run(self, run: str) -> None:
     if run in self.model.params:

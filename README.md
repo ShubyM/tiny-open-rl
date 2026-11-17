@@ -46,8 +46,8 @@ at a time. A preparation error claims and answers its failed head without waitin
 
 Under contention, the planner divides available GPU time among backlogged accounts according to their weights and
 demand. Both the node and its shared trainers select the ready account owed the most service. Starting more LoRA
-runs on the same base does not buy an account more turns. Among equally owed accounts, a trainer can continue its
-current run for up to `RUN_COMMANDS` commands, then prioritizes sampler saves and the runs served the fewest GPU-ms.
+runs on the same base does not buy an account more turns. Among equally owed accounts, workers choose the ready runs
+that received the fewest GPU-ms, breaking ties by queue arrival. A stream of sampler saves follows the same rule.
 Sampling can batch multiple ready runs at the same priority. Each interval of a wave is split among the requests still
 executing: for two requests finishing at 100 and 900 ms on one GPU, the charges are 50 and 850 GPU-ms.
 Token estimates are still reported as run counters, but do not determine service.
@@ -65,13 +65,13 @@ Sampling controllers run in the node's event loop and drive isolated vLLM engine
 node queues a warm startup at placement; on one GPU it starts the engine for the first request. `ENGINE=module:Class`
 can select another engine implementing async `start(base, lora, env)`, `load_checkpoint(name, path)`, `sample(job, name)`,
 `sleep()`, `wake()` and `close()`. Settings are per engine; loading an already loaded checkpoint name must be idempotent,
-and `close()` must wait for its processes to exit. Checkpoint names include both the URI and its version.
+and `close()` must wait for its processes to exit. Engines identify loaded checkpoints by their immutable version IDs.
 
 The node reserves every GPU of a worker together. An idle shared holder yields to a ready waiter. A busy holder
 gets a minimum wall-clock quantum, extended when parking and resuming are expensive. Once that quantum expires,
 the node can hand the GPUs to a ready process whose account is owed more service. Training yields between commands; sampling yields
 between waves of up to `SAMPLE_RUNS` LoRA sessions or one full fine-tune session, with at most `SAMPLE_COMMANDS` commands
-per session. This GPU turn is separate from a run's continuation budget. The reservation starts before wake and remains
+per session. The reservation starts before wake and remains
 held until parking acknowledges or the entire process group has exited. A trainer's
 parking copies weights, gradients and Adam state to pinned host memory, then restores them on its next turn.
 
@@ -87,20 +87,27 @@ services, stop the nodes gracefully and restart the scheduler and node daemons t
 
 | Variable | Default | Controls |
 |---|---|---|
-| `RUN_COMMANDS` | 4 | Commands in a preferred trainer continuation |
 | `QUANTUM_MS` | 2000 | Minimum busy GPU turn, checked between commands or waves |
 | `SWITCH_BUDGET` | 0.1 | Target ratio of measured park and resume time to useful time in a turn |
 | `SAMPLE_RUNS` | 3 | LoRA sessions in a sampling wave; full fine-tunes use one |
 | `SAMPLE_COMMANDS` | 128 | Commands from each session in a wave |
 
-When no other run is ready, the same run can be chosen again after its continuation ends.
+A trainer can keep executing while it has prepared commands and uncontested capacity. The node starts preparing
+the next queue heads before executing the current batch. Clients supply the training data: a trainer waiting for
+rollouts or the next submission can be idle. A ready trainer sharing GPUs can wait for the current sampling wave
+to finish. Its full GPU block must fit outside exclusive reservations.
 
 ### Checkpoints
 
-`CKPT` is where checkpoints live. On one machine it is a folder (`/tmp/tinyrl` unless set), and nothing leaves the
-machine. Set it to a bucket (`gs://...`, `s3://...`) to keep checkpoints past a machine, or to share them across
-machines. A save still lands in the node's `CKPT_CACHE` first and replies, and the node daemon uploads it behind, so a
-bucket never holds up a step. A sampler on the node reads the cached copy; one on another node waits for the upload.
+Each save writes an immutable safetensors directory at `CKPT/objects/<version>`. The trainer commits the version
+and its logical `tinker://` name together in Redis under its ownership token. A late writer can finish its own
+directory, but readers of the name still load the version published by the current owner. New deployments use
+this versioned layout; checkpoints from the older named-directory layout require migration before upgrading.
+
+Use a shared folder for local storage or a bucket URL such as `gs://...`. Bucket saves first land in the writer's
+`CKPT_CACHE`. Other nodes can fetch that exact version from the writer while the upload is pending. The uploader
+writes a per-version manifest after all shards land. A node that dies before upload can lose its staged version.
+Sweeps protect in-progress writes and published versions, then reclaim unreferenced versions after a grace period.
 
 ### On Kubernetes
 
@@ -151,7 +158,7 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
   `[tokens, vocab]` logits never exist all at once. The optimizer updates fp32 master weights and keeps fp32 AdamW state, while the
   forward pass runs in bf16 under autocast. A LoRA run's frozen base model stays bf16.
 * **Portable checkpoints.** Training checkpoints (`save_weights`) and sampler weights (`save_weights_for_sampler`) go through
-  [store.py](tinyrl/storage/store.py) behind `put(uri)` and `get(uri)` as pure `safetensors` (no `torch.save` pickle), so any trainer can
+  [store.py](tinyrl/storage/store.py) through `put(tensors, meta)` and `get(version)` as pure `safetensors` (no `torch.save` pickle), so any trainer can
   resume a run with its exact fp32 weights and AdamW state. `CKPT` can be a bucket (`gs://...`, with `pip install .[gcs]`), so
   every node sees every checkpoint.
 * **One owner per worker.** The node holds and renews its workers' leases. It verifies ownership before dispatch, and a
@@ -193,7 +200,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for local GPU selection, wor
 Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM_MS`,
-`RUN_COMMANDS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `IDLE_MS`, `DRAIN_S`,
+`SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `IDLE_MS`, `DRAIN_S`,
 `ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted), `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 
 ## Telemetry

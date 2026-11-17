@@ -9,7 +9,7 @@ import uuid
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from tinyrl.bus import Bus, connect
+from tinyrl.bus import Bus, connect, queue_checkpoint
 from tinyrl.storage.registry import Registry
 
 
@@ -46,6 +46,11 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   """Starts a throwaway redis-server for the test class, or uses REDIS_URL. Each test gets an empty database."""
 
   proc: subprocess.Popen | None = None
+
+  async def seed_checkpoint(self, uri, size, *, ttl=None, owned=False, version=None):
+    pipeline = self.bus.r.pipeline()
+    queue_checkpoint(pipeline, uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned)
+    await pipeline.execute()
 
   @classmethod
   def setUpClass(cls):

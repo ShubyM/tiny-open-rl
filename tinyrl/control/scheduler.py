@@ -12,7 +12,7 @@ import dataclasses
 import itertools
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus, Cmd, Ev, Op, Role
+from tinyrl.bus import Bus, Cmd, Ev, Role
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 
@@ -183,10 +183,8 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
   return {a: (v if a in active else min(0.0, v)) for a, v in lag.items() if a in active or v < -1e-9}, seen
 
 
-def select_runs(
-  state: State, heads: list[Cmd], service: dict[str, float], width: int, prefer: str | None = None
-) -> list[str]:
-  """Fill a wave from accounts tied for most owed service; apply run preferences only within that tier."""
+def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width: int) -> list[str]:
+  """Choose the least-served ready runs from the accounts owed the most GPU time."""
   if width < 1:
     raise ValueError("batch width must be positive")
   ready = {cmd.run: cmd for cmd in reversed(heads)}
@@ -194,7 +192,7 @@ def select_runs(
 
   def rank(cmd: Cmd) -> tuple:
     arrival = tuple(map(int, cmd.entry_id.split("-")))
-    return cmd.run != prefer, cmd.op != Op.SAVE_WEIGHTS_FOR_SAMPLER, service.get(cmd.run, floor), arrival, cmd.run
+    return service.get(cmd.run, floor), arrival, cmd.run
 
   lag = {run: state.ready_lag(run) for run in ready}
   highest = max(lag.values(), default=0.0)

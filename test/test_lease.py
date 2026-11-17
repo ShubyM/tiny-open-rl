@@ -144,7 +144,7 @@ class TestLease(RedisTest):
     info = await self.bus.get_run(run)
     self.assertIsNone(info.get("owner"))
     uri, version = unpack_snap(info["snap"])
-    tensors, meta = self.store.get(uri, version)
+    tensors, meta = self.store.get(version)
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])
     self.assertIsNotNone(await self.registry.get_checkpoint(uri))

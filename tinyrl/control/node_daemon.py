@@ -31,7 +31,7 @@ from tinyrl.workers.sampler import Sampler
 
 GPUS, DRAIN_S, TICK, IDLE_MS = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK", 0.25), getenv("IDLE_MS", 150)
 QUANTUM_MS, SWITCH_BUDGET = getenv("QUANTUM_MS", 2000), float(getenv("SWITCH_BUDGET", 0.1))
-RUN_COMMANDS, SAMPLE_RUNS = getenv("RUN_COMMANDS", 4), getenv("SAMPLE_RUNS", 3)
+SAMPLE_RUNS = getenv("SAMPLE_RUNS", 3)
 SAMPLE_COMMANDS, SWEEP_S, SWEEP_GRACE_S = getenv("SAMPLE_COMMANDS", 128), getenv("SWEEP_S", 60.0), 600
 
 
@@ -226,7 +226,7 @@ class Lifetime:
     self.spec = node.state.procs[proc].spec
     self.sampling = self.spec.role == Role.SAMPLER
     self.life = f"{proc}@{node.id}-{os.urandom(6).hex()}"
-    self.task = self.model = self.guard = self.closing = self.reader = self.last_run = None
+    self.task = self.model = self.guard = self.closing = self.reader = None
     self.bound_gpus, self.warm, self.active = (), False, False
     self.granted_at, self.quantum, self.park_s, self.gpu_ms = 0.0, QUANTUM_MS / 1000, 0.0, 0.0
     self.owned: dict[str, tuple[str, str | None, str | None]] = {}  # run -> (token, pos, snap)
@@ -234,7 +234,7 @@ class Lifetime:
     self.heads: list[Cmd] = []
     self.prepared: dict[str, tuple[str, asyncio.Task]] = {}
     self.service: dict[str, float] = {}
-    self.renewed, self.virtual, self.turn_commands = time.monotonic(), 0.0, 0
+    self.renewed, self.virtual = time.monotonic(), 0.0
 
   def streams(self) -> list[str]:
     return self.node.state.runs(self.proc) if self.sampling else sorted(self.owned)
@@ -365,8 +365,9 @@ class Lifetime:
         await self.node.claim_after_drain(self.life, self.bound_gpus)
         await self.model.call("resume", None)
       await self.keep_lease()
-      if checkpoint := await self.model.call("save_run", run):
-        snap = f"{checkpoint['uri']}\n{checkpoint['version'] or ''}"
+      version = await self.bus.begin_checkpoint(run, token)
+      if checkpoint := await self.model.call("save_run", run, version):
+        snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
     await self.bus.detach_run(run, token, pos, snap, checkpoint)
     self.owned.pop(run, None)
     self.heads = [c for c in self.heads if c.run != run]
@@ -383,9 +384,6 @@ class Lifetime:
     if self.model and (p := self.model.proc) and p.poll() is not None:
       raise RuntimeError(f"process {self.proc} exited")
     cur = self.node.on.get(self.life)
-    if cur is not None and not has_work and any(o is not self and o.active for o in self.node.lives.values()):
-      live = [r for r in self.streams() if r not in self.loading]
-      has_work = bool(live and await self.bus.peek_commands(live, idle_ms=LEASE_MS if self.sampling else None))
     if self.active != has_work:
       self.active = has_work
       self.node.notify()
@@ -456,8 +454,11 @@ class Lifetime:
 
   async def peek(self, delay: float) -> list[Cmd]:
     await asyncio.sleep(delay)
-    streams = self.streams()
-    cmds = await self.bus.peek_commands(streams, IDLE_MS, idle_ms=LEASE_MS if self.sampling else None)
+    while True:
+      cmds = await self.bus.peek_commands(self.streams(), IDLE_MS, idle_ms=LEASE_MS if self.sampling else None)
+      # Refresh known heads even when another replica drained them. Otherwise keep reading during model execution.
+      if cmds or self.heads:
+        break
     for cmd in cmds:
       if cmd.request_id not in self.prepared:
         task = asyncio.create_task(self.prepare(cmd))
@@ -468,22 +469,23 @@ class Lifetime:
   async def prepare(self, cmd: Cmd):
     with span("node.prepare"):
       try:
-        run, ckpt = await self.bus.get_run(cmd.run), None
-        if self.sampling:
-          if run is None:
-            raise ValueError(f"no sampling session {cmd.run}")
-          if uri := run.get("model_path"):
-            version = await self.registry.version(uri)
-            self.loading.add(cmd.run)
-            self.node.notify()
-            await self.node.push_heartbeat(wake=True)
-            try:
-              ckpt = await asyncio.to_thread(self.store.local_folder, uri, version)
-            finally:
-              self.loading.discard(cmd.run)
-              self.node.notify()
-              await self.node.push_heartbeat(wake=True)
-        return run, ckpt
+        run = await self.bus.get_run(cmd.run)
+        if not self.sampling:
+          return run
+        if run is None:
+          raise ValueError(f"no sampling session {cmd.run}")
+        if not (uri := run.get("model_path")):
+          return None
+        version = await self.registry.version(uri)
+        self.loading.add(cmd.run)
+        self.node.notify()
+        try:
+          await self.node.push_heartbeat(wake=True)
+          return await asyncio.to_thread(self.store.local_folder, version)
+        finally:
+          self.loading.discard(cmd.run)
+          self.node.notify()
+          await self.node.push_heartbeat(wake=True)
       except Exception as e:
         return e
 
@@ -506,9 +508,8 @@ class Lifetime:
   async def execute(self, candidates: list[Cmd]) -> Cmd | None:
     for c in candidates:
       self.service[c.run] = max(self.service.get(c.run, self.virtual), self.virtual)
-    stay = self.last_run if not self.sampling and self.turn_commands < RUN_COMMANDS else None
     width = SAMPLE_RUNS if self.sampling and self.spec.lora else 1
-    runs = scheduler.select_runs(self.node.state, candidates, self.service, width, stay)
+    runs = scheduler.select_runs(self.node.state, candidates, self.service, width)
     inputs = {c.run: self.prepared[c.request_id][1].result() for c in candidates if c.run in runs}
     batch = self.sampling and any(not isinstance(v, Exception) for v in inputs.values())
     await self.stop_reader()
@@ -526,33 +527,45 @@ class Lifetime:
         for cmd in cmds:
           group.create_task(self.answer(cmd, inputs[cmd.run], wave))
     else:
-      self.last_run, self.turn_commands = first.run, self.turn_commands + 1 if first.run == stay else 1
       if (await self.answer(first, inputs[first.run], wave)).ok:
         result = first
     r1, r2 = self.ready()
     self.virtual = max(self.virtual, min(self.service.get(c.run, self.virtual) for c in [*r1, *r2, *cmds]))
     return result
 
+  async def execute_trainer(self, cmd: Cmd, run: dict, wave: Wave, charge: Charge):
+    token, _, snap = self.owned[cmd.run]
+    version = None
+    if cmd.op == Op.LOAD_WEIGHTS:
+      # Resolve at dispatch: a preceding save can still be executing while this command is prefetched.
+      try:
+        version = await self.registry.version(json.loads(cmd.body)["uri"])
+      except (KeyError, ValueError) as exc:
+        return Reply.error(exc), {}
+    elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
+      version = await self.bus.begin_checkpoint(cmd.run, token)
+    saved = unpack_snap(snap)[1] if snap and cmd.run not in self.loaded and cmd.op != Op.LOAD_WEIGHTS else None
+    await self.keep_lease()
+    reply, effects = await wave.run(self.model.call("execute", cmd, run, saved, version), charge)
+    self.loaded.add(cmd.run) if effects.get("loaded") else self.loaded.discard(cmd.run)
+    return reply, effects
+
   async def answer(self, cmd: Cmd, inputs, wave: Wave) -> Reply:
     charge = Charge()
     acct = self.node.state.account(cmd.run)
-    token, _, snap = (None, None, None) if self.sampling else self.owned[cmd.run]
     effects = {}
     with span("node.execute"):
       if isinstance(inputs, Exception):
         reply = Reply.error(inputs)
       elif self.sampling:
-        reply = await wave.run(self.model.execute(cmd, *inputs), charge)
+        reply = await wave.run(self.model.execute(cmd, inputs), charge)
       else:
-        version = await self.registry.version(json.loads(cmd.body)["uri"]) if cmd.op == Op.LOAD_WEIGHTS else None
-        saved = unpack_snap(snap) if snap and cmd.run not in self.loaded and cmd.op != Op.LOAD_WEIGHTS else None
-        await self.keep_lease()
-        reply, effects = await wave.run(self.model.call("execute", cmd, inputs[0], saved, version), charge)
-        self.loaded.add(cmd.run) if effects.get("loaded") else self.loaded.discard(cmd.run)
+        reply, effects = await self.execute_trainer(cmd, inputs, wave, charge)
     with span("node.publish"):
       if self.sampling:
         billed = await self.bus.commit_sample(cmd, reply, acct, charge=charge)
       else:
+        token = self.owned[cmd.run][0]
         mutates = bool(effects.get("mutated"))
         billed, old = await self.bus.commit_reply(cmd, reply, token, acct, mutates, charge, effects.get("saved"))
         if not billed:

@@ -130,7 +130,7 @@ class TestAPI(RedisTest):
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
     self.assertEqual(sampler["path"], f"tinker://{run_id}/sampler_weights/step-0")
-    with open(f"{self.store.path(sampler['path'])}/adapter_config.json") as f:
+    with open(f"{self.store.local_folder(await self.registry.version(sampler['path']))[0]}/adapter_config.json") as f:
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}
@@ -165,8 +165,8 @@ class TestAPI(RedisTest):
     self.assertEqual((await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"], [])
 
   async def test_a_checkpoint_leaves_the_registry_when_its_ttl_runs_out(self):
-    await self.registry.register_checkpoint("tinker://r/weights/soon", 10, ttl=0.2)
-    await self.registry.register_checkpoint("tinker://r/weights/later", 10, ttl=3600)
+    await self.seed_checkpoint("tinker://r/weights/soon", 10, ttl=0.2)
+    await self.seed_checkpoint("tinker://r/weights/later", 10, ttl=3600)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     for _ in range(100):
       if await self.registry.get_checkpoint("tinker://r/weights/soon") is None:
@@ -290,7 +290,7 @@ class TestAPI(RedisTest):
 
     saved = (await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final_pin"}))).json()
 
-    folder = self.store.path(saved["path"])
+    folder = self.store.local_folder(await self.registry.version(saved["path"]))[0]
     files = os.listdir(folder)
     self.assertTrue(all(f.endswith(".safetensors") for f in files), f"Found non-safetensors files: {files}")
 
@@ -309,7 +309,7 @@ class TestAPI(RedisTest):
     saved = (
       await self.result(await self.post("save_weights_for_sampler", json={"model_id": run, "path": "sampler"}))
     ).json()
-    files = glob.glob(f"{self.store.path(saved['path'])}/*.safetensors")
+    files = glob.glob(f"{self.store.local_folder(await self.registry.version(saved['path']))[0]}/*.safetensors")
     self.assertTrue(files)
     for path in files:
       self.assertTrue(all(t.dtype == torch.bfloat16 for t in safetensors.torch.load_file(path).values()))

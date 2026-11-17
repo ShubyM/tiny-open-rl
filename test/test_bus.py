@@ -108,7 +108,7 @@ class TestBus(RedisTest):
     run = await self.new_run()
     owned, saved = [f"tinker://{run}/{path}" for path in ("sampler_weights/session", "weights/save")]
     for uri in (owned, saved):
-      await self.registry.register_checkpoint(uri, 1, ttl=60, owned=uri == owned)
+      await self.seed_checkpoint(uri, 1, ttl=60, owned=uri == owned)
     self.assertTrue(await self.bus.detach_run(run, self.tokens[run], None, f"{owned}\nv1"))
     token, _, snap = await self.bus.acquire_run(run, "w0")
     self.assertEqual(unpack_snap(snap), (owned, "v1"))

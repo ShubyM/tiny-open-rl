@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 
@@ -36,9 +37,9 @@ def wake(p, stream: str = "wake") -> None:
   p.xadd(key(stream), {"t": 1}, maxlen=1, approximate=False)
 
 
-def unpack_snap(snap: str) -> tuple[str, str | None]:
-  uri, _, version = snap.partition("\n")
-  return uri, version or None
+def unpack_snap(snap: str) -> tuple[str, str]:
+  uri, version = snap.split("\n", 1)
+  return uri, version
 
 
 class Op(StrEnum):
@@ -147,12 +148,13 @@ def queue_delete(p, run_id: str) -> None:
   p.srem(key("runs"), run_id)
   p.delete(key("q", run_id))
   p.hdel(key("run", run_id), "owner", "snap")
+  p.hdel(key("writing"), run_id)
   p.xadd(
     key("events"), {"kind": Ev.RUN_DELETED, "body": json.dumps({"run": run_id})}, maxlen=1_000_000, approximate=True
   )
 
 
-def queue_checkpoint(p, uri: str, size: int, ttl=None, owned=False, version=None) -> None:
+def queue_checkpoint(p, uri: str, size: int, *, version: str, ttl=None, owned=False) -> None:
   """Queue a checkpoint's metadata and indexes in the same transaction as its publication."""
   run, cid = uri.removeprefix("tinker://").split("/", 1)
   kind, now = cid.split("/", 1)[0], time.time()
@@ -160,7 +162,6 @@ def queue_checkpoint(p, uri: str, size: int, ttl=None, owned=False, version=None
   info = {"checkpoint_id": cid, "checkpoint_type": kind, "time": now, "tinker_path": uri, "size_bytes": size}
   expires = now + ttl if ttl else None
   info.update(expires_at=expires, owned=owned, version=version)
-  p.setnx(key("ckpt_since"), now)
   p.hset(key("ckpt", run), cid, json.dumps(info))
   if kind != "parked":
     p.zadd(key("ckpts"), {uri: now})
@@ -416,6 +417,7 @@ class Bus:
         return None
       p.multi()
       p.hdel(k, "owner")
+      p.hdel(key("writing"), run_id)
       wake(p)
       return bool(await p.execute())
 
@@ -439,6 +441,20 @@ class Bus:
 
     return await self.transact(op, k, lk)
 
+  async def begin_checkpoint(self, run: str, token: str) -> str:
+    """Protect this write from collection until this owner publishes it, fails it, or is reaped."""
+    k, version = key("run", run), uuid.uuid4().hex
+
+    async def op(p):
+      if await p.hget(k, "owner") != token.encode():
+        raise RuntimeError(f"lost ownership of {run}")
+      p.multi()
+      p.hset(key("writing"), run, version)
+      await p.execute()
+      return version
+
+    return await self.transact(op, k)
+
   async def detach_run(
     self, run_id: str, token: str, pos: str | None, snap: str | None, checkpoint: dict | None = None
   ) -> bool:
@@ -453,6 +469,7 @@ class Bus:
       if checkpoint:
         queue_checkpoint(p, **checkpoint)
       p.hdel(k, "owner")
+      p.hdel(key("writing"), run_id)
       p.hset(k, "snap", snap) if snap else p.hdel(k, "snap")
       wake(p)
       return bool(await p.execute())
@@ -473,6 +490,8 @@ class Bus:
         return None
       ckpts = await p.hgetall(ck) if deleting else {}
       p.multi()
+      if cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
+        p.hdel(key("writing"), cmd.run)
       if checkpoint and reply.ok:
         queue_checkpoint(p, **checkpoint)
       finish_cmd(p, cmd, reply, acct, charge)

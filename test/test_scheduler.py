@@ -349,7 +349,7 @@ class TestLocalQuantum(unittest.TestCase):
       service[run] += 10 if run == "slow" else 1
     self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
 
-  def test_continuations_and_sampler_saves_do_not_override_account_lag(self):
+  def test_account_lag_precedes_run_service_and_arrival(self):
     cluster = Cluster()
     cluster.run("current", account="alice")
     cluster.run("save", account="alice")
@@ -363,7 +363,18 @@ class TestLocalQuantum(unittest.TestCase):
       Cmd("save", "2-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""),
       Cmd("waiting", "3-0", Op.OPTIM_STEP, b""),
     ]
-    self.assertEqual(select_runs(state, heads, {}, width=3, prefer="current"), ["waiting"])
+    self.assertEqual(select_runs(state, heads, {"waiting": 1000}, width=3), ["waiting"])
+
+  def test_continuous_sampler_saves_share_a_trainer_with_training_work(self):
+    cluster = Cluster()
+    for run in ("saving", "training"):
+      cluster.run(run, account="alice")
+    heads = [Cmd("saving", "1-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""), Cmd("training", "2-0", Op.OPTIM_STEP, b"")]
+    service = {"saving": 0, "training": 0}
+    for _ in range(12):
+      [run] = select_runs(cluster.s, heads, service, width=1)
+      service[run] += 3 if run == "saving" else 1
+    self.assertEqual(service, {"saving": 9, "training": 9})
 
   def test_claim_gpus_enforces_exclusivity_and_exact_gang_width(self):
     node = self.make_daemon(2)
@@ -746,8 +757,38 @@ class TestMultiNodeExecution(RedisTest):
       uri = f"tinker://{r}/weights/after-rebalance"
       await self.run_cmd(r, Op.SAVE_WEIGHTS, json.dumps({"uri": uri}).encode())
       version = await self.registry.version(uri)
-      actual, _ = await asyncio.to_thread(self.nodes[0].store.get, uri, version)
+      actual, _ = await asyncio.to_thread(self.nodes[0].store.get, version)
       torch.testing.assert_close(actual, expected)
+
+  async def test_ready_trainer_runs_while_sampler_stays_backlogged_on_one_gpu(self):
+    sampling, release = asyncio.Event(), asyncio.Event()
+
+    class BusySampler(FakeEngine):
+      async def sample(self, job, name):
+        sampling.set()
+        await release.wait()
+        await asyncio.sleep(0.01)
+        return await super().sample(job, name)
+
+    with (
+      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
+      mock.patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 2),
+    ):
+      await self.add_node("shared", gpus=1, engine=BusySampler)
+      self.start_scheduler()
+      await self.create("train", account="team")
+      await self.run_cmd("train", Op.FORWARD_BACKWARD, proto_body("train", 6))
+      await self.bus.create_run(Run("sample", "tiny", 4, role=Role.SAMPLER, account="team"))
+      for _ in range(64):
+        await self.submit("sample", Op.SAMPLE, json.dumps(JOB).encode())
+      try:
+        await asyncio.wait_for(sampling.wait(), 5)
+        requests = [await self.submit("train", Op.OPTIM_STEP, b'{"adam_params":{}}') for _ in range(3)]
+      finally:
+        release.set()
+      for request in requests:
+        self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
+      self.assertGreater((await self.bus.queued_and_in_flight("sample"))["queued"], 0)
 
   async def test_shared_trainer_splits_gpu_time_by_account_not_run_count(self):
     node = await self.add_node("single-gpu")

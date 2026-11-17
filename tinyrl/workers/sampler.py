@@ -6,7 +6,6 @@ ENGINE names the engine's class, vLLM (tinyrl/workers/vllm.py) unless set. Engin
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib
 import json
 import os
@@ -77,16 +76,13 @@ class Sampler:
       if self.running is None:
         self.running = await self.engine_type.start(self.base, self.lora, self.env)
 
-  async def execute(self, cmd: Cmd, run: dict | None, checkpoint: tuple[str, str] | None) -> Reply:
+  async def execute(self, cmd: Cmd, checkpoint: tuple[str, str] | None) -> Reply:
     try:
-      if run is None:
-        raise ValueError(f"no sampling session {cmd.run}")
-      job, uri, name = json.loads(cmd.body), run.get("model_path"), None
+      job, name = json.loads(cmd.body), None
       await self.start()
       async with self.loading:
         if checkpoint:
-          path, version = checkpoint
-          name = hashlib.sha256(f"{uri}\0{version}".encode()).hexdigest()
+          path, name = checkpoint
           await self.running.load_checkpoint(name, path)
       return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, await self.running.sample(job, name)))
     except Exception as e:
