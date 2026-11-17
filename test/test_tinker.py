@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import pathlib
@@ -10,6 +11,7 @@ import unittest
 import urllib.request
 
 from test.helpers import start_redis, tiny
+from tinyrl.bus import connect
 
 EXAMPLE = pathlib.Path(__file__).parent.parent / "examples" / "tinker_sdk.py"
 
@@ -63,10 +65,15 @@ class TestTinkerSDK(unittest.TestCase):
       self.assertEqual(out.returncode, 0, out.stderr[-3000:])
 
       model_id = out.stdout.split("model ")[1].split()[0]
-      import redis
 
-      with redis.Redis.from_url(env["REDIS_URL"]) as db:
-        record = json.loads(db.hget(f"tinyrl:ckpt:{model_id}", "sampler_weights/final"))
+      async def published() -> dict:
+        db = connect(env["REDIS_URL"])
+        try:
+          return json.loads(await db.hget(f"tinyrl:ckpt:{model_id}", "sampler_weights/final"))
+        finally:
+          await db.aclose()
+
+      record = asyncio.run(published())
       version = record["version"].partition("@")[0]
       final = pathlib.Path(tmp, "ckpt", "objects", version)
       for _ in range(300):
