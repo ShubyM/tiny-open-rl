@@ -130,8 +130,9 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
   the worker's consumer group after GPU admission; preparation failures are claimed and answered without a GPU.
   `XINFO GROUPS` says what's queued and `XPENDING` says what's in flight, under which owner, and for how long.
   `GET /api/v1/runs/<id>` just asks.
-* **A dead trainer fails fast.** Its commands stay in the pending list. The node claims abandoned work with `XAUTOCLAIM`
-  and fails it before replacement execution starts, so clients receive a definite failure instead of an uncertain replay.
+* **A dead trainer fails fast.** The current owner reads pending entries with `XPENDING` and fails each under its
+  ownership token before executing new commands. A replacement sampler can reclaim an idle pending sample even if
+  the client never submits another request.
 * **A stopping trainer saves its runs.** On node SIGTERM, the node finishes the current batch and saves weights, pending gradients
   and Adam state within the grace period. Unclaimed work stays queued. The replacement trainer restores the published checkpoint
   before its next command.
