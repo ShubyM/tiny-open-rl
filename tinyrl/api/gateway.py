@@ -166,7 +166,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
           state["procs"][proc]["pid"] = pid
       for proc, gpus in info.get("on", {}).items():
         if state["procs"].get(proc, {}).get("node") == node:
-          state["procs"][proc]["actual_gpus"] = gpus
+          state["procs"][proc]["gpus"] = gpus
     return {"nodes": {n: v["gpus"] for n, v in raw["nodes"].items()}, "state": state}
 
   @api.get("/api/v1/healthz")

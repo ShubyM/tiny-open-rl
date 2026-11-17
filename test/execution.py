@@ -34,7 +34,7 @@ class TestNode(NodeDaemon):
   def __init__(self, bus, store=None, gpus=8, node="test-node", model=tiny, engine=FakeEngine, gpu_mib=0):
     super().__init__(bus, gpus=gpus, node=node, gpu_mib=gpu_mib, store=store)
     self.default_model, self.engine_type = model, engine
-    self.processes, self.samplers, self.pinned, self.unpinned = {}, {}, {}, set()
+    self.processes, self.samplers, self.pinned, self.unpinned = {}, {}, set(), set()
     self.announced = False
     self.state.nodes[self.id] = (gpus, gpu_mib * 2**20)
 
@@ -57,32 +57,26 @@ class TestNode(NodeDaemon):
     state = scheduler.from_state(await self.bus.read_state())
     if not self.announced:
       state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))
-    for proc, gpus in list(self.pinned.items()):
+    for proc in list(self.pinned):
       if proc in state.procs and proc not in self.unpinned:
         state.procs[proc].node = self.id
-        if gpus is not None:
-          state.procs[proc].gpus = gpus
-        elif not state.procs[proc].gpus and (fb := state.free(self.id, state.procs[proc].spec.gpus)):
-          state.procs[proc].gpus = fb[0]
     return state
 
   async def sync(self):
     self.state = await self.read_state()
 
-  async def bind(self, proc: str, *runs: str, gpus=None):
+  async def bind(self, proc: str, *runs: str):
     """Create or update `proc` in `tinyrl:plan` hosting `runs` on this node, then start its `Lifetime`."""
-    raw = await self.bus.read_state()
-    state = scheduler.from_state(raw)
+    state = scheduler.from_state(await self.bus.read_state())
     for r in runs:
       state.procs.setdefault(proc, scheduler.Proc(state.jobs[r].spec))
       state.home[r] = [proc]
-    plan = scheduler.to_plan(state)
-    await self.bus.write_plan(plan)
-    return await self.add(proc, gpus=gpus)
+    await self.bus.write_plan(scheduler.to_plan(state))
+    return await self.add(proc)
 
-  async def add(self, proc: str, gpus=None):
+  async def add(self, proc: str):
     self.unpinned.discard(proc)
-    self.pinned[proc] = None if gpus is None else tuple(gpus)
+    self.pinned.add(proc)
     await self.sync()
     self.dispatch()
     if proc in self.lives:
@@ -99,10 +93,10 @@ class TestNode(NodeDaemon):
 
   def drop_local(self, proc: str):
     """Unplace a locally pinned process so its `Lifetime` detaches its runs and exits."""
-    self.pinned.pop(proc, None)
+    self.pinned.discard(proc)
     self.unpinned.add(proc)
     if p := self.state.procs.get(proc):
-      p.node, p.gpus = None, ()
+      p.node = None
     self.notify()
 
   async def worker_for(self, run: str) -> str | None:

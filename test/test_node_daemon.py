@@ -172,10 +172,9 @@ class TestNodeDaemon(RedisTest):
       request = await self.bus.submit_command(
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
       )
-      await self.until(
-        lambda: (pb := node.state.home.get(b, [""])[0]) in node.lives and node.state.procs[pb].gpus == (0,), node
-      )
+      await self.until(lambda: (pb := node.state.home.get(b, [""])[0]) in node.lives and node.lives[pb].active, node)
       pb = node.state.home[b][0]
+      self.assertEqual(node.select_gpus(pb), (0,))
       self.assertEqual(node.on.get(holder.life), (0,))
       self.assertNotIn(node.lives[pb].life, node.on)  # Rule R1: never enters GPU 0 until holder finishes parking
       self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})
@@ -200,15 +199,16 @@ class TestNodeDaemon(RedisTest):
     await self.create(run, base, node)
     proc = node.state.home[run][0]
     first = node.lives[proc].model.proc.pid
-    # Move single-GPU trainer from (0,) -> (1,) in the plan; it hops without restarting its subprocess.
-    state = scheduler.from_state(await self.bus.read_state())
-    state.procs[proc].gpus = (1,)
-    await self.bus.write_plan(scheduler.to_plan(state))
-    await node.tick()
-    request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
-    await self.reply(request, node)
-    self.assertEqual(node.lives[proc].model.proc.pid, first)
-    self.assertEqual(node.on[node.lives[proc].life], (1,))
+    # When GPU 0 is busy (draining/occupied), the 1-GPU trainer hops to GPU 1 without restarting its subprocess.
+    node.draining_gpus.add(0)
+    node.notify()
+    try:
+      request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+      await self.reply(request, node)
+      self.assertEqual(node.lives[proc].model.proc.pid, first)
+      self.assertEqual(node.on[node.lives[proc].life], (1,))
+    finally:
+      node.draining_gpus.clear()
     os.killpg(first, signal.SIGKILL)
     await self.until(lambda: proc in node.lives and node.lives[proc].model.proc.pid != first, node)
     await self.create(run, base, node)

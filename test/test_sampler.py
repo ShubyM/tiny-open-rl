@@ -255,8 +255,8 @@ class TestSampler(RedisTest):
         return await super().sample(job, name)
 
     node = self.node(store, gpus=1, engine=Occupied)
-    await node.bind("busy", "busy", gpus=[0])
-    waiting = await node.bind("waiting", "ready", "broken", gpus=())
+    await node.bind("busy", "busy")
+    waiting = await node.bind("waiting", "ready", "broken")
     self.pump(node)
     holding = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
     try:
@@ -273,11 +273,9 @@ class TestSampler(RedisTest):
     finally:
       finish.set()
     self.assertTrue((await self.bus.wait_for_reply(holding, 5)).ok)
-    await node.add("waiting", gpus=[0])
-    await node.add("busy", gpus=())
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
 
-  async def test_a_busy_holder_yields_its_gpu_after_its_turn_of_tokens(self):
+  async def test_a_busy_holder_yields_its_gpu_after_its_quantum(self):
     await self.bus.create_run(Run("busy", "base-a", 4, role=Role.SAMPLER, account="a"))
     await self.bus.create_run(Run("ready", "base-b", 4, role=Role.SAMPLER, account="b"))
     order, sampling, finish = [], asyncio.Event(), asyncio.Event()
@@ -294,7 +292,10 @@ class TestSampler(RedisTest):
 
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
     await node.announce_node()
-    with mock.patch.object(scheduler, "TURN", 1), mock.patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 1):
+    with (
+      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
+      mock.patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 1),
+    ):
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode(), cost=10)
       self.pump(node, sched=True)
       await asyncio.wait_for(sampling.wait(), 5)

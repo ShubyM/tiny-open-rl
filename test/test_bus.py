@@ -35,7 +35,7 @@ class TestBus(RedisTest):
     self.assertIsNone(await self.bus.wait_for_reply(request_id, 0))
 
     committed, old = await self.bus.commit_reply(
-      cmd, ok(type="optim_step"), self.tokens[run_id], "alice", mutates=True, started=time.time()
+      cmd, ok(type="optim_step"), self.tokens[run_id], "alice", mutates=True, t0=time.time() - 0.05, share=2.0
     )
     self.assertEqual((committed, old), (True, None))
     self.assertEqual(await self.bus.wait_for_reply(request_id, 0), ok(type="optim_step"))
@@ -45,7 +45,7 @@ class TestBus(RedisTest):
     self.assertEqual(
       (run["base"], run["rank"], run["steps"], run["tokens"], run["pos"]), ("base", 8, 1, 42, cmd.entry_id)
     )
-    self.assertEqual((await self.bus.read_state())["service"], {"alice": 42.0})
+    self.assertGreaterEqual((await self.bus.read_state())["service"]["alice"], 100.0)
 
   async def test_a_reply_wakes_every_waiter_and_reading_it_never_consumes_it(self):
     run_id = await self.new_run()
@@ -256,14 +256,15 @@ class TestBus(RedisTest):
     sid = await self.new_run(role=Role.SAMPLER, account="bob")
     req = await self.bus.submit_command(sid, Op.SAMPLE, b"{}", cost=100)
     [cmd] = await self.bus.take_commands([sid], "s1", 1)
-    now = time.time()
+    now = time.time() - 0.04
     results = await asyncio.gather(*(self.bus.commit_sample(cmd, ok(replica=i), "bob", now) for i in range(5)))
     self.assertEqual(sum(results), 1)
     winner = results.index(True)
     self.assertEqual(await self.bus.wait_for_reply(req, 0), ok(replica=winner))
     run = await self.bus.get_run(sid)
     self.assertEqual((run["cmds"], run["tokens"]), (1, 100))
-    self.assertEqual((await self.bus.read_state())["service"], {"bob": 100.0})
+    service = (await self.bus.read_state())["service"]["bob"]
+    self.assertTrue(40.0 <= service < 150.0, service)
 
   async def test_a_dead_node_daemon_stops_counting(self):
     await self.bus.node_heartbeat("node-a", 2)

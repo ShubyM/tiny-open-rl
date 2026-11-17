@@ -122,7 +122,7 @@ def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
   return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"], int(fields.get(b"cost", 1)))
 
 
-def finish_cmd(p, cmd: Cmd, reply: Reply, account: str, started: float | None, write: bool = True) -> None:
+def finish_cmd(p, cmd: Cmd, reply: Reply, acct: str, t0: float | None, share: float = 1.0, write: bool = True) -> None:
   p.xack(key("q", cmd.run), GROUP, cmd.entry_id)
   p.xdel(key("q", cmd.run), cmd.entry_id)
   if write:
@@ -132,13 +132,13 @@ def finish_cmd(p, cmd: Cmd, reply: Reply, account: str, started: float | None, w
     )
     p.expire(fk, REPLY_TTL)
     counts = {"failed": 1} if not reply.ok else {"steps": 1} if cmd.op == Op.OPTIM_STEP else {}
-    if started is not None:
-      wait = max(0, int(started * 1000) - int(cmd.entry_id.split("-")[0]))
-      counts |= {"cmds": 1, "wait_ms": wait, "busy_ms": int((time.time() - started) * 1000)}
+    if t0 is not None:
+      ms = max(0.0, (time.time() - t0) * 1000.0)
+      counts |= {"cmds": 1, "wait_ms": max(0, int(t0 * 1000) - int(cmd.entry_id.split("-")[0])), "busy_ms": int(ms)}
       if reply.ok:
         counts["tokens"] = cmd.cost
-        if account:
-          p.hincrbyfloat(key("service"), account, cmd.cost)
+        if acct:
+          p.hincrbyfloat(key("service"), acct, max(1.0, ms) * share)
     for name, n in counts.items():
       p.hincrby(key("run", cmd.run), name, n)
   wake(p)
@@ -239,11 +239,11 @@ class Bus:
     await p.execute()
 
   async def read_state(self) -> dict:
-    """Cluster snapshot: live nodes, runs with `(owner, pos, snap, tokens)`, stream backlog, plan and account service."""
+    """Cluster snapshot: live nodes, runs with `(owner, pos, snap)`, stream backlog, plan, and `gpu_ms` service."""
     nodes, runs = await self.live_nodes(details=True), sorted(r.decode() for r in await self.r.smembers(key("runs")))
     p = self.r.pipeline(transaction=False)
     for r in runs:
-      p.hmget(key("run", r), "record", "owner", "pos", "snap", "tokens")
+      p.hmget(key("run", r), "record", "owner", "pos", "snap")
       p.xinfo_groups(key("q", r))
     p.get(key("plan"))
     p.hgetall(key("service"))
@@ -254,7 +254,7 @@ class Bus:
       if isinstance(f, Exception) or not f[0]:
         continue
       info = {"record": json.loads(f[0]), "owner": f[1] and f[1].decode(), "pos": f[2] and f[2].decode()}
-      out_runs[r] = info | {"snap": f[3] and f[3].decode(), "tokens": int(f[4] or 0)}
+      out_runs[r] = info | {"snap": f[3] and f[3].decode()}
       if not isinstance(groups, Exception) and (g := next((g for g in groups if g["name"] == GROUP.encode()), None)):
         queues[r] = int(g.get("lag") or 0) + int(g.get("pending") or 0)
     plan = json.loads(raw[-2]) if raw[-2] and not isinstance(raw[-2], Exception) else {}
@@ -410,10 +410,8 @@ class Bus:
 
     return bool(await self.transact(op, k))
 
-  async def commit_reply(
-    self, cmd: Cmd, reply: Reply, token: str, account: str = "", mutates: bool = False, started: float | None = None
-  ) -> tuple[bool, str | None]:
-    """Atomically publish a trainer reply, bill service, and advance `pos` (clearing `snap`) iff `token` owns the run."""
+  async def commit_reply(self, cmd: Cmd, reply: Reply, token: str, acct="", mutates=False, t0=None, share=1.0):
+    """Atomically publish a trainer reply, bill `gpu_ms`, and advance `pos` (clearing `snap`) iff `token` owns it."""
     k, ck, deleting = key("run", cmd.run), key("ckpt", cmd.run), cmd.op == Op.DELETE_MODEL and reply.ok
 
     async def op(p):
@@ -422,7 +420,7 @@ class Bus:
         return None
       ckpts = await p.hgetall(ck) if deleting else {}
       p.multi()
-      finish_cmd(p, cmd, reply, account, started)
+      finish_cmd(p, cmd, reply, acct, t0, share)
       if mutates and reply.ok and not deleting:
         p.hset(k, "pos", cmd.entry_id)
         p.hdel(k, "snap")
@@ -439,14 +437,14 @@ class Bus:
     res = await self.transact(op, k, *([ck] if deleting else []))
     return (False, None) if res is None else (True, res or None)
 
-  async def commit_sample(self, cmd: Cmd, reply: Reply, account: str = "", started: float | None = None) -> bool:
-    """Stateless reader commit: first replica writes `f:<request_id>` and bills `service` once; duplicates only ack."""
+  async def commit_sample(self, cmd: Cmd, reply: Reply, account="", started=None, share=1.0) -> bool:
+    """Stateless reader commit: first replica writes `f:<request_id>` and bills `gpu_ms` once; duplicates only ack."""
     fk = key("f", cmd.request_id)
 
     async def op(p):
       already = await p.xlen(fk)
       p.multi()
-      finish_cmd(p, cmd, reply, account, started, write=not already)
+      finish_cmd(p, cmd, reply, account, started, share, write=not already)
       await p.execute()
       return not already
 
