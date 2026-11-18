@@ -274,7 +274,9 @@ class Lifetime:
         # A trainer keeps its turn for CYCLE_GRACE_MS after a command: its client's next one is a round trip away.
         grace = self.idle_since + CYCLE_GRACE_MS / 1000 - time.monotonic()
         linger = not self.sampling and self.life in self.node.on and grace > 0
-        self.step_ready = any(c.op == Op.OPTIM_STEP and c.run in self.open_grads for c in ready)
+        # It also outstays its quantum while a training step is open, because parking then moves the gradients too.
+        closing = any(c.op == Op.OPTIM_STEP and c.run in self.open_grads for c in ready)
+        self.step_ready = closing or (linger and not ready and bool(self.open_grads))
         warm = self.warm and self.model is not None and self.model.running is None
         await self.sync_gpus(bool(ready) or linger or warm)
         if not self.wanted():

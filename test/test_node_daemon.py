@@ -6,6 +6,7 @@ import signal
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -346,6 +347,47 @@ class TestNodeDaemon(RedisTest):
     for c in clients:
       c.result()
     self.assertLessEqual(len(parks), 3)  # a trainer that gave up the GPU in every gap would park 16 times
+
+  async def test_a_swap_waits_for_an_open_training_step_to_finish(self):
+    self.enterContext(patch("tinyrl.control.node_daemon.QUANTUM_MS", 40))  # a turn often ends between two commands
+    node = self.node(gpus=1)
+    await node.announce_node()
+    self.background(scheduler.run(self.bus))
+    a, b = new_id(), new_id()
+    await self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
+    await self.bus.create_run(Run(b, "tiny-b", 4, account="acct-b", lora=LORA))
+    await self.create(a, "tiny", node)
+    await self.create(b, "tiny", node)
+    parks = []  # the last command each process ran before it parked
+
+    def watch(w):
+      call, last = w.call, []
+
+      async def watched(method, *args):
+        if method == "execute":
+          last[:] = [args[0].op]
+        if method == "park":
+          parks.extend(last)
+        return await call(method, *args)
+
+      w.call = watched
+
+    for w in node.processes.values():
+      watch(w)
+
+    async def client(run):
+      for _ in range(8):
+        for op, body in ((Op.FORWARD_BACKWARD, proto_body(run, 6)), (Op.OPTIM_STEP, b'{"adam_params":{}}')):
+          reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, body), 60)
+          self.assertTrue(reply is not None and reply.ok)
+          await asyncio.sleep(0.015)
+
+    clients = [self.background(client(a)), self.background(client(b))]
+    await self.until(lambda: all(c.done() for c in clients), node)
+    for c in clients:
+      c.result()
+    self.assertGreater(len(parks), 2)
+    self.assertNotIn(Op.FORWARD_BACKWARD, parks)  # parking with gradients open moves them too
 
 
 if __name__ == "__main__":
