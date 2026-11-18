@@ -246,27 +246,28 @@ def rebalance_target(s: State, name: str) -> str | None:
   return min((o for o in opts if o[:2] < here), default=(0, 0, None))[2]
 
 
-def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
-  """Pure planner transition: update lag, assign/merge/split/scale runs, place processes, and rebalance across nodes."""
-  s, out = copy.deepcopy(state), []
-  cap, biggest = float(sum(g for g, _ in s.nodes.values())), max((g for g, _ in s.nodes.values()), default=0)
-  demand: dict[str, float] = {}
+def demand(s: State, cap: float) -> dict[str, float]:
+  """The GPUs each account could use now: one run's worth per ready run, more for a backlogged elastic sampler."""
+  biggest, want = max((g for g, _ in s.nodes.values()), default=0), {}
   for r, j in s.jobs.items():
     if s.ready(r) and j.spec.gpus <= biggest:
       elastic = j.spec.role == Role.SAMPLER and not j.spec.exclusive and cap > j.spec.gpus
       reps = min(int(cap) // j.spec.gpus, max(1, j.backlog // max(1, SCALE_BATCH))) if elastic else 1
       a = s.account(r)
-      demand[a] = demand.get(a, 0.0) + reps * j.spec.gpus
-  s.lag, s.seen = update_lag(s.lag, s.seen, s.service, cap, demand, s.weights)
+      want[a] = want.get(a, 0.0) + reps * j.spec.gpus
+  return want
 
-  def spawn(run: str, spec: Spec, node: str, rule: str, append: bool = False) -> None:
-    q = s.add_proc(spec)
-    s.procs[q].node = node
-    s.home[run] = [*s.home[run], q] if append else [q]
-    out.append((Ev.ASSIGNED, {"run": run, "proc": q}))
-    out.append((Ev.PLACED, {"proc": q, "node": node, "rule": rule}))
 
-  # 1. Unplace vanished/shrunk nodes and drop extra sampler replicas from oversubscribed nodes.
+def spawn(s: State, out: list, run: str, spec: Spec, node: str, rule: str, append: bool = False) -> None:
+  q = s.add_proc(spec)
+  s.procs[q].node = node
+  s.home[run] = [*s.home[run], q] if append else [q]
+  out.append((Ev.ASSIGNED, {"run": run, "proc": q}))
+  out.append((Ev.PLACED, {"proc": q, "node": node, "rule": rule}))
+
+
+def drop_lost(s: State, out: list) -> None:
+  """Unplace processes whose node vanished or shrank, and drop extra sampler replicas from oversubscribed nodes."""
   for name, p in sorted(s.procs.items()):
     over = p.node in s.nodes and (
       p.spec.gpus > s.nodes[p.node][0] or (p.spec.exclusive and not s.can_host(p.node, p.spec, name))
@@ -279,7 +280,9 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
     want = max(1, s.jobs[r].backlog // max(1, SCALE_BATCH)) if s.jobs[r].spec.role == Role.SAMPLER and s.ready(r) else 1
     s.home[r] = [ps[0], *(p for p in ps[1:] if (nd := s.procs[p].node) and s.spare(nd) >= 0)][:want] if ps else []
 
-  # 2. Assign homeless runs; coalesce crowded LoRA trainers, split busy ones, and scale out samplers onto spare GPUs.
+
+def assign(s: State, out: list) -> None:
+  """Give every homeless run a process: a matching one with room, or a new one."""
   for r, j in sorted(s.jobs.items()):
     if not s.home.get(r):
       match = [n for n, p in sorted(s.procs.items()) if j.spec.shareable and p.spec == j.spec]
@@ -288,6 +291,9 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
       s.home[r] = [target := min(match, key=lambda n: (len(s.runs(n)), n)) if match else s.add_proc(j.spec)]
       out.append((Ev.ASSIGNED, {"run": r, "proc": target}))
 
+
+def merge_and_split(s: State, out: list) -> None:
+  """Coalesce crowded LoRA trainers, and split busy ones onto spare GPUs."""
   for name, p in sorted(list(s.procs.items())):
     if p.spec.role != Role.TRAINER or not p.spec.shareable or not p.node:
       continue
@@ -307,8 +313,11 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
       move = max(busy[1:], key=lambda r: (s.lag.get(s.account(r), 0.0), r))
       if owner_of(s.jobs[move].owner)[0] not in ("", name):
         break
-      spawn(move, p.spec, spot[0], "place.split")
+      spawn(s, out, move, p.spec, spot[0], "place.split")
 
+
+def scale_out(s: State, out: list) -> None:
+  """Give a backlogged sampler more replicas: idle matching processes first, then new ones on spare GPUs."""
   for r, j in sorted(s.jobs.items()):
     elastic = j.spec.role == Role.SAMPLER and not j.spec.exclusive and s.ready(r)
     want = j.backlog // max(1, SCALE_BATCH) if elastic else 1
@@ -318,11 +327,13 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
         s.home[r].append(idle[0])
         out.append((Ev.ASSIGNED, {"run": r, "proc": idle[0]}))
       elif spot := choose_node(s, s.home[r][0], True):
-        spawn(r, j.spec, spot[0], "place.scale_out", append=True)
+        spawn(s, out, r, j.spec, spot[0], "place.scale_out", append=True)
       else:
         break
 
-  # 3. Garbage-collect empty processes and place unplaced processes (exclusives first).
+
+def collect_and_place(s: State, out: list) -> None:
+  """Remove empty processes, then place the unplaced ones, exclusives first."""
   held = {owner_of(j.owner)[0] for j in s.jobs.values() if owner_of(j.owner)[1] in s.nodes}
   for name in [n for n in sorted(s.procs) if not s.runs(n) and n not in held]:
     if s.procs.pop(name).node:
@@ -334,12 +345,23 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
       rule = "place.near_its_trainer" if spot[1] else "place.least_loaded_node"
       out.append((Ev.PLACED, {"proc": name, "node": spot[0], "rule": rule}))
 
-  # 4. Cross-node rebalance: fill spare nodes, evacuate exclusive-squeezed procs, or rotate on REBALANCE_MS.
+
+def rebalance(s: State, out: list) -> None:
+  """Fill spare nodes, evacuate exclusive-squeezed processes, or rotate across nodes once lag reaches `REBALANCE_MS`."""
   for name in sorted(s.procs, key=lambda n: (-s.lag_of(n), n)):
     p = s.procs[name]
     if p.node and not p.spec.exclusive and s.runs(name) and (target := rebalance_target(s, name)):
       p.node = target
       out.append((Ev.PLACED, {"proc": name, "node": target, "rule": "place.rebalance"}))
+
+
+def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
+  """Pure planner transition: update lag, then run the placement phases in order."""
+  s, out = copy.deepcopy(state), []
+  cap = float(sum(g for g, _ in s.nodes.values()))
+  s.lag, s.seen = update_lag(s.lag, s.seen, s.service, cap, demand(s, cap), s.weights)
+  for phase in (drop_lost, assign, merge_and_split, scale_out, collect_and_place, rebalance):
+    phase(s, out)
   return s, out
 
 
