@@ -245,8 +245,10 @@ class TestNodeDaemon(RedisTest):
       request = await self.bus.submit_command(
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
       )
-      await self.until(lambda: (pb := node.state.home.get(b, [""])[0]) in node.lives and node.lives[pb].active, node)
+      # The holder keeps its turn for CYCLE_GRACE_MS after its command, then the newcomer is planned onto its GPU.
+      await self.until(lambda: (pb := node.state.home.get(b, [""])[0]) in node.lives and node.select_gpus(pb), node)
       pb = node.state.home[b][0]
+      self.assertTrue(node.lives[pb].active)
       self.assertEqual(node.select_gpus(pb), (0,))
       self.assertEqual(node.on.get(holder.life), (0,))
       self.assertNotIn(node.lives[pb].life, node.on)  # Rule R1: never enters GPU 0 until holder finishes parking
@@ -317,6 +319,33 @@ class TestNodeDaemon(RedisTest):
       await asyncio.sleep(0.015)
     await self.reply(req_b, node)
     self.assertLessEqual(len(parks), 2)  # `a` holds its quantum across all 4 step gaps instead of parking every step!
+
+  async def test_contending_sequential_clients_do_not_swap_the_gpu_on_every_command(self):
+    node = self.node(gpus=1)
+    await node.announce_node()
+    self.background(scheduler.run(self.bus))
+    a, b = new_id(), new_id()
+    await self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
+    await self.bus.create_run(Run(b, "tiny-b", 4, account="acct-b", lora=LORA))
+    await self.create(a, "tiny", node)
+    await self.create(b, "tiny", node)
+    parks = []
+    for w in node.processes.values():
+      orig = w.trainer.park
+      w.trainer.park = lambda p=orig: (parks.append(1), p())[1]
+
+    async def client(run):
+      for _ in range(4):
+        for op, body in ((Op.FORWARD_BACKWARD, proto_body(run, 6)), (Op.OPTIM_STEP, b'{"adam_params":{}}')):
+          reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, body), 60)
+          self.assertTrue(reply is not None and reply.ok)
+          await asyncio.sleep(0.015)  # the client's round trip, during which its trainer has nothing ready
+
+    clients = [self.background(client(a)), self.background(client(b))]
+    await self.until(lambda: all(c.done() for c in clients), node)
+    for c in clients:
+      c.result()
+    self.assertLessEqual(len(parks), 3)  # a trainer that gave up the GPU in every gap would park 16 times
 
 
 if __name__ == "__main__":

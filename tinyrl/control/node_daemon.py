@@ -246,7 +246,9 @@ class Lifetime:
     if self.life in self.node.on or excl.isdisjoint(self.bound_gpus):
       return True
     # Retire the blocked rank group through normal fenced detach. Its successor can bind a different block.
-    return not (self.sampling or self.active and any(excl.isdisjoint(b) for b in blocks(self.node.gpus, p.spec.gpus)))
+    return not (
+      self.sampling or self.ready()[0] and any(excl.isdisjoint(b) for b in blocks(self.node.gpus, p.spec.gpus))
+    )
 
   def priority(self) -> tuple:
     s = self.node.state
@@ -269,11 +271,12 @@ class Lifetime:
           ready, _ = self.ready()
           if not self.wanted():
             break
-        if not ready:
-          await self.await_cycle()
-          ready, _ = self.ready()
+        # A trainer keeps its turn for CYCLE_GRACE_MS after a command: its client's next one is a round trip away.
+        grace = self.idle_since + CYCLE_GRACE_MS / 1000 - time.monotonic()
+        linger = not self.sampling and self.life in self.node.on and grace > 0
         self.step_ready = any(c.op == Op.OPTIM_STEP and c.run in self.open_grads for c in ready)
-        await self.sync_gpus(bool(ready) or (self.warm and self.model is not None and self.model.running is None))
+        warm = self.warm and self.model is not None and self.model.running is None
+        await self.sync_gpus(bool(ready) or linger or warm)
         if not self.wanted():
           break
         if ready and self.life in self.node.on:
@@ -282,7 +285,8 @@ class Lifetime:
         else:
           if self.reader is None:
             self.read(IDLE_MS / 1000 if self.heads else 0)
-          await changed.wait()
+          with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(changed.wait(), grace if linger else None)
       self.active = False
       await self.stop_reader()
       for r in list(self.owned):
@@ -373,7 +377,6 @@ class Lifetime:
         snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
     await self.bus.detach_run(run, token, pos, snap, checkpoint)
     self.owned.pop(run, None)
-    self.open_grads.discard(run)
     self.heads = [c for c in self.heads if c.run != run]
     for req in [req for req, (r, _) in self.prepared.items() if r == run]:
       self.prepared.pop(req)[1].cancel()
@@ -442,26 +445,6 @@ class Lifetime:
     if self.sampling:
       return await self.bus.take_commands(runs, self.life, count, reclaim=True)
     return [c for r in runs for c in await self.bus.take_trainer_cycle(r, self.owned[r][0], count)]
-
-  async def await_cycle(self) -> None:
-    on = self.node.on
-    ws = [o for o in self.node.lives.values() if o is not self and o.active and o.wanted() and o.life not in on]
-    over = time.monotonic() >= self.granted_at + self.quantum and not self.open_grads
-    if self.sampling or self.life not in on or not ws or (over and max(w.priority() for w in ws) > self.priority()):
-      return
-    while (rem := self.idle_since + CYCLE_GRACE_MS / 1000 - time.monotonic()) > 0 and self.wanted():
-      if any(o.spec.exclusive and o.active and o.life not in on for o in self.node.lives.values()):
-        return
-      if self.reader is None:
-        self.read()
-      with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(asyncio.shield(self.reader), min(rem, 0.015))
-      await self.collect()
-      if self.heads:
-        if pending := [t for _, t in self.prepared.values() if not t.done()]:
-          await asyncio.wait(pending, timeout=0.02)
-        return
-    self.open_grads.clear()
 
   def read(self, delay: float = 0) -> None:
     self.reader = asyncio.create_task(self.peek(delay))
@@ -592,7 +575,6 @@ class Lifetime:
         billed, old = await self.bus.commit_reply(cmd, reply, token, acct, mutates, charge, effects.get("saved"))
         if not billed:
           self.owned.pop(cmd.run, None)
-          self.open_grads.discard(cmd.run)
           self.loaded.discard(cmd.run)
           raise RuntimeError(f"lost ownership of {cmd.run}")
         if cmd.op == Op.DELETE_MODEL and reply.ok:
@@ -601,10 +583,9 @@ class Lifetime:
           self.owned[cmd.run] = (token, cmd.entry_id, None)
           if old:
             await self.registry.unregister_checkpoints(unpack_snap(old)[0])
+        self.open_grads.discard(cmd.run)
         if cmd.op == Op.FORWARD_BACKWARD and reply.ok:
-          self.open_grads.update((cmd.run,) if mutates else ())
-        elif cmd.op in (Op.FORWARD_BACKWARD, Op.OPTIM_STEP, Op.CREATE_MODEL, Op.LOAD_WEIGHTS, Op.DELETE_MODEL):
-          self.open_grads.discard(cmd.run)
+          self.open_grads.add(cmd.run)
     if billed and charge.gpu_ms:
       self.service[cmd.run] = self.service.get(cmd.run, self.virtual) + charge.gpu_ms
       self.gpu_ms += charge.gpu_ms

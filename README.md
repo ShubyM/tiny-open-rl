@@ -70,8 +70,8 @@ and `close()` must wait for its processes to exit. Engines identify loaded check
 The node reserves every GPU of a worker together. An idle shared holder yields to a ready waiter. A busy holder
 gets a minimum wall-clock quantum, extended when parking and resuming are expensive. Once that quantum expires,
 the node can hand the GPUs to a ready process whose account is owed more service. Training claims one clock cycle
-through `optim_step` (and any trailing sampler save) up to `CYCLE_COMMANDS`, dwelling up to `CYCLE_GRACE_MS` for the
-client's next step while inside its quantum or ahead in priority; sampling yields
+through `optim_step` (and any trailing sampler save) up to `CYCLE_COMMANDS`, and a trainer keeps its turn for
+`CYCLE_GRACE_MS` after a command while its client sends the next one; sampling yields
 between waves of up to `SAMPLE_RUNS` LoRA sessions or one full fine-tune session, with at most `SAMPLE_COMMANDS` commands
 per session. The reservation starts before wake and remains
 held until parking acknowledges or the entire process group has exited. A trainer's
@@ -93,7 +93,7 @@ services, stop the nodes gracefully and restart the scheduler and node daemons t
 | `MAX_QUANTUM_MS` | 15000 | Upper bound on adaptive turn quantum so large PCIe parks cannot starve peers |
 | `SWITCH_BUDGET` | 0.1 | Target ratio of measured park and resume time to useful time in a turn |
 | `CYCLE_COMMANDS` | 8 | Maximum trainer commands claimed in one `forward_backward* -> optim_step` cycle |
-| `CYCLE_GRACE_MS` | 100 | Inter-step dwell grace while inside a turn quantum, ahead in priority, or awaiting `optim_step` |
+| `CYCLE_GRACE_MS` | 100 | How long a trainer keeps its turn after a command, waiting for its client's next one |
 | `SAMPLE_RUNS` | 3 | LoRA sessions in a sampling wave; full fine-tunes use one |
 | `SAMPLE_COMMANDS` | 128 | Commands from each session in a wave |
 
