@@ -104,9 +104,10 @@ class TestNodeDaemon(RedisTest):
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       await node.announce_node()
       self.background(scheduler.run(self.bus))
-      release, read = threading.Event(), node.store.local_folder
+      started, release, read = threading.Event(), threading.Event(), node.store.local_folder
 
       def slow_read(*args):  # a big copy still running off-GPU
+        started.set()
         release.wait()
         return read(*args)
 
@@ -121,7 +122,7 @@ class TestNodeDaemon(RedisTest):
         ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(ready, node)
         resident = node.lives[node.state.home["slow"][0]]
-        await self.until(lambda: "slow" in resident.loading, node)
+        await self.until(started.is_set, node)
         # Another base-model sampler yields the GPU from `resident` while `slow` is still downloading off-GPU.
         await self.bus.create_run(Run("other", "other-base", 4, role=Role.SAMPLER))
         request = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())

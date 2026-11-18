@@ -119,11 +119,8 @@ class NodeDaemon:
   async def push_heartbeat(self, wake: bool = False) -> None:
     on = {life.split("@", 1)[0]: list(gs) for life, gs in self.on.items()}
     pids = {p: m.proc.pid for p, lf in self.lives.items() if (m := lf.model) and m.proc and m.proc.pid is not None}
-    prep = sorted({r for lf in self.lives.values() for r in lf.loading})
     self.heartbeat = time.monotonic()
-    await self.bus.node_heartbeat(
-      self.id, self.gpus, self.gpu_mib * 2**20, wake, on=on, pids=pids, preparing=prep, lag=self.lag
-    )
+    await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20, wake, on=on, pids=pids, lag=self.lag)
 
   async def tick(self) -> None:
     await self.push_heartbeat()
@@ -231,7 +228,7 @@ class Lifetime:
     self.bound_gpus, self.warm, self.active = (), False, False
     self.granted_at, self.quantum, self.park_s, self.gpu_ms = 0.0, QUANTUM_MS / 1000, 0.0, 0.0
     self.owned: dict[str, tuple[str, str | None, str | None]] = {}  # run -> (token, pos, snap)
-    self.loaded, self.loading, self.open_grads = set(), set(), set()
+    self.loaded, self.open_grads = set(), set()
     self.heads, self.prepared, self.service = [], {}, {}
     self.renewed, self.virtual, self.idle_since, self.step_ready = time.monotonic(), 0.0, 0.0, False
 
@@ -308,7 +305,7 @@ class Lifetime:
   # ***** lease and subprocess *****
 
   def spawn_model(self, gpus: tuple[int, ...]) -> None:
-    env = {**scheduler.settings(self.spec, self.node.gpus, self.node.gpu_mib * 2**20), **os.environ, **self.store.env()}
+    env = {**scheduler.settings(self.node.gpus, self.node.gpu_mib * 2**20), **os.environ, **self.store.env()}
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
     if not self.sampling:
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -486,16 +483,7 @@ class Lifetime:
           raise ValueError(f"no sampling session {cmd.run}")
         if not (uri := run.get("model_path")):
           return None
-        version = await self.registry.version(uri)
-        self.loading.add(cmd.run)
-        self.node.notify()
-        try:
-          await self.node.push_heartbeat(wake=True)
-          return await asyncio.to_thread(self.store.local_folder, version)
-        finally:
-          self.loading.discard(cmd.run)
-          self.node.notify()
-          await self.node.push_heartbeat(wake=True)
+        return await asyncio.to_thread(self.store.local_folder, await self.registry.version(uri))
       except Exception as e:
         return e
 

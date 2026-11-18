@@ -35,8 +35,8 @@ kind share a sampler, and an exclusive run's sessions share a sampler of their o
 its own. Worker names encode nothing.
 
 Run one node daemon per GPU machine (`GPUS`, default 1) and one cluster scheduler. The scheduler places a worker on a
-node with room for it, preferring the node of a full fine-tune sampler's trainer and then the least-used node, and moves
-work off dead nodes. It also fits the workers to the work. A shared LoRA trainer with several busy runs is split onto
+node with room for it, preferring the node of a sampler's trainer and then the least-used node, and moves work off
+dead nodes and off nodes where exclusives leave it no room. It also fits the workers to the work. A shared LoRA trainer with several busy runs is split onto
 unallocated GPUs, and crowded ones are merged. A shared sampler gets one replica per `SCALE_BATCH` queued commands. A
 busy worker on an oversubscribed node moves to a node with spare GPUs, or to a less loaded node once its account is owed
 `REBALANCE_MS` more GPU time than a worker running there. A moved trainer saves its runs and restores them on the new node.

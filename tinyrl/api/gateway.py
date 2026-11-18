@@ -171,7 +171,6 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     """The cluster's plan, account lags, and each process's actual GPUs and PID from its node's last heartbeat."""
     raw = await bus.read_state()
     state = dataclasses.asdict(scheduler.from_state(raw))
-    state.pop("preparing", None)
     for proc, placed in state["procs"].items():
       heartbeat = raw["nodes"].get(placed["node"], {})
       for src, field in (("pids", "pid"), ("on", "gpus")):

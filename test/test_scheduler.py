@@ -21,6 +21,7 @@ from tinyrl.control.node_daemon import QUANTUM_MS, NodeDaemon, plan_gpus
 from tinyrl.control.scheduler import (
   REBALANCE_MS,
   SCALE_BATCH,
+  Job,
   Proc,
   Spec,
   State,
@@ -56,8 +57,8 @@ class Cluster:
     self.s, changes = step(from_state(self.raw()))
     return changes
 
-  def node(self, name: str, gpus: int, memory: int = 80 * GIB, preparing: tuple[str, ...] = ()) -> None:
-    self.nodes[name] = {"gpus": gpus, "memory": memory, "preparing": list(preparing)}
+  def node(self, name: str, gpus: int, memory: int = 80 * GIB) -> None:
+    self.nodes[name] = {"gpus": gpus, "memory": memory}
     self.settle()
 
   def lose(self, node: str) -> None:
@@ -256,7 +257,8 @@ class TestCluster(unittest.TestCase):
     self.assertNotEqual(p1, p2)
     self.assertEqual({c.s.procs[p1].node, c.s.procs[p2].node}, {"a", "b"})
     c.run("excl", exclusive=True, backlog=1)
-    c.settle()
+    c.settle()  # the trainer on the exclusive's node is unplaced and joins the other node
+    c.settle()  # where the two merge
     self.assertEqual(c.s.home["r1"], c.s.home["r2"])
     check_plan_invariants(self, c.s)
 
@@ -288,6 +290,176 @@ class TestCluster(unittest.TestCase):
     self.assertEqual(a, b)
     self.assertEqual(x, y)
     self.assertEqual(len({a, b, fft, x, y, z}), 4)
+    self.assertNotEqual(c.s.home["X"], c.s.home["Z"])  # exclusive LoRA runs on one base still get a trainer each
+
+  def test_a_sampling_session_without_an_account_bills_its_training_run(self):
+    c = Cluster()
+    c.run("t", session="s1")
+    c.run("q", role="sampler", train_run="t", session="s2")
+    c.run("base", role="sampler", session="s3")
+    self.assertEqual([c.s.account(r) for r in ("t", "q", "base")], ["s1", "s1", "s3"])
+
+  def test_a_proc_is_owed_what_its_ready_runs_are_owed(self):
+    jobs = {"a": Job(Spec(lora=True), account="A", backlog=1), "b": Job(Spec(lora=True), account="B")}
+    s = State(
+      procs={"p": Proc(Spec(lora=True), "n")}, home={"a": ["p"], "b": ["p"]}, jobs=jobs, lag={"A": 5.0, "B": 9.0}
+    )
+    self.assertEqual(s.lag_of("p"), 5.0)
+
+  def test_demand_is_what_each_account_could_run_now(self):
+    c = Cluster()
+    c.node("a", 2)
+    c.node("b", 2)
+    c.run("idle", rank=4, base="z", account="idle")  # nothing queued: nothing
+    c.run("wide", gpus=4, backlog=1, account="wide")  # wider than any node: nothing
+    c.run("t", rank=4, backlog=9, account="t")  # a trainer is one process however long its queue
+    c.run("x", role="sampler", train_run="t", exclusive=True, backlog=9, account="x")  # so is an exclusive sampler
+    c.run("s", role="sampler", base="m", backlog=3 * SCALE_BATCH, account="s")  # a shared sampler: a replica per batch
+    c.run("big", role="sampler", base="n", backlog=99 * SCALE_BATCH, account="big")  # up to every GPU there is
+    self.assertEqual(scheduler.demand(c.s, 4.0), {"t": 1, "x": 1, "s": 3, "big": 4})
+
+  def test_a_backlogged_shared_sampler_gets_a_replica_per_batch_and_an_exclusive_one_does_not(self):
+    c = Cluster()
+    for node in "abcd":
+      c.node(node, 1)
+    c.run("t")
+    c.run("x", role="sampler", train_run="t", exclusive=True, backlog=3 * SCALE_BATCH)
+    c.run("s", role="sampler", backlog=3 * SCALE_BATCH)
+    self.assertEqual((len(c.s.home["x"]), len(set(c.s.home["s"]))), (1, 3))
+
+  def test_scale_out_reuses_an_idle_sampler_but_not_a_busy_one(self):
+    c = Cluster()
+    c.node("a", 1)
+    c.node("b", 2)
+    first = c.run("s", role="sampler")
+    c.s.procs["p9"] = Proc(c.s.procs[first].spec, "b")
+    c.runs["o"], c.queues["o"], c.s.home["o"] = dict(c.runs["s"]), 0, ["p9"]
+    c.queue("s", 2 * SCALE_BATCH)
+    c.settle()
+    self.assertEqual(c.s.home["s"], [first, "p9"])  # the idle one on b, not a third process
+    c.queue("s", 3 * SCALE_BATCH)
+    c.queue("o", 1)
+    c.settle()
+    self.assertEqual(len(c.s.home["s"]), 3)  # p9 is busy with `o` now: a new process on b's other GPU
+    self.assertEqual(c.s.procs[c.s.home["s"][2]].node, "b")
+
+  def test_two_busy_sessions_do_not_split_their_sampler(self):
+    c = Cluster()
+    c.node("a", 1)
+    c.node("b", 1)
+    self.assertEqual(c.run("s1", role="sampler"), c.run("s2", role="sampler"))
+    c.queue("s1", 1)
+    c.queue("s2", 1)
+    c.settle()
+    self.assertEqual(c.s.home["s1"], c.s.home["s2"])
+
+  def test_idle_lora_trainers_stay_split_while_their_node_has_room(self):
+    c = Cluster()
+    c.node("a", 2)
+    self.assertNotEqual(c.run("r1", rank=4, backlog=1), c.run("r2", rank=4, backlog=1))
+    c.queue("r1", 0)
+    c.queue("r2", 0)
+    c.settle()
+    self.assertNotEqual(c.s.home["r1"], c.s.home["r2"])
+
+  def test_a_busy_lora_trainer_moves_to_a_spare_node_rather_than_merging(self):
+    c = Cluster()
+    c.node("a", 1)
+    c.node("b", 1)
+    p1, p2 = c.run("r1", rank=4, backlog=1), c.run("r2", rank=4, backlog=1)
+    c.lose("b")
+    c.settle()
+    self.assertEqual((c.s.procs[p1].node, c.s.procs[p2].node), ("a", "a"))
+    c.node("c", 1)
+    self.assertEqual((c.s.home["r1"], c.s.home["r2"]), ([p1], [p2]))
+    self.assertEqual({c.s.procs[p1].node, c.s.procs[p2].node}, {"a", "c"})
+
+  def test_an_idle_proc_stays_on_a_crowded_node(self):
+    c = Cluster()
+    c.node("a", 1)
+    idle = c.run("idle", rank=4, base="x")
+    for i in range(2):
+      c.run(f"busy{i}", rank=4, base=f"y{i}", backlog=1)
+    c.node("b", 1)
+    self.assertEqual(c.s.procs[idle].node, "a")
+
+  def test_a_busy_proc_beside_an_idle_one_is_not_crowded(self):
+    c = Cluster()
+    c.node("a", 1)
+    c.run("idle", rank=4, base="x")
+    busy = c.run("busy", rank=4, base="y", backlog=1)
+    c.node("b", 1)
+    self.assertEqual(c.s.procs[busy].node, "a")
+
+  def test_an_exclusive_proc_holds_its_gpus_whether_or_not_it_is_busy(self):
+    jobs = {"r": Job(Spec(exclusive=True), backlog=1)}
+    s = State(nodes={"n": (2, 0)}, procs={"x": Proc(Spec(exclusive=True), "n")}, home={"r": ["x"]}, jobs=jobs)
+    self.assertEqual(s.spare("n"), 1)
+
+  def test_crowding_moves_a_shared_proc_and_never_an_exclusive_one(self):
+    c = Cluster()
+    c.node("a", 2)
+    x = c.run("x", exclusive=True, backlog=1)
+    shared = [c.run(f"r{i}", rank=4, base=f"m{i}", backlog=1) for i in range(2)]
+    c.node("b", 1)
+    self.assertEqual(c.s.procs[x].node, "a")
+    self.assertEqual(sorted(c.s.procs[p].node for p in shared), ["a", "b"])
+
+  def test_scale_out_does_not_reuse_a_sampler_that_has_no_node(self):
+    c = Cluster()
+    c.node("a", 1)
+    first = c.run("s", role="sampler")
+    c.s.procs["p9"] = Proc(c.s.procs[first].spec, None)
+    c.runs["o"], c.queues["o"], c.s.home["o"] = dict(c.runs["s"]), 0, ["p9"]
+    c.queue("s", 2 * SCALE_BATCH)
+    c.settle()
+    self.assertEqual(c.s.home["s"], [first])
+
+  def test_rotation_weighs_a_mover_against_the_busy_shared_procs_on_the_other_node(self):
+    def target(c_lag: float, n2: int = 1, **extra) -> str | None:
+      specs = {"me": (Spec(lora=True, base="me"), "n1", 1), "b": (Spec(lora=True, base="b"), "n1", 1)}
+      specs |= {"c": (Spec(lora=True, base="c"), "n2", 1)} | extra
+      s = State(nodes={"n1": (1, 0), "n2": (n2, 0)}, lag={"me": 30000.0, "b": 25000.0, "c": c_lag, "x": -50000.0})
+      for name, (spec, node, backlog) in specs.items():
+        s.procs[name], s.home[name], s.jobs[name] = Proc(spec, node), [name], Job(spec, account=name, backlog=backlog)
+      return scheduler.rebalance_target(s, "me")
+
+    self.assertEqual(target(5000.0), "n2")  # owed REBALANCE_MS more than `c`, who is owed less than `b`
+    self.assertIsNone(target(15000.0))  # not owed enough more than `c`
+    self.assertIsNone(target(15000.0, d=(Spec(lora=True, base="d"), "n2", 0)))  # an idle proc there changes nothing
+    self.assertIsNone(target(15000.0, 2, x=(Spec(exclusive=True), "n2", 1)))  # nor does an exclusive one
+
+  def test_a_new_run_joins_the_matching_trainer_with_the_fewest_runs(self):
+    c = Cluster()
+    c.node("a", 2)
+    first = c.run("r1", rank=4)
+    c.s.procs["p9"] = Proc(c.s.procs[first].spec, "a")
+    c.runs["r2"], c.queues["r2"], c.s.home["r2"] = dict(c.runs["r1"]), 0, [first]
+    c.runs["r3"], c.queues["r3"], c.s.home["r3"] = dict(c.runs["r1"]), 0, ["p9"]
+    self.assertEqual(c.run("r4", rank=4), "p9")
+
+  def test_only_a_trainer_is_owed_room_for_a_sampler(self):
+    c = Cluster()
+    c.node("a", 2)
+    c.run("q", role="sampler")
+    c.node("b", 2)
+    c.run("r1", rank=4, base="m1")
+    self.assertEqual([c.s.procs[p].node for p in (c.s.home["q"][0], c.s.home["r1"][0])], ["a", "b"])
+    new = c.run("r2", rank=4, base="m2")
+    self.assertEqual(c.s.procs[new].node, "a")
+
+  def test_an_empty_proc_owned_from_a_lost_node_is_collected(self):
+    c = Cluster()
+    c.node("n", 1)
+    c.run("r")
+    c.s.procs["p9"] = Proc(Spec(), None)
+    c.runs["r"]["owner"] = "p9@gone-1:1"
+    c.settle()
+    self.assertNotIn("p9", c.s.procs)
+
+  def test_sampler_settings_follow_the_node(self):
+    self.assertEqual(scheduler.settings(1, 24 * GIB), {})
+    self.assertEqual(scheduler.settings(2, 80 * GIB), {"TINYRL_WARM_SAMPLER": "1", "TINYRL_KV_BYTES": str(24 * GIB)})
 
   def test_exclusive_evacuates_squeezed_shareable_procs_and_never_overcommits(self):
     c = Cluster()
@@ -297,6 +469,7 @@ class TestCluster(unittest.TestCase):
     pb = c.run("rb", backlog=1)
     self.assertEqual({c.s.procs[pa].node, c.s.procs[pb].node}, {"a", "b"})
     x = c.run("x", exclusive=True, backlog=1)
+    c.settle()  # the proc that no longer fits beside `x` is unplaced, and placed again on the other node
     x_node = c.s.procs[x].node
     other = "b" if x_node == "a" else "a"
     self.assertEqual((c.s.procs[pa].node, c.s.procs[pb].node), (other, other))
@@ -751,6 +924,27 @@ class TestMultiNodeExecution(RedisTest):
         if run in lf.owned and proc in node.processes:
           return node.processes[proc].trainer.model.params[run]
     raise AssertionError(f"no live owner found for {run}")
+
+  async def test_the_plan_is_written_when_it_changes_and_wakes_nodes_when_assignments_do(self):
+    await self.bus.node_heartbeat("n", 1)
+    await self.bus.create_run(Run("r", "tiny", 4, lora=LORA, account="acct"))
+    writes, write = [], self.bus.write_plan
+
+    async def record(plan, changes=(), notify_nodes=True):
+      writes.append(notify_nodes)
+      await write(plan, changes, notify_nodes)
+
+    self.bus.write_plan = record
+    await scheduler.tick(self.bus)  # the run gets a process, and the process a node
+    await scheduler.tick(self.bus)  # nothing changed
+    await self.bus.r.hincrbyfloat(key("service"), "acct", 5.0)
+    await scheduler.tick(self.bus)  # only what the account has been served moved
+    await self.bus.create_run(Run("r2", "tiny", 4, lora=LORA, account="acct"))
+    await scheduler.tick(self.bus)  # a run joined the process: only `home` moved
+    await self.bus.r.hdel(key("nodes"), "n")
+    await self.bus.node_heartbeat("m", 1)
+    await scheduler.tick(self.bus)  # the process changed node: only `procs` moved
+    self.assertEqual(writes, [True, False, True, True])
 
   async def test_new_node_rebalances_mid_accumulation_with_exact_model_parameters(self):
     opt = json.dumps({"adam_params": {"learning_rate": 1e-2}}).encode()
