@@ -75,7 +75,7 @@ def plan_gpus(
     opts = [lf.bound_gpus] if lf.bound_gpus else blocks(total, lf.spec.gpus)
     if free := [b for b in opts if not (taken & set(b)) and (b == cur[p] or not (hold & set(b)))]:
       avoid = pinned if lf.spec.exclusive else set()
-      keep[p] = min(free, key=lambda b: (b != cur[p], not avoid.isdisjoint(b), not held.isdisjoint(b), b))
+      keep[p] = min(free, key=lambda b: (b != cur[p], not avoid.isdisjoint(b), not held.isdisjoint(b)))
       taken |= set(keep[p])
       excl |= set(keep[p]) if lf.spec.exclusive else set()
     else:
@@ -273,8 +273,8 @@ class Lifetime:
         linger = not self.sampling and self.life in self.node.on and grace > 0
         # It also outstays its quantum while a training step is open, because parking then moves the gradients too.
         closing = any(c.op == Op.OPTIM_STEP and c.run in self.open_grads for c in ready)
-        self.step_ready = closing or (linger and not ready and bool(self.open_grads))
-        warm = self.warm and self.model is not None and self.model.running is None
+        self.step_ready = closing or (not ready and bool(self.open_grads))
+        warm = self.warm and self.model.running is None
         await self.sync_gpus(bool(ready) or linger or warm)
         if not self.wanted():
           break
@@ -343,7 +343,7 @@ class Lifetime:
       except Exception:
         if not self.closing and time.monotonic() - self.renewed >= LEASE_MS / 1000:
           break
-    if self.task and not self.task.cancelling():
+    if not self.task.cancelling():
       self.task.cancel()
 
   # ***** acquire & detach (L2/L3 <-> process) *****
@@ -366,7 +366,7 @@ class Lifetime:
     """Flush `run` if dirty (0 bytes if clean), release `run.owner` fenced by `(token, pos)`, and drop if requested."""
     token, pos, snap = self.owned[run]
     checkpoint = None
-    if pos is not None and snap is None and run in self.loaded and self.model is not None:
+    if pos is not None and snap is None and run in self.loaded:
       if self.spec.gpus > 1 and self.life not in self.node.on and torch.cuda.is_available():
         await self.node.claim_after_drain(self.life, self.bound_gpus)
         await self.model.call("resume", None)
@@ -434,8 +434,8 @@ class Lifetime:
       for cmd in await self.claim(self.streams(), 1):
         if self.sampling:
           await self.bus.commit_sample(cmd, err)
-        elif info := self.owned.get(cmd.run):
-          await self.bus.commit_reply(cmd, err, info[0])
+        else:
+          await self.bus.commit_reply(cmd, err, self.owned[cmd.run][0])
       raise
 
   # ***** peeking, preparing off-GPU, and executing *****
@@ -479,8 +479,6 @@ class Lifetime:
         run = await self.bus.get_run(cmd.run)
         if not self.sampling:
           return run
-        if run is None:
-          raise ValueError(f"no sampling session {cmd.run}")
         if not (uri := run.get("model_path")):
           return None
         return await asyncio.to_thread(self.store.local_folder, await self.registry.version(uri))
@@ -513,7 +511,7 @@ class Lifetime:
     await self.stop_reader()
     await self.keep_lease()
     with span("node.claim"):
-      cmds = await self.claim(runs, SAMPLE_COMMANDS if self.sampling and not bad else 1)
+      cmds = await self.claim(runs, 1 if bad else SAMPLE_COMMANDS)
     self.heads = [c for c in self.heads if c.run not in runs]
     self.read()
     if not cmds:
@@ -543,7 +541,7 @@ class Lifetime:
         return Reply.error(exc), {}
     elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
       version = await self.bus.begin_checkpoint(cmd.run, token)
-    saved = unpack_snap(snap)[1] if snap and cmd.run not in self.loaded and cmd.op != Op.LOAD_WEIGHTS else None
+    saved = unpack_snap(snap)[1] if snap else None  # the trainer reads it only for a run it has not loaded
     await self.keep_lease()
     reply, effects = await wave.run(self.model.call("execute", cmd, run, saved, version), charge)
     self.loaded.add(cmd.run) if effects.get("loaded") else self.loaded.discard(cmd.run)
@@ -580,11 +578,10 @@ class Lifetime:
         self.open_grads.discard(cmd.run)
         if cmd.op == Op.FORWARD_BACKWARD and reply.ok:
           self.open_grads.add(cmd.run)
-    if billed and charge.gpu_ms:
+    if billed:
       self.service[cmd.run] = self.service.get(cmd.run, self.virtual) + charge.gpu_ms
       self.gpu_ms += charge.gpu_ms
-      if acct:
-        self.node.state.service[acct] = self.node.state.service.get(acct, 0.0) + charge.gpu_ms
+      self.node.state.service[acct] = self.node.state.service.get(acct, 0.0) + charge.gpu_ms
     if DEBUG:
       print(f"{self.proc} {cmd.request_id} {cmd.op:24s} {charge.busy_ms:9d} ms")
     return reply
