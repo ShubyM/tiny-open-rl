@@ -468,8 +468,11 @@ class Stress(RedisTest):
       self.problems.append(
         f"did not settle after deleting every run: procs {sorted(plan.get('procs', {}))} lives {lives}"
       )
+    # A node cut off from Redis cannot drop its leases. They must carry an expiry, and then they lapse by themselves.
+    cut, leases = {n.id for n in self.cut}, [k.decode() async for k in self.bus.r.scan_iter(match=key("lease", "*"))]
+    lapsing = [k for k in leases if k.split("@")[-1].rsplit("-", 1)[0] in cut and await self.bus.r.pttl(k) != -1]
     left = {
-      "leases": [k.decode() async for k in self.bus.r.scan_iter(match=key("lease", "*"))],
+      "leases": sorted(set(leases) - set(lapsing)),
       "queues": [k.decode() async for k in self.bus.r.scan_iter(match=key("q", "*"))],
       "writing": sorted(k.decode() for k in await self.bus.r.hkeys(key("writing"))),
       "owners": [r for r in trainers if await self.bus.r.hget(key("run", r), "owner")],
