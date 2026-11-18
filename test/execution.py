@@ -11,8 +11,7 @@ from tinyrl.workers.trainer import Trainer
 
 class InlineProcess:
   def __init__(self, trainer: Trainer):
-    self.trainer, self.proc, self.closed = trainer, self, False
-    self.pid = None
+    self.trainer, self.proc, self.closed, self.pid = trainer, self, False, None
 
   async def call(self, method, *args):
     if self.closed:
@@ -35,70 +34,91 @@ class TestNode(NodeDaemon):
   def __init__(self, bus, store=None, gpus=8, node="test-node", model=tiny, engine=FakeEngine, gpu_mib=0):
     super().__init__(bus, gpus=gpus, node=node, gpu_mib=gpu_mib, store=store)
     self.default_model, self.engine_type = model, engine
-    self.processes, self.samplers, self.pinned = {}, {}, set()
+    self.processes, self.samplers, self.pinned, self.unpinned = {}, {}, set(), set()
+    self.announced = False
     self.state.nodes[self.id] = (gpus, gpu_mib * 2**20)
 
-  def open_trainer(self, worker, env):
+  async def announce_node(self):
+    self.announced = True
+    await super().announce_node()
+
+  def open_trainer(self, proc, width, env):
     process = InlineProcess(Trainer(Model(self.default_model), self.store))
-    self.processes[worker] = process
+    self.processes[proc] = process
     return process
 
-  def open_sampler(self, worker, env):
-    sampler = super().open_sampler(worker, env)
+  def open_sampler(self, proc, spec, env):
+    sampler = super().open_sampler(proc, spec, env)
     sampler.engine_type = self.engine_type
-    self.samplers[worker] = sampler
+    self.samplers[proc] = sampler
     return sampler
 
   async def read_state(self):
-    """The table, with the workers a test placed here itself, since no scheduler places them."""
-    state = scheduler.from_table(await self.bus.read_table())
-    state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))  # live before its first heartbeat
-    for worker in self.pinned & state.workers.keys():
-      state.workers[worker].node = self.id
-    return scheduler.keep_chosen_gpus(state, self.state)
+    state = scheduler.from_state(await self.bus.read_state())
+    if not self.announced:
+      state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))
+    for proc in list(self.pinned):
+      if proc in state.procs and proc not in self.unpinned:
+        state.procs[proc].node = self.id
+    return state
 
   async def sync(self):
     self.state = await self.read_state()
 
-  async def add(self, worker, gpus=None):
-    self.pinned.add(worker)
+  async def bind(self, proc: str, *runs: str):
+    """Create or update `proc` in `tinyrl:plan` hosting `runs` on this node, then start its `Lifetime`."""
+    state = scheduler.from_state(await self.bus.read_state())
+    for r in runs:
+      state.procs.setdefault(proc, scheduler.Proc(state.jobs[r].spec))
+      state.home[r] = [proc]
+    await self.bus.write_plan(scheduler.to_plan(state))
+    return await self.add(proc)
+
+  async def add(self, proc: str):
+    self.unpinned.discard(proc)
+    self.pinned.add(proc)
     await self.sync()
     self.dispatch()
-    desired = self.state.workers[worker]
-    if gpus is not None:
-      desired.gpus = tuple(gpus)
-    scheduler.place_gpus(self.state, self.id, self.running)
-    if worker in self.running:
-      return self.running[worker]
-    task = self.tasks.get(worker) or self.start(worker)
+    if proc in self.lives:
+      self.notify()
+      return self.lives[proc]
+    task = self.tasks.get(proc) or self.start(proc)
     async with asyncio.timeout(5):
-      while worker not in self.running:
+      while proc not in self.lives:
         if task.done():
           task.result()
-          raise AssertionError(f"could not acquire {worker}")
+          raise AssertionError(f"could not start {proc}")
         await asyncio.sleep(0.001)
-    return self.running[worker]
+    return self.lives[proc]
 
-  async def worker_for(self, run):
+  def drop_local(self, proc: str):
+    """Unplace a locally pinned process so its `Lifetime` detaches its runs and exits."""
+    self.pinned.discard(proc)
+    self.unpinned.add(proc)
+    if p := self.state.procs.get(proc):
+      p.node = None
+    self.notify()
+
+  async def worker_for(self, run: str) -> str | None:
     await assign_new_runs(self.bus)
     await self.sync()
-    return r.worker if (r := self.state.jobs.get(run)) else None
+    ps = self.state.home.get(run)
+    return ps[0] if ps else None
 
-  async def drain(self, run):
-    """Let the real worker coroutines finish the commands visible in their Redis streams."""
-    if (worker := await self.worker_for(run)) is None:
-      return None  # a live worker may already have completed the run's DELETE_MODEL
-    await self.add(worker)
+  async def drain(self, run: str):
+    """Let real `Lifetime` coroutines execute every queued command for `run`'s process."""
+    if (proc := await self.worker_for(run)) is None:
+      return None
+    await self.add(proc)
     async with asyncio.timeout(15):
       while True:
         await self.tick()
-        queues = await asyncio.gather(
-          *(self.bus.queued_and_in_flight(r) for r in scheduler.jobs_of(self.state, worker))
-        )
+        runs = self.state.runs(proc)
+        queues = await asyncio.gather(*(self.bus.queued_and_in_flight(r) for r in runs))
         if not any(q.get("queued") or q.get("in_flight") for q in queues):
           break
-        await asyncio.sleep(0.001)
-    return self.running.get(worker)
+        await asyncio.sleep(0.002)
+    return self.lives.get(proc)
 
   async def aclose(self):
     await self.close(graceful=False)
