@@ -260,6 +260,21 @@ class TestCluster(unittest.TestCase):
     self.assertEqual(c.s.home["r1"], c.s.home["r2"])
     check_plan_invariants(self, c.s)
 
+  def test_subscribed_node_with_idle_peers_does_not_split_or_scale_out_thrash(self):
+    c = Cluster()
+    c.node("a", 2)
+    s1 = c.run("s1", role="sampler", base="m1")
+    c.run("s2", role="sampler", base="m2")
+    p1 = c.run("r1", rank=8, backlog=1)
+    self.assertEqual(c.run("r2", rank=8, backlog=1), p1)
+    self.assertEqual(c.s.home["r1"], c.s.home["r2"])
+    c.queue("r1", 0)
+    c.queue("r2", 0)
+    c.queue("s1", 12)
+    c.settle()
+    self.assertEqual((c.s.home["s1"], c.s.made), ([s1], 3))
+    check_plan_invariants(self, c.s)
+
   def test_sampling_sessions_share_only_their_kind_and_exclusive_training_run(self):
     c = Cluster()
     c.run("X", rank=8, exclusive=True)

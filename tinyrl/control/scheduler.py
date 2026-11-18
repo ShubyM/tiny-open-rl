@@ -105,8 +105,8 @@ class State:
   def load(self, node: str, skip: str = "") -> float:
     return self.busy_gpus(node, skip) / max(1, self.nodes[node][0] - self.excl_used(node, skip))
 
-  def can_host(self, node: str, spec: Spec, skip: str = "") -> bool:
-    return self.excl_used(node, skip) + spec.gpus <= self.nodes[node][0]
+  def can_host(self, node: str, spec: Spec, skip: str = "", spare: bool = False) -> bool:
+    return (self.used(node) if spare else self.excl_used(node, skip)) + spec.gpus <= self.nodes[node][0]
 
   def add_proc(self, spec: Spec) -> str:
     self.made = next(n for n in itertools.count(self.made + 1) if f"p{n}" not in self.procs)
@@ -202,8 +202,7 @@ def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width
 
 def choose_node(s: State, proc: str, only_spare: bool = False) -> tuple[str, bool] | None:
   spec, skip = s.procs[proc].spec, ("" if only_spare else proc)
-  nodes = [n for n in sorted(s.nodes) if s.can_host(n, spec, skip) and (not only_spare or s.spare(n) >= spec.gpus)]
-  if not nodes:
+  if not (nodes := [n for n in sorted(s.nodes) if s.can_host(n, spec, skip, only_spare)]):
     return None
   near = set()
   if spec.role == Role.SAMPLER and not spec.lora:
@@ -284,7 +283,7 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
   for r, j in sorted(s.jobs.items()):
     if not s.home.get(r):
       match = [n for n, p in sorted(s.procs.items()) if j.spec.shareable and p.spec == j.spec]
-      if match and s.ready(r) and any(s.can_host(n, j.spec) and s.spare(n) >= j.spec.gpus for n in s.nodes):
+      if match and s.ready(r) and any(s.can_host(n, j.spec, spare=True) for n in s.nodes):
         match = [n for n in match if not s.busy(n) and (not s.procs[n].node or s.can_host(s.procs[n].node, j.spec))]
       s.home[r] = [target := min(match, key=lambda n: (len(s.runs(n)), n)) if match else s.add_proc(j.spec)]
       out.append((Ev.ASSIGNED, {"run": r, "proc": target}))
