@@ -51,7 +51,7 @@ class Job:
 
 def owner_of(token: str | None) -> tuple[str, str]:
   proc, _, rest = (token or "").rsplit(":", 1)[0].partition("@")
-  return (proc, rest.rsplit("-", 1)[0]) if rest else ("", "")
+  return proc, rest.rsplit("-", 1)[0]
 
 
 @dataclass
@@ -68,7 +68,7 @@ class State:
   weights: dict[str, float] = field(default_factory=dict)
 
   def runs(self, proc: str) -> list[str]:
-    return [r for r, ps in sorted(self.home.items()) if proc in ps and r in self.jobs]
+    return [r for r, ps in sorted(self.home.items()) if proc in ps]
 
   def ready(self, run: str) -> bool:
     return self.jobs[run].backlog > 0 and run not in self.preparing
@@ -89,8 +89,8 @@ class State:
     account = self.account(run)
     return self.lag.get(account, 0.0) - max(0.0, self.service.get(account, 0.0) - self.seen.get(account, 0.0))
 
-  def used(self, node: str, skip: str = "") -> int:
-    return sum(p.spec.gpus for n, p in self.procs.items() if n != skip and p.node == node)
+  def used(self, node: str) -> int:
+    return sum(p.spec.gpus for p in self.procs.values() if p.node == node)
 
   def excl_used(self, node: str, skip: str = "") -> int:
     return sum(p.spec.gpus for n, p in self.procs.items() if n != skip and p.node == node and p.spec.exclusive)
@@ -99,8 +99,8 @@ class State:
     shared = (n for n, p in self.procs.items() if p.node == node and not p.spec.exclusive and n != skip)
     return sum(self.procs[n].spec.gpus for n in shared if self.busy(n))
 
-  def spare(self, node: str, skip: str = "") -> int:
-    return self.nodes[node][0] - self.excl_used(node, skip) - self.busy_gpus(node, skip)
+  def spare(self, node: str) -> int:
+    return self.nodes[node][0] - self.excl_used(node) - self.busy_gpus(node)
 
   def load(self, node: str, skip: str = "") -> float:
     return self.busy_gpus(node, skip) / max(1, self.nodes[node][0] - self.excl_used(node, skip))
@@ -115,7 +115,7 @@ class State:
 
 
 def from_state(raw: dict) -> State:
-  plan, queues, rnodes = raw.get("plan") or {}, raw.get("queues", {}), raw.get("nodes", {})
+  plan, queues, rnodes = raw["plan"], raw.get("queues", {}), raw.get("nodes", {})
   nodes = {n: (int(v["gpus"]), int(v.get("memory", 0))) for n, v in rnodes.items()}
   prep = {r for v in rnodes.values() for r in v.get("preparing", ())}
   jobs, procs = {}, {}
@@ -137,8 +137,7 @@ def from_state(raw: dict) -> State:
 
 def to_plan(s: State) -> dict:
   procs = {n: dataclasses.asdict(p) for n, p in s.procs.items()}
-  plan = {"made": s.made, "procs": procs, "home": s.home, "lag": s.lag, "seen": s.seen}
-  return plan | ({"weights": s.weights} if s.weights else {})
+  return {"made": s.made, "procs": procs, "home": s.home, "lag": s.lag, "seen": s.seen, "weights": s.weights}
 
 
 def settings(spec: Spec, gpus: int, gpu_bytes: int) -> dict[str, str]:
@@ -155,7 +154,7 @@ def waterfill(capacity: float, demand: dict[str, float], weights: dict[str, floa
   """Weighted progressive max-min fair rates `r*[a] <= demand[a]` summing to `min(capacity, sum(demand))`."""
   rates, rem, left = {}, float(capacity), {a: float(d) for a, d in demand.items() if d > 0}
   w = {a: max(1e-9, float((weights or {}).get(a, 1.0))) for a in left}
-  while left and rem > 1e-9:
+  while left:
     tw, level = sum(w[a] for a in left), min(left[a] / w[a] for a in left)
     if level * tw >= rem - 1e-9:
       return rates | {a: rem * w[a] / tw for a in left}
@@ -180,7 +179,7 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
       wa = max(1e-9, float(w.get(a, 1.0)))
       lag[a] = min(0.0, lag[a] + work * wa / (live_w + wa))
   active = {a for a in accts if demand.get(a, 0.0) > 0 or deltas[a] > 0}
-  return {a: (v if a in active else min(0.0, v)) for a, v in lag.items() if a in active or v < -1e-9}, seen
+  return {a: v for a, v in lag.items() if a in active or v < -1e-9}, seen
 
 
 def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width: int) -> list[str]:
@@ -201,23 +200,23 @@ def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width
 
 
 def choose_node(s: State, proc: str, only_spare: bool = False) -> tuple[str, bool] | None:
-  spec, skip = s.procs[proc].spec, ("" if only_spare else proc)
-  if not (nodes := [n for n in sorted(s.nodes) if s.can_host(n, spec, skip, only_spare)]):
+  spec = s.procs[proc].spec
+  if not (nodes := [n for n in sorted(s.nodes) if s.can_host(n, spec, spare=only_spare)]):
     return None
   near = set()
-  if spec.role == Role.SAMPLER and not spec.lora:
+  if not spec.lora:
     ts = (t for r in s.runs(proc) if (t := s.jobs[r].train_run) in s.jobs)
-    near = {s.procs[p].node for t in ts for p in s.home.get(t, ()) if p in s.procs and s.procs[p].node}
-  samplers = [n for n, p in s.procs.items() if (p.node or n == proc) and p.spec.role == Role.SAMPLER]
+    near = {s.procs[p].node for t in ts for p in s.home.get(t, ())}
+  samplers = [n for n, p in s.procs.items() if p.node or n == proc]
   covered = {s.jobs[r].train_run for n in samplers for r in s.runs(n)}
 
   def placement_rank(node: str) -> tuple:
     unpaired = [n for n, p in s.procs.items() if p.node == node and p.spec.role == Role.TRAINER and not p.spec.lora]
     owed = sum(s.procs[n].spec.gpus for n in unpaired if not (covered & set(s.runs(n))))
-    used, capacity = s.used(node, skip), s.nodes[node][0]
+    used, capacity = s.used(node), s.nodes[node][0]
     free = capacity - used - owed
     paired = spec.gpus * (2 if spec.role == Role.TRAINER and not spec.lora else 1)
-    return free < paired, free < spec.gpus, s.spare(node, skip) < spec.gpus, node not in near, used / capacity
+    return free < paired, free < spec.gpus, s.spare(node) < spec.gpus, node not in near, used / capacity
 
   node = min(nodes, key=placement_rank)
   return node, node in near
@@ -229,7 +228,7 @@ def rebalance_target(s: State, name: str) -> str | None:
   squeezed = s.excl_used(p.node) + p.spec.gpus > s.nodes[p.node][0]
   if not squeezed and (not s.busy(name) or s.spare(p.node) >= 0):
     return None
-  fit = [n for n in sorted(s.nodes) if n != p.node and s.can_host(n, p.spec)]
+  fit = [n for n in sorted(s.nodes) if s.can_host(n, p.spec)]
   if spare := [n for n in fit if s.spare(n) >= p.spec.gpus]:
     return min(spare, key=lambda n: s.used(n) / s.nodes[n][0])
   if squeezed:
@@ -251,7 +250,7 @@ def demand(s: State, cap: float) -> dict[str, float]:
   biggest, want = max((g for g, _ in s.nodes.values()), default=0), {}
   for r, j in s.jobs.items():
     if s.ready(r) and j.spec.gpus <= biggest:
-      elastic = j.spec.role == Role.SAMPLER and not j.spec.exclusive and cap > j.spec.gpus
+      elastic = j.spec.role == Role.SAMPLER and not j.spec.exclusive
       reps = min(int(cap) // j.spec.gpus, max(1, j.backlog // max(1, SCALE_BATCH))) if elastic else 1
       a = s.account(r)
       want[a] = want.get(a, 0.0) + reps * j.spec.gpus
@@ -276,9 +275,9 @@ def drop_lost(s: State, out: list) -> None:
       p.node = None
       out.append((Ev.UNPLACED, {"proc": name, "rule": "place.node_lost"}))
   for r, ps in list(s.home.items()):
-    ps = [p for p in dict.fromkeys(ps) if p in s.procs and s.procs[p].spec == s.jobs[r].spec]
-    want = max(1, s.jobs[r].backlog // max(1, SCALE_BATCH)) if s.jobs[r].spec.role == Role.SAMPLER and s.ready(r) else 1
-    s.home[r] = [ps[0], *(p for p in ps[1:] if (nd := s.procs[p].node) and s.spare(nd) >= 0)][:want] if ps else []
+    ps = list(dict.fromkeys(ps))
+    want = max(1, s.jobs[r].backlog // max(1, SCALE_BATCH)) if s.ready(r) else 1
+    s.home[r] = [ps[0], *(p for p in ps[1:] if (nd := s.procs[p].node) and s.spare(nd) >= 0)][:want]
 
 
 def assign(s: State, out: list) -> None:
@@ -286,7 +285,7 @@ def assign(s: State, out: list) -> None:
   for r, j in sorted(s.jobs.items()):
     if not s.home.get(r):
       match = [n for n, p in sorted(s.procs.items()) if j.spec.shareable and p.spec == j.spec]
-      if match and s.ready(r) and any(s.can_host(n, j.spec, spare=True) for n in s.nodes):
+      if s.ready(r) and any(s.can_host(n, j.spec, spare=True) for n in s.nodes):
         match = [n for n in match if not s.busy(n) and (not s.procs[n].node or s.can_host(s.procs[n].node, j.spec))]
       s.home[r] = [target := min(match, key=lambda n: (len(s.runs(n)), n)) if match else s.add_proc(j.spec)]
       out.append((Ev.ASSIGNED, {"run": r, "proc": target}))
@@ -322,7 +321,7 @@ def scale_out(s: State, out: list) -> None:
     elastic = j.spec.role == Role.SAMPLER and not j.spec.exclusive and s.ready(r)
     want = j.backlog // max(1, SCALE_BATCH) if elastic else 1
     while len(s.home[r]) < want:
-      pool = [q for q, p in sorted(s.procs.items()) if q not in s.home[r] and p.spec == j.spec and p.node]
+      pool = [q for q, p in sorted(s.procs.items()) if p.spec == j.spec and p.node]
       if idle := [q for q in pool if not s.busy(q) and s.spare(s.procs[q].node) >= j.spec.gpus]:
         s.home[r].append(idle[0])
         out.append((Ev.ASSIGNED, {"run": r, "proc": idle[0]}))
