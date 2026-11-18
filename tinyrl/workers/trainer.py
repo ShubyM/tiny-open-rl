@@ -9,7 +9,6 @@ import contextlib
 import json
 import os
 import sys
-import time
 
 import torch
 import torch.distributed as dist
@@ -18,7 +17,9 @@ from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Reply
 from tinyrl.storage.store import Store, nbytes
 from tinyrl.trace import span
-from tinyrl.workers.model import Model
+from tinyrl.workers.model import GradientRecoveryError, Model
+
+RECOVERABLE_ERRORS = (ValueError, KeyError, GradientRecoveryError)
 
 
 def ok(body: dict) -> Reply:
@@ -28,7 +29,7 @@ def ok(body: dict) -> Reply:
 def serve_follower(model: Model) -> None:
   while True:
     dist.broadcast_object_list(msg := [None], src=0)
-    with contextlib.suppress(ValueError, KeyError):  # rejected the same way on every rank, before any collective
+    with contextlib.suppress(*RECOVERABLE_ERRORS):  # rejected the same way on every rank, before any collective
       getattr(model, msg[0][0])(*msg[0][1])
 
 
@@ -46,46 +47,48 @@ class Trainer:
         return getattr(self.model, method)(*args)
     except Exception as e:
       # The other ranks may be waiting in a collective this rank left; torchrun must restart them all.
-      if self.world_size > 1 and not isinstance(e, (ValueError, KeyError)):
+      if self.world_size > 1 and not isinstance(e, RECOVERABLE_ERRORS):
         os._exit(1)
       raise
 
   def save(
-    self, run: str, uri: str, sampler: bool = False, ttl_seconds: int | None = None, owned: bool = False
+    self,
+    run: str,
+    uri: str,
+    sampler: bool = False,
+    ttl_seconds: int | None = None,
+    owned: bool = False,
+    version: str | None = None,
   ) -> dict:
     tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
-    version = self.store.put(uri, tensors, meta)
-    return {
-      "uri": uri,
-      "size": sum(map(nbytes, tensors.values())),
-      "ttl": ttl_seconds,
-      "owned": owned,
-      "version": version,
-    }
+    version = self.store.put(tensors, meta, version=version)
+    size = sum(map(nbytes, tensors.values()))
+    return {"uri": uri, "size": size, "ttl": ttl_seconds, "owned": owned, "version": version}
 
-  def load_run(self, run: str, uri: str, version: str | None, optimizer: bool, gradients: bool) -> None:
-    self.call_model("restore_run", run, *self.store.get(uri, version), optimizer, gradients)
+  def load_run(self, run: str, version: str | None, optimizer: bool, gradients: bool) -> None:
+    self.call_model("restore_run", run, *self.store.get(version), optimizer, gradients)
 
   def execute(
-    self, cmd: Cmd, run: dict | None = None, parked: tuple[str, str | None] | None = None, version: str | None = None
+    self, cmd: Cmd, run: dict | None = None, snap: str | None = None, version: str | None = None
   ) -> tuple[Reply, dict]:
     with span("trainer.execute"):
       effects, created = {}, False
+      revision = None
       try:
         if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
           if cmd.op == Op.DELETE_MODEL:
             return ok({"type": cmd.op, "model_id": cmd.run}), effects
-          if not parked and cmd.op != Op.LOAD_WEIGHTS:
+          if not snap and cmd.op != Op.LOAD_WEIGHTS:
             raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
           if run is None:
             raise KeyError(f"no training run {cmd.run}")
           self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
           created = True
-          if parked:
-            self.load_run(cmd.run, *parked, optimizer=True, gradients=True)
-            effects["restored"] = parked[0]
+          if snap and cmd.op != Op.LOAD_WEIGHTS:
+            self.load_run(cmd.run, snap, optimizer=True, gradients=True)
             created = False  # recovery succeeded, even if the command that follows is rejected
 
+        revision = self.model.state_revision  # restoring the parked state itself leaves its snapshot valid
         if cmd.op == Op.FORWARD_BACKWARD:
           req = wire.parse(cmd.body)
           fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
@@ -100,17 +103,14 @@ class Trainer:
             metrics = self.call_model("optim_step", cmd.run, args["adam_params"])
             return ok({"type": cmd.op, "metrics": metrics}), effects
           case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
+            sampler = cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER
             effects["saved"] = self.save(
-              cmd.run,
-              args["uri"],
-              cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER,
-              args.get("ttl_seconds"),
-              args.get("owned", False),
+              cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False), version
             )
           case Op.LOAD_WEIGHTS:
-            self.load_run(cmd.run, args["uri"], version, optimizer=args["optimizer"], gradients=False)
+            self.load_run(cmd.run, version, optimizer=args["optimizer"], gradients=False)
           case Op.DELETE_MODEL:
-            self.call_model("delete_run", cmd.run)
+            self.drop_run(cmd.run)
           case _:
             raise ValueError(f"unknown op {cmd.op}")
 
@@ -120,14 +120,19 @@ class Trainer:
         return ok(reply), effects
       except Exception as e:
         if created:  # a failed restore must not leave a fresh model serving requests as recovered state
-          self.call_model("delete_run", cmd.run)
+          self.drop_run(cmd.run)
         return Reply.error(e), effects
+      finally:
+        loaded = cmd.run in self.model.params
+        effects.update(loaded=loaded, mutated=loaded and revision is not None and self.model.state_revision != revision)
 
-  def park_all(self) -> list[dict]:
-    return [
-      {"run": run, **self.save(run, f"tinker://{run}/parked/{time.time_ns()}", owned=True)}
-      for run in list(self.model.params)
-    ]
+  def save_run(self, run: str, version: str) -> dict | None:
+    if run in self.model.params:
+      return self.save(run, f"tinker://{run}/parked/{version}", owned=True, version=version)
+
+  def drop_run(self, run: str) -> None:
+    if run in self.model.params:
+      self.call_model("delete_run", run)
 
   def park(self) -> None:
     self.call_model("park_on_host")

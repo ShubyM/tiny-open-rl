@@ -15,18 +15,19 @@ class TestEvents(RedisTest):
     self.assertLessEqual(events[0].t, events[1].t)
     self.assertEqual([e.id for e in await self.bus.read_events(first)], [second])
 
-  async def test_the_scheduler_assigns_new_runs_and_the_log_has_the_worker_membership(self):
+  async def test_the_scheduler_assigns_new_runs_and_the_log_has_the_process_membership(self):
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     for run in ("a", "b"):
-      await self.bus.create_run(Run(run, "", "tiny", 4))
-    await self.bus.create_run(Run("f", "", "tiny", 0))
+      await self.bus.create_run(Run(run, "tiny", 4))
+    await self.bus.create_run(Run("f", "tiny", 0))
+    home = {}
     for _ in range(100):
-      runs = {r: (await self.bus.get_run(r))["worker"] for r in ("a", "b", "f")}
-      if all(runs.values()):
+      state = scheduler.from_state(await self.bus.read_state())
+      home = state.home
+      if all(home.get(r) for r in ("a", "b", "f")):
         break
       await asyncio.sleep(0.02)
-    self.assertEqual(runs["a"], runs["b"])
-    self.assertNotEqual(runs["a"], runs["f"])
-    state = scheduler.from_table(await self.bus.read_table())
-    self.assertEqual(sorted(scheduler.jobs_of(state, runs["a"])), ["a", "b"])
-    self.assertEqual(scheduler.jobs_of(state, runs["f"]), ["f"])
+    self.assertEqual(home["a"], home["b"])
+    self.assertNotEqual(home["a"], home["f"])
+    self.assertEqual(state.runs(home["a"][0]), ["a", "b"])
+    self.assertEqual(state.runs(home["f"][0]), ["f"])

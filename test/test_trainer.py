@@ -29,6 +29,12 @@ def counting(n: int, start: int = 0, **inputs) -> wire.Datum:
   return wire.Datum(tokens[:-1].astype(np.int32), {"target_tokens": tokens[1:].astype(np.int64), **inputs})
 
 
+def partial_backward_failure(run: str) -> bytes:
+  req = wire.parse(proto_body(run, n=60))  # second datum counts past the tiny model's vocabulary
+  req.data[0].CopyFrom(wire.parse(proto_body(run, n=2)).data[0])  # completes in its own, shorter pass
+  return req.SerializeToString()
+
+
 def train(model: Model, run: str, steps: int = 8, lr: float = 1e-2) -> list[float]:
   losses = []
   for _ in range(steps):
@@ -72,7 +78,7 @@ class TestForwardPass(unittest.TestCase):
     mask[2, 7:] = 0
 
     with torch.no_grad():
-      got = target_logprobs(lm, ids, mask, targets)
+      got = target_logprobs(lm, ids, targets)  # which passes no mask: padding on the right changes no real position
       want = lm(ids, attention_mask=mask).logits.log_softmax(-1).gather(-1, targets[..., None])[..., 0]
     torch.testing.assert_close(got[mask.bool()], want[mask.bool()])
 
@@ -197,31 +203,29 @@ class TestModel(unittest.TestCase):
     store = Store(root=tempfile.mkdtemp())
     model, (a, b) = lora_runs(2)
     train(model, a, steps=3)
-    uri = f"tinker://{a}/weights/step-3"
-    store.put(uri, *model.training_state(a))
+    version = store.put(*model.training_state(a))
     saved_weights = [p.detach().clone() for p in model.params[a].values()]
     saved_optimizer = copy.deepcopy(model.optimizers[a].state_dict())
 
     train(model, a, steps=3)
-    model.restore_run(a, *store.get(uri), optimizer=True)
+    model.restore_run(a, *store.get(version), optimizer=True)
     self.assertTrue(same(saved_weights, model.params[a]))
     torch.testing.assert_close(model.optimizers[a].state_dict()["state"], saved_optimizer["state"])
 
-    model.restore_run(b, *store.get(uri), optimizer=False)  # a run can start from another run's checkpoint
+    model.restore_run(b, *store.get(version), optimizer=False)  # a run can start from another run's checkpoint
     self.assertTrue(same(saved_weights, model.params[b]))
 
   def test_loading_a_checkpoint_that_does_not_fit_fails(self):
     store = Store(root=tempfile.mkdtemp())
     model, (a,) = lora_runs()
-    uri = f"tinker://{a}/sampler_weights/step-0"
-    store.put(uri, *model.sampler_weights(a))
+    version = store.put(*model.sampler_weights(a))
 
     no_mlp = new_id()
     model.create_run(no_mlp, "tiny", 4, {**LORA, "train_mlp": False})
     with self.assertRaises(ValueError):
-      model.restore_run(no_mlp, *store.get(uri), optimizer=False)
+      model.restore_run(no_mlp, *store.get(version), optimizer=False)
     with self.assertRaises(ValueError):
-      model.restore_run(a, *store.get(uri), optimizer=True)  # it was saved without the optimizer
+      model.restore_run(a, *store.get(version), optimizer=True)  # it was saved without the optimizer
     with self.assertRaises(ValueError):
       store.get(f"tinker://{a}/weights/missing")
 
@@ -248,14 +252,37 @@ class TestModel(unittest.TestCase):
       self.assertTrue(all(p.grad is None for p in loaded.model.params[run].values()))
       self.assertTrue(loaded.model.optimizers[run].state)
 
+  def test_repeated_partial_failure_and_explicit_load_of_its_checkpoint(self):
+    with tempfile.TemporaryDirectory() as folder:
+      model, (run,) = lora_runs()
+      trainer = Trainer(model, Store(root=folder))
+      fail = Cmd(run, "1", Op.FORWARD_BACKWARD, partial_backward_failure(run))
+      for _ in range(2):
+        # Even with a warning already pending, another partial failure discards newly accumulated gradients.
+        model.forward_backward(run, [counting(2)], "cross_entropy", {}, False)
+        reply, effects = trainer.execute(fail)
+        self.assertFalse(reply.ok)
+        self.assertTrue(effects.get("mutated"))
+        self.assertTrue(all(p.grad is None for p in model.params[run].values()))
+        reply, effects = trainer.execute(Cmd(run, "2", Op.FORWARD_BACKWARD, proto_body(run, loss_fn="unknown")))
+        self.assertFalse(reply.ok)
+        self.assertFalse(effects.get("mutated"))
+
+      saved = trainer.save_run(run, new_id().replace("-", ""))
+      body = json.dumps({"uri": saved["uri"], "optimizer": True}).encode()
+      reply, _ = trainer.execute(Cmd(run, "3", Op.LOAD_WEIGHTS, body), version=saved["version"])
+      self.assertTrue(reply.ok, reply.body)
+      reply, _ = trainer.execute(Cmd(run, "4", Op.OPTIM_STEP, b'{"adam_params":{}}'))
+      self.assertTrue(reply.ok, reply.body)
+
   def test_sampler_weights_load_in_peft_and_transformers(self):
     store = Store(root=tempfile.mkdtemp())
     ids = torch.randint(0, 96, (2, 8))
 
     model, (lora_run,) = lora_runs()
     train(model, lora_run, steps=3)
-    store.put(f"tinker://{lora_run}/sampler_weights/final", *model.sampler_weights(lora_run))
-    lora_dir = store.path(f"tinker://{lora_run}/sampler_weights/final")
+    version = store.put(*model.sampler_weights(lora_run))
+    lora_dir, _ = store.local_folder(version)
     with torch.no_grad():
       torch.testing.assert_close(
         PeftModel.from_pretrained(tiny(), lora_dir).eval()(ids).logits,
@@ -265,8 +292,8 @@ class TestModel(unittest.TestCase):
     fft, fft_run = Model(tiny), new_id()
     fft.create_run(fft_run, "tiny", 0, {})
     train(fft, fft_run, steps=3)
-    store.put(f"tinker://{fft_run}/sampler_weights/final", *fft.sampler_weights(fft_run))
-    fft_dir = store.path(f"tinker://{fft_run}/sampler_weights/final")
+    version = store.put(*fft.sampler_weights(fft_run))
+    fft_dir, _ = store.local_folder(version)
     with torch.no_grad():
       torch.testing.assert_close(
         LlamaForCausalLM.from_pretrained(fft_dir).eval()(ids).logits,
@@ -299,26 +326,25 @@ class TestTrainer(RedisTest):
         self.node.dispatch()
         await asyncio.sleep(0.01)
 
-  async def finish_worker(self, worker):
-    await self.until(lambda: worker not in self.node.running)
+  async def finish_worker(self, proc):
+    await self.until(lambda: proc not in self.node.lives)
 
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
-    await self.bus.create_run(Run(run, run, "tiny", 0))
+    await self.bus.create_run(Run(run, "tiny", 0))
     await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
-    await self.node.add(run)
+    await self.node.bind(run, run)
     child = self.node.processes[run]
     await self.finish_worker(run)
     self.assertTrue(child.closed)
-    self.assertIsNone(await self.bus.lease_owner(run))
+    self.assertIsNone((await self.bus.get_run(run)).get("owner"))
 
   async def test_graceful_replacement_registers_and_restores_weights_optimizer_and_pending_gradients(self):
-    self.node.gpus = 2
-    self.node.state.nodes[self.node.id] = (2, 0)
     for rank, lora, width in ((4, LORA, 2), (0, {}, 1)):
       ctrl, run = new_id(), new_id()
-      for r, worker in ((run, f"p-{rank}"), (ctrl, f"ctrl-{rank}")):
-        await self.bus.create_run(Run(r, worker, "tiny", rank, lora=lora, gpus=width))
+      for r, proc in ((run, f"p-{rank}"), (ctrl, f"ctrl-{rank}")):
+        await self.bus.create_run(Run(r, "tiny", rank, lora=lora, gpus=width))
+        await self.node.bind(proc, r)
         await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))
         for _ in range(2):
           await self.submit(
@@ -326,32 +352,67 @@ class TestTrainer(RedisTest):
           )
         await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
         await self.node.drain(r)
-      desired = self.node.state.workers[f"p-{rank}"]
-      desired.node, desired.gpus = None, ()  # the parked wide worker must regain its actual GPUs to checkpoint
-      self.node.notify()
+      self.node.drop_local(f"p-{rank}")  # detaches dirty run to store before releasing owner
       await self.finish_worker(f"p-{rank}")
-      parked = await self.bus.parked_checkpoint(run)
-      self.assertIsNotNone(parked)
+      info = await self.bus.get_run(run)
+      self.assertIsNone(info.get("owner"))
+      parked = info["snap"].partition("\n")[0]
       self.assertIsNotNone(await self.registry.get_checkpoint(parked))
+      # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
-      await self.node.drain(run)  # recovery succeeds even when the following command is rejected
+      await self.node.drain(run)
       self.assertFalse((await self.bus.wait_for_reply(invalid, 1)).ok)
+      self.assertEqual((await self.bus.get_run(run))["snap"].partition("\n")[0], parked)
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
-      self.assertIsNone(await self.bus.parked_checkpoint(run))
+      self.assertIsNone((await self.bus.get_run(run)).get("snap"))
       self.assertIsNone(await self.registry.get_checkpoint(parked))  # recovery cannot replay old state after a crash
+
+  async def test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure(self):
+    run = new_id()
+    await self.bus.create_run(Run(run, "tiny", 0))
+    await self.node.bind("p", run)
+    await self.submit(
+      run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.FORWARD_BACKWARD, proto_body(run))
+    )
+    await self.node.drain(run)
+    self.assertTrue(any(p.grad is not None for p in self.model("p").params[run].values()))
+    expected = {k: p.detach().clone() for k, p in self.model("p").params[run].items()}
+    step = (Op.OPTIM_STEP, {"adam_params": {}})
+    for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
+      self.node.drop_local("p")
+      await self.finish_worker("p")
+      parked = (await self.bus.get_run(run))["snap"].partition("\n")[0]
+      [request] = await self.submit(run, command)
+      await self.node.drain(run)
+      reply = await self.bus.wait_for_reply(request, 1)
+      self.assertFalse(reply.ok)
+      if command == step:
+        self.assertIn("accumulated gradients were discarded", reply.body.decode())
+      info = await self.bus.get_run(run)
+      self.assertEqual(info["pos"], request.rsplit("/", 1)[1])
+      self.assertIsNone(info.get("snap"))
+      self.assertIsNone(await self.registry.get_checkpoint(parked))
+
+    self.node.drop_local("p")
+    await self.finish_worker("p")
+    [request] = await self.submit(run, step)
+    await self.node.drain(run)
+    self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
+    torch.testing.assert_close(self.model("p").params[run], expected, atol=0, rtol=0)
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     run, uri = new_id(), "tinker://saved/weights/step-1"
-    await self.bus.create_run(Run(run, "p", "tiny", 4, lora=LORA))
+    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
+    await self.node.bind("p", run)
     await self.submit(
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
     )
     await self.node.drain(run)
-    self.node.tasks["p"].cancel()  # a lost process has no park checkpoint
+    self.node.tasks["p"].cancel()  # a lost process has no detached snapshot
     await self.finish_worker("p")
     ids = await self.submit(
       run,
@@ -385,6 +446,7 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
       args = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=2"]
       multi = Process([*args, "-m", "tinyrl.workers.trainer"], env)
       try:
+        saved_versions = []
         for run in (r1, r2):
           invalid = wire.parse(proto_body(run))
           invalid.loss_fn = "unknown"  # a rejected operation must leave every rank ready for the next collective
@@ -399,9 +461,13 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
           ]
           for i, (op, body) in enumerate(commands):
             cmd = Cmd(run, str(i), op, body if isinstance(body, bytes) else json.dumps(body).encode())
-            reply, _ = single.execute(cmd) if run == r1 else await asyncio.wait_for(multi.call("execute", cmd), 90)
+            reply, effects = (
+              single.execute(cmd) if run == r1 else await asyncio.wait_for(multi.call("execute", cmd), 90)
+            )
             self.assertEqual(reply.ok, i != 1, reply.body)
-        expected, actual = (store.get(f"tinker://{run}/sampler_weights/s1")[0] for run in (r1, r2))
+            if checkpoint := effects.get("saved"):
+              saved_versions.append(checkpoint["version"])
+        expected, actual = (store.get(v)[0] for v in saved_versions)
         self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")
         for name in expected:
           torch.testing.assert_close(actual[name], expected[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")
@@ -456,7 +522,6 @@ class TestCheckpointNames(unittest.TestCase):
         "num_key_value_heads": 1,
         "head_dim": 16,
         "vocab_size": 128,
-        "num_kv_shared_layers": 1,
         "layer_types": ["sliding_attention", "full_attention"],
         "hidden_size_per_layer_input": 0,
       },

@@ -88,7 +88,7 @@ class VLLM:
     env = {
       "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",  # its FlashAttention 4 kernels compile at each start unless cached
       "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": os.path.expanduser("~/.cache/flash-attention-cute"),
-      **{k: v for k, v in options.items() if k not in {"TINYRL_GPU_MEM", "TINYRL_KV_BYTES", "TINYRL_WARM_SAMPLER"}},
+      **{k: v for k, v in options.items() if k not in {"TINYRL_KV_BYTES", "TINYRL_WARM_SAMPLER"}},
       "VLLM_SERVER_DEV_MODE": "1",
       "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
     }
@@ -99,8 +99,6 @@ class VLLM:
       extra += ["--compilation-config", CUDAGRAPH_CONFIG]
     if not any(a == "--kernel-config" or a.startswith("--kernel-config=") for a in extra):
       extra += ["--kernel-config", KERNEL_CONFIG]
-    if memory := options.get("TINYRL_GPU_MEM"):
-      extra += ["--gpu-memory-utilization", memory]
     if (kv := options.get("TINYRL_KV_BYTES")) and not any(
       a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra
     ):
