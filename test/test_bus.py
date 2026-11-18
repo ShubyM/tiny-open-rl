@@ -353,25 +353,6 @@ class TestBus(RedisTest):
     self.assertEqual((cmd.run, cmd.request_id), (run_id, request))
     self.assertEqual(await self.bus.take_commands([run_id], "o", block_ms=10), [])
 
-  async def test_take_trainer_cycle_pops_through_optim_step_and_sampler_save_only(self):
-    run = await self.new_run()
-    token = self.tokens[run]
-    ops = [
-      Op.FORWARD_BACKWARD,
-      Op.FORWARD_BACKWARD,
-      Op.OPTIM_STEP,
-      Op.SAVE_WEIGHTS_FOR_SAMPLER,
-      Op.FORWARD_BACKWARD,
-      Op.OPTIM_STEP,
-    ]
-    reqs = [await self.bus.submit_command(run, op, b"{}") for op in ops]
-    first_cycle = await self.bus.take_trainer_cycle(run, token, limit=8)
-    self.assertEqual([c.request_id for c in first_cycle], reqs[:4])
-    state = await self.bus.queued_and_in_flight(run)
-    self.assertEqual((state["queued"], len(state["in_flight"])), (2, 4))
-    second_cycle = await self.bus.take_trainer_cycle(run, token, limit=8)
-    self.assertEqual([c.request_id for c in second_cycle], reqs[4:])
-
 
 class TestRedisRestart(unittest.IsolatedAsyncioTestCase):
   async def test_a_call_waits_out_a_redis_restart(self):

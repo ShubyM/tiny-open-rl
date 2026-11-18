@@ -31,8 +31,8 @@ from tinyrl.workers.sampler import Sampler
 
 GPUS, DRAIN_S, TICK, IDLE_MS = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK", 0.25), getenv("IDLE_MS", 150)
 QUANTUM_MS, MAX_QUANTUM_MS = getenv("QUANTUM_MS", 2000), getenv("MAX_QUANTUM_MS", 15000)
-CYCLE_COMMANDS, CYCLE_GRACE_MS = getenv("CYCLE_COMMANDS", 8), getenv("CYCLE_GRACE_MS", 100)
-SWITCH_BUDGET, SAMPLE_RUNS = float(getenv("SWITCH_BUDGET", 0.1)), getenv("SAMPLE_RUNS", 3)
+CYCLE_GRACE_MS, SWITCH_BUDGET = getenv("CYCLE_GRACE_MS", 100), float(getenv("SWITCH_BUDGET", 0.1))
+SAMPLE_RUNS = getenv("SAMPLE_RUNS", 3)
 SAMPLE_COMMANDS, SWEEP_S, SWEEP_GRACE_S = getenv("SAMPLE_COMMANDS", 128), getenv("SWEEP_S", 60.0), 600
 
 
@@ -446,7 +446,11 @@ class Lifetime:
   async def claim(self, runs: list[str], count: int) -> list[Cmd]:
     if self.sampling:
       return await self.bus.take_commands(runs, self.life, count, reclaim=True)
-    return [c for r in runs for c in await self.bus.take_trainer_cycle(r, self.owned[r][0], count)]
+    cmds = []
+    for run in runs:
+      if cmd := await self.bus.take_trainer_command(run, self.owned[run][0]):
+        cmds.append(cmd)
+    return cmds
 
   def read(self, delay: float = 0) -> None:
     self.reader = asyncio.create_task(self.peek(delay))
@@ -521,20 +525,20 @@ class Lifetime:
     await self.stop_reader()
     await self.keep_lease()
     with span("node.claim"):
-      cmds = await self.claim(runs, SAMPLE_COMMANDS if self.sampling and not bad else (1 if bad else CYCLE_COMMANDS))
+      cmds = await self.claim(runs, SAMPLE_COMMANDS if self.sampling and not bad else 1)
     self.heads = [c for c in self.heads if c.run not in runs]
     self.read()
     if not cmds:
       return None
-    wave, result = Wave(self.spec.gpus), None
+    wave = Wave(self.spec.gpus)
+    first, result = cmds[0], None
     if self.sampling:
       async with asyncio.TaskGroup() as group:
         for cmd in cmds:
           group.create_task(self.answer(cmd, inputs[cmd.run], wave))
     else:
-      for cmd in cmds:
-        if cmd.run in self.owned and (await self.answer(cmd, inputs[cmd.run], wave)).ok:
-          result = cmd
+      if (await self.answer(first, inputs[first.run], wave)).ok:
+        result = first
     self.idle_since = time.monotonic() if not bad else self.idle_since
     r1, r2 = self.ready()
     self.virtual = max(self.virtual, min(self.service.get(c.run, self.virtual) for c in [*r1, *r2, *cmds]))

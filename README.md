@@ -69,8 +69,7 @@ and `close()` must wait for its processes to exit. Engines identify loaded check
 
 The node reserves every GPU of a worker together. An idle shared holder yields to a ready waiter. A busy holder
 gets a minimum wall-clock quantum, extended when parking and resuming are expensive. Once that quantum expires,
-the node can hand the GPUs to a ready process whose account is owed more service. Training claims one clock cycle
-through `optim_step` (and any trailing sampler save) up to `CYCLE_COMMANDS`, and a trainer keeps its turn for
+the node can hand the GPUs to a ready process whose account is owed more service. Training yields between commands, and a trainer keeps its turn for
 `CYCLE_GRACE_MS` after a command while its client sends the next one; sampling yields
 between waves of up to `SAMPLE_RUNS` LoRA sessions or one full fine-tune session, with at most `SAMPLE_COMMANDS` commands
 per session. The reservation starts before wake and remains
@@ -89,10 +88,9 @@ services, stop the nodes gracefully and restart the scheduler and node daemons t
 
 | Variable | Default | Controls |
 |---|---|---|
-| `QUANTUM_MS` | 2000 | Minimum busy GPU turn, checked between cycles or waves |
+| `QUANTUM_MS` | 2000 | Minimum busy GPU turn, checked between commands or waves |
 | `MAX_QUANTUM_MS` | 15000 | Upper bound on adaptive turn quantum so large PCIe parks cannot starve peers |
 | `SWITCH_BUDGET` | 0.1 | Target ratio of measured park and resume time to useful time in a turn |
-| `CYCLE_COMMANDS` | 8 | Maximum trainer commands claimed in one `forward_backward* -> optim_step` cycle |
 | `CYCLE_GRACE_MS` | 100 | How long a trainer keeps its turn after a command, waiting for its client's next one |
 | `SAMPLE_RUNS` | 3 | LoRA sessions in a sampling wave; full fine-tunes use one |
 | `SAMPLE_COMMANDS` | 128 | Commands from each session in a wave |
@@ -206,7 +204,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for local GPU selection, wor
 Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM_MS`,
-`MAX_QUANTUM_MS`, `SWITCH_BUDGET`, `CYCLE_COMMANDS`, `CYCLE_GRACE_MS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `IDLE_MS`, `DRAIN_S`,
+`MAX_QUANTUM_MS`, `SWITCH_BUDGET`, `CYCLE_GRACE_MS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `IDLE_MS`, `DRAIN_S`,
 `ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted), `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 
 ## Telemetry
