@@ -4,7 +4,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 import uuid
 
@@ -18,17 +17,16 @@ from tinyrl.storage.store import SHARD_BYTES, Store
 class TestStore(unittest.TestCase):
   def test_put_and_get_roundtrip_tensors_and_metadata(self):
     store = Store(root=tempfile.mkdtemp())
-    uri = "tinker://run-1/weights/step-3"
     want = {
       "w": torch.arange(64, dtype=torch.float32).reshape(8, 8),
       "b": torch.randn(8, dtype=torch.bfloat16),
       "w.step": torch.tensor(3.0),
     }
-    store.put(uri, want, {"optimizer": True})
-    folder = store.path(uri)
+    version = store.put(want, {"optimizer": True})
+    folder, _ = store.local_folder(version)
     self.assertEqual(os.listdir(folder), ["state.safetensors"])
 
-    got, meta = store.get(uri)
+    got, meta = store.get(version)
     self.assertEqual(meta, {"optimizer": True})
     self.assertTrue(all(torch.equal(got[k], want[k]) for k in want))
 
@@ -40,32 +38,30 @@ class TestStore(unittest.TestCase):
   def test_a_remote_checkpoint_saved_on_one_node_loads_on_another(self):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
-    uri = "tinker://run-1/sampler_weights/step-1"
-    saved = saver.put(uri, {"w": torch.ones(4)}, {"lora": True, "config": {"r": 4}})
+    saved = saver.put({"w": torch.ones(4)}, {"lora": True, "config": {"r": 4}})
     saver.upload_pending_saves()  # what start() does in the background
 
-    folder, version = loader.local_folder(uri, saved)
+    folder, version = loader.local_folder(saved)
     self.assertEqual(sorted(os.listdir(folder)), ["adapter_config.json", "adapter_model.safetensors"])
-    self.assertTrue(torch.equal(loader.get(uri)[0]["w"], torch.ones(4)))
-    self.assertEqual(loader.local_folder(uri), (folder, version))  # downloaded once
+    self.assertTrue(torch.equal(loader.get(saved)[0]["w"], torch.ones(4)))
+    self.assertEqual(loader.local_folder(saved), (folder, version))  # downloaded once
 
-    saver.put(uri, {"w": torch.zeros(4)}, {"lora": True, "config": {"r": 4}})  # the same name, saved again
+    newer = saver.put({"w": torch.zeros(4)}, {"lora": True, "config": {"r": 4}})  # the same name, saved again
     saver.upload_pending_saves()
-    self.assertNotEqual(loader.local_folder(uri)[1], version)
-    self.assertTrue(torch.equal(loader.get(uri)[0]["w"], torch.zeros(4)))
+    self.assertNotEqual(loader.local_folder(newer)[1], version)
+    self.assertTrue(torch.equal(loader.get(newer)[0]["w"], torch.zeros(4)))
     with self.assertRaises(ValueError):
       loader.get("tinker://run-1/weights/missing")
 
   def test_roundtrips_contiguous_and_non_contiguous_tensors(self):
     store = Store(root=tempfile.mkdtemp())
-    uri = "tinker://run-1/weights/shape-test"
     base = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     want = {
       "contiguous": base.clone(),
       "transposed": base.T,
     }
-    store.put(uri, want)
-    got, _ = store.get(uri)
+    version = store.put(want)
+    got, _ = store.get(version)
     self.assertTrue(torch.equal(got["contiguous"], want["contiguous"]), "roundtrips contiguous tensor")
     self.assertTrue(torch.equal(got["transposed"], want["transposed"]), "roundtrips non-contiguous tensor")
 
@@ -78,29 +74,28 @@ class TestStore(unittest.TestCase):
       )
       return
     store = Store(root=tempfile.mkdtemp())
-    uri = "tinker://run-1/weights/step-3"
     want = {
       "w1": torch.arange(64, dtype=torch.float32).reshape(8, 8),
       "w2": torch.randn(8, dtype=torch.bfloat16),
       "w3": torch.tensor(3.0),
     }
-    store.put(uri, want, {"optimizer": True, "lora": False})
-    folder = store.path(uri)
+    version = store.put(want, {"optimizer": True, "lora": False})
+    folder, _ = store.local_folder(version)
     files = sorted(os.listdir(folder))
     self.assertTrue(any("state-00001-of-" in f for f in files))
 
-    got, meta = store.get(uri)
+    got, meta = store.get(version)
     self.assertEqual(meta, {"optimizer": True, "lora": False})
     for k in want:
       self.assertTrue(torch.equal(got[k], want[k]))
 
-    _, v1 = store.local_folder(uri)
-    store.put(uri, want, {"optimizer": True, "lora": False})
-    _, v2 = store.local_folder(uri)
+    _, v1 = store.local_folder(version)
+    version = store.put(want, {"optimizer": True, "lora": False})
+    _, v2 = store.local_folder(version)
     self.assertNotEqual(v1, v2)
 
-    store.put(uri + "-sampler", want, {"lora": False, "config": {"test": True}})
-    sampler_folder = store.path(uri + "-sampler")
+    version = store.put(want, {"lora": False, "config": {"test": True}})
+    sampler_folder, _ = store.local_folder(version)
     sampler_files = sorted(os.listdir(sampler_folder))
     self.assertIn("config.json", sampler_files)
     self.assertIn("model.safetensors.index.json", sampler_files)
@@ -111,8 +106,8 @@ class TestStore(unittest.TestCase):
       "t3": torch.ones(8, dtype=torch.uint8),
       "t4": torch.ones(8, dtype=torch.uint8),
     }
-    store.put(uri + "-huge", want_huge, {"lora": False, "config": {"test": True}})
-    huge_folder = store.path(uri + "-huge")
+    version = store.put(want_huge, {"lora": False, "config": {"test": True}})
+    huge_folder, _ = store.local_folder(version)
     st_file = next(f for f in sorted(os.listdir(huge_folder)) if f.endswith(".safetensors"))
     import safetensors
 
@@ -143,88 +138,40 @@ class TestStore(unittest.TestCase):
     with safetensors.safe_open(f"{folder}/mine.safetensors", framework="pt") as f:
       self.assertEqual(f.metadata(), {"meta": "{}"})
 
-  def test_local_overwrite_is_atomic_and_keeps_prior_reader_files(self):
+  def test_concurrent_saves_leave_the_opened_version_intact(self):
     store = Store(tempfile.mkdtemp())
-    uri = "tinker://run-local/weights/atomic"
-    ones = torch.ones(8, dtype=torch.float32)
-
-    store.put(uri + ".bak", {"a": ones * 7, "b": ones * 7, "c": ones * 7})
-    store.put(uri, {"a": ones, "b": ones * 2, "c": ones * 3})
-    p1 = os.path.realpath(store.local_folder(uri)[0])
-
+    original = store.put({"a": torch.ones(8), "b": torch.ones(8) * 2})
     errors = []
-    running = True
+    stop = threading.Event()
 
     def reader():
-      while running:
-        try:
-          got, _ = store.get(uri)
-          val_a = got["a"][0].item()
-          self.assertTrue(torch.equal(got["a"], ones * val_a))
-          self.assertTrue(torch.equal(got["b"], ones * (val_a * 2 if val_a == 1 else val_a)))
-          self.assertTrue(torch.equal(got["c"], ones * (val_a * 3 if val_a == 1 else val_a)))
-        except Exception as e:
-          errors.append(e)
+      try:
+        while not stop.is_set():
+          tensors, _ = store.get(original)
+          torch.testing.assert_close(tensors, {"a": torch.ones(8), "b": torch.ones(8) * 2})
+      except Exception as exc:
+        errors.append(exc)
 
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
+    thread = threading.Thread(target=reader)
+    thread.start()
     try:
       for step in range(2, 7):
-        store.put(uri, {"a": ones * step, "b": ones * step, "c": ones * step})
-        if step == 2:
-          self.assertTrue(os.path.exists(p1), "p1 shard files stay intact for in-flight reader")
-        if step == 3:
-          self.assertFalse(os.path.exists(p1), "p1 is garbage-collected after two newer saves")
-          parent = os.path.dirname(store.path(uri))
-          atomic_entries = [
-            n
-            for n in os.listdir(parent)
-            if (n == "atomic" or n.startswith(".atomic.")) and not n.startswith(".atomic.bak.")
-          ]
-          self.assertLessEqual(len(atomic_entries), 4)
+        self.assertNotEqual(store.put({"a": torch.full((8,), step)}), original)
     finally:
-      running = False
-      t.join()
+      stop.set()
+      thread.join()
     self.assertEqual(errors, [])
-    self.assertTrue(
-      torch.equal(store.get(uri + ".bak")[0]["a"], ones * 7), "sibling checkpoint with prefix stays intact"
-    )
-
-  def test_delete_takes_every_version_and_leaves_the_neighbours(self):
-    store = Store(root=tempfile.mkdtemp())
-    for uri in ("tinker://r/sampler_weights/step-1", "tinker://r/sampler_weights/step-1.5", "tinker://q/weights/final"):
-      store.put(uri, {"w": torch.ones(4)})
-    store.put("tinker://r/sampler_weights/step-1", {"w": torch.zeros(4)})  # a second version, so there's a .prev
-    self.assertEqual(
-      sorted(store.list_checkpoints()),
-      ["tinker://q/weights/final", "tinker://r/sampler_weights/step-1", "tinker://r/sampler_weights/step-1.5"],
-    )
-    store.delete("tinker://r/sampler_weights/step-1")
-    self.assertEqual(
-      sorted(store.list_checkpoints()), ["tinker://q/weights/final", "tinker://r/sampler_weights/step-1.5"]
-    )
-    self.assertTrue(all("step-1.5" in n for n in os.listdir(f"{store.base}/r/sampler_weights")))  # no orphan versions
-    self.assertTrue(torch.equal(store.get("tinker://r/sampler_weights/step-1.5")[0]["w"], torch.ones(4)))
-
-  def test_a_remote_checkpoint_is_listed_and_deleted(self):
-    store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
-    store.put("tinker://r/weights/final", {"w": torch.ones(4)})
-    store.upload_pending_saves()
-    self.assertEqual(store.list_checkpoints(), ["tinker://r/weights/final"])
-    self.assertGreater(store.saved_at("tinker://r/weights/final"), 0)
-    store.delete("tinker://r/weights/final")
-    self.assertEqual(store.list_checkpoints(), [])
+    self.assertEqual(len(store.versions()), 6)
 
   def test_a_remote_save_returns_before_its_upload_and_other_nodes_read_it_once_it_lands(self):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
-    uri = "tinker://r/weights/final"
-    version = saver.put(uri, {"w": torch.ones(4)})  # returns before anything uploads it
-    self.assertTrue(torch.equal(saver.get(uri, version)[0]["w"], torch.ones(4)))  # this node reads it at once
+    version = saver.put({"w": torch.ones(4)})  # returns before anything uploads it
+    self.assertTrue(torch.equal(saver.get(version)[0]["w"], torch.ones(4)))  # this node reads it at once
     with self.assertRaisesRegex(ValueError, "has not landed"):
-      loader.get(uri, version)
+      loader.get(version)
     saver.upload_pending_saves()
-    self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))
+    self.assertTrue(torch.equal(loader.get(version)[0]["w"], torch.ones(4)))
 
   def test_another_node_copies_a_save_from_the_node_that_made_it_before_it_uploads(self):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
@@ -233,94 +180,98 @@ class TestStore(unittest.TestCase):
     saver.stopping.set()  # no uploads, so the copy can only come from the saver
     saver.uploader.join()
     meta, w = {"lora": False, "config": {"model_type": "x"}}, torch.randn(64, 64).to(torch.bfloat16)
-    versions = [saver.put(f"tinker://r/sampler_weights/{step}", {"w": w * step}, meta) for step in range(2)]
-    self.assertFalse(saver.fs.exists(f"{saver.base}/r"))
-    folder, version = loader.local_folder("tinker://r/sampler_weights/1", versions[1])
+    versions = [saver.put({"w": w * step}, meta) for step in range(2)]
+    self.assertFalse(saver.fs.exists(f"{saver.base}/objects"))
+    folder, version = loader.local_folder(versions[1])
     self.assertEqual(version, versions[1].partition("@")[0])
     for name in os.listdir(f"{saver.cache}/{version}"):
       with open(f"{saver.cache}/{version}/{name}", "rb") as a, open(f"{folder}/{name}", "rb") as b:
         self.assertEqual(a.read(), b.read())
-    self.assertTrue(torch.equal(loader.get("tinker://r/sampler_weights/0", versions[0])[0]["w"], w * 0))
+    self.assertTrue(torch.equal(loader.get(versions[0])[0]["w"], w * 0))
     saver.close()  # its saves upload, then it stops serving them
     later = Store(root, cache=tempfile.mkdtemp())
-    self.assertTrue(torch.equal(later.get("tinker://r/sampler_weights/1", versions[1])[0]["w"], w))
+    self.assertTrue(torch.equal(later.get(versions[1])[0]["w"], w))
 
   def test_a_save_whose_node_is_gone_comes_from_the_bucket_or_fails(self):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     saver.peer = "127.0.0.1:9"  # a node that no longer answers
-    uri = "tinker://r/weights/final"
-    version = saver.put(uri, {"w": torch.ones(4)})
+    version = saver.put({"w": torch.ones(4)})
     with self.assertRaisesRegex(ValueError, "has not landed, and 127.0.0.1:9 failed to copy"):
-      loader.get(uri, version)
+      loader.get(version)
     saver.upload_pending_saves()
-    self.assertTrue(torch.equal(loader.get(uri, version)[0]["w"], torch.ones(4)))
-
-  def test_three_saves_leave_exactly_two_versions(self):
-    root = f"memory://tinyrl-test-d4-count-{uuid.uuid4()}"
-    store = Store(root=root, cache=tempfile.mkdtemp())
-    uri = "tinker://r/weights/d4_count"
-
-    store.put(uri, {"w": torch.ones(1)})
-    store.upload_pending_saves()
-
-    store.put(uri, {"w": torch.ones(2)})
-    store.upload_pending_saves()
-
-    store.put(uri, {"w": torch.ones(3)})
-    store.upload_pending_saves()
-
-    # Check that exactly two versions exist in the bucket
-    remote_dir = f"{store.base}/r/weights/d4_count"
-    versions = [e for e in store.fs.ls(remote_dir, detail=False) if os.path.basename(e) != "_latest"]
-    self.assertEqual(len(versions), 2)
+    self.assertTrue(torch.equal(loader.get(version)[0]["w"], torch.ones(4)))
 
 
 class TestRegistry(RedisTest):
   async def test_deletion_wins_over_concurrent_ttl_updates(self):
     run = new_id()
-    await self.bus.create_run(Run(id=run, worker="p", base="base", rank=8))
-    await self.bus.take_lease("p", "owner")
+    await self.bus.create_run(Run(id=run, base="base", rank=8))
+    await self.bus.open_lease("owner")
+    token, _, _ = await self.bus.acquire_run(run, "owner")
     uri = f"tinker://{run}/sampler_weights/session"
-    await self.registry.register_checkpoint(uri, 1, ttl=60, owned=True)
+    await self.seed_checkpoint(uri, 1, ttl=60, owned=True)
     await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
     [cmd] = await self.bus.take_commands([run], "owner", count=1)
     await asyncio.gather(
       *(self.registry.set_checkpoint_ttl(uri, 600) for _ in range(20)),
-      self.bus.write_reply(cmd, Reply(True, "application/json", b"{}"), "p", "owner"),
+      self.bus.commit_reply(cmd, Reply(True, "application/json", b"{}"), token),
     )
     self.assertFalse(await self.registry.set_checkpoint_ttl(uri, 600))
     self.assertIsNone(await self.registry.get_checkpoint(uri))
     for index in ("ckpts", "expiry"):
       self.assertIsNone(await self.bus.r.zscore(key(index), uri))
 
-  async def test_sweep_keeps_registered_and_recent_checkpoints(self):
-    store = Store(tempfile.mkdtemp())
-    before, kept, deleted, young = [f"tinker://r/weights/{n}" for n in ("before", "kept", "deleted", "young")]
-    for uri in (before, kept, deleted, young):
-      store.put(uri, {"w": torch.ones(1)})
-      age = 1800 if uri == before else 900 if uri != young else 0
-      os.utime(store.path(uri), (time.time() - age, time.time() - age), follow_symlinks=False)
-    await self.registry.register_checkpoint(kept, 1)
-    await self.registry.register_checkpoint(deleted, 1)
-    await self.registry.unregister_checkpoints(deleted)
-    await self.bus.r.set(key("ckpt_since"), time.time() - 1200)
-    await self.registry.sweep(store, 600)
-    self.assertEqual(set(store.list_checkpoints()), {before, kept, young})
+  async def test_stale_writer_cannot_replace_published_bytes_on_disk_or_in_bucket(self):
+    for root in (tempfile.mkdtemp(), f"file://{tempfile.mkdtemp()}"):
+      with self.subTest(root=root):
+        old, new = (Store(root, cache=tempfile.mkdtemp()) for _ in range(2))
+        run = new_id()
+        uri = f"tinker://{run}/weights/final"
+        await self.bus.create_run(Run(run, "base", 4))
+        await self.bus.open_lease("previous")
+        stale, _, _ = await self.bus.acquire_run(run, "previous")
+        await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
+        first = await self.bus.take_trainer_command(run, stale)
+        abandoned = await self.bus.begin_checkpoint(run, stale)
+        await self.bus.drop_lease("previous")
+        await self.bus.open_lease("current")
+        owner, _, _ = await self.bus.acquire_run(run, "current")
+        await self.bus.fail_stranded_commands(run, owner)
+        await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
+        cmd = await self.bus.take_trainer_command(run, owner)
+        version = await self.bus.begin_checkpoint(run, owner)
+        winner = new.put({"w": torch.ones(2)}, version=version)
+        await self.registry.sweep(new, grace=0)  # protected even before the reply publishes it
+        good = {"uri": uri, "size": 8, "version": winner}
+        reply = Reply(True, "application/json", b"{}")
+        self.assertTrue((await self.bus.commit_reply(cmd, reply, owner, checkpoint=good))[0])
+        new.upload_pending_saves()
+        late = old.put({"w": torch.zeros(2)}, version=abandoned)
+        old.upload_pending_saves()
+        self.assertFalse((await self.bus.commit_reply(first, reply, stale, checkpoint=good | {"version": late}))[0])
+        reader = Store(root, cache=tempfile.mkdtemp())
+        published = await self.registry.version(uri)
+        self.assertEqual(published, winner)
+        torch.testing.assert_close(reader.get(published)[0]["w"], torch.ones(2))
+        await self.registry.sweep(reader, grace=600)
+        self.assertEqual(reader.versions(), {abandoned, version})
+        await self.registry.sweep(reader, grace=0)
+        self.assertEqual(reader.versions(), {version})
+        await self.registry.unregister_checkpoints(uri)
+        await self.registry.sweep(reader, grace=0)
+        self.assertEqual(reader.versions(), set())
+        await self.bus.drop_lease("current")
 
-  async def test_sweep_deletes_an_unregistered_save_still_waiting_to_upload(self):
+  async def test_sweep_removes_only_unregistered_staged_uploads(self):
     store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
-    kept, dropped = "tinker://r/weights/kept", "tinker://r/weights/dropped"
-    versions = [store.put(uri, {"w": torch.ones(1)}) for uri in (kept, dropped)]
-    for version in versions:
-      os.utime(f"{store.cache}/{version}.upload", (time.time() - 900, time.time() - 900))
-    await self.registry.register_checkpoint(kept, 1, version=versions[0])
-    await self.bus.r.set(key("ckpt_since"), time.time() - 1200)
-    await self.registry.sweep(store, 600)
-    self.assertTrue(os.path.isdir(f"{store.cache}/{versions[0]}"))
-    self.assertTrue(os.path.exists(f"{store.cache}/{versions[0]}.upload"))
-    self.assertFalse(os.path.isdir(f"{store.cache}/{versions[1]}"))
-    self.assertFalse(os.path.exists(f"{store.cache}/{versions[1]}.upload"))
+    kept, dropped = (store.put({"w": torch.ones(1)}) for _ in range(2))
+    await self.seed_checkpoint("tinker://r/weights/kept", 1, version=kept)
+    await self.registry.sweep(store, 0)
+    self.assertTrue(os.path.isdir(f"{store.cache}/{kept}"))
+    self.assertTrue(os.path.exists(f"{store.cache}/{kept}.upload"))
+    self.assertFalse(os.path.exists(f"{store.cache}/{dropped}"))
+    self.assertFalse(os.path.exists(f"{store.cache}/{dropped}.upload"))
 
 
 if __name__ == "__main__":

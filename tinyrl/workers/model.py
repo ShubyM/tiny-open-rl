@@ -74,11 +74,9 @@ LOSSES = {"cross_entropy": cross_entropy, "importance_sampling": importance_samp
 def should_checkpoint_layers(lm: PreTrainedModel, lora: bool) -> bool:
   if "GRAD_CKPT" in os.environ:
     return bool(int(os.environ["GRAD_CKPT"]))
-  if not GRAD_CKPT:
-    return False
-  if lora and lm.device.type == "cuda" and torch.cuda.get_device_properties(lm.device).total_memory >= 64 * 1024**3:
-    return False
-  return True
+  if GRAD_CKPT and lora and lm.device.type == "cuda":
+    return torch.cuda.get_device_properties(lm.device).total_memory < 64 * 1024**3
+  return bool(GRAD_CKPT)
 
 
 def token_budget(lm: PreTrainedModel) -> int:
@@ -213,6 +211,10 @@ def lora_targets(lm: PreTrainedModel, config: dict) -> list[str]:
   return [n for n, m in mods if n.rsplit(".", 1)[-1] in targets and isinstance(m, torch.nn.Linear)]
 
 
+class GradientRecoveryError(RuntimeError):
+  """Every rank consumed the same pending warning before entering the optimizer step."""
+
+
 class Model:
   """A base model and the runs training on it: a LoRA adapter per run, or the whole model for one full fine-tune."""
 
@@ -221,7 +223,8 @@ class Model:
     self.params: dict[str, dict[str, torch.nn.Parameter]] = {}  # canonical name -> trainable parameter
     self.optimizers: dict[str, torch.optim.AdamW] = {}
     self.pinned: dict[int, torch.Tensor] = {}
-    self.parked, self.dirty, self.needs_recovery = False, set(), set()
+    self.dirty, self.needs_recovery = set(), set()
+    self.state_revision = 0  # local to this synchronous worker, to detect writes even when a command raises
 
   def create_run(self, run: str, base: str, rank: int, config: dict) -> None:
     if self.lm is None:  # the first run loads the base model
@@ -254,23 +257,22 @@ class Model:
     if config.get("seed") is not None:
       torch.manual_seed(config["seed"])
 
-    self.dirty.discard(run)
     if not self.lora:
       if self.params:
         raise ValueError(f"a full fine-tune has its trainer to itself, and {next(iter(self.params))} is on this one")
       self.params[run] = {name: p.requires_grad_() for name, p in self.lm.named_parameters()}
-      return
-
-    alpha, drop = config.get("lora_alpha", 16), config.get("lora_dropout", 0.05)
-    adapter = LoraConfig(r=rank, lora_alpha=alpha, lora_dropout=drop, target_modules=lora_targets(self.lm, config))
-    with torch.device(self.lm.device):
-      self.lm.add_adapter(adapter, adapter_name=run)
-    infix = f".{run}."
-    self.params[run] = {name.replace(infix, "."): p for name, p in self.lm.named_parameters() if infix in name}
-    for p in self.params[run].values():
-      p.data = p.data.float()  # PEFT gives an adapter its base model's dtype, but master weights are fp32
-      if dist.is_initialized():  # every rank holds the whole adapter, starting from rank 0's
-        dist.broadcast(p.data, src=0)
+    else:
+      alpha, drop = config.get("lora_alpha", 16), config.get("lora_dropout", 0.05)
+      adapter = LoraConfig(r=rank, lora_alpha=alpha, lora_dropout=drop, target_modules=lora_targets(self.lm, config))
+      with torch.device(self.lm.device):
+        self.lm.add_adapter(adapter, adapter_name=run)
+      infix = f".{run}."
+      self.params[run] = {name.replace(infix, "."): p for name, p in self.lm.named_parameters() if infix in name}
+      for p in self.params[run].values():
+        p.data = p.data.float()  # PEFT gives an adapter its base model's dtype, but master weights are fp32
+        if dist.is_initialized():  # every rank holds the whole adapter, starting from rank 0's
+          dist.broadcast(p.data, src=0)
+    self.state_revision += 1
 
   def activate_run(self, run: str) -> PreTrainedModel:
     """The model, with the run's adapter active."""
@@ -288,7 +290,7 @@ class Model:
     lm = self.activate_run(run).train(not forward_only)
     lengths = [min(len(d.tokens), len(d.inputs["target_tokens"])) for d in data]
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
-    total, accumulating = 0.0, False
+    total, revision = 0.0, self.state_revision
     world, rank = (dist.get_world_size(), dist.get_rank()) if dist.is_initialized() else (1, 0)
     mine = sorted(range(len(lengths)), key=lambda i: lengths[i])[rank::world]
     passes = [[mine[j] for j in p] for p in batches([lengths[i] for i in mine], token_budget(lm))]
@@ -308,7 +310,7 @@ class Model:
             lp = target_logprobs(lm, x["ids"], x["targets"])
           loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
           if not forward_only:
-            accumulating = True
+            self.state_revision += 1
             (loss * world).backward()  # FSDP averages gradients over ranks, and the loss is a sum
           total += loss.item()
 
@@ -327,7 +329,7 @@ class Model:
           logprobs[i] = lp_i
       return logprobs, {"loss:sum": total, "loss:mean": total / max(1, len(data))}
     except Exception:
-      if accumulating:
+      if self.state_revision != revision:
         self.needs_recovery.add(run)
         for p in self.params[run].values():
           p.grad = None
@@ -342,7 +344,8 @@ class Model:
   def optim_step(self, run: str, adam: dict) -> dict[str, float]:
     if run in self.needs_recovery:
       self.needs_recovery.remove(run)
-      raise RuntimeError("a forward_backward failed after it began; accumulated gradients were discarded")
+      self.state_revision += 1
+      raise GradientRecoveryError("a forward_backward failed after it began; accumulated gradients were discarded")
     self.activate_run(run)
     optimizer = self.adam_for_run(run)
 
@@ -351,7 +354,8 @@ class Model:
       g["lr"], g["eps"] = adam.get("learning_rate", 1e-4), adam.get("eps", 1e-12)
       g["weight_decay"], g["betas"] = adam.get("weight_decay", 0.0), (adam.get("beta1", 0.9), adam.get("beta2", 0.95))
 
-    max_norm = adam.get("grad_clip_norm") or math.inf  # 0 means don't clip
+    max_norm = float(adam.get("grad_clip_norm") or math.inf)  # 0 means don't clip
+    self.state_revision += 1  # clipping writes gradients in place, even if the subsequent Adam step fails
     grad_norm = torch.nn.utils.clip_grad_norm_(self.params[run].values(), max_norm).item()
     # moments on the host come back to the GPU, after freeing torch's cache to make room
     if not self.lora and torch.cuda.is_available() and any(not t.is_cuda for t in self.adam_moments()):
@@ -367,15 +371,15 @@ class Model:
   def training_state(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """A run's portable training checkpoint: fp32 master weights and named AdamW state, with no pickle."""
     self.activate_run(run)
-    tensors = {name: full_tensor(p.detach()) for name, p in self.params[run].items()}
-    optim = self.optimizers.get(run)
+    tensors, optim = {}, self.optimizers.get(run)
     for name, p in self.params[run].items():
+      tensors[name] = full_tensor(p.detach())
       if p.grad is not None:
         tensors[f"{name}.grad"] = full_tensor(p.grad.detach())
       if optim and p in optim.state:
         for k in ("exp_avg", "exp_avg_sq", "step"):
           tensors[f"{name}.{k}"] = full_tensor(optim.state[p][k].detach())
-    return tensors, {"optimizer": True}
+    return tensors, {"optimizer": True, "needs_recovery": run in self.needs_recovery}
 
   def sampler_weights(self, run: str) -> tuple[dict[str, torch.Tensor], dict]:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
@@ -406,15 +410,19 @@ class Model:
     for n, p in self.params[run].items():
       if weights[n].shape != p.shape or (req_opt and not all(f"{n}.{s}" in tensors for s in reqs)):
         raise ValueError(f"bad: {n}")
+    self.state_revision += 1
     for name, p in self.params[run].items():
       p.data.copy_(like_param(weights[name], p))
       has_grad = gradients and f"{name}.grad" in tensors
       p.grad = like_param(tensors[f"{name}.grad"], p) if has_grad else None
 
-    self.needs_recovery.discard(run)
+    if gradients and meta.get("needs_recovery"):
+      self.needs_recovery.add(run)
+    else:
+      self.needs_recovery.discard(run)
     self.pinned.clear()
     self.optimizers.pop(run, None)
-    if optimizer and any(k.endswith(".step") for k in tensors):
+    if req_opt:
       opt = self.adam_for_run(run)
       for name, p in self.params[run].items():
         opt.state[p] = {
@@ -477,11 +485,11 @@ class Model:
   def park_on_host(self) -> None:
     """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume_on_gpu() undoes it."""
     self.move_tensors(self.gpu_tensors(), "cpu")
-    self.parked = True
+    if dist.is_initialized():
+      dist.barrier()  # every rank has freed its GPU before rank 0 tells the node
 
   def resume_on_gpu(self) -> None:
     self.move_tensors(self.gpu_tensors(optim=self.lora), "cuda")
-    self.parked = False
 
   def delete_run(self, run: str) -> None:
     lm = self.activate_run(run)
@@ -494,5 +502,6 @@ class Model:
       if torch.cuda.is_available():
         torch.cuda.empty_cache()
     del self.params[run]
-    self.pinned.clear()
     self.optimizers.pop(run, None)
+    for k in set(self.pinned) - {id(x) for x in self.gpu_tensors()}:
+      del self.pinned[k]

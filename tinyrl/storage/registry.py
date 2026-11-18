@@ -6,50 +6,24 @@ import asyncio
 import json
 import time
 
-from redis.exceptions import WatchError
-
 from tinyrl.bus import Bus, key
 from tinyrl.storage.store import Store
 
 
 class Registry:
   def __init__(self, bus: Bus):
-    self.r = bus.r
-
-  async def register_checkpoint(
-    self,
-    uri: str,
-    size: int,
-    ttl: int | None = None,
-    owned: bool = False,
-    version: str | None = None,
-  ) -> None:
-    """Record a checkpoint the store now holds. One the run owns, like a sampling session's weights or the state a stopping trainer parked, goes when the run is deleted. The rest stay until deleted, or their TTL runs out."""
-    run, cid = uri.removeprefix("tinker://").split("/", 1)
-    now, kind = time.time(), cid.split("/", 1)[0]
-    info = {
-      "checkpoint_id": cid,
-      "checkpoint_type": {"weights": "training", "sampler_weights": "sampler"}.get(kind, kind),
-      "time": now,
-    }
-    info |= {"tinker_path": uri, "size_bytes": size, "expires_at": now + ttl if ttl else None, "owned": owned}
-    info["version"] = version  # what a node reads it by
-    p = self.r.pipeline(transaction=True)
-    p.setnx(key("ckpt_since"), now)
-    p.hset(key("ckpt", run), cid, json.dumps(info))
-    if kind != "parked":
-      p.zadd(key("ckpts"), {uri: now})
-    p.zadd(key("expiry"), {uri: now + ttl}) if ttl else p.zrem(key("expiry"), uri)
-    await p.execute()
+    self.bus, self.r = bus, bus.r
 
   async def get_checkpoint(self, uri: str) -> dict | None:
     run, cid = uri.removeprefix("tinker://").split("/", 1)
     info = await self.r.hget(key("ckpt", run), cid)
     return json.loads(info) if info else None
 
-  async def version(self, uri: str) -> str | None:
+  async def version(self, uri: str) -> str:
     """The version to read a checkpoint by."""
-    return (await self.get_checkpoint(uri) or {}).get("version")
+    if version := (await self.get_checkpoint(uri) or {}).get("version"):
+      return version
+    raise ValueError(f"no checkpoint at {uri}")
 
   async def checkpoints_of_run(self, run: str) -> list[dict]:
     found = [json.loads(v) for v in (await self.r.hgetall(key("ckpt", run))).values()]
@@ -64,20 +38,18 @@ class Registry:
   async def set_checkpoint_ttl(self, uri: str, ttl: int | None) -> bool:
     """Make a checkpoint expire ttl seconds from now, or never with None."""
     run, cid = uri.removeprefix("tinker://").split("/", 1)
-    while True:
-      try:
-        async with self.r.pipeline(transaction=True) as p:
-          await p.watch(key("ckpt", run))
-          if (data := await p.hget(key("ckpt", run), cid)) is None:
-            return False
-          info = json.loads(data) | {"expires_at": time.time() + ttl if ttl else None}
-          p.multi()
-          p.hset(key("ckpt", run), cid, json.dumps(info))
-          p.zadd(key("expiry"), {uri: info["expires_at"]}) if ttl else p.zrem(key("expiry"), uri)
-          await p.execute()
-          return True
-      except WatchError:
-        continue
+    k = key("ckpt", run)
+
+    async def update(p):
+      if not (data := await p.hget(k, cid)):
+        return False
+      expires = time.time() + ttl if ttl else None
+      p.multi()
+      p.hset(k, cid, json.dumps(json.loads(data) | {"expires_at": expires}))
+      p.zadd(key("expiry"), {uri: expires}) if ttl else p.zrem(key("expiry"), uri)
+      return bool(await p.execute())
+
+    return await self.bus.transact(update, k)
 
   async def unregister_checkpoints(self, *uris: str) -> int:
     """Take checkpoints out of the registry. The node daemons' sweeps then delete their files."""
@@ -89,23 +61,17 @@ class Registry:
       p.zrem(key("expiry"), uri)
     return sum((await p.execute())[::3]) if uris else 0
 
-  async def checkpoints_owned_by_run(self, run: str) -> list[str]:
-    found = [json.loads(v) for v in (await self.r.hgetall(key("ckpt", run))).values()]
-    return [c["tinker_path"] for c in found if c["owned"]]
-
   async def expired_checkpoints(self) -> list[str]:
     """The checkpoints whose TTL has run out."""
     return [u.decode() for u in await self.r.zrangebyscore(key("expiry"), 0, time.time())]
 
-  async def registered(self) -> set[str]:
-    """Every checkpoint in the registry, parked ones too."""
-    uris = set()
+  async def sweep(self, store: Store, grace: float) -> None:
+    # Enumerate candidates first, then inspect write intents before published references. A commit moves a
+    # version atomically from one to the other, so even a slow save stays protected throughout publication.
+    unused = await asyncio.to_thread(store.versions)
+    unused.difference_update(v.decode() for v in await self.r.hvals(key("writing")))
     async for k in self.r.scan_iter(match=key("ckpt", "*")):
       for info in map(json.loads, await self.r.hvals(k)):
-        uris.add(info["tinker_path"])
-    return uris
-
-  async def sweep(self, store: Store, grace: float) -> None:
-    """Let the node's store delete what the registry doesn't have. Checkpoints older than the registry itself are left alone, so turning it on never deletes what came before."""
-    since = await self.r.get(key("ckpt_since"))  # when the first checkpoint was registered
-    await asyncio.to_thread(store.sweep, await self.registered(), float(since) if since else None, grace)
+        if version := info.get("version"):
+          unused.discard(version.partition("@")[0])
+    await asyncio.to_thread(store.sweep, unused, grace)

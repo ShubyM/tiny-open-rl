@@ -130,7 +130,7 @@ class TestAPI(RedisTest):
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
     self.assertEqual(sampler["path"], f"tinker://{run_id}/sampler_weights/step-0")
-    with open(f"{self.store.path(sampler['path'])}/adapter_config.json") as f:
+    with open(f"{self.store.local_folder(await self.registry.version(sampler['path']))[0]}/adapter_config.json") as f:
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}
@@ -165,8 +165,8 @@ class TestAPI(RedisTest):
     self.assertEqual((await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"], [])
 
   async def test_a_checkpoint_leaves_the_registry_when_its_ttl_runs_out(self):
-    await self.registry.register_checkpoint("tinker://r/weights/soon", 10, ttl=0.2)
-    await self.registry.register_checkpoint("tinker://r/weights/later", 10, ttl=3600)
+    await self.seed_checkpoint("tinker://r/weights/soon", 10, ttl=0.2)
+    await self.seed_checkpoint("tinker://r/weights/later", 10, ttl=3600)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     for _ in range(100):
       if await self.registry.get_checkpoint("tinker://r/weights/soon") is None:
@@ -200,7 +200,7 @@ class TestAPI(RedisTest):
     full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
     exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})
 
-    workers = [(await self.bus.get_run(run_id))["worker"] for run_id in (shared, also_shared, full, exclusive)]
+    workers = [await self.worker(run_id) for run_id in (shared, also_shared, full, exclusive)]
     self.assertEqual(workers[0], workers[1])
     self.assertEqual(len(set(workers)), 3)
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
@@ -213,7 +213,7 @@ class TestAPI(RedisTest):
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
     await self.node.sync()
-    self.assertEqual(scheduler.jobs_of(self.node.state, await self.worker(full)), [full])
+    self.assertEqual(self.node.state.runs(await self.worker(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -290,7 +290,7 @@ class TestAPI(RedisTest):
 
     saved = (await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final_pin"}))).json()
 
-    folder = self.store.path(saved["path"])
+    folder = self.store.local_folder(await self.registry.version(saved["path"]))[0]
     files = os.listdir(folder)
     self.assertTrue(all(f.endswith(".safetensors") for f in files), f"Found non-safetensors files: {files}")
 
@@ -309,7 +309,7 @@ class TestAPI(RedisTest):
     saved = (
       await self.result(await self.post("save_weights_for_sampler", json={"model_id": run, "path": "sampler"}))
     ).json()
-    files = glob.glob(f"{self.store.path(saved['path'])}/*.safetensors")
+    files = glob.glob(f"{self.store.local_folder(await self.registry.version(saved['path']))[0]}/*.safetensors")
     self.assertTrue(files)
     for path in files:
       self.assertTrue(all(t.dtype == torch.bfloat16 for t in safetensors.torch.load_file(path).values()))
@@ -401,9 +401,9 @@ class TestAPI(RedisTest):
     await self.bus.append_event("node_up", node="node-1", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     worker = await self.worker(run_id)
-    data = await self.scheduling_until(lambda d: d["state"]["workers"].get(worker, {}).get("node"))
-    self.assertEqual(data["state"]["workers"][worker]["node"], "node-1")
-    sampler = data["state"]["workers"][await self.worker(samp_id)]
+    data = await self.scheduling_until(lambda d: d["state"]["procs"].get(worker, {}).get("node"))
+    self.assertEqual(data["state"]["procs"][worker]["node"], "node-1")
+    sampler = data["state"]["procs"][await self.worker(samp_id)]
     self.assertEqual(
       sampler["spec"],
       {"role": "sampler", "base": "tiny", "lora": True, "exclusive": True, "train_run": excl_id, "gpus": 1},
@@ -412,7 +412,7 @@ class TestAPI(RedisTest):
 
     await self.post("delete_model", json={"model_id": run_id})
     await self.drain(run_id)
-    data = await self.scheduling_until(lambda d: worker not in d["state"]["workers"])
+    data = await self.scheduling_until(lambda d: worker not in d["state"]["procs"])
     self.assertNotIn(run_id, data["state"]["jobs"])
 
   async def scheduling_until(self, done, tries: int = 100) -> dict:
@@ -449,10 +449,10 @@ class TestAPI(RedisTest):
     await self.bus.node_heartbeat("n8", 8)
     await self.bus.append_event("node_up", node="n8", gpus=8, memory=0)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
-    await self.scheduling_until(lambda d: d["state"]["workers"].get(sampler, {}).get("node"))
+    await self.scheduling_until(lambda d: d["state"]["procs"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)
-    await self.scheduling_until(lambda d: sampler not in d["state"]["workers"])
+    await self.scheduling_until(lambda d: sampler not in d["state"]["procs"])
 
 
 if __name__ == "__main__":
