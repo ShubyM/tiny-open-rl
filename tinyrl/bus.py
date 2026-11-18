@@ -137,7 +137,7 @@ def finish_cmd(p, cmd: Cmd, reply: Reply, acct: str, charge: Charge | None) -> N
     counts.update(cmds=1, wait_ms=wait_ms, busy_ms=charge.busy_ms)
     if reply.ok:
       counts["tokens"] = cmd.cost
-    if acct and charge.gpu_ms:
+    if charge.gpu_ms:
       p.hincrbyfloat(key("service"), acct, charge.gpu_ms)
   for name, n in counts.items():
     p.hincrby(key("run", cmd.run), name, n)
@@ -223,12 +223,11 @@ class Bus:
   async def end_session(self, session_id: str) -> None:
     left = False
     for run_id in (await self.get_session(session_id) or {}).get("runs", []):
-      role = (await self.get_run(run_id) or {}).get("role")
       if not await self.r.sismember(key("runs"), run_id):
         continue
-      if role == Role.SAMPLER:
+      if (await self.get_run(run_id))["role"] == Role.SAMPLER:
         await self.delete_run(run_id)
-      elif role == Role.TRAINER:
+      else:
         left = bool(await self.submit_command(run_id, Op.DELETE_MODEL, b"{}")) or left
     await (self.r.zadd(key("seen"), {session_id: time.time()}) if left else self.r.zrem(key("seen"), session_id))
 
@@ -252,22 +251,18 @@ class Bus:
     await p.execute()
 
   async def read_state(self) -> dict:
-    """Cluster snapshot: live nodes, runs with `(owner, pos, snap)`, stream backlog, plan, and `gpu_ms` service."""
+    """Cluster snapshot: live nodes, runs with their owner, stream backlog, plan, and `gpu_ms` service."""
     nodes, runs = await self.live_nodes(details=True), sorted(r.decode() for r in await self.r.smembers(key("runs")))
     p = self.r.pipeline(transaction=False)
     for r in runs:
-      p.hmget(key("run", r), "record", "owner", "pos", "snap")
+      p.hmget(key("run", r), "record", "owner")
       p.xlen(key("q", r))  # A commit deletes its entry, so this includes both queued and pending work.
     p.get(key("plan"))
     p.hgetall(key("service"))
     *rows, plan, service = await p.execute()
     out_runs, queues = {}, {}
     for r, f, backlog in zip(runs, rows[::2], rows[1::2]):
-      if not f[0]:
-        continue
-      info = {"record": json.loads(f[0]), "owner": f[1] and f[1].decode(), "pos": f[2] and f[2].decode()}
-      out_runs[r] = info | {"snap": f[3] and f[3].decode()}
-      queues[r] = backlog
+      out_runs[r], queues[r] = {"record": json.loads(f[0]), "owner": f[1] and f[1].decode()}, backlog
     service = {k.decode(): float(v) for k, v in service.items()}
     return {"nodes": nodes, "runs": out_runs, "queues": queues, "plan": json.loads(plan or "{}"), "service": service}
 
@@ -281,7 +276,7 @@ class Bus:
     await p.execute()
 
   async def get_run(self, run_id: str) -> dict | None:
-    if not (f := await self.r.hgetall(key("run", run_id))) or b"record" not in f:
+    if not (f := await self.r.hgetall(key("run", run_id))):
       return None
     meta = {n: f[n.encode()].decode() for n in ("owner", "pos", "snap") if f.get(n.encode())}
     return {**json.loads(f[b"record"]), **meta, **{k.decode(): int(v) for k, v in f.items() if k not in RUN_META}}
@@ -299,7 +294,7 @@ class Bus:
     home = (json.loads(plan_raw) if plan_raw else {}).get("home", {})
     out = {}
     for r, f in zip(runs, rows):
-      if b"record" in f and (ps := home.get(r)):
+      if ps := home.get(r):
         out[(ps[0], r)] = {k.decode(): int(v) for k, v in f.items() if k not in RUN_META}
     return out
 
@@ -317,7 +312,7 @@ class Bus:
     if seq_id is not None and (first := await self.r.get(key("seq", run_id, str(seq_id)))):
       return first.decode()
     seq = [] if seq_id is None else ["IDMP", run_id, seq_id]
-    args = ["NOMKSTREAM", *seq, "*", "op", op, "body", body, "cost", cost, *(["seq", seq_id] if seq else [])]
+    args = ["NOMKSTREAM", *seq, "*", "op", op, "body", body, "cost", cost]
     if (entry_id := await self.r.execute_command("XADD", key("q", run_id), *args)) is None:
       return None
     request_id = f"{run_id}/{entry_id.decode()}"
@@ -339,9 +334,9 @@ class Bus:
       if isinstance(groups, Exception):
         if "no such key" not in str(groups):
           raise groups
-      elif g := next((g for g in groups if g["name"] == GROUP.encode()), None):
-        cursors[key("q", r)] = g["last-delivered-id"]
-        if reclaim and g["pending"]:
+      else:  # a queue has the one group create_run gave it
+        cursors[key("q", r)] = groups[0]["last-delivered-id"]
+        if reclaim and groups[0]["pending"]:
           pending.append(r)
     if not cursors:
       return await asyncio.sleep(block_ms / 1000) or []
@@ -386,16 +381,14 @@ class Bus:
       if entry := await self.r.xrange(key("q", run), eid, eid):  # else a commit has since deleted it
         return parse_cmd(run, *entry[0])
 
-  async def take_commands(
-    self, runs: list[str], consumer: str, count: int = 16, block_ms: int = 0, reclaim: bool = False
-  ) -> list[Cmd]:
-    """Claim up to `count` new commands of each run. With `reclaim`, first those a dead replica left in flight."""
+  async def take_commands(self, runs: list[str], consumer: str, count: int = 16) -> list[Cmd]:
+    """Claim up to `count` commands of each run: first those a dead replica left in flight, then new ones."""
     cmds = []
-    for r in runs if reclaim else ():
+    for r in runs:
       if ids := (await self.abandoned(r))[:count]:
         # Idle for a second, so two live replicas reclaiming at once don't take the same entries from each other.
         got = await self.r.xclaim(key("q", r), GROUP, consumer, 1000, ids)
-        cmds += [parse_cmd(r, eid, fields) for eid, fields in got if fields]
+        cmds += [parse_cmd(r, eid, fields) for eid, fields in got]
     p = self.r.pipeline(transaction=False)
     for r in runs:
       p.xreadgroup(GROUP, consumer, {key("q", r): ">"}, count=count)
@@ -405,9 +398,6 @@ class Bus:
           raise got
       else:
         cmds += [parse_cmd(r, eid, fields) for _, entries in got for eid, fields in entries]
-    if not cmds and block_ms:
-      await self.peek_commands(runs, block_ms, reclaim)
-      return await self.take_commands(runs, consumer, count, reclaim=reclaim)
     return cmds
 
   async def take_trainer_command(self, run: str, token: str) -> Cmd | None:
@@ -457,8 +447,8 @@ class Bus:
       return None
 
     async def op(p):
-      rec, owner, epoch, pos, snap = await p.hmget(k, "record", "owner", "epoch", "pos", "snap")
-      if not rec or owner is not None or not await p.exists(lk):
+      owner, epoch, pos, snap = await p.hmget(k, "owner", "epoch", "pos", "snap")
+      if owner is not None or not await p.exists(lk):
         return None
       n = int(epoch or 0) + 1
       p.multi()
@@ -517,12 +507,11 @@ class Bus:
         return None
       ckpts = await p.hgetall(ck) if deleting else {}
       p.multi()
-      if cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
-        p.hdel(key("writing"), cmd.run)
-      if checkpoint and reply.ok:
+      p.hdel(key("writing"), cmd.run)
+      if checkpoint:
         queue_checkpoint(p, **checkpoint)
       finish_cmd(p, cmd, reply, acct, charge)
-      if mutates and not deleting:
+      if mutates:
         p.hset(k, "pos", cmd.entry_id)
         p.hdel(k, "snap")
       elif deleting:
@@ -533,7 +522,7 @@ class Bus:
           p.zrem(key("expiry"), uri)
         queue_delete(p, cmd.run)
       await p.execute()
-      return old_snap.decode() if old_snap and mutates and not deleting else ""
+      return old_snap.decode() if old_snap and mutates else ""
 
     res = await self.transact(op, k, key("f", cmd.request_id), *([ck] if deleting else []))
     return (False, None) if res is None else (True, res or None)
@@ -560,14 +549,10 @@ class Bus:
 
   # ***** nodes, replies, events *****
 
-  async def node_heartbeat(self, node: str, gpus: int, memory: int = 0, wake_scheduler: bool = False, **info) -> None:
-    p = self.r.pipeline()
-    p.hset(
+  async def node_heartbeat(self, node: str, gpus: int, memory: int = 0, **info) -> None:
+    await self.r.hset(
       key("nodes"), node, json.dumps({"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, **info})
     )
-    if wake_scheduler:
-      wake(p)
-    await p.execute()
 
   async def live_nodes(self, details: bool = False) -> dict:
     nodes = {k.decode(): json.loads(v) for k, v in (await self.r.hgetall(key("nodes"))).items()}
@@ -605,8 +590,8 @@ class Bus:
     got = await self.r.xread({key(stream): wake_id}, count=1, block=block_ms or None)
     return got[0][1][-1][0].decode() if got else wake_id
 
-  async def read_events(self, after: str = "0-0", count: int = 10_000, block_ms: int = 0) -> list[Event]:
-    got = await self.r.xread({key("events"): after}, count=count, block=block_ms or None)
+  async def read_events(self, after: str = "0-0", count: int = 10_000) -> list[Event]:
+    got = await self.r.xread({key("events"): after}, count=count)
     rows = got[0][1] if got else ()
     return [
       Event(i.decode(), int(i.decode().split("-")[0]) / 1000, f[b"kind"].decode(), json.loads(f[b"body"]))

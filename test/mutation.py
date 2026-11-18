@@ -28,7 +28,7 @@ CASES = [
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (BUS, "finish_cmd", "if acct and charge.gpu_ms:", "if reply.ok and acct and charge.gpu_ms:", BILLING),
+  (BUS, "finish_cmd", "if charge.gpu_ms:", "if reply.ok and charge.gpu_ms:", BILLING),
   (BUS, "take_trainer_command", 'await p.hget(k, "owner") != token.encode()', "False", CLAIM),
   (
     BUS,
@@ -37,7 +37,7 @@ CASES = [
     "await p.exists(fk)",
     DEDUP,
   ),
-  (BUS, "commit_reply", "if mutates and not deleting:", "if reply.ok and mutates and not deleting:", RECOVERY),
+  (BUS, "commit_reply", "if mutates:", "if reply.ok and mutates:", RECOVERY),
 ]
 
 

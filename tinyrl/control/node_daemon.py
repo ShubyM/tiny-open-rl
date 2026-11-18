@@ -116,11 +116,11 @@ class NodeDaemon:
     finally:
       await self.close()
 
-  async def push_heartbeat(self, wake: bool = False) -> None:
+  async def push_heartbeat(self) -> None:
     on = {life.split("@", 1)[0]: list(gs) for life, gs in self.on.items()}
     pids = {p: m.proc.pid for p, lf in self.lives.items() if (m := lf.model) and m.proc and m.proc.pid is not None}
     self.heartbeat = time.monotonic()
-    await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20, wake, on=on, pids=pids, lag=self.lag)
+    await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20, on=on, pids=pids, lag=self.lag)
 
   async def tick(self) -> None:
     await self.push_heartbeat()
@@ -442,7 +442,7 @@ class Lifetime:
 
   async def claim(self, runs: list[str], count: int) -> list[Cmd]:
     if self.sampling:
-      return await self.bus.take_commands(runs, self.life, count, reclaim=True)
+      return await self.bus.take_commands(runs, self.life, count)
     cmds = []
     for run in runs:
       if cmd := await self.bus.take_trainer_command(run, self.owned[run][0]):
