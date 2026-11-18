@@ -42,7 +42,9 @@ class TestAPI(RedisTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.store = Store(root=tempfile.mkdtemp())
-    self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app(self.bus)), base_url="http://tinyrl")
+    self.http = httpx.AsyncClient(
+      transport=httpx.ASGITransport(app=gateway.app(self.bus, self.store)), base_url="http://tinyrl"
+    )
     self.node = TestNode(self.bus, store=self.store)
 
   async def asyncTearDown(self):
@@ -126,6 +128,14 @@ class TestAPI(RedisTest):
     load = {"model_id": run_id, "path": saved["path"], "optimizer": True}
     loaded = (await self.result(await self.post("load_weights", json=load))).json()
     self.assertEqual((loaded["type"], loaded["path"]), ("load_weights", saved["path"]))
+
+    # what a client resuming from the checkpoint asks first, answered without the run
+    info = (await self.post("weights_info", json={"tinker_path": saved["path"]})).json()
+    trained = {"train_unembed": True, "train_mlp": True, "train_attn": True}
+    self.assertEqual(info, {"base_model": "tiny", "is_lora": True, "lora_rank": 4} | trained)
+    self.assertEqual(
+      (await self.post("weights_info", json={"tinker_path": f"tinker://{run_id}/weights/nope"})).status_code, 404
+    )
 
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
