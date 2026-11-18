@@ -254,12 +254,17 @@ Open `simulator/index.html` in a browser; it runs locally without installing dep
 ```sh
 python -m unittest discover -s test -t .                             # starts its own redis-server, or set REDIS_URL
 TINKER_PYTHON=$(which python) python -m unittest test.test_tinker   # runs examples/tinker_sdk.py against redis, gateway, scheduler and node_daemon
+python -m test.mutation                                              # control-plane mutation tests
 SEED=3 CHAOS=1 python -m test.stress_fleet                           # one random cluster and workload, with workers and nodes failing
 ```
 
 Integration tests use real Redis, tiny random Llama models and the unmodified SDK. Deterministic node tests substitute
 an inline CPU model process or a fake sampling engine; separate process tests cover Unix IPC, parent death, SIGTERM
 shutdown and two-rank numerical equivalence. CUDA parking tests run when a GPU is available.
+
+Mutation tests run the selected tests on clean code, then inject one fault at a time into a temporary copy.
+They cover trainer scheduling, GPU accounting, ownership, duplicate sampler replies and checkpoint recovery.
+CI fails if a fault survives or a test cannot run. The reported score covers these selected faults.
 
 [test/stress_fleet.py](test/stress_fleet.py) is not part of the suite. Each seed runs several accounts' trainers and
 samplers on a few GPUs and checks that every command is answered, that no two processes are ever on one GPU, that each

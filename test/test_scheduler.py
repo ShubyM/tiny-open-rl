@@ -364,6 +364,14 @@ class TestLocalQuantum(unittest.TestCase):
       service[run] += 10 if run == "slow" else 1
     self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
 
+  def test_equal_service_uses_numeric_stream_arrival_order(self):
+    heads = [
+      Cmd("later", "10-0", Op.OPTIM_STEP, b""),
+      Cmd("same_ms_later", "9-10", Op.OPTIM_STEP, b""),
+      Cmd("first", "9-2", Op.OPTIM_STEP, b""),
+    ]
+    self.assertEqual(select_runs(State(), heads, {}, width=3), ["first", "same_ms_later", "later"])
+
   def test_account_lag_precedes_run_service_and_arrival(self):
     cluster = Cluster()
     cluster.run("current", account="alice")
