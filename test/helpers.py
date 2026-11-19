@@ -10,7 +10,6 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from tinyrl.bus import Bus, connect, queue_checkpoint
-from tinyrl.storage.registry import Registry
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -48,7 +47,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   proc: subprocess.Popen | None = None
 
   async def seed_checkpoint(self, uri, size, *, ttl=None, owned=False, version=None):
-    pipeline = self.bus.r.pipeline()
+    pipeline = self.bus.s.pipeline()
     queue_checkpoint(pipeline, uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned)
     await pipeline.execute()
 
@@ -70,19 +69,20 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
     self.renewal_tasks = []
     self.bus = Bus(connect(self.url))
-    self.registry = Registry(self.bus)
     await self.bus.r.flushall()
 
   async def worker(self, run: str) -> str:
     """The run's primary process, once every new run is assigned the way the scheduler assigns it."""
-    plan = await assign_new_runs(self.bus)
-    return plan["home"][run][0]
+    from tinyrl.control import scheduler
+
+    await assign_new_runs(self.bus)
+    return scheduler.from_state(await self.bus.read_state()).procs_of(run)[0]
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
       task.cancel()
     await asyncio.gather(*self.renewal_tasks, return_exceptions=True)
-    await self.bus.r.aclose()
+    await self.bus.aclose()
 
 
 async def assign_new_runs(bus) -> dict:
@@ -97,8 +97,8 @@ async def assign_new_runs(bus) -> dict:
     **{n: v for n, v in scheduler.to_plan(new)["procs"].items() if n not in plan.get("procs", {})},
   }
   home = {
-    **{r: ps for r, ps in plan.get("home", {}).items() if r in new.jobs},
-    **{b["run"]: [b["proc"]] for k, b in changes if k == "assigned"},
+    **{r: p for r, p in plan.get("home", {}).items() if r in new.jobs},
+    **{b["run"]: b["proc"] for k, b in changes if k == "assigned"},
   }
   merged = {**plan, "made": max(plan.get("made", 0), new.made), "procs": procs, "home": home}
   if merged != plan:

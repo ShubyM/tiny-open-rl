@@ -33,7 +33,6 @@ from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
 from tinyrl.bus import Bus, Op, Role, Run, connect, key
 from tinyrl.control import scheduler
-from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import Model
 from tinyrl.workers.trainer import Trainer
@@ -165,7 +164,7 @@ class Stress(RedisTest):
     await asyncio.gather(*self.loops.values(), return_exceptions=True)
     for node in self.nodes.values():
       await node.aclose()
-      await node.bus.r.aclose()
+      await node.bus.aclose()
     for node in self.cut:
       await asyncio.to_thread(node.store.close)
     await super().asyncTearDown()
@@ -196,15 +195,15 @@ class Stress(RedisTest):
     if task := node.sweeping:
       task.cancel()
     await self.bus.r.hdel(key("nodes"), name)
-    await node.bus.r.aclose()
+    await node.bus.aclose()
 
   async def cut_node(self, name: str) -> None:
     """The node loses Redis for good, mid-work: none of its replies, releases or lease drops arrive. Its leases and
     heartbeat run out by themselves. Its store goes on uploading, so the saves it acknowledged are not lost."""
     node = self.nodes.pop(name)
     self.loops.pop(name).cancel()
-    await node.bus.r.aclose()
-    node.bus.r = node.registry.r = Unreachable()
+    await node.bus.aclose()
+    node.bus.r = node.bus.s = Unreachable()
     for task in node.tasks.values():
       task.cancel()
     await asyncio.gather(*node.tasks.values(), return_exceptions=True)
@@ -212,11 +211,11 @@ class Stress(RedisTest):
 
   def start_scheduler(self) -> None:
     bus = Bus(connect(self.url))
-    self.addAsyncCleanup(bus.r.aclose)
+    self.addAsyncCleanup(bus.aclose)
 
     async def loop():
       while True:
-        await scheduler.tick(bus, Registry(bus))
+        await scheduler.tick(bus)
         await asyncio.sleep(0.01)
 
     self.loops["scheduler"] = asyncio.create_task(loop())
@@ -287,18 +286,14 @@ class Stress(RedisTest):
       f"lag { {a: round(v) for a, v in plan.get('lag', {}).items()} } service { {a: round(v) for a, v in raw['service'].items()} }"
     )
     for node in self.nodes.values():
-      out.append(
-        f"{node.id}: gpus={node.gpus} on={node.on} drains={node.drains} physical={node.occ.on} draining={node.draining}"
-      )
+      out.append(f"{node.id}: gpus={node.gpus} on={node.on} physical={node.occ.on} draining={node.draining}")
       for proc, lf in node.lives.items():
-        heads = [
-          (c.run[:4], c.op.value, c.request_id in lf.prepared and lf.prepared[c.request_id][1].done()) for c in lf.heads
-        ]
+        heads = [(c.run[:4], c.op.value) for c in lf.heads.values()]
+        owned = [r[:4] for r in getattr(lf, "owned", ())]
         out.append(
-          f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} active={lf.active} wanted={lf.wanted()} "
-          f"owned={[r[:4] for r in lf.owned]} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
-          f"reader={'none' if lf.reader is None else 'done' if lf.reader.done() else 'reading'} "
-          f"task={'done' if node.tasks[proc].done() else 'running'} q={lf.quantum:.2f} granted={time.monotonic() - lf.granted_at:.1f}s ago"
+          f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} demand={lf.demand.value} wanted={lf.wanted()} "
+          f"owned={owned} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
+          f"task={'done' if node.tasks[proc].done() else 'running'} hold={lf.hold_until - time.monotonic():.1f}s"
         )
     print("\n".join(out), file=sys.stderr)
 
@@ -379,7 +374,7 @@ class Stress(RedisTest):
     self.finished.append(run)
 
   async def compare(self, run: str, uri: str, ref: Model) -> None:
-    version = await self.registry.version(uri)
+    version = await self.bus.checkpoint_version(uri)
     want, _ = ref.training_state(run)
     for _ in range(100):  # the save may still be on its way from the node that made it to the bucket
       for node in list(self.nodes.values()):
@@ -460,7 +455,9 @@ class Stress(RedisTest):
       await self.bus.delete_run(session)
     try:
       async with asyncio.timeout(30):
-        while (await self.bus.read_state())["plan"].get("procs") or any(n.lives for n in self.nodes.values()):
+        while (await self.bus.read_state())["plan"].get("procs") or any(
+          n.lives or n.tasks for n in self.nodes.values()
+        ):
           await asyncio.sleep(0.05)
     except TimeoutError:
       plan = (await self.bus.read_state())["plan"]

@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 
 import numpy as np
 import torch
@@ -357,7 +358,7 @@ class TestTrainer(RedisTest):
       info = await self.bus.get_run(run)
       self.assertIsNone(info.get("owner"))
       parked = info["snap"].partition("\n")[0]
-      self.assertIsNotNone(await self.registry.get_checkpoint(parked))
+      self.assertIsNotNone(await self.bus.get_checkpoint(parked))
       # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
       await self.node.drain(run)
@@ -369,7 +370,7 @@ class TestTrainer(RedisTest):
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
       self.assertIsNone((await self.bus.get_run(run)).get("snap"))
-      self.assertIsNone(await self.registry.get_checkpoint(parked))  # recovery cannot replay old state after a crash
+      self.assertIsNone(await self.bus.get_checkpoint(parked))  # recovery cannot replay old state after a crash
 
   async def test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure(self):
     run = new_id()
@@ -395,7 +396,7 @@ class TestTrainer(RedisTest):
       info = await self.bus.get_run(run)
       self.assertEqual(info["pos"], request.rsplit("/", 1)[1])
       self.assertIsNone(info.get("snap"))
-      self.assertIsNone(await self.registry.get_checkpoint(parked))
+      self.assertIsNone(await self.bus.get_checkpoint(parked))
 
     self.node.drop_local("p")
     await self.finish_worker("p")
@@ -457,6 +458,7 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
             (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
             (Op.FORWARD_BACKWARD, proto_body(run)),
             (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
+            (Op.FORWARD_BACKWARD, proto_body(run)),
             (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{run}/sampler_weights/s1"}),
           ]
           for i, (op, body) in enumerate(commands):
@@ -471,6 +473,14 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")
         for name in expected:
           torch.testing.assert_close(actual[name], expected[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")
+        # Verify parked CPU-side training_state gather matches single-rank weights, grads, and AdamW moments.
+        single.park()
+        await asyncio.wait_for(multi.call("park"), 30)
+        exp_state = store.get(single.save_run(r1, uuid.uuid4().hex)["version"])[0]
+        got_state = store.get((await asyncio.wait_for(multi.call("save_run", r2, uuid.uuid4().hex), 30))["version"])[0]
+        self.assertEqual(exp_state.keys(), got_state.keys(), f"rank {rank} parked state")
+        for name in exp_state:
+          torch.testing.assert_close(got_state[name], exp_state[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")
       finally:
         await multi.close()
 

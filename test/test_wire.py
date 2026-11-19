@@ -24,7 +24,7 @@ def json_body(n: int = 3, loss_fn: str = "cross_entropy", **config) -> dict:
 
 class TestRequests(unittest.TestCase):
   def test_json_becomes_the_same_protobuf(self):
-    req = wire.parse(wire.from_json(json_body(clip_range=0.3, mode="x")))
+    req = wire.parse(wire.from_json(json_body(clip_range=0.3, mode="x")).SerializeToString())
     self.assertEqual(req.model_id, "m")
     self.assertEqual(req.loss_fn, "cross_entropy")
     self.assertFalse(req.forward_only)
@@ -43,7 +43,9 @@ class TestRequests(unittest.TestCase):
       "model_input": {"chunks": [{"tokens": [5, 6]}]},
       "loss_fn_inputs": {"target_tokens": [6, 7], "advantages": [1, -1]},
     }
-    req = wire.parse(wire.from_json({"model_id": "m", "forward_input": {"data": [datum]}}, forward_only=True))
+    req = wire.parse(
+      wire.from_json({"model_id": "m", "forward_input": {"data": [datum]}}, forward_only=True).SerializeToString()
+    )
     self.assertTrue(req.forward_only)
 
     inputs = wire.datums(req)[0].inputs

@@ -10,7 +10,7 @@ import uuid
 import torch
 
 from test.helpers import RedisTest, new_id
-from tinyrl.bus import Op, Reply, Run, key
+from tinyrl.bus import Op, Reply, Run
 from tinyrl.storage.store import SHARD_BYTES, Store
 
 
@@ -202,25 +202,37 @@ class TestStore(unittest.TestCase):
     saver.upload_pending_saves()
     self.assertTrue(torch.equal(loader.get(version)[0]["w"], torch.ones(4)))
 
+  def test_trim_cache_keeps_unuploaded_saves_and_evicts_oldest_uploaded(self):
+    from unittest.mock import patch
+
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    store = Store(root, cache=tempfile.mkdtemp())
+    old = store.put({"w": torch.ones(64)})
+    store.upload_pending_saves()
+    pending = store.put({"w": torch.ones(64)})
+    with patch("tinyrl.storage.store.CACHE_BYTES", 1):
+      store.trim_cache()
+    self.assertFalse(os.path.exists(f"{store.cache}/{old}"))
+    self.assertTrue(os.path.isdir(f"{store.cache}/{pending}"))
+
 
 class TestRegistry(RedisTest):
   async def test_deletion_wins_over_concurrent_ttl_updates(self):
     run = new_id()
     await self.bus.create_run(Run(id=run, base="base", rank=8))
-    await self.bus.open_lease("owner")
+    await self.bus.touch_leases("owner")
     token, _, _ = await self.bus.acquire_run(run, "owner")
     uri = f"tinker://{run}/sampler_weights/session"
     await self.seed_checkpoint(uri, 1, ttl=60, owned=True)
     await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
-    [cmd] = await self.bus.take_commands([run], "owner", count=1)
+    cmd = await self.bus.claim_trainer(run, token)
     await asyncio.gather(
-      *(self.registry.set_checkpoint_ttl(uri, 600) for _ in range(20)),
+      *(self.bus.set_checkpoint_ttl(uri, 600) for _ in range(20)),
       self.bus.commit_reply(cmd, Reply(True, "application/json", b"{}"), token),
     )
-    self.assertFalse(await self.registry.set_checkpoint_ttl(uri, 600))
-    self.assertIsNone(await self.registry.get_checkpoint(uri))
-    for index in ("ckpts", "expiry"):
-      self.assertIsNone(await self.bus.r.zscore(key(index), uri))
+    self.assertFalse(await self.bus.set_checkpoint_ttl(uri, 600))
+    self.assertIsNone(await self.bus.get_checkpoint(uri))
+    self.assertEqual(await self.bus.checkpoints_of_run(run), [])
 
   async def test_stale_writer_cannot_replace_published_bytes_on_disk_or_in_bucket(self):
     for root in (tempfile.mkdtemp(), f"file://{tempfile.mkdtemp()}"):
@@ -229,37 +241,37 @@ class TestRegistry(RedisTest):
         run = new_id()
         uri = f"tinker://{run}/weights/final"
         await self.bus.create_run(Run(run, "base", 4))
-        await self.bus.open_lease("previous")
+        await self.bus.touch_leases("previous")
         stale, _, _ = await self.bus.acquire_run(run, "previous")
         await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        first = await self.bus.take_trainer_command(run, stale)
+        first = await self.bus.claim_trainer(run, stale)
         abandoned = await self.bus.begin_checkpoint(run, stale)
         await self.bus.drop_lease("previous")
-        await self.bus.open_lease("current")
+        await self.bus.touch_leases("current")
         owner, _, _ = await self.bus.acquire_run(run, "current")
         await self.bus.fail_stranded_commands(run, owner)
         await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        cmd = await self.bus.take_trainer_command(run, owner)
+        cmd = await self.bus.claim_trainer(run, owner)
         version = await self.bus.begin_checkpoint(run, owner)
         winner = new.put({"w": torch.ones(2)}, version=version)
-        await self.registry.sweep(new, grace=0)  # protected even before the reply publishes it
+        await self.bus.sweep_checkpoints(new, grace=0)  # protected even before the reply publishes it
         good = {"uri": uri, "size": 8, "version": winner}
         reply = Reply(True, "application/json", b"{}")
-        self.assertTrue((await self.bus.commit_reply(cmd, reply, owner, checkpoint=good))[0])
+        self.assertTrue(await self.bus.commit_reply(cmd, reply, owner, checkpoint=good))
         new.upload_pending_saves()
         late = old.put({"w": torch.zeros(2)}, version=abandoned)
         old.upload_pending_saves()
-        self.assertFalse((await self.bus.commit_reply(first, reply, stale, checkpoint=good | {"version": late}))[0])
+        self.assertFalse(await self.bus.commit_reply(first, reply, stale, checkpoint=good | {"version": late}))
         reader = Store(root, cache=tempfile.mkdtemp())
-        published = await self.registry.version(uri)
+        published = await self.bus.checkpoint_version(uri)
         self.assertEqual(published, winner)
         torch.testing.assert_close(reader.get(published)[0]["w"], torch.ones(2))
-        await self.registry.sweep(reader, grace=600)
+        await self.bus.sweep_checkpoints(reader, grace=600)
         self.assertEqual(reader.versions(), {abandoned, version})
-        await self.registry.sweep(reader, grace=0)
+        await self.bus.sweep_checkpoints(reader, grace=0)
         self.assertEqual(reader.versions(), {version})
-        await self.registry.unregister_checkpoints(uri)
-        await self.registry.sweep(reader, grace=0)
+        await self.bus.unregister_checkpoints(uri)
+        await self.bus.sweep_checkpoints(reader, grace=0)
         self.assertEqual(reader.versions(), set())
         await self.bus.drop_lease("current")
 
@@ -267,7 +279,7 @@ class TestRegistry(RedisTest):
     store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
     kept, dropped = (store.put({"w": torch.ones(1)}) for _ in range(2))
     await self.seed_checkpoint("tinker://r/weights/kept", 1, version=kept)
-    await self.registry.sweep(store, 0)
+    await self.bus.sweep_checkpoints(store, 0)
     self.assertTrue(os.path.isdir(f"{store.cache}/{kept}"))
     self.assertTrue(os.path.exists(f"{store.cache}/{kept}.upload"))
     self.assertFalse(os.path.exists(f"{store.cache}/{dropped}"))

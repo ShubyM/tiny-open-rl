@@ -17,16 +17,15 @@ import subprocess
 import sys
 import time
 
-import torch
-
-from tinyrl.bus import LEASE_MS, Bus, Cmd, Ev, Op, Reply, Role, unpack_snap
+from tinyrl.bus import LEASE_MS, Bus
 from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge, Wave
+from tinyrl.control.fairness import Demand, Worker, blocks, plan_gpus, select_runs
 from tinyrl.control.process import Process
 from tinyrl.helpers import DEBUG, getenv
-from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 from tinyrl.trace import span
+from tinyrl.types import Cmd, Ev, Op, Reply, Role, unpack_snap
 from tinyrl.workers.sampler import Sampler
 
 GPUS, DRAIN_S, TICK, IDLE_MS = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK", 0.25), getenv("IDLE_MS", 150)
@@ -46,58 +45,23 @@ def gpu_memory_mib() -> int:
     return 0
 
 
-def blocks(total: int, width: int) -> list[tuple[int, ...]]:
-  step = width if width > 0 and total % width == 0 else 1
-  return [tuple(range(i, i + width)) for i in range(0, total - width + 1, step)] if 1 <= width <= total else []
-
-
-def plan_gpus(
-  lives: dict[str, Lifetime], on: dict[str, tuple[int, ...]], total: int, now: float, draining: set[int] = frozenset()
-) -> tuple[dict[str, tuple[int, ...]], float | None]:
-  """Select active GPU blocks: hold `ACTIVE_QUANTUM`, fill rest by `(exclusive, lag, -gpu_ms)`, keep idle warm."""
-  cur = {p: on.get(lf.life, ()) for p, lf in lives.items()}
-  held = {g for gs in on.values() for g in gs}
-  pinned = {g for lf in lives.values() if lf.spec.role == Role.TRAINER and lf.spec.gpus > 1 for g in lf.bound_gpus}
-  want_excl = any(lf.spec.exclusive and lf.active and not cur[p] for p, lf in lives.items())
-  # 1. Exclusive residents and busy residents inside ACTIVE_QUANTUM stay put without switching.
-  residents = {p: lf for p, lf in lives.items() if cur[p] and draining.isdisjoint(cur[p]) and lf.wanted()}
-  ends = {p: lf.granted_at + lf.quantum for p, lf in residents.items() if lf.active and not want_excl}
-  holding = {p: end for p, end in ends.items() if end > now}
-  closing = {p for p in ends if getattr(residents[p], "step_ready", False)}
-  keep = {p: cur[p] for p, lf in residents.items() if p in holding or p in closing or lf.spec.exclusive}
-  taken, hold = set(draining).union(*keep.values()), set()
-  excl = {g for p, block in keep.items() if lives[p].spec.exclusive for g in block}
-  # 2. OVERTIME residents and ready waiters claim open blocks in priority order; prefer cur[p] or truly empty GPUs.
-  waiting = False
-  for p, lf in sorted(lives.items(), key=lambda kv: kv[1].priority(), reverse=True):
-    if p in keep or not lf.active or not lf.wanted():
-      continue
-    opts = [lf.bound_gpus] if lf.bound_gpus else blocks(total, lf.spec.gpus)
-    if free := [b for b in opts if not (taken & set(b)) and (b == cur[p] or not (hold & set(b)))]:
-      avoid = pinned if lf.spec.exclusive else set()
-      keep[p] = min(free, key=lambda b: (b != cur[p], not avoid.isdisjoint(b), not held.isdisjoint(b), b))
-      taken |= set(keep[p])
-      excl |= set(keep[p]) if lf.spec.exclusive else set()
-    else:
-      waiting = True
-      if cand := [b for b in opts if not (excl & set(b))]:
-        hold |= set(cand[0])
-  # 3. Idle residents stay warm in VRAM on uncontested GPUs (zero park/resume when alone).
-  keep.update((p, b) for p, b in cur.items() if b and p not in keep and taken.isdisjoint(b) and lives[p].wanted())
-  return keep, min(holding.values(), default=None) if waiting else None
+async def stop_tasks(*tasks: asyncio.Task | None) -> None:
+  if live := [t for t in tasks if t]:
+    for t in live:
+      t.cancel()
+    await asyncio.gather(*live, return_exceptions=True)
 
 
 class NodeDaemon:
   def __init__(
     self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None, store: Store | None = None
   ):
-    self.bus, self.registry = bus, Registry(bus)
+    self.bus = bus
     self.store = store if store is not None else Store()
     self.store.start()
     self.gpus, self.id = gpus, node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.on: dict[str, tuple[int, ...]] = {}  # life -> occupied GPUs (single source of local GPU truth)
-    self.drains: dict[str, tuple[int, ...]] = {}  # ordered requests for rank-bound checkpoint/restore
     self.lives: dict[str, Lifetime] = {}
     self.tasks: dict[str, asyncio.Task] = {}
     self.timer: asyncio.TimerHandle | None = None
@@ -116,13 +80,21 @@ class NodeDaemon:
     finally:
       await self.close()
 
-  async def push_heartbeat(self, wake: bool = False) -> None:
+  async def push_heartbeat(self) -> None:
     on = {life.split("@", 1)[0]: list(gs) for life, gs in self.on.items()}
     pids = {p: m.proc.pid for p, lf in self.lives.items() if (m := lf.model) and m.proc and m.proc.pid is not None}
-    self.heartbeat = time.monotonic()
-    await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20, wake, on=on, pids=pids, lag=self.lag)
+    leases = tuple(lf.life for lf in self.lives.values() if not lf.closing)
+    before = time.monotonic()
+    await self.bus.node_heartbeat(
+      self.id, self.gpus, self.gpu_mib * 2**20, leases=leases, on=on, pids=pids, lag=self.lag
+    )
+    self.heartbeat = before
 
   async def tick(self) -> None:
+    if not self.draining and time.monotonic() - self.heartbeat >= LEASE_MS / 1000:
+      for lf in list(self.lives.values()):
+        if not lf.closing and lf.task and not lf.task.cancelling():
+          lf.task.cancel()
     await self.push_heartbeat()
     self.state = await self.read_state()
     self.dispatch()
@@ -131,7 +103,8 @@ class NodeDaemon:
         if p.node == self.id and proc not in self.tasks and self.state.runs(proc):
           self.start(proc)
     if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
-      self.swept, self.sweeping = time.time(), asyncio.create_task(self.registry.sweep(self.store, SWEEP_GRACE_S))
+      self.swept = time.time()
+      self.sweeping = asyncio.create_task(self.bus.sweep_checkpoints(self.store, SWEEP_GRACE_S))
     self.notify()
 
   def dispatch(self) -> None:
@@ -141,13 +114,15 @@ class NodeDaemon:
           print(f"{proc} stopped: {err!r}", file=sys.stderr, flush=True)
         del self.tasks[proc]
         self.lives.pop(proc, None)
-      elif self.id not in self.state.nodes and not task.cancelling():
+      elif not task.cancelling() and (
+        self.id not in self.state.nodes or ((lf := self.lives.get(proc)) and not lf.closing and lf.exited())
+      ):
         task.cancel()
 
   def select_gpus(self, proc: str) -> tuple[int, ...]:
-    draining = {g for block in self.drains.values() for g in block}
-    lives = {p: lf for p, lf in self.lives.items() if lf.life not in self.drains}
-    keep, wake_at = plan_gpus(lives, self.on, self.gpus, now := time.monotonic(), draining)
+    occupied = set().union(*self.on.values())
+    workers = {p: lf.worker() for p, lf in self.lives.items() if lf.wanted()}
+    keep, wake_at = plan_gpus(workers, self.gpus, now := time.monotonic(), occupied)
     if self.timer:
       self.timer.cancel()
     self.timer = asyncio.get_running_loop().call_later(max(0.0, wake_at - now), self.notify) if wake_at else None
@@ -166,23 +141,9 @@ class NodeDaemon:
     if self.on.pop(life, None) is not None:
       self.notify()
 
-  async def claim_after_drain(self, life: str, gpus: tuple[int, ...]) -> None:
-    """Reserve a block as its holders park. Overlapping requests claim in arrival order."""
-    devices = set(gpus)
-    self.drains[life] = gpus
-    self.notify()
-    try:
-      while True:
-        first = next(owner for owner, block in self.drains.items() if devices.intersection(block))
-        if first == life and self.claim_gpus(life, gpus, len(gpus)):
-          return
-        await self.changed.wait()
-    finally:
-      del self.drains[life]
-      self.notify()
-
   def start(self, proc: str) -> asyncio.Task:
-    self.tasks[proc] = task = asyncio.create_task(Lifetime(self, proc).run())
+    cls = SamplerLife if self.state.procs[proc].spec.role == Role.SAMPLER else TrainerLife
+    self.tasks[proc] = task = asyncio.create_task(cls(self, proc).run())
     return task
 
   async def close(self, graceful: bool = True) -> None:
@@ -190,16 +151,20 @@ class NodeDaemon:
     if self.timer:
       self.timer.cancel()
     self.notify()
+    deadline, pending = time.monotonic() + (DRAIN_S if graceful else 0), set(self.tasks.values())
+    while pending and time.monotonic() < deadline:
+      _, pending = await asyncio.wait(pending, timeout=min(LEASE_MS / 4000, deadline - time.monotonic()))
+      with contextlib.suppress(Exception):
+        await self.bus.touch_leases(*(lf.life for lf in self.lives.values() if not lf.closing), xx=True)
+    for task in pending:
+      task.cancel()
     if self.tasks:
-      _, pending = await asyncio.wait(self.tasks.values(), timeout=DRAIN_S if graceful else 0)
-      for task in pending:
-        task.cancel()
       await asyncio.gather(*self.tasks.values(), return_exceptions=True)
       self.dispatch()
     await asyncio.to_thread(self.store.close)
 
   async def read_state(self) -> scheduler.State:
-    return scheduler.from_state(await self.bus.read_state())
+    return scheduler.from_state(await self.bus.read_state(backlogs=False))
 
   def notify(self) -> None:
     changed, self.changed = self.changed, asyncio.Event()
@@ -218,22 +183,38 @@ class NodeDaemon:
 
 
 class Lifetime:
-  """One process incarnation: reconciles local GPU quantum residency and run ownership toward `node.state`."""
+  """One process incarnation: owns local GPU quantum residency and fenced subprocess teardown."""
+
+  gang = False
 
   def __init__(self, node: NodeDaemon, proc: str):
-    self.node, self.bus, self.registry, self.store, self.proc = node, node.bus, node.registry, node.store, proc
-    self.spec, self.sampling = (sp := node.state.procs[proc].spec), sp.role == Role.SAMPLER
+    self.node, self.bus, self.store, self.proc = node, node.bus, node.store, proc
+    self.spec, self.eager, self.pinned = node.state.procs[proc].spec, True, True
     self.life = f"{proc}@{node.id}-{os.urandom(6).hex()}"
-    self.task = self.model = self.guard = self.closing = self.reader = None
-    self.bound_gpus, self.warm, self.active = (), False, False
-    self.granted_at, self.quantum, self.park_s, self.gpu_ms = 0.0, QUANTUM_MS / 1000, 0.0, 0.0
-    self.owned: dict[str, tuple[str, str | None, str | None]] = {}  # run -> (token, pos, snap)
-    self.loaded, self.open_grads = set(), set()
-    self.heads, self.prepared, self.service = [], {}, {}
-    self.renewed, self.virtual, self.idle_since, self.step_ready = time.monotonic(), 0.0, 0.0, False
+    self.task = self.model = self.closing = self.reader = None
+    self.reader_streams: list[str] = []
+    self.bound_gpus, self.demand = (), Demand.IDLE
+    self.hold_until, self.park_s, self.gpu_ms = 0.0, 0.0, 0.0
+    self.heads: dict[str, Cmd] = {}
+    self.service, self.service_floor = {}, 0.0
+
+  def exited(self) -> bool:
+    return bool(self.model and (p := self.model.proc) and p.poll() is not None)
 
   def streams(self) -> list[str]:
-    return self.node.state.runs(self.proc) if self.sampling else sorted(self.owned)
+    return self.node.state.runs(self.proc)
+
+  def ready(self) -> tuple[list[Cmd], list[Cmd]]:
+    return list(self.heads.values()), []
+
+  def ready_runs(self) -> list[str]:
+    return [c.run for c in self.ready()[0]]
+
+  async def sync_runs(self) -> None:
+    pass
+
+  async def finish(self) -> None:
+    pass
 
   def wanted(self) -> bool:
     p = self.node.state.procs.get(self.proc)
@@ -242,56 +223,62 @@ class Lifetime:
     excl = {g for o in self.node.lives.values() if o.spec.exclusive for g in self.node.on.get(o.life, ())}
     if self.life in self.node.on or excl.isdisjoint(self.bound_gpus):
       return True
-    # Retire the blocked rank group through normal fenced detach. Its successor can bind a different block.
-    return not (
-      self.sampling or self.ready()[0] and any(excl.isdisjoint(b) for b in blocks(self.node.gpus, p.spec.gpus))
+    # A blocked sampler exits immediately; a blocked multi-GPU trainer detaches once work and another block exist.
+    return self.gang and not (
+      self.ready_runs() and any(excl.isdisjoint(b) for b in blocks(self.node.gpus, p.spec.gpus))
     )
 
-  def priority(self) -> tuple:
-    s = self.node.state
-    runs = [c.run for c in self.ready()[0] if c.run in s.jobs] or [r for r in self.streams() if r in s.jobs]
-    top = round(max(map(s.ready_lag, runs), default=-self.gpu_ms), 3)
-    return (self.spec.exclusive, top, round(-self.gpu_ms, 3), self.life in self.node.on, self.proc)
+  def worker(self) -> Worker:
+    s, sp, bnd = self.node.state, self.spec, self.bound_gpus
+    runs = [r for r in self.ready_runs() if r in s.jobs] or [r for r in self.streams() if r in s.jobs]
+    cur, lag = self.node.on.get(self.life, ()), max(map(s.ready_lag, runs), default=-self.gpu_ms)
+    return Worker(sp.gpus, sp.exclusive, self.demand, cur, bnd, self.gang, self.hold_until, lag, self.gpu_ms)
+
+  def spawn_model(self, gpus: tuple[int, ...]) -> None:
+    env = {**scheduler.settings(self.node.gpus, self.node.gpu_mib * 2**20), **os.environ, **self.store.env()}
+    self.model = self.open_model(env | {"CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))})
 
   async def run(self) -> None:
     self.task = asyncio.current_task()
     try:
-      if not await self.open():
+      if self.node.draining:
         return
+      opening = asyncio.create_task(self.bus.touch_leases(self.life))
+      try:
+        await asyncio.shield(opening)
+      except BaseException:
+        with contextlib.suppress(Exception):
+          await opening
+        raise
+      self.node.lives[self.proc] = self
+      if self.eager:
+        self.spawn_model(tuple(range(self.node.gpus)))
       while self.wanted():
         changed = self.node.changed
         await self.sync_runs()
         await self.collect()
         ready, failed = self.ready()
         if failed:
-          await self.execute(failed)
+          await self.dispatch(failed, failed=True)
           ready, _ = self.ready()
           if not self.wanted():
             break
-        # A trainer keeps its turn for CYCLE_GRACE_MS after a command: its client's next one is a round trip away.
-        grace = self.idle_since + CYCLE_GRACE_MS / 1000 - time.monotonic()
-        linger = not self.sampling and self.life in self.node.on and grace > 0
-        # It also outstays its quantum while a training step is open, because parking then moves the gradients too.
-        closing = any(c.op == Op.OPTIM_STEP and c.run in self.open_grads for c in ready)
-        self.step_ready = closing or (linger and not ready and bool(self.open_grads))
-        warm = self.warm and self.model is not None and self.model.running is None
-        await self.sync_gpus(bool(ready) or linger or warm)
+        demand, wait_s = self.turn(ready)
+        await self.sync_gpus(demand)
         if not self.wanted():
           break
         if ready and self.life in self.node.on:
-          if (cmd := await self.execute(ready)) and cmd.op == Op.DELETE_MODEL and not self.spec.lora:
+          if await self.dispatch(ready):
             break
         else:
-          if self.reader is None:
-            self.read(IDLE_MS / 1000 if self.heads else 0)
+          self.start_reader(*self.reader_args())
           with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(changed.wait(), grace if linger else None)
-      self.active = False
+            await asyncio.wait_for(changed.wait(), wait_s)
+      self.demand = Demand.IDLE
       await self.stop_reader()
-      for r in list(self.owned):
-        await self.detach(r, drop=False)
+      await self.finish()
     finally:
-      self.active = False
+      self.demand = Demand.IDLE
       self.closing = asyncio.create_task(self.cleanup())
       self.node.notify()
       while True:
@@ -302,299 +289,86 @@ class Lifetime:
           if self.closing.cancelled():
             self.closing = asyncio.create_task(self.cleanup())
 
-  # ***** lease and subprocess *****
-
-  def spawn_model(self, gpus: tuple[int, ...]) -> None:
-    env = {**scheduler.settings(self.node.gpus, self.node.gpu_mib * 2**20), **os.environ, **self.store.env()}
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
-    if not self.sampling:
-      env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    open_s, open_t = self.node.open_sampler, self.node.open_trainer
-    self.model = open_s(self.proc, self.spec, env) if self.sampling else open_t(self.proc, self.spec.gpus, env)
-    self.warm = self.sampling and env.get("TINYRL_WARM_SAMPLER", "0") != "0"
-
-  async def open(self) -> bool:
-    if self.node.draining or not await self.bus.open_lease(self.life):
-      return False
-    self.node.lives[self.proc] = self
-    if self.sampling or self.spec.gpus == 1:
-      self.spawn_model(tuple(range(self.node.gpus)))
-    self.guard = asyncio.create_task(self.keepalive())
-    self.read()
-    return True
-
-  async def keep_lease(self) -> None:
-    before = time.monotonic()
-    if not (
-      await self.bus.renew_lease(self.life) or (not self.closing and await self.bus.renew_lease(self.life, True))
-    ):
-      raise RuntimeError(f"lost lease {self.life}")
-    self.renewed = before
-
-  async def keepalive(self) -> None:
-    while True:
-      await asyncio.sleep(LEASE_MS / 4000)
-      if not self.closing and not self.node.draining and time.monotonic() - self.node.heartbeat >= LEASE_MS / 1000:
-        break
-      try:
-        await self.keep_lease()
-        if not self.closing and self.model and (p := self.model.proc) and p.poll() is not None:
-          break
-      except Exception:
-        if not self.closing and time.monotonic() - self.renewed >= LEASE_MS / 1000:
-          break
-    if self.task and not self.task.cancelling():
-      self.task.cancel()
-
-  # ***** acquire & detach (L2/L3 <-> process) *****
-
-  async def sync_runs(self) -> None:
-    if self.sampling:
+  def start_reader(self, peek, streams: list[str], delay: float = 0) -> None:
+    if self.reader is not None or not streams:
       return
-    want, added = set(self.node.state.runs(self.proc)), False
-    for r in [r for r in list(self.owned) if r not in want]:
-      await self.detach(r, drop=True)
-    for r in sorted(want - self.owned.keys()):
-      if got := await self.bus.acquire_run(r, self.life):
-        self.owned[r], added = got, True
-        await self.bus.fail_stranded_commands(r, got[0])
-    if added:
-      await self.stop_reader()
-      self.read()
+    self.reader_streams = list(streams)
 
-  async def detach(self, run: str, drop: bool) -> None:
-    """Flush `run` if dirty (0 bytes if clean), release `run.owner` fenced by `(token, pos)`, and drop if requested."""
-    token, pos, snap = self.owned[run]
-    checkpoint = None
-    if pos is not None and snap is None and run in self.loaded and self.model is not None:
-      if self.spec.gpus > 1 and self.life not in self.node.on and torch.cuda.is_available():
-        await self.node.claim_after_drain(self.life, self.bound_gpus)
-        await self.model.call("resume", None)
-      await self.keep_lease()
-      version = await self.bus.begin_checkpoint(run, token)
-      if checkpoint := await self.model.call("save_run", run, version):
-        snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
-    await self.bus.detach_run(run, token, pos, snap, checkpoint)
-    self.owned.pop(run, None)
-    self.heads = [c for c in self.heads if c.run != run]
-    for req in [req for req, (r, _) in self.prepared.items() if r == run]:
-      self.prepared.pop(req)[1].cancel()
-    if run in self.loaded:
-      self.loaded.discard(run)
-      if drop and self.model is not None:
-        await self.model.call("drop_run", run)
+    async def read() -> list[Cmd]:
+      if delay:
+        await asyncio.sleep(delay)
+      return await peek(streams, IDLE_MS)
 
-  # ***** promote & demote (L1 <-> L0) *****
+    self.reader = asyncio.create_task(read())
+    self.reader.add_done_callback(lambda _: self.node.notify())
 
-  async def sync_gpus(self, has_work: bool) -> None:
-    if self.model and (p := self.model.proc) and p.poll() is not None:
+  async def stop_reader(self) -> None:
+    await stop_tasks(self.reader)
+    self.reader, self.reader_streams = None, []
+
+  async def poll_reader(self, peek, streams: list[str], fetch: bool = True) -> list[Cmd] | None:
+    if self.reader and self.reader.done():
+      res, self.reader, self.reader_streams = self.reader.result(), None, []
+      return res
+    if self.reader and self.reader_streams == streams:
+      return None
+    await self.stop_reader()
+    return await peek(streams, 0) if fetch and streams else None
+
+  async def sync_gpus(self, demand: Demand) -> None:
+    if self.exited():
       raise RuntimeError(f"process {self.proc} exited")
     cur = self.node.on.get(self.life)
-    if self.active != has_work:
-      self.active = has_work
+    if self.demand != demand:
+      self.demand = demand
       self.node.notify()
     want = self.node.select_gpus(self.proc)
     if cur is not None and want != cur:
       t0 = time.monotonic()
       with span("node.park"):
-        await (self.model.park() if self.sampling else self.model.call("park"))
+        await self.model.park()
       self.park_s = time.monotonic() - t0
       self.node.release_gpus(self.life)
-      if self.spec.exclusive and self.wanted():
-        # Lend the original devices for checkpointing, including when the exclusive is idle.
-        await self.node.claim_after_drain(self.life, cur)
-        await self.promote(cur)
       await self.node.push_heartbeat()
-    elif cur is None and want and has_work and self.node.claim_gpus(self.life, want, self.spec.gpus):
-      await self.promote(want)
-      await self.node.push_heartbeat()
-
-  async def promote(self, gpus: tuple[int, ...]) -> None:
-    try:
-      await self.keep_lease()
-      t0 = time.monotonic()
-      with span("node.resume"):
-        if not self.sampling:
+    elif cur is None and want and demand != Demand.IDLE and self.node.claim_gpus(self.life, want, self.spec.gpus):
+      try:
+        t0 = time.monotonic()
+        with span("node.resume"):
           if self.model is None:
-            self.bound_gpus = gpus
-            self.spawn_model(gpus)
-          await self.model.call("resume", gpus[0] if self.spec.gpus == 1 else None)
-        elif self.model.running is None:
-          self.bound_gpus = gpus
-          self.model.env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
-          await self.model.start()
-        else:
-          await self.model.resume()
-      self.granted_at = time.monotonic()
-      sw = (self.park_s + self.granted_at - t0) / max(0.01, SWITCH_BUDGET) if self.park_s else 0.0
-      self.quantum = min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, sw))
-      self.node.select_gpus(self.proc)
-    except Exception as e:
-      err = Reply.error(e)
-      for cmd in await self.claim(self.streams(), 1):
-        if self.sampling:
-          await self.bus.commit_sample(cmd, err)
-        elif info := self.owned.get(cmd.run):
-          await self.bus.commit_reply(cmd, err, info[0])
-      raise
-
-  # ***** peeking, preparing off-GPU, and executing *****
-
-  async def claim(self, runs: list[str], count: int) -> list[Cmd]:
-    if self.sampling:
-      return await self.bus.take_commands(runs, self.life, count, reclaim=True)
-    cmds = []
-    for run in runs:
-      if cmd := await self.bus.take_trainer_command(run, self.owned[run][0]):
-        cmds.append(cmd)
-    return cmds
-
-  def read(self, delay: float = 0) -> None:
-    self.reader = asyncio.create_task(self.peek(delay))
-    self.reader.add_done_callback(lambda _: self.node.notify())
-
-  async def stop_reader(self) -> None:
-    if self.reader:
-      self.reader.cancel()
-      await asyncio.gather(self.reader, return_exceptions=True)
-      self.reader = None
-
-  async def peek(self, delay: float) -> list[Cmd]:
-    await asyncio.sleep(delay)
-    while True:
-      cmds = await self.bus.peek_commands(self.streams(), IDLE_MS, reclaim=self.sampling)
-      # Refresh known heads even when another replica drained them. Otherwise keep reading during model execution.
-      if cmds or self.heads:
-        break
-    for cmd in cmds:
-      if cmd.request_id not in self.prepared:
-        task = asyncio.create_task(self.prepare(cmd))
-        task.add_done_callback(lambda _: self.node.notify())
-        self.prepared[cmd.request_id] = (cmd.run, task)
-    return cmds
-
-  async def prepare(self, cmd: Cmd):
-    with span("node.prepare"):
-      try:
-        run = await self.bus.get_run(cmd.run)
-        if not self.sampling:
-          return run
-        if run is None:
-          raise ValueError(f"no sampling session {cmd.run}")
-        if not (uri := run.get("model_path")):
-          return None
-        return await asyncio.to_thread(self.store.local_folder, await self.registry.version(uri))
+            self.spawn_model(want)
+          if not self.bound_gpus and self.pinned:
+            self.bound_gpus = want
+          await self.model.resume(want)
+        now = time.monotonic()
+        sw = (self.park_s + now - t0) / max(0.01, SWITCH_BUDGET) if self.park_s else 0.0
+        self.hold_until = now + min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, sw))
+        self.node.select_gpus(self.proc)
       except Exception as e:
-        return e
+        await self.fail_promote(Reply.error(e))
+        raise
+      await self.node.push_heartbeat()
 
-  async def collect(self) -> None:
-    if not self.reader or not self.reader.done():
-      return
-    live = set(self.streams())
-    self.heads, self.reader = [c for c in self.reader.result() if c.run in live], None
-    keep = {c.request_id for c in self.heads}
-    for req in self.prepared.keys() - keep:
-      self.prepared.pop(req)[1].cancel()
-    self.service = {c.run: self.service.get(c.run, self.virtual) for c in self.heads}
-
-  def ready(self) -> tuple[list[Cmd], list[Cmd]]:
-    live = set(self.streams())
-    done = [c for c in self.heads if c.run in live and (t := self.prepared.get(c.request_id)) and t[1].done()]
-    failed = [c for c in done if isinstance(self.prepared[c.request_id][1].result(), Exception)]
-    return [c for c in done if c not in failed], failed
-
-  async def execute(self, candidates: list[Cmd]) -> Cmd | None:
+  def choose_runs(self, candidates: list[Cmd], width: int = 1) -> list[str]:
     for c in candidates:
-      self.service[c.run] = max(self.service.get(c.run, self.virtual), self.virtual)
-    width = SAMPLE_RUNS if self.sampling and self.spec.lora else 1
-    runs = scheduler.select_runs(self.node.state, candidates, self.service, width)
-    inputs = {c.run: self.prepared[c.request_id][1].result() for c in candidates if c.run in runs}
-    bad = any(isinstance(v, Exception) for v in inputs.values())
-    await self.stop_reader()
-    await self.keep_lease()
-    with span("node.claim"):
-      cmds = await self.claim(runs, SAMPLE_COMMANDS if self.sampling and not bad else 1)
-    self.heads = [c for c in self.heads if c.run not in runs]
-    self.read()
-    if not cmds:
-      return None
-    wave = Wave(self.spec.gpus)
-    first, result = cmds[0], None
-    if self.sampling:
-      async with asyncio.TaskGroup() as group:
-        for cmd in cmds:
-          group.create_task(self.answer(cmd, inputs[cmd.run], wave))
-    else:
-      if (await self.answer(first, inputs[first.run], wave)).ok:
-        result = first
-    self.idle_since = time.monotonic() if not bad else self.idle_since
-    r1, r2 = self.ready()
-    self.virtual = max(self.virtual, min(self.service.get(c.run, self.virtual) for c in [*r1, *r2, *cmds]))
-    return result
+      self.service[c.run] = max(self.service.get(c.run, self.service_floor), self.service_floor)
+    return select_runs(candidates, self.node.state.account, self.node.state.ready_lag, self.service, width)
 
-  async def execute_trainer(self, cmd: Cmd, run: dict, wave: Wave, charge: Charge):
-    token, _, snap = self.owned[cmd.run]
-    version = None
-    if cmd.op == Op.LOAD_WEIGHTS:
-      # Resolve at dispatch: a preceding save can still be executing while this command is prefetched.
-      try:
-        version = await self.registry.version(json.loads(cmd.body)["uri"])
-      except (KeyError, ValueError) as exc:
-        return Reply.error(exc), {}
-    elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
-      version = await self.bus.begin_checkpoint(cmd.run, token)
-    saved = unpack_snap(snap)[1] if snap and cmd.run not in self.loaded and cmd.op != Op.LOAD_WEIGHTS else None
-    await self.keep_lease()
-    reply, effects = await wave.run(self.model.call("execute", cmd, run, saved, version), charge)
-    self.loaded.add(cmd.run) if effects.get("loaded") else self.loaded.discard(cmd.run)
-    return reply, effects
-
-  async def answer(self, cmd: Cmd, inputs, wave: Wave) -> Reply:
-    charge = Charge()
-    acct = self.node.state.account(cmd.run)
-    effects = {}
-    with span("node.execute"):
-      if isinstance(inputs, Exception):
-        reply = Reply.error(inputs)
-      elif self.sampling:
-        reply = await wave.run(self.model.execute(cmd, inputs), charge)
-      else:
-        reply, effects = await self.execute_trainer(cmd, inputs, wave, charge)
-    with span("node.publish"):
-      if self.sampling:
-        billed = await self.bus.commit_sample(cmd, reply, acct, charge=charge)
-      else:
-        token = self.owned[cmd.run][0]
-        mutates = bool(effects.get("mutated"))
-        billed, old = await self.bus.commit_reply(cmd, reply, token, acct, mutates, charge, effects.get("saved"))
-        if not billed:
-          self.owned.pop(cmd.run, None)
-          self.loaded.discard(cmd.run)
-          raise RuntimeError(f"lost ownership of {cmd.run}")
-        if cmd.op == Op.DELETE_MODEL and reply.ok:
-          self.owned.pop(cmd.run, None)
-        elif mutates:
-          self.owned[cmd.run] = (token, cmd.entry_id, None)
-          if old:
-            await self.registry.unregister_checkpoints(unpack_snap(old)[0])
-        self.open_grads.discard(cmd.run)
-        if cmd.op == Op.FORWARD_BACKWARD and reply.ok:
-          self.open_grads.add(cmd.run)
+  def bill(self, cmd: Cmd, acct: str, charge: Charge, billed: bool) -> None:
     if billed and charge.gpu_ms:
-      self.service[cmd.run] = self.service.get(cmd.run, self.virtual) + charge.gpu_ms
+      self.service[cmd.run] = self.service.get(cmd.run, self.service_floor) + charge.gpu_ms
       self.gpu_ms += charge.gpu_ms
       if acct:
         self.node.state.service[acct] = self.node.state.service.get(acct, 0.0) + charge.gpu_ms
     if DEBUG:
       print(f"{self.proc} {cmd.request_id} {cmd.op:24s} {charge.busy_ms:9d} ms")
-    return reply
+
+  def advance_floor(self) -> None:
+    seen = [self.service.get(r, self.service_floor) for r in (*self.service, *self.ready_runs())]
+    self.service_floor = max(self.service_floor, min(seen, default=self.service_floor))
 
   async def cleanup(self) -> None:
-    """Close the child first, then release GPUs (`on`), fail stranded commands, and drop the lease."""
-    futures = [f for f in [self.reader, *(t for _, t in self.prepared.values())] if f]
-    for f in futures:
-      f.cancel()
-    await asyncio.gather(*futures, return_exceptions=True)
+    """Close the child first, then release GPUs (`on`), fail stranded trainer work, and drop the lease."""
+    await stop_tasks(self.reader, *getattr(self, "staged", {}).values())
     while self.model:
       try:
         with span("node.close"):
@@ -604,12 +378,223 @@ class Lifetime:
         print(f"{self.proc} could not close, retrying: {e!r}", file=sys.stderr, flush=True)
         await asyncio.sleep(TICK)
     self.node.release_gpus(self.life)
-    if self.guard:
-      self.guard.cancel()
-      await asyncio.gather(self.guard, return_exceptions=True)
+    try:
+      for r, (token, _, _) in list(getattr(self, "owned", {}).items()):
+        await self.bus.fail_stranded_commands(r, token)
+    finally:
+      await self.bus.drop_lease(self.life)
+
+
+class TrainerLife(Lifetime):
+  """Single-writer training process: owns runs via epoch tokens, executes one command at a time."""
+
+  def __init__(self, node: NodeDaemon, proc: str):
+    super().__init__(node, proc)
+    self.gang = self.pinned = self.spec.gpus > 1
+    self.eager = self.spec.gpus == 1
+    self.owned, self.loaded, self.open_grads, self.idle_since = {}, set(), set(), 0.0
+
+  def streams(self) -> list[str]:
+    return sorted(self.owned)
+
+  def open_model(self, env: dict[str, str]):
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    return self.node.open_trainer(self.proc, self.spec.gpus, env)
+
+  def reader_args(self):
+    return self.bus.peek_trainer, [r for r in sorted(self.owned) if r not in self.heads], 0
+
+  def turn(self, ready: list[Cmd]) -> tuple[Demand, float | None]:
+    # Keep the GPU across client round-trips (`CYCLE_GRACE_MS`) and open training steps (avoid moving gradients).
+    grace = self.idle_since + CYCLE_GRACE_MS / 1000 - time.monotonic()
+    linger = self.life in self.node.on and grace > 0
+    closing = any(c.op == Op.OPTIM_STEP and c.run in self.open_grads for c in ready)
+    if closing or (linger and not ready and self.open_grads):
+      return Demand.FINISH_STEP, grace if linger else None
+    return (Demand.READY if ready or linger else Demand.IDLE), grace if linger else None
+
+  async def fail_promote(self, err: Reply) -> None:
     for r, (token, _, _) in list(self.owned.items()):
-      await self.bus.fail_stranded_commands(r, token)
-    await self.bus.drop_lease(self.life)
+      if cmd := await self.bus.claim_trainer(r, token):
+        await self.bus.commit_reply(cmd, err, token)
+
+  async def sync_runs(self) -> None:
+    want = set(self.node.state.runs(self.proc))
+    for r in [r for r in list(self.owned) if r not in want]:
+      await self.detach(r, drop=True)
+    for r in sorted(want - self.owned.keys()):
+      if got := await self.bus.acquire_run(r, self.life):
+        self.owned[r] = got
+        await self.bus.fail_stranded_commands(r, got[0])
+
+  async def detach(self, run: str, drop: bool) -> None:
+    """Flush `run` if dirty (0 bytes if clean), release `run.owner` fenced by `(token, pos)`, and drop if requested."""
+    token, pos, snap = self.owned[run]
+    checkpoint = None
+    if pos is not None and snap is None and run in self.loaded and self.model is not None:
+      version = await self.bus.begin_checkpoint(run, token)
+      if checkpoint := await self.model.call("save_run", run, version):
+        snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
+    await self.bus.detach_run(run, token, pos, snap, checkpoint)
+    for d in (self.owned, self.heads, self.service):
+      d.pop(run, None)
+    self.open_grads.discard(run)
+    if run in self.loaded:
+      self.loaded.discard(run)
+      if drop and self.model is not None:
+        await self.model.call("drop_run", run)
+
+  async def collect(self) -> None:
+    missing = [r for r in sorted(self.owned) if r not in self.heads]
+    if (cmds := await self.poll_reader(self.bus.peek_trainer, missing)) is not None:
+      self.heads |= {c.run: c for c in cmds if c.run in self.owned}
+      self.service = {r: self.service.get(r, self.service_floor) for r in self.heads}
+
+  async def dispatch(self, ready: list[Cmd], failed: bool = False) -> bool:
+    [run] = self.choose_runs(ready, 1)
+    self.heads.pop(run, None)
+    token, _, snap = self.owned[run]
+    with span("node.claim"):
+      cmd = await self.bus.claim_trainer(run, token)
+    if cmd is None:
+      return False
+    charge, acct, effects, version = Charge(), self.node.state.account(run), {}, None
+    with span("node.execute"):
+      try:
+        if cmd.op == Op.LOAD_WEIGHTS:
+          version = await self.bus.checkpoint_version(json.loads(cmd.body)["uri"])
+        elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
+          version = await self.bus.begin_checkpoint(run, token)
+      except (KeyError, ValueError) as exc:
+        reply = Reply.error(exc)
+      else:
+        job = self.node.state.jobs.get(run)
+        saved = unpack_snap(snap)[1] if snap and run not in self.loaded and cmd.op != Op.LOAD_WEIGHTS else None
+        reply, effects = await Wave(self.spec.gpus).run(
+          self.model.call("execute", cmd, job.record if job else None, saved, version), charge
+        )
+        self.loaded.add(run) if effects.get("loaded") else self.loaded.discard(run)
+    with span("node.publish"):
+      mutates = bool(effects.get("mutated"))
+      billed = await self.bus.commit_reply(cmd, reply, token, acct, mutates, charge, effects.get("saved"))
+      if not billed:
+        self.owned.pop(run, None)
+        self.loaded.discard(run)
+        raise RuntimeError(f"lost ownership of {run}")
+      if cmd.op == Op.DELETE_MODEL and reply.ok:
+        self.owned.pop(run, None)
+      elif mutates:
+        self.owned[run] = (token, cmd.entry_id, None)
+      self.open_grads.discard(run)
+      if cmd.op == Op.FORWARD_BACKWARD and reply.ok:
+        self.open_grads.add(run)
+    self.bill(cmd, acct, charge, billed)
+    self.advance_floor()
+    self.idle_since = time.monotonic()
+    return cmd.op == Op.DELETE_MODEL and reply.ok and not self.spec.lora
+
+  async def finish(self) -> None:
+    for r in list(self.owned):
+      await self.detach(r, drop=False)
+
+
+class SamplerLife(Lifetime):
+  """Stateless sampling pool replica: stages checkpoints per version off-GPU and runs bounded concurrent waves."""
+
+  def __init__(self, node: NodeDaemon, proc: str):
+    super().__init__(node, proc)
+    self.inputs, self.staged = {}, {}
+
+  def open_model(self, env: dict[str, str]):
+    return self.node.open_sampler(self.proc, self.spec, env)
+
+  def reader_args(self):
+    return self.bus.peek_sampler, sorted(self.streams()), IDLE_MS / 1000 if self.heads else 0
+
+  def turn(self, ready: list[Cmd]) -> tuple[Demand, float | None]:
+    return (Demand.READY if ready or self.model.warm_pending else Demand.IDLE), None
+
+  async def fail_promote(self, err: Reply) -> None:
+    for cmd in await self.bus.take_commands(self.streams(), self.life, 1):
+      await self.bus.commit_sample(cmd, err)
+
+  async def stage(self, version: str):
+    with span("node.prepare"):
+      try:
+        return await asyncio.to_thread(self.store.local_folder, version)
+      except Exception as e:
+        return e
+
+  def ready(self) -> tuple[list[Cmd], list[Cmd]]:
+    live = set(self.streams())
+    done = [
+      (c, v.result() if isinstance(v, asyncio.Task) else v)
+      for r, c in self.heads.items()
+      if r in live and r in self.inputs and (not isinstance(v := self.inputs[r], asyncio.Task) or v.done())
+    ]
+    return [c for c, v in done if not isinstance(v, Exception)], [c for c, v in done if isinstance(v, Exception)]
+
+  async def collect(self) -> None:
+    live, jobs = sorted(self.streams()), self.node.state.jobs
+    live_set = set(live)
+    self.heads = {r: c for r, c in self.heads.items() if r in live_set}
+    if (cmds := await self.poll_reader(self.bus.peek_sampler, live, not self.heads)) is None:
+      return
+    self.heads = {c.run: c for c in cmds if c.run in live_set}
+    uris = sorted({p for r in self.heads if (j := jobs.get(r)) and (p := j.record.get("model_path"))})
+    got = await self.bus.checkpoint_versions(uris)
+    self.inputs = {}
+    for r in self.heads:
+      if not (p := jobs[r].record.get("model_path")):
+        self.inputs[r] = None
+      elif isinstance(v := got[p], str):
+        if v not in self.staged:
+          (task := asyncio.create_task(self.stage(v))).add_done_callback(lambda _: self.node.notify())
+          self.staged[v] = task
+        self.inputs[r] = self.staged[v]
+      else:
+        self.inputs[r] = v
+    active = set(self.inputs.values())
+    for v in list(self.staged):
+      if len(self.staged) > 64 and self.staged[v].done() and self.staged[v] not in active:
+        del self.staged[v]
+    self.service = {r: self.service.get(r, self.service_floor) for r in self.heads}
+
+  async def dispatch(self, candidates: list[Cmd], failed: bool = False) -> bool:
+    runs = self.choose_runs(candidates, SAMPLE_RUNS if self.spec.lora else 1)
+    inputs = {r: (v.result() if isinstance(v := self.inputs[r], asyncio.Task) else v) for r in runs}
+    if failed:
+      dead = {self.inputs.get(r) for r in runs}
+      self.staged = {k: t for k, t in self.staged.items() if t not in dead}  # allow retry if upload lands later
+    await self.stop_reader()
+    with span("node.claim"):
+      cmds = await self.bus.take_commands(runs, self.life, 1 if failed else SAMPLE_COMMANDS)
+    for r in runs:
+      self.heads.pop(r, None)
+    if not cmds:
+      return False
+    for ckpt in ({inputs[c.run] for c in cmds} - {None}) if not failed else ():
+      try:
+        await self.model.load(ckpt)
+      except Exception as e:
+        inputs = {r: e if v == ckpt else v for r, v in inputs.items()}
+    wave = Wave(self.spec.gpus)
+
+    async def answer(cmd: Cmd) -> None:
+      charge, acct, inp = Charge(), self.node.state.account(cmd.run), inputs[cmd.run]
+      with span("node.execute"):
+        reply = (
+          Reply.error(inp) if isinstance(inp, Exception) else await wave.run(self.model.execute(cmd, inp, True), charge)
+        )
+      with span("node.publish"):
+        billed = await self.bus.commit_sample(cmd, reply, acct, charge=charge)
+      self.bill(cmd, acct, charge, billed)
+
+    async with asyncio.TaskGroup() as group:
+      for cmd in cmds:
+        group.create_task(answer(cmd))
+    self.advance_floor()
+    return False
 
 
 if __name__ == "__main__":
