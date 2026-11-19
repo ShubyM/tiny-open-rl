@@ -57,7 +57,7 @@ def plan_gpus(
   """Select active GPU blocks: hold `ACTIVE_QUANTUM`, fill rest by `(exclusive, lag, -gpu_ms)`, keep idle warm."""
   cur = {p: on.get(lf.life, ()) for p, lf in lives.items()}
   held = {g for gs in on.values() for g in gs}
-  pinned = {g for lf in lives.values() if lf.spec.role == Role.TRAINER and lf.spec.gpus > 1 for g in lf.bound_gpus}
+  pinned = {g for lf in lives.values() if lf.spec.role == Role.TRAINER for g in lf.bound_gpus}
   want_excl = any(lf.spec.exclusive and lf.active and not cur[p] for p, lf in lives.items())
   # 1. Exclusive residents and busy residents inside ACTIVE_QUANTUM stay put without switching.
   residents = {p: lf for p, lf in lives.items() if cur[p] and draining.isdisjoint(cur[p]) and lf.wanted()}
@@ -83,7 +83,7 @@ def plan_gpus(
       if cand := [b for b in opts if not (excl & set(b))]:
         hold |= set(cand[0])
   # 3. Idle residents stay warm in VRAM on uncontested GPUs (zero park/resume when alone).
-  keep.update((p, b) for p, b in cur.items() if b and p not in keep and taken.isdisjoint(b) and lives[p].wanted())
+  keep.update((p, b) for p, b in cur.items() if b and taken.isdisjoint(b) and lives[p].wanted())
   return keep, min(holding.values(), default=None) if waiting else None
 
 
@@ -126,10 +126,9 @@ class NodeDaemon:
     await self.push_heartbeat()
     self.state = await self.read_state()
     self.dispatch()
-    if not self.draining:
-      for proc, p in sorted(self.state.procs.items()):
-        if p.node == self.id and proc not in self.tasks and self.state.runs(proc):
-          self.start(proc)
+    for proc, p in sorted(self.state.procs.items()):
+      if p.node == self.id and proc not in self.tasks and self.state.runs(proc):
+        self.start(proc)
     if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
       self.swept, self.sweeping = time.time(), asyncio.create_task(self.registry.sweep(self.store, SWEEP_GRACE_S))
     self.notify()
@@ -156,7 +155,7 @@ class NodeDaemon:
   def claim_gpus(self, life: str, gpus: tuple[int, ...], width: int) -> bool:
     if len(gpus) != width or len(set(gpus)) != width or any(g < 0 or g >= self.gpus for g in gpus):
       return False
-    if {g for k, gs in self.on.items() if k != life for g in gs} & set(gpus):
+    if {g for gs in self.on.values() for g in gs} & set(gpus):
       return False
     self.on[life] = gpus
     self.notify()
@@ -187,8 +186,6 @@ class NodeDaemon:
 
   async def close(self, graceful: bool = True) -> None:
     self.draining = True
-    if self.timer:
-      self.timer.cancel()
     self.notify()
     if self.tasks:
       _, pending = await asyncio.wait(self.tasks.values(), timeout=DRAIN_S if graceful else 0)
@@ -249,7 +246,7 @@ class Lifetime:
 
   def priority(self) -> tuple:
     s = self.node.state
-    runs = [c.run for c in self.ready()[0] if c.run in s.jobs] or [r for r in self.streams() if r in s.jobs]
+    runs = [c.run for c in self.ready()[0]] or self.streams()
     top = round(max(map(s.ready_lag, runs), default=-self.gpu_ms), 3)
     return (self.spec.exclusive, top, round(-self.gpu_ms, 3), self.life in self.node.on, self.proc)
 
@@ -325,10 +322,7 @@ class Lifetime:
 
   async def keep_lease(self) -> None:
     before = time.monotonic()
-    if not (
-      await self.bus.renew_lease(self.life) or (not self.closing and await self.bus.renew_lease(self.life, True))
-    ):
-      raise RuntimeError(f"lost lease {self.life}")
+    await self.bus.renew_lease(self.life, recover=not self.closing)
     self.renewed = before
 
   async def keepalive(self) -> None:
@@ -343,8 +337,7 @@ class Lifetime:
       except Exception:
         if not self.closing and time.monotonic() - self.renewed >= LEASE_MS / 1000:
           break
-    if not self.task.cancelling():
-      self.task.cancel()
+    self.task.cancel()
 
   # ***** acquire & detach (L2/L3 <-> process) *****
 
@@ -372,16 +365,15 @@ class Lifetime:
         await self.model.call("resume", None)
       await self.keep_lease()
       version = await self.bus.begin_checkpoint(run, token)
-      if checkpoint := await self.model.call("save_run", run, version):
-        snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
+      checkpoint = await self.model.call("save_run", run, version)
+      snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
     await self.bus.detach_run(run, token, pos, snap, checkpoint)
     self.owned.pop(run, None)
-    self.heads = [c for c in self.heads if c.run != run]
     for req in [req for req, (r, _) in self.prepared.items() if r == run]:
       self.prepared.pop(req)[1].cancel()
     if run in self.loaded:
       self.loaded.discard(run)
-      if drop and self.model is not None:
+      if drop:
         await self.model.call("drop_run", run)
 
   # ***** promote & demote (L1 <-> L0) *****
@@ -405,7 +397,7 @@ class Lifetime:
         await self.node.claim_after_drain(self.life, cur)
         await self.promote(cur)
       await self.node.push_heartbeat()
-    elif cur is None and want and has_work and self.node.claim_gpus(self.life, want, self.spec.gpus):
+    elif cur is None and want and self.node.claim_gpus(self.life, want, self.spec.gpus):
       await self.promote(want)
       await self.node.push_heartbeat()
 
@@ -486,7 +478,7 @@ class Lifetime:
         return e
 
   async def collect(self) -> None:
-    if not self.reader or not self.reader.done():
+    if not self.reader.done():
       return
     live = set(self.streams())
     self.heads, self.reader = [c for c in self.reader.result() if c.run in live], None
@@ -506,7 +498,7 @@ class Lifetime:
       self.service[c.run] = max(self.service.get(c.run, self.virtual), self.virtual)
     width = SAMPLE_RUNS if self.sampling and self.spec.lora else 1
     runs = scheduler.select_runs(self.node.state, candidates, self.service, width)
-    inputs = {c.run: self.prepared[c.request_id][1].result() for c in candidates if c.run in runs}
+    inputs = {c.run: self.prepared[c.request_id][1].result() for c in candidates}
     bad = any(isinstance(v, Exception) for v in inputs.values())
     await self.stop_reader()
     await self.keep_lease()
