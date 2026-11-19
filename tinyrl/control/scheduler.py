@@ -177,14 +177,18 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
 
 
 def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width: int) -> list[str]:
-  """Choose up to `width` ready runs: accounts owed the most GPU time first, then their least-served runs."""
+  """Choose one ready account, then batch up to `width` of its least-served runs."""
   ready = {cmd.run: cmd for cmd in reversed(heads)}
   floor = min((service[run] for run in ready if run in service), default=0.0)
 
   def rank(cmd: Cmd) -> tuple:
     return -state.ready_lag(cmd.run), service.get(cmd.run, floor), tuple(map(int, cmd.entry_id.split("-")))
 
-  return [cmd.run for cmd in sorted(ready.values(), key=rank)[:width]]
+  runs = [cmd.run for cmd in sorted(ready.values(), key=rank)]
+  if not runs:
+    return []
+  account = state.account(runs[0])
+  return [run for run in runs if state.account(run) == account][:width]
 
 
 # ***** placement, elastic scaling, and cross-node rebalance *****

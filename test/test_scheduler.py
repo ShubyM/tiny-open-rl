@@ -543,7 +543,8 @@ class TestLocalQuantum(unittest.TestCase):
       Cmd("same_ms_later", "9-10", Op.OPTIM_STEP, b""),
       Cmd("first", "9-2", Op.OPTIM_STEP, b""),
     ]
-    self.assertEqual(select_runs(State(), heads, {}, width=3), ["first", "same_ms_later", "later"])
+    state = State(jobs={cmd.run: Job(Spec(), account="alice") for cmd in heads})
+    self.assertEqual(select_runs(state, heads, {}, width=3), ["first", "same_ms_later", "later"])
 
   def test_account_lag_precedes_run_service_and_arrival(self):
     cluster = Cluster()
@@ -560,8 +561,7 @@ class TestLocalQuantum(unittest.TestCase):
       Cmd("waiting", "3-0", Op.OPTIM_STEP, b""),
     ]
     self.assertEqual(select_runs(state, heads, {"waiting": 1000}, width=1), ["waiting"])
-    # A wave has room for three runs, so the account owed less fills the rest of it.
-    self.assertEqual(select_runs(state, heads, {"waiting": 1000}, width=3), ["waiting", "current", "save"])
+    self.assertEqual(select_runs(state, heads, {"waiting": 1000}, width=3), ["waiting"])
 
   def test_continuous_sampler_saves_share_a_trainer_with_training_work(self):
     cluster = Cluster()

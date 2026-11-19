@@ -142,7 +142,7 @@ class TestSampler(RedisTest):
     for i in range(4):
       uri = f"tinker://r{i}/sampler_weights/s0"
       await self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": True, "config": {}}))
-      await self.bus.create_run(Run(f"s{i}", "base", 4, role=Role.SAMPLER, model_path=uri))
+      await self.bus.create_run(Run(f"s{i}", "base", 4, role=Role.SAMPLER, model_path=uri, account="alice"))
     active, peak, parallel = {}, 0, 0
 
     class WaveEngine(FakeEngine):

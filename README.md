@@ -49,10 +49,11 @@ otherwise idle worker from yielding its GPU. Executable commands are claimed onl
 at a time. A preparation error claims and answers its failed head without waiting for a GPU.
 
 Under contention, the planner divides available GPU time among backlogged accounts according to their weights and
-demand. Both the node and its shared trainers select the ready account owed the most service. Starting more LoRA
+demand. Both the node and its shared workers select the ready account owed the most service. Starting more LoRA
 runs on the same base does not buy an account more turns. Among equally owed accounts, workers choose the ready runs
 that received the fewest GPU-ms, breaking ties by queue arrival. A stream of sampler saves follows the same rule.
-Sampling can batch multiple ready runs at the same priority. Each interval of a wave is split among the requests still
+A shared sampler batches ready runs from the selected account. It chooses again after each wave, even when the same
+worker keeps the GPU. Each interval of a wave is split among the requests still
 executing: for two requests finishing at 100 and 900 ms on one GPU, the charges are 50 and 850 GPU-ms.
 Token estimates are still reported as run counters, but do not determine service.
 
