@@ -139,22 +139,17 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     return {"request_id": request_id, "model_id": run}
 
   async def open_sampler(base_model: str | None, model_path: str | None, session_id: str = "") -> str:
-    train = {}
-    if model_path:
-      train_run, _ = parse_uri(model_path)
-      uri = model_path
-      train = await bus.get_run(train_run) or {}
-      if train.get("base"):
-        base, lora = train["base"], train["rank"] > 0
-      else:
-        meta = await asyncio.to_thread(store.read_meta, await bus.checkpoint_version(uri))
-        base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
-      if not base:
-        raise ValueError("could not resolve base_model")
-    else:
-      if not base_model:
-        raise ValueError("base_model required when model_path is None")
-      base, lora, uri, train_run = base_model, True, None, None
+    model_path = model_path or None
+    train_run = parse_uri(model_path)[0] if model_path else None
+    train = (await bus.get_run(train_run) or {}) if train_run else {}
+    base, lora = base_model, True
+    if train.get("base"):
+      base, lora = train["base"], train["rank"] > 0
+    elif model_path:
+      meta = await asyncio.to_thread(store.read_meta, await bus.checkpoint_version(model_path))
+      base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
+    if not base:
+      raise ValueError("could not resolve base_model" if model_path else "base_model required when model_path is None")
 
     exclusive = bool(train.get("exclusive"))
     sess_meta = ((await bus.get_session(session_id)) or {}).get("metadata", {}) if session_id else {}
@@ -162,7 +157,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     gpus = await asyncio.to_thread(estimator.gpus, base, "vllm")
     sid = f"samp-{uuid.uuid4().hex[:12]}"
     await bus.create_run(
-      Run(sid, base, int(lora), session_id, uri, {}, exclusive, Role.SAMPLER, train_run, gpus, account)
+      Run(sid, base, int(lora), session_id, model_path, {}, exclusive, Role.SAMPLER, train_run, gpus, account)
     )
     return sid
 
@@ -436,12 +431,12 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.get("/metrics")
   async def metrics():
     """Every run's counters, account service and node loop lag for Prometheus."""
-    raw = await bus.read_state(backlogs=False)
+    raw = await bus.read_state(backlogs=False, counters=True)
     state = scheduler.from_state(raw)
     lines = []
-    for run, counters in (await bus.run_counters()).items():
+    for run, info in raw["runs"].items():
       if ps := state.procs_of(run):
-        for name, n in counters.items():
+        for name, n in info["counters"].items():
           name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
           lines.append(f'tinyrl_{name}_total{{worker="{ps[0]}",run="{run}"}} {n}')
     for account, total in sorted(raw["service"].items()):

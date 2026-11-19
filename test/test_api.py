@@ -168,7 +168,7 @@ class TestAPI(RedisTest):
     final = f"/api/v1/training_runs/{run_id}/checkpoints/weights/final"
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": 60})).status_code, 400)
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": None})).status_code, 200)
-    self.assertEqual(await self.bus.expired_checkpoints(), [])
+    self.assertEqual(await self.bus.expire_checkpoints(), 0)
     self.assertEqual((await self.http.delete(final)).status_code, 200)
     self.assertEqual((await self.http.delete(final)).status_code, 404)
 
@@ -240,8 +240,11 @@ class TestAPI(RedisTest):
     session = await self.post("create_session", json={"tags": [], "user_metadata": None, "sdk_version": "0.29.0"})
     session_id = session.json()["session_id"]
     run_id = await self.create_model(session_id=session_id)
-    sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
+    sampling = await self.post(
+      "create_sampling_session", json={"session_id": session_id, "base_model": "tiny", "model_path": ""}
+    )
     samp_id = sampling.json()["sampling_session_id"]
+    self.assertIsNone((await self.bus.get_run(samp_id))["model_path"])
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 

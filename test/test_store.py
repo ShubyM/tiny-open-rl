@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -217,6 +218,36 @@ class TestStore(unittest.TestCase):
 
 
 class TestRegistry(RedisTest):
+  async def test_preexisting_checkpoint_indexes_support_reads_and_expiry(self):
+    # Populate the persisted main schema directly, without using the writer under test.
+    def record(cid, kind):
+      return {
+        "checkpoint_id": cid,
+        "checkpoint_type": kind,
+        "time": 1,
+        "tinker_path": f"tinker://r/{cid}",
+        "size_bytes": 1,
+        "expires_at": None,
+        "owned": False,
+        "version": cid.split("/")[1],
+      }
+
+    saved, parked = record("weights/saved", "training"), record("parked/host", "parked")
+    uri = saved["tinker_path"]
+    for row in [saved, parked]:
+      await self.bus.s.hset("tinyrl:ckpt:r", row["checkpoint_id"], json.dumps(row))
+    await self.bus.s.zadd("tinyrl:ckpts", {uri: 1})
+    self.assertEqual(await self.bus.page_of_checkpoints(10, 0), ([saved], 1))
+    self.assertEqual(await self.bus.checkpoints_of_run("r"), [saved])
+    self.assertEqual(
+      await self.bus.checkpoint_versions([uri, parked["tinker_path"]]), {uri: "saved", parked["tinker_path"]: "host"}
+    )
+    self.assertTrue(await self.bus.set_checkpoint_ttl(uri, -1))
+    self.assertEqual(await self.bus.expire_checkpoints(), 1)
+    self.assertEqual(await self.bus.page_of_checkpoints(10, 0), ([], 0))
+    self.assertIsNone(await self.bus.get_checkpoint(uri))
+    self.assertEqual(await self.bus.get_checkpoint(parked["tinker_path"]), parked)
+
   async def test_deletion_wins_over_concurrent_ttl_updates(self):
     run = new_id()
     await self.bus.create_run(Run(id=run, base="base", rank=8))

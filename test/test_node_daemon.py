@@ -221,6 +221,40 @@ class TestNodeDaemon(RedisTest):
     self.assertEqual(await self.bus.queued_and_in_flight(run), {"live": True, "queued": 1, "in_flight": []})
     await self.reply(next_request, node)
 
+  async def test_failed_park_keeps_gpu_until_child_closes(self):
+    node, a, b = self.node(), new_id(), new_id()
+    for run, base in ((a, "a"), (b, "b")):
+      await self.bus.create_run(Run(run, base, 4, lora=LORA))
+    holder = await node.bind("holder", a)
+    await self.create(a, "a", node)
+    closing, release = asyncio.Event(), asyncio.Event()
+    child, close = holder.model, holder.model.close
+
+    async def fail_park():
+      raise RuntimeError("park failed")
+
+    async def slow_close():
+      closing.set()
+      await release.wait()
+      await close()
+
+    child.park, child.close = fail_park, slow_close
+    contender = await node.bind("contender", b)
+    request = await self.bus.submit_command(
+      b, Op.CREATE_MODEL, json.dumps({"base_model": "b", "rank": 4, "lora": LORA}).encode()
+    )
+    try:
+      await self.until(closing.is_set, node)
+      self.assertEqual(node.select_gpus(contender.proc), (0,))
+      self.assertEqual(node.on, {holder.life: (0,)})
+      self.assertFalse(node.claim_gpus(contender.life, (0,), 1))
+      self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})
+    finally:
+      release.set()
+    await self.reply(request, node)
+    self.assertTrue(child.closed)
+    self.assertEqual(node.on, {contender.life: (0,)})
+
   async def test_admission_waits_for_the_previous_model_process_to_park(self):
     require_unix()
     node = self.node(real=True)

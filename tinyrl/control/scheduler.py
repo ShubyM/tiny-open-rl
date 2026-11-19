@@ -145,7 +145,12 @@ def from_state(raw: dict) -> State:
   jobs = {r: j for r, j in jobs.items() if not j.spec.train_run or j.spec.train_run in jobs}
   for n, p in plan.get("procs", {}).items():
     procs[n] = Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
-  home = {r: p for r, p in plan.get("home", {}).items() if r in jobs and jobs[r].spec.role == Role.TRAINER}
+  # Earlier plans stored a trainer's single home as a one-element list.
+  home = {
+    r: p[0] if isinstance(p, list) else p
+    for r, p in plan.get("home", {}).items()
+    if p and r in jobs and jobs[r].spec.role == Role.TRAINER
+  }
   fv = [{a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights")]
   return State(int(plan.get("made", 0)), nodes, procs, home, jobs, fv[0], fv[1], dict(raw.get("service", {})), fv[2])
 
@@ -301,7 +306,7 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
 async def tick(bus: Bus) -> list[tuple[Ev, dict]]:
   for session in await bus.expired_sessions():
     await bus.end_session(session)
-  await bus.unregister_checkpoints(*await bus.expired_checkpoints())
+  await bus.expire_checkpoints()
   raw = await bus.read_state()
   old, (new, changes) = raw["plan"], step(from_state(raw))
   plan = to_plan(new)

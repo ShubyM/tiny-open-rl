@@ -16,6 +16,8 @@ import socket
 import subprocess
 import sys
 import time
+from collections import Counter
+from dataclasses import dataclass
 
 from tinyrl.bus import LEASE_MS, Bus
 from tinyrl.control import scheduler
@@ -156,11 +158,8 @@ class NodeDaemon:
       _, pending = await asyncio.wait(pending, timeout=min(LEASE_MS / 4000, deadline - time.monotonic()))
       with contextlib.suppress(Exception):
         await self.bus.touch_leases(*(lf.life for lf in self.lives.values() if not lf.closing), xx=True)
-    for task in pending:
-      task.cancel()
-    if self.tasks:
-      await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-      self.dispatch()
+    await stop_tasks(*pending)
+    self.dispatch()
     await asyncio.to_thread(self.store.close)
 
   async def read_state(self) -> scheduler.State:
@@ -210,10 +209,7 @@ class Lifetime:
   def ready_runs(self) -> list[str]:
     return [c.run for c in self.ready()[0]]
 
-  async def sync_runs(self) -> None:
-    pass
-
-  async def finish(self) -> None:
+  async def sync_runs(self, *, detach_all: bool = False) -> None:
     pass
 
   def wanted(self) -> bool:
@@ -276,7 +272,7 @@ class Lifetime:
             await asyncio.wait_for(changed.wait(), wait_s)
       self.demand = Demand.IDLE
       await self.stop_reader()
-      await self.finish()
+      await self.sync_runs(detach_all=True)
     finally:
       self.demand = Demand.IDLE
       self.closing = asyncio.create_task(self.cleanup())
@@ -316,6 +312,7 @@ class Lifetime:
     return await peek(streams, 0) if fetch and streams else None
 
   async def sync_gpus(self, demand: Demand) -> None:
+    """Between model calls, release GPUs only after park succeeds. Cleanup retains them until the child closes."""
     if self.exited():
       raise RuntimeError(f"process {self.proc} exited")
     cur = self.node.on.get(self.life)
@@ -379,10 +376,19 @@ class Lifetime:
         await asyncio.sleep(TICK)
     self.node.release_gpus(self.life)
     try:
-      for r, (token, _, _) in list(getattr(self, "owned", {}).items()):
-        await self.bus.fail_stranded_commands(r, token)
+      for run, state in getattr(self, "owned", {}).items():
+        await self.bus.fail_stranded_commands(run, state.token)
     finally:
       await self.bus.drop_lease(self.life)
+
+
+@dataclass
+class OwnedRun:
+  token: str
+  pos: str | None
+  snap: str | None
+  loaded: bool = False
+  open_grad: bool = False
 
 
 class TrainerLife(Lifetime):
@@ -392,7 +398,8 @@ class TrainerLife(Lifetime):
     super().__init__(node, proc)
     self.gang = self.pinned = self.spec.gpus > 1
     self.eager = self.spec.gpus == 1
-    self.owned, self.loaded, self.open_grads, self.idle_since = {}, set(), set(), 0.0
+    self.owned: dict[str, OwnedRun] = {}
+    self.idle_since = 0.0
 
   def streams(self) -> list[str]:
     return sorted(self.owned)
@@ -408,41 +415,37 @@ class TrainerLife(Lifetime):
     # Keep the GPU across client round-trips (`CYCLE_GRACE_MS`) and open training steps (avoid moving gradients).
     grace = self.idle_since + CYCLE_GRACE_MS / 1000 - time.monotonic()
     linger = self.life in self.node.on and grace > 0
-    closing = any(c.op == Op.OPTIM_STEP and c.run in self.open_grads for c in ready)
-    if closing or (linger and not ready and self.open_grads):
+    closing = any(c.op == Op.OPTIM_STEP and self.owned[c.run].open_grad for c in ready)
+    if closing or (linger and not ready and any(s.open_grad for s in self.owned.values())):
       return Demand.FINISH_STEP, grace if linger else None
     return (Demand.READY if ready or linger else Demand.IDLE), grace if linger else None
 
   async def fail_promote(self, err: Reply) -> None:
-    for r, (token, _, _) in list(self.owned.items()):
-      if cmd := await self.bus.claim_trainer(r, token):
-        await self.bus.commit_reply(cmd, err, token)
+    for run, state in self.owned.items():
+      if cmd := await self.bus.claim_trainer(run, state.token):
+        await self.bus.commit_reply(cmd, err, state.token)
 
-  async def sync_runs(self) -> None:
-    want = set(self.node.state.runs(self.proc))
-    for r in [r for r in list(self.owned) if r not in want]:
-      await self.detach(r, drop=True)
+  async def sync_runs(self, *, detach_all: bool = False) -> None:
+    want = set() if detach_all else set(self.node.state.runs(self.proc))
+    for r in sorted(self.owned.keys() - want):
+      await self.detach(r, drop=not detach_all)
     for r in sorted(want - self.owned.keys()):
       if got := await self.bus.acquire_run(r, self.life):
-        self.owned[r] = got
-        await self.bus.fail_stranded_commands(r, got[0])
+        self.owned[r] = state = OwnedRun(*got)
+        await self.bus.fail_stranded_commands(r, state.token)
 
   async def detach(self, run: str, drop: bool) -> None:
     """Flush `run` if dirty (0 bytes if clean), release `run.owner` fenced by `(token, pos)`, and drop if requested."""
-    token, pos, snap = self.owned[run]
-    checkpoint = None
-    if pos is not None and snap is None and run in self.loaded and self.model is not None:
-      version = await self.bus.begin_checkpoint(run, token)
+    state, checkpoint = self.owned[run], None
+    if state.pos is not None and state.snap is None and state.loaded:
+      version = await self.bus.begin_checkpoint(run, state.token)
       if checkpoint := await self.model.call("save_run", run, version):
-        snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
-    await self.bus.detach_run(run, token, pos, snap, checkpoint)
+        state.snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
+    await self.bus.detach_run(run, state.token, state.pos, state.snap, checkpoint)
     for d in (self.owned, self.heads, self.service):
       d.pop(run, None)
-    self.open_grads.discard(run)
-    if run in self.loaded:
-      self.loaded.discard(run)
-      if drop and self.model is not None:
-        await self.model.call("drop_run", run)
+    if drop and state.loaded:
+      await self.model.call("drop_run", run)
 
   async def collect(self) -> None:
     missing = [r for r in sorted(self.owned) if r not in self.heads]
@@ -453,9 +456,9 @@ class TrainerLife(Lifetime):
   async def dispatch(self, ready: list[Cmd], failed: bool = False) -> bool:
     [run] = self.choose_runs(ready, 1)
     self.heads.pop(run, None)
-    token, _, snap = self.owned[run]
+    state = self.owned[run]
     with span("node.claim"):
-      cmd = await self.bus.claim_trainer(run, token)
+      cmd = await self.bus.claim_trainer(run, state.token)
     if cmd is None:
       return False
     charge, acct, effects, version = Charge(), self.node.state.account(run), {}, None
@@ -464,38 +467,31 @@ class TrainerLife(Lifetime):
         if cmd.op == Op.LOAD_WEIGHTS:
           version = await self.bus.checkpoint_version(json.loads(cmd.body)["uri"])
         elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
-          version = await self.bus.begin_checkpoint(run, token)
+          version = await self.bus.begin_checkpoint(run, state.token)
       except (KeyError, ValueError) as exc:
         reply = Reply.error(exc)
       else:
         job = self.node.state.jobs.get(run)
-        saved = unpack_snap(snap)[1] if snap and run not in self.loaded and cmd.op != Op.LOAD_WEIGHTS else None
+        saved = unpack_snap(state.snap)[1] if state.snap and not state.loaded and cmd.op != Op.LOAD_WEIGHTS else None
         reply, effects = await Wave(self.spec.gpus).run(
           self.model.call("execute", cmd, job.record if job else None, saved, version), charge
         )
-        self.loaded.add(run) if effects.get("loaded") else self.loaded.discard(run)
+        state.loaded = bool(effects.get("loaded"))
     with span("node.publish"):
       mutates = bool(effects.get("mutated"))
-      billed = await self.bus.commit_reply(cmd, reply, token, acct, mutates, charge, effects.get("saved"))
+      billed = await self.bus.commit_reply(cmd, reply, state.token, acct, mutates, charge, effects.get("saved"))
       if not billed:
         self.owned.pop(run, None)
-        self.loaded.discard(run)
         raise RuntimeError(f"lost ownership of {run}")
       if cmd.op == Op.DELETE_MODEL and reply.ok:
         self.owned.pop(run, None)
       elif mutates:
-        self.owned[run] = (token, cmd.entry_id, None)
-      self.open_grads.discard(run)
-      if cmd.op == Op.FORWARD_BACKWARD and reply.ok:
-        self.open_grads.add(run)
+        state.pos, state.snap = cmd.entry_id, None
+      state.open_grad = cmd.op == Op.FORWARD_BACKWARD and reply.ok
     self.bill(cmd, acct, charge, billed)
     self.advance_floor()
     self.idle_since = time.monotonic()
     return cmd.op == Op.DELETE_MODEL and reply.ok and not self.spec.lora
-
-  async def finish(self) -> None:
-    for r in list(self.owned):
-      await self.detach(r, drop=False)
 
 
 class SamplerLife(Lifetime):
@@ -541,31 +537,25 @@ class SamplerLife(Lifetime):
     if (cmds := await self.poll_reader(self.bus.peek_sampler, live, not self.heads)) is None:
       return
     self.heads = {c.run: c for c in cmds if c.run in live_set}
-    uris = sorted({p for r in self.heads if (j := jobs.get(r)) and (p := j.record.get("model_path"))})
-    got = await self.bus.checkpoint_versions(uris)
+    paths = {r: jobs[r].record.get("model_path") for r in self.heads}
+    versions = await self.bus.checkpoint_versions(sorted(set(paths.values()) - {None}))
+    wanted = {v for v in versions.values() if isinstance(v, str)}
+    self.staged = {v: t for v, t in self.staged.items() if v in wanted or not t.done()}
+    for v in wanted - self.staged.keys():
+      self.staged[v] = task = asyncio.create_task(self.stage(v))
+      task.add_done_callback(lambda _: self.node.notify())
     self.inputs = {}
-    for r in self.heads:
-      if not (p := jobs[r].record.get("model_path")):
-        self.inputs[r] = None
-      elif isinstance(v := got[p], str):
-        if v not in self.staged:
-          (task := asyncio.create_task(self.stage(v))).add_done_callback(lambda _: self.node.notify())
-          self.staged[v] = task
-        self.inputs[r] = self.staged[v]
-      else:
-        self.inputs[r] = v
-    active = set(self.inputs.values())
-    for v in list(self.staged):
-      if len(self.staged) > 64 and self.staged[v].done() and self.staged[v] not in active:
-        del self.staged[v]
+    for r, path in paths.items():
+      version = versions.get(path)
+      self.inputs[r] = self.staged.get(version, version)
     self.service = {r: self.service.get(r, self.service_floor) for r in self.heads}
 
   async def dispatch(self, candidates: list[Cmd], failed: bool = False) -> bool:
     runs = self.choose_runs(candidates, SAMPLE_RUNS if self.spec.lora else 1)
     inputs = {r: (v.result() if isinstance(v := self.inputs[r], asyncio.Task) else v) for r in runs}
-    if failed:
-      dead = {self.inputs.get(r) for r in runs}
-      self.staged = {k: t for k, t in self.staged.items() if t not in dead}  # allow retry if upload lands later
+    # Resolve consumed versions again next wave: cache eviction and failed transfers are both recoverable.
+    consumed = {self.inputs[r] for r in runs}
+    self.staged = {v: task for v, task in self.staged.items() if task not in consumed}
     await self.stop_reader()
     with span("node.claim"):
       cmds = await self.bus.take_commands(runs, self.life, 1 if failed else SAMPLE_COMMANDS)
@@ -573,19 +563,27 @@ class SamplerLife(Lifetime):
       self.heads.pop(r, None)
     if not cmds:
       return False
-    for ckpt in ({inputs[c.run] for c in cmds} - {None}) if not failed else ():
-      try:
-        await self.model.load(ckpt)
-      except Exception as e:
-        inputs = {r: e if v == ckpt else v for r, v in inputs.items()}
     wave = Wave(self.spec.gpus)
+    uses = Counter(inputs[c.run] for c in cmds)
+    loads, errors = {}, {}
+    for ckpt in uses:
+      if ckpt is None or failed:
+        continue
+      loads[ckpt] = load = Charge()
+      try:
+        await wave.run(self.model.load(ckpt), load)
+      except Exception as e:
+        errors[ckpt] = e
 
     async def answer(cmd: Cmd) -> None:
       charge, acct, inp = Charge(), self.node.state.account(cmd.run), inputs[cmd.run]
       with span("node.execute"):
-        reply = (
-          Reply.error(inp) if isinstance(inp, Exception) else await wave.run(self.model.execute(cmd, inp, True), charge)
-        )
+        error = errors.get(inp, inp if failed else None)
+        reply = Reply.error(error) if error else await wave.run(self.model.execute(cmd, inp, True), charge)
+        if load := loads.get(inp):
+          charge.started_ms = load.started_ms
+          charge.busy_ms += load.busy_ms
+          charge.gpu_ms += load.gpu_ms / uses[inp]
       with span("node.publish"):
         billed = await self.bus.commit_sample(cmd, reply, acct, charge=charge)
       self.bill(cmd, acct, charge, billed)

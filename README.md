@@ -23,7 +23,7 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path
 pip install -e .
 redis-server &                        # Redis 8.6+
 python -m tinyrl.api.gateway &        # Tinker HTTP API on :8000
-python -m tinyrl.control.scheduler &  # assigns runs -> workers -> nodes
+python -m tinyrl.control.scheduler &  # places trainers and sizes sampler pools
 python -m tinyrl.control.node_daemon  # manages worker processes and GPUs
 ```
 
@@ -47,7 +47,8 @@ flowchart TD
 
 Every training or sampling call is a command on its run's Redis stream, and its reply is a one-entry stream keyed by the request.
 
-- **Workers & scheduling:** LoRA runs on the same base model share a trainer; sampling sessions on the same base model share a sampler; full fine-tunes and exclusive runs get dedicated workers. The scheduler maintains placement and account lag in `tinyrl:plan` (splitting/merging busy LoRA trainers, scaling samplers by `SCALE_BATCH`, rebalancing by `REBALANCE_MS`). Each node daemon owns worker leases, GPU reservations, adaptive time-slicing (`QUANTUM_MS`–`MAX_QUANTUM_MS`), and account-fair GPU-time scheduling.
+- **Cluster placement.** Each training run has one trainer home. Compatible LoRA runs can share a trainer. Sampler sessions use any replica in a pool with the same model and worker configuration. The scheduler sizes each pool from its combined backlog and available GPUs.
+- **GPU turns.** Each node grants local GPUs to one worker at a time and releases them after the worker parks or exits. A sampling wave serves one account. Its requests share the GPU time spent loading their weights and executing samples. The cluster tracks each account’s share, and nodes use billed GPU time to choose subsequent turns.
 - **Trainers & samplers:** Trainers run as isolated synchronous PyTorch/PEFT processes (FSDP via `torchrun` across multiple GPUs) with bf16 forward, fp32 master weights + AdamW state, chunked logprobs, and pinned host-memory parking when yielding a GPU. Samplers drive isolated vLLM processes (or a custom `ENGINE=module:Class`).
 - **Checkpoints:** Pure `safetensors` via [store.py](tinyrl/storage/store.py) (`put`/`get`), committed atomically under the worker's ownership token. Bucket saves stage in `CKPT_CACHE` and upload asynchronously; other nodes can fetch pending versions directly from the writer node.
 - **Reliability:** Retried calls with the same `seq_id` execute once; replies and step counters commit atomically under lease fencing. On `SIGTERM`, a node drains its current batch and saves state within `DRAIN_S`; crashed work fails fast rather than replaying uncertain updates.
@@ -59,7 +60,7 @@ Every training or sampling call is a command on its run's Redis stream, and its 
 
 | File | Responsibility |
 |---|---|
-| [tinyrl/bus.py](tinyrl/bus.py) | Runs, sessions, command streams, fenced replies, and leases |
+| [tinyrl/bus.py](tinyrl/bus.py) | Sessions, command streams, fenced replies, leases, and the checkpoint registry |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints, and Prometheus `/metrics` |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy encoding |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | Cluster assignment: runs to workers, workers to nodes |
@@ -73,7 +74,7 @@ Every training or sampling call is a command on its run's Redis stream, and its 
 | [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | vLLM engine lifecycle, checkpoint loading, and sleep/wake |
 | [tinyrl/workers/snapshot.py](tinyrl/workers/snapshot.py) | CRIU snapshots and restores for vLLM |
 | [tinyrl/storage/store.py](tinyrl/storage/store.py) | Safetensors I/O, local cache, peer reads, and async uploads |
-| [tinyrl/storage/registry.py](tinyrl/storage/registry.py) | Checkpoint ownership, versions, TTLs, and GC |
+| [tinyrl/control/fairness.py](tinyrl/control/fairness.py) | Account service, run selection, and local GPU turn planning |
 | [tinyrl/storage/models.py](tinyrl/storage/models.py) | Base-model fetching and local caching |
 | [tinyrl/trace.py](tinyrl/trace.py) | NVTX ranges for Nsight Systems |
 
@@ -89,6 +90,10 @@ All settings are environment variables:
 | **Storage** | `CKPT` (`/tmp/tinyrl`), `CKPT_CACHE`, `CKPT_CACHE_BYTES`, `CKPT_TTL`, `SHARD_BYTES`, `SWEEP_S`, `MODEL_CACHE`, `MODEL_MIRROR` |
 | **Scheduling** | `QUANTUM_MS` (`2000`), `MAX_QUANTUM_MS` (`15000`), `SWITCH_BUDGET` (`0.1`), `CYCLE_GRACE_MS` (`100`), `SAMPLE_RUNS` (`3`), `SAMPLE_COMMANDS` (`128`), `SCALE_BATCH` (`4`), `REBALANCE_MS` (`20000`) |
 | **Execution** | `TOKEN_BUDGET`, `CHUNK`, `GRAD_CKPT`, `ENGINE`, `VLLM_ARGS`, `TINYRL_SNAPSHOTS`, `DEBUG=1` |
+
+## Upgrading an existing cluster
+
+Stop the old scheduler and drain the old nodes before starting the new control plane. Keep Redis, checkpoint storage, and the node caches. The scheduler reads the old trainer placements and writes one worker ID per trainer on its next tick. Sampler membership is derived from the pool configuration. Existing streams retain their pending commands and checkpoint names keep their versions.
 
 ## Observability
 
