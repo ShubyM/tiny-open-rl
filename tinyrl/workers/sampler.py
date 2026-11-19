@@ -76,14 +76,19 @@ class Sampler:
       if self.running is None:
         self.running = await self.engine_type.start(self.base, self.lora, self.env)
 
-  async def execute(self, cmd: Cmd, checkpoint: tuple[str, str] | None) -> Reply:
+  async def load(self, checkpoint: tuple[str, str] | None) -> str | None:
+    await self.start()
+    if checkpoint is None:
+      return None
+    path, name = checkpoint
+    async with self.loading:
+      await self.running.load_checkpoint(name, path)
+    return name
+
+  async def execute(self, cmd: Cmd, checkpoint: tuple[str, str] | None, loaded: bool = False) -> Reply:
     try:
-      job, name = json.loads(cmd.body), None
-      await self.start()
-      async with self.loading:
-        if checkpoint:
-          path, name = checkpoint
-          await self.running.load_checkpoint(name, path)
+      job = json.loads(cmd.body)
+      name = checkpoint[1] if loaded and checkpoint else await self.load(checkpoint)
       return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, await self.running.sample(job, name)))
     except Exception as e:
       return Reply.error(e)

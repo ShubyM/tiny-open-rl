@@ -28,10 +28,6 @@ class Spec:
   train_run: str | None = None
   gpus: int = 1
 
-  @property
-  def shareable(self) -> bool:
-    return self.role == Role.SAMPLER or (self.lora and not self.exclusive)
-
 
 @dataclass
 class Proc:
@@ -46,6 +42,7 @@ class Job:
   account: str = ""
   owner: str | None = None
   backlog: int = 0
+  record: dict = field(default_factory=dict)
 
 
 def owner_of(token: str | None) -> tuple[str, str]:
@@ -66,18 +63,22 @@ class State:
   weights: dict[str, float] = field(default_factory=dict)
 
   def runs(self, proc: str) -> list[str]:
-    if (p := self.procs.get(proc)) is None:
+    if not (p := self.procs.get(proc)):
       return []
-    if p.spec.role == Role.SAMPLER:
-      return [r for r, j in sorted(self.jobs.items()) if j.spec == p.spec]
-    return [r for r, owner in sorted(self.home.items()) if owner == proc]
+    return (
+      [r for r, j in sorted(self.jobs.items()) if j.spec == p.spec]
+      if p.spec.role == Role.SAMPLER
+      else [r for r, o in sorted(self.home.items()) if o == proc]
+    )
 
   def procs_of(self, run: str) -> list[str]:
-    if (j := self.jobs.get(run)) is None:
+    if not (j := self.jobs.get(run)):
       return []
-    if j.spec.role == Role.SAMPLER:
-      return [n for n, p in sorted(self.procs.items()) if p.spec == j.spec]
-    return [p] if (p := self.home.get(run)) in self.procs else []
+    return (
+      [n for n, p in sorted(self.procs.items()) if p.spec == j.spec]
+      if j.spec.role == Role.SAMPLER
+      else ([p] if (p := self.home.get(run)) in self.procs else [])
+    )
 
   def ready(self, run: str) -> bool:
     return self.jobs[run].backlog > 0
@@ -132,7 +133,7 @@ def from_state(raw: dict) -> State:
     excl, tr, role = bool(rec.get("exclusive")), rec.get("train_run"), Role(rec.get("role", "trainer"))
     spec = Spec(role, rec.get("base", ""), rec.get("rank", 0) > 0, excl, tr if excl else None, int(rec.get("gpus", 1)))
     acct = rec.get("account") or ("" if tr else rec.get("session", ""))
-    jobs[r] = Job(spec, tr, acct, info.get("owner"), queues.get(r, 0))
+    jobs[r] = Job(spec, tr, acct, info.get("owner"), queues.get(r, 0), rec)
   jobs = {r: j for r, j in jobs.items() if not j.spec.train_run or j.spec.train_run in jobs}
   for n, p in plan.get("procs", {}).items():
     procs[n] = Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
@@ -259,7 +260,7 @@ def assign(s: State, out: list) -> None:
   """Give every homeless training run a process: the matching shareable one with the fewest runs, or a new one."""
   for r, j in sorted(s.jobs.items()):
     if j.spec.role == Role.TRAINER and r not in s.home:
-      match = [n for n, p in sorted(s.procs.items()) if j.spec.shareable and p.spec == j.spec]
+      match = [n for n, p in sorted(s.procs.items()) if j.spec.lora and not j.spec.exclusive and p.spec == j.spec]
       s.home[r] = target = min(match, key=lambda n: len(s.runs(n))) if match else s.add_proc(j.spec)
       out.append((Ev.ASSIGNED, {"run": r, "proc": target}))
 
@@ -267,7 +268,7 @@ def assign(s: State, out: list) -> None:
 def merge_and_split(s: State, out: list) -> None:
   """Coalesce crowded LoRA trainers, and split busy ones onto spare GPUs."""
   for name, p in sorted(list(s.procs.items())):
-    if p.spec.role != Role.TRAINER or not p.spec.shareable or not p.node:
+    if p.spec.role != Role.TRAINER or not p.spec.lora or p.spec.exclusive or not p.node:
       continue
     idle_dup = not s.busy(name) and s.used(p.node) > s.nodes[p.node][0]
     busy_dup = s.spare(p.node) < 0 and not any(s.spare(n) >= p.spec.gpus for n in s.nodes)

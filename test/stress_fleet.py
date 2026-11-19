@@ -288,12 +288,12 @@ class Stress(RedisTest):
     for node in self.nodes.values():
       out.append(f"{node.id}: gpus={node.gpus} on={node.on} physical={node.occ.on} draining={node.draining}")
       for proc, lf in node.lives.items():
-        heads = [
-          (c.run[:4], c.op.value, c.request_id in lf.prepared and lf.prepared[c.request_id][1].done()) for c in lf.heads
-        ]
+        raw_heads = lf.heads.values() if isinstance(lf.heads, dict) else lf.heads
+        heads = [(c.run[:4], c.op.value) for c in raw_heads]
+        owned = [r[:4] for r in getattr(lf, "owned", ())]
         out.append(
           f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} active={lf.active} wanted={lf.wanted()} "
-          f"owned={[r[:4] for r in lf.owned]} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
+          f"owned={owned} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
           f"reader={'none' if lf.reader is None else 'done' if lf.reader.done() else 'reading'} "
           f"task={'done' if node.tasks[proc].done() else 'running'} q={lf.quantum:.2f} granted={time.monotonic() - lf.granted_at:.1f}s ago"
         )

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from test.helpers import RedisTest
 from tinyrl.bus import Op, Reply, Role, Run
 from tinyrl.control import scheduler
-from tinyrl.control.node_daemon import Lifetime
+from tinyrl.control.node_daemon import SamplerLife, TrainerLife
 
 
 class TestAccounting(RedisTest):
@@ -17,7 +17,7 @@ class TestAccounting(RedisTest):
     if role == Role.TRAINER:
       state.home = dict.fromkeys(runs, "worker")
     node = SimpleNamespace(id="node", bus=self.bus, store=None, state=state, notify=Mock())
-    life = Lifetime(node, "worker")
+    life = (SamplerLife if role == Role.SAMPLER else TrainerLife)(node, "worker")
     await self.bus.touch_leases(life.life)
     if role == Role.TRAINER:
       for run in runs:
@@ -26,9 +26,15 @@ class TestAccounting(RedisTest):
     return life
 
   async def execute(self, life):
-    life.heads = await life.peek(0)
-    await asyncio.gather(*(task for _, task in life.prepared.values()))
-    return await life.execute(life.heads)
+    if isinstance(life, SamplerLife):
+      life.reader = asyncio.create_task(self.bus.peek_sampler(life.streams(), 0))
+      await life.reader
+      await life.collect()
+      await asyncio.gather(*life.staged.values())
+      ready, _ = life.ready()
+      return await life.execute_wave(ready)
+    await life.collect()
+    return await life.execute_one(list(life.heads.values()))
 
   async def test_sampler_shares_busy_time_until_the_short_request_fails(self):
     life = await self.lifetime(Role.SAMPLER, "short", "long")
@@ -59,14 +65,12 @@ class TestAccounting(RedisTest):
   async def test_trainer_bills_only_the_failure_that_entered_the_model(self):
     life = await self.lifetime(Role.TRAINER, "run")
     failure = ValueError("bad input")
-    life.prepare = AsyncMock(return_value=failure)
     life.model = SimpleNamespace(call=AsyncMock(return_value=(Reply.error(failure), {})))
-    await self.bus.submit_command("run", Op.OPTIM_STEP, b"{}")
+    await self.bus.submit_command("run", Op.LOAD_WEIGHTS, b'{"uri":"tinker://run/weights/missing"}')
     await self.execute(life)
     life.model.call.assert_not_awaited()
     self.assertEqual(life.gpu_ms, 0)
     self.assertEqual((await self.bus.read_state())["service"], {})
-    life.prepare.return_value = ({}, None)
     await self.bus.submit_command("run", Op.OPTIM_STEP, b"{}")
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=[0, 250_000]):
       await self.execute(life)
