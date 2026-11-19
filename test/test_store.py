@@ -220,7 +220,7 @@ class TestRegistry(RedisTest):
   async def test_deletion_wins_over_concurrent_ttl_updates(self):
     run = new_id()
     await self.bus.create_run(Run(id=run, base="base", rank=8))
-    await self.bus.open_lease("owner")
+    await self.bus.touch_leases("owner")
     token, _, _ = await self.bus.acquire_run(run, "owner")
     uri = f"tinker://{run}/sampler_weights/session"
     await self.seed_checkpoint(uri, 1, ttl=60, owned=True)
@@ -242,13 +242,13 @@ class TestRegistry(RedisTest):
         run = new_id()
         uri = f"tinker://{run}/weights/final"
         await self.bus.create_run(Run(run, "base", 4))
-        await self.bus.open_lease("previous")
+        await self.bus.touch_leases("previous")
         stale, _, _ = await self.bus.acquire_run(run, "previous")
         await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
         first = await self.bus.take_trainer_command(run, stale)
         abandoned = await self.bus.begin_checkpoint(run, stale)
         await self.bus.drop_lease("previous")
-        await self.bus.open_lease("current")
+        await self.bus.touch_leases("current")
         owner, _, _ = await self.bus.acquire_run(run, "current")
         await self.bus.fail_stranded_commands(run, owner)
         await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")

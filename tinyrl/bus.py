@@ -426,11 +426,13 @@ class Bus:
 
   # ***** single-writer ownership, detachment, stateless sample commit, and process leases *****
 
-  async def open_lease(self, life: str) -> bool:
-    return bool(await self.r.set(key("lease", life), 1, nx=True, px=LEASE_MS))
-
-  async def renew_lease(self, life: str, recover: bool = False) -> bool:
-    return bool(await self.r.set(key("lease", life), 1, xx=not recover, px=LEASE_MS))
+  async def touch_leases(self, *lives: str) -> None:
+    if not lives:
+      return
+    p = self.r.pipeline(transaction=False)
+    for life in lives:
+      p.set(key("lease", life), 1, px=LEASE_MS)
+    await p.execute()
 
   async def drop_lease(self, life: str) -> None:
     await self.r.delete(key("lease", life))
@@ -560,11 +562,15 @@ class Bus:
 
   # ***** nodes, replies, events *****
 
-  async def node_heartbeat(self, node: str, gpus: int, memory: int = 0, wake_scheduler: bool = False, **info) -> None:
+  async def node_heartbeat(
+    self, node: str, gpus: int, memory: int = 0, wake_scheduler: bool = False, leases: tuple[str, ...] = (), **info
+  ) -> None:
     p = self.r.pipeline()
     p.hset(
       key("nodes"), node, json.dumps({"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, **info})
     )
+    for life in leases:
+      p.set(key("lease", life), 1, px=LEASE_MS)
     if wake_scheduler:
       wake(p)
     await p.execute()

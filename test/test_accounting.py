@@ -17,7 +17,7 @@ class TestAccounting(RedisTest):
     state.home = dict.fromkeys(runs, ["worker"])
     node = SimpleNamespace(id="node", bus=self.bus, registry=self.registry, store=None, state=state, notify=Mock())
     life = Lifetime(node, "worker")
-    await self.bus.open_lease(life.life)
+    await self.bus.touch_leases(life.life)
     if role == Role.TRAINER:
       for run in runs:
         life.owned[run] = await self.bus.acquire_run(run, life.life)

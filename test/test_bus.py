@@ -16,7 +16,7 @@ def ok(**body) -> Reply:
 class TestBus(RedisTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
-    await self.bus.open_lease("w0")
+    await self.bus.touch_leases("w0")
 
   async def new_run(self, session: str = "", role: Role = Role.TRAINER, account: str = "", claim: bool = True) -> str:
     run_id = new_id()
@@ -173,14 +173,14 @@ class TestBus(RedisTest):
 
     # Reap refuses while lease is live, and succeeds once lease expires.
     self.assertFalse(await self.bus.reap_run(run_id, old_token))
-    await self.bus.open_lease("new")
+    await self.bus.touch_leases("new")
     self.assertIsNone(await self.bus.acquire_run(run_id, "new"))
     await self.bus.drop_lease("w0")
     new_token, _, _ = await self.bus.acquire_run(run_id, "new")
     self.assertNotEqual(new_token, old_token)
 
     # Stale token cannot commit, detach, reap, or fail stranded commands — even if w0 re-opens a lease (epoch ABA).
-    await self.bus.open_lease("w0")
+    await self.bus.touch_leases("w0")
     self.assertEqual(await self.bus.commit_reply(taken[0], ok(by="zombie"), old_token), (False, None))
     self.assertFalse(await self.bus.detach_run(run_id, old_token, None, "tinker://x/parked/1\nv1"))
     self.assertFalse(await self.bus.reap_run(run_id, old_token))
@@ -217,7 +217,7 @@ class TestBus(RedisTest):
     await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
     abandoned = await self.bus.take_trainer_command(run, old)
     await self.bus.drop_lease("w0")
-    await self.bus.open_lease("replacement")
+    await self.bus.touch_leases("replacement")
     current, _, _ = await self.bus.acquire_run(run, "replacement")
     await self.bus.fail_stranded_commands(run, current)
     request = await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
@@ -242,8 +242,7 @@ class TestBus(RedisTest):
 
   async def test_concurrent_acquires_pick_one_winner_and_detach_fences_exact_pos(self):
     run_id = await self.new_run(claim=False)
-    for life in ("a", "b", "c"):
-      await self.bus.open_lease(life)
+    await self.bus.touch_leases("a", "b", "c")
     got = await asyncio.gather(*(self.bus.acquire_run(run_id, life) for life in ("a", "b", "c")))
     winners = [g for g in got if g is not None]
     self.assertEqual(len(winners), 1)
@@ -276,8 +275,9 @@ class TestBus(RedisTest):
     run_id = await self.new_run()
     token = self.tokens[run_id]
     await self.bus.r.pexpire(key("lease", "w0"), 0)
-    self.assertFalse(await self.bus.renew_lease("w0"))
-    self.assertTrue(await self.bus.renew_lease("w0", recover=True))  # recovered before anyone reaped
+    self.assertFalse(await self.bus.r.exists(key("lease", "w0")))
+    await self.bus.touch_leases("w0")  # recovered before anyone reaped
+    self.assertTrue(await self.bus.r.exists(key("lease", "w0")))
     await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
     [cmd] = await self.bus.take_commands([run_id], "w0", 1)
     self.assertEqual(await self.bus.commit_reply(cmd, ok(alive=1), token, mutates=True), (True, None))

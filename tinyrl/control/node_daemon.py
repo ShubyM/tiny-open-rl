@@ -98,8 +98,10 @@ class NodeDaemon:
     self.lives: dict[str, Lifetime] = {}
     self.tasks: dict[str, asyncio.Task] = {}
     self.timer: asyncio.TimerHandle | None = None
+    self.keeper: asyncio.Task | None = None
     self.state, self.changed, self.draining = scheduler.State(), asyncio.Event(), False
-    self.heartbeat, self.lag, self.swept, self.sweeping = time.monotonic(), 0.0, 0.0, None
+    self.heartbeat = self.renewed = time.monotonic()
+    self.lag, self.swept, self.sweeping = 0.0, 0.0, None
 
   async def serve(self) -> None:
     await self.announce_node()
@@ -116,8 +118,30 @@ class NodeDaemon:
   async def push_heartbeat(self, wake: bool = False) -> None:
     on = {life.split("@", 1)[0]: list(gs) for life, gs in self.on.items()}
     pids = {p: m.proc.pid for p, lf in self.lives.items() if (m := lf.model) and m.proc and m.proc.pid is not None}
-    self.heartbeat = time.monotonic()
-    await self.bus.node_heartbeat(self.id, self.gpus, self.gpu_mib * 2**20, wake, on=on, pids=pids, lag=self.lag)
+    leases = tuple(lf.life for lf in self.lives.values() if not lf.closing)
+    before = time.monotonic()
+    await self.bus.node_heartbeat(
+      self.id, self.gpus, self.gpu_mib * 2**20, wake, leases=leases, on=on, pids=pids, lag=self.lag
+    )
+    self.heartbeat = self.renewed = before
+
+  async def keep_leases(self) -> None:
+    while any(not t.done() for t in self.tasks.values()):
+      await asyncio.sleep(LEASE_MS / 4000)
+      if not any(not t.done() for t in self.tasks.values()):
+        break
+      now = time.monotonic()
+      stalled = not self.draining and now - self.heartbeat >= LEASE_MS / 1000
+      if not stalled and (lives := [lf.life for lf in self.lives.values() if not lf.closing]):
+        try:
+          await self.bus.touch_leases(*lives)
+          self.renewed = now
+        except Exception:
+          stalled = not self.draining and time.monotonic() - self.renewed >= LEASE_MS / 1000
+      for lf in list(self.lives.values()):
+        dead = lf.model and (p := lf.model.proc) and p.poll() is not None
+        if not lf.closing and (stalled or dead) and lf.task and not lf.task.cancelling():
+          lf.task.cancel()
 
   async def tick(self) -> None:
     await self.push_heartbeat()
@@ -138,7 +162,12 @@ class NodeDaemon:
           print(f"{proc} stopped: {err!r}", file=sys.stderr, flush=True)
         del self.tasks[proc]
         self.lives.pop(proc, None)
-      elif self.id not in self.state.nodes and not task.cancelling():
+      elif not task.cancelling() and (
+        self.id not in self.state.nodes
+        or (
+          (lf := self.lives.get(proc)) and not lf.closing and lf.model and (p := lf.model.proc) and p.poll() is not None
+        )
+      ):
         task.cancel()
 
   def select_gpus(self, proc: str) -> tuple[int, ...]:
@@ -176,6 +205,10 @@ class NodeDaemon:
         task.cancel()
       await asyncio.gather(*self.tasks.values(), return_exceptions=True)
       self.dispatch()
+    if self.keeper:
+      self.keeper.cancel()
+      await asyncio.gather(self.keeper, return_exceptions=True)
+      self.keeper = None
     await asyncio.to_thread(self.store.close)
 
   async def read_state(self) -> scheduler.State:
@@ -204,13 +237,13 @@ class Lifetime:
     self.node, self.bus, self.registry, self.store, self.proc = node, node.bus, node.registry, node.store, proc
     self.spec, self.sampling = (sp := node.state.procs[proc].spec), sp.role == Role.SAMPLER
     self.life = f"{proc}@{node.id}-{os.urandom(6).hex()}"
-    self.task = self.model = self.guard = self.closing = self.reader = None
+    self.task = self.model = self.closing = self.reader = None
     self.bound_gpus, self.warm, self.active = (), False, False
     self.granted_at, self.quantum, self.park_s, self.gpu_ms = 0.0, QUANTUM_MS / 1000, 0.0, 0.0
     self.owned: dict[str, tuple[str, str | None, str | None]] = {}  # run -> (token, pos, snap)
     self.loaded, self.open_grads = set(), set()
     self.heads, self.prepared, self.service = [], {}, {}
-    self.renewed, self.virtual, self.idle_since, self.step_ready = time.monotonic(), 0.0, 0.0, False
+    self.virtual, self.idle_since, self.step_ready = 0.0, 0.0, False
 
   def streams(self) -> list[str]:
     return self.node.state.runs(self.proc) if self.sampling else sorted(self.owned)
@@ -294,37 +327,16 @@ class Lifetime:
     self.warm = self.sampling and env.get("TINYRL_WARM_SAMPLER", "0") != "0"
 
   async def open(self) -> bool:
-    if self.node.draining or not await self.bus.open_lease(self.life):
+    if self.node.draining:
       return False
+    await self.bus.touch_leases(self.life)
     self.node.lives[self.proc] = self
+    if self.node.keeper is None or self.node.keeper.done():
+      self.node.keeper = asyncio.create_task(self.node.keep_leases())
     if self.sampling or self.spec.gpus == 1:
       self.spawn_model(tuple(range(self.node.gpus)))
-    self.guard = asyncio.create_task(self.keepalive())
     self.read()
     return True
-
-  async def keep_lease(self) -> None:
-    before = time.monotonic()
-    if not (
-      await self.bus.renew_lease(self.life) or (not self.closing and await self.bus.renew_lease(self.life, True))
-    ):
-      raise RuntimeError(f"lost lease {self.life}")
-    self.renewed = before
-
-  async def keepalive(self) -> None:
-    while True:
-      await asyncio.sleep(LEASE_MS / 4000)
-      if not self.closing and not self.node.draining and time.monotonic() - self.node.heartbeat >= LEASE_MS / 1000:
-        break
-      try:
-        await self.keep_lease()
-        if not self.closing and self.model and (p := self.model.proc) and p.poll() is not None:
-          break
-      except Exception:
-        if not self.closing and time.monotonic() - self.renewed >= LEASE_MS / 1000:
-          break
-    if self.task and not self.task.cancelling():
-      self.task.cancel()
 
   # ***** acquire & detach (L2/L3 <-> process) *****
 
@@ -347,7 +359,6 @@ class Lifetime:
     token, pos, snap = self.owned[run]
     checkpoint = None
     if pos is not None and snap is None and run in self.loaded and self.model is not None:
-      await self.keep_lease()
       version = await self.bus.begin_checkpoint(run, token)
       if checkpoint := await self.model.call("save_run", run, version):
         snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
@@ -384,7 +395,6 @@ class Lifetime:
 
   async def promote(self, gpus: tuple[int, ...]) -> None:
     try:
-      await self.keep_lease()
       t0 = time.monotonic()
       with span("node.resume"):
         if not self.sampling:
@@ -484,7 +494,6 @@ class Lifetime:
     inputs = {c.run: self.prepared[c.request_id][1].result() for c in candidates if c.run in runs}
     bad = any(isinstance(v, Exception) for v in inputs.values())
     await self.stop_reader()
-    await self.keep_lease()
     with span("node.claim"):
       cmds = await self.claim(runs, SAMPLE_COMMANDS if self.sampling and not bad else 1)
     self.heads = [c for c in self.heads if c.run not in runs]
@@ -517,7 +526,6 @@ class Lifetime:
     elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
       version = await self.bus.begin_checkpoint(cmd.run, token)
     saved = unpack_snap(snap)[1] if snap and cmd.run not in self.loaded and cmd.op != Op.LOAD_WEIGHTS else None
-    await self.keep_lease()
     reply, effects = await wave.run(self.model.call("execute", cmd, run, saved, version), charge)
     self.loaded.add(cmd.run) if effects.get("loaded") else self.loaded.discard(cmd.run)
     return reply, effects
@@ -577,9 +585,6 @@ class Lifetime:
         print(f"{self.proc} could not close, retrying: {e!r}", file=sys.stderr, flush=True)
         await asyncio.sleep(TICK)
     self.node.release_gpus(self.life)
-    if self.guard:
-      self.guard.cancel()
-      await asyncio.gather(self.guard, return_exceptions=True)
     for r, (token, _, _) in list(self.owned.items()):
       await self.bus.fail_stranded_commands(r, token)
     await self.bus.drop_lease(self.life)
