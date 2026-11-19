@@ -68,7 +68,7 @@ class Sampler:
 
   @property
   def proc(self):
-    return getattr(self.running, "server", None)
+    return self.running.server if self.running else None
 
   async def start(self) -> None:
     """Start the engine, once."""
