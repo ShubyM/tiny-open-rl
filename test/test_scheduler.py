@@ -18,8 +18,8 @@ from test.test_trainer import LORA, counting
 from tinyrl.api import wire
 from tinyrl.bus import GROUP, LEASE_MS, Bus, Cmd, Ev, Op, Role, Run, connect, key
 from tinyrl.control import scheduler
-from tinyrl.control.fairness import Demand, Worker, plan_gpus, select_runs, update_lag, waterfill
-from tinyrl.control.node_daemon import NodeDaemon
+from tinyrl.control.fairness import Demand, GpuSlot, plan_gpus, select_runs, update_lag, waterfill
+from tinyrl.control.node_daemon import QUANTUM_MS, NodeDaemon
 from tinyrl.control.scheduler import (
   REBALANCE_MS,
   SCALE_BATCH,
@@ -31,7 +31,6 @@ from tinyrl.control.scheduler import (
   step,
   to_plan,
 )
-from tinyrl.control.workers import QUANTUM_MS
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import Model
 
@@ -68,7 +67,7 @@ class Cluster:
     self.runs[name] = {"record": {"role": "trainer", "base": "a", "rank": 0} | body, "owner": owner}
     self.queues[name] = backlog
     self.settle()
-    return self.s.home[name][0]
+    return self.s.assignments[name][0]
 
   def queue(self, run: str, n: int) -> None:
     self.queues[run] = n
@@ -83,7 +82,7 @@ class Cluster:
 
 
 def apply_gpus(
-  workers: dict[str, Worker],
+  workers: dict[str, GpuSlot],
   quanta: dict[str, float],
   state: State,
   total: int,
@@ -91,7 +90,7 @@ def apply_gpus(
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
   """Drive pure `plan_gpus` on `Worker` snapshots, resetting `hold_until` only when a worker's block changes."""
   ranked = {
-    p: replace(w, lag=max((state.ready_lag(r) for r in state.runs(p) if state.ready(r)), default=-w.gpu_ms))
+    p: replace(w, lag=max((state.ready_lag(r) for r in state.runs(p) if state.has_backlog(r)), default=-w.gpu_ms))
     for p, w in workers.items()
   }
   keep, wake_at = plan_gpus(ranked, total, now)
@@ -107,7 +106,7 @@ def check_plan_invariants(test: unittest.TestCase, s: State) -> None:
     test.assertLessEqual(s.excl_used(node), total)
   for p in s.procs.values():
     test.assertTrue(p.node is None or (p.node in s.nodes and p.spec.gpus <= s.nodes[p.node][0]))
-  for r, ps in s.home.items():
+  for r, ps in s.assignments.items():
     test.assertIn(r, s.jobs)
     if s.jobs[r].spec.role == Role.TRAINER:
       test.assertLessEqual(len(ps), 1)
@@ -115,7 +114,7 @@ def check_plan_invariants(test: unittest.TestCase, s: State) -> None:
       test.assertIn(proc, s.procs)
 
 
-def check_gpu_invariants(test: unittest.TestCase, keep: dict, workers: dict[str, Worker], total: int) -> None:
+def check_gpu_invariants(test: unittest.TestCase, keep: dict, workers: dict[str, GpuSlot], total: int) -> None:
   seen = []
   for p, gs in keep.items():
     test.assertEqual(len(gs), workers[p].gpus)
@@ -233,13 +232,13 @@ class TestCluster(unittest.TestCase):
     p1 = c.run("r1", rank=8, backlog=1)
     self.assertEqual(c.run("r2", rank=8, backlog=1), p1)
     c.node("b", 1)
-    p2 = c.s.home["r2"][0]
+    p2 = c.s.assignments["r2"][0]
     self.assertNotEqual(p1, p2)
     self.assertEqual({c.s.procs[p1].node, c.s.procs[p2].node}, {"a", "b"})
     c.run("excl", exclusive=True, backlog=1)
     c.settle()  # the trainer on the exclusive's node is unplaced and joins the other node
     c.settle()  # where the two merge
-    self.assertEqual(c.s.home["r1"], c.s.home["r2"])
+    self.assertEqual(c.s.assignments["r1"], c.s.assignments["r2"])
     check_plan_invariants(self, c.s)
 
   def test_subscribed_node_with_idle_peers_does_not_split_or_scale_out_thrash(self):
@@ -249,12 +248,12 @@ class TestCluster(unittest.TestCase):
     c.run("s2", role="sampler", base="m2")
     p1 = c.run("r1", rank=8, backlog=1)
     self.assertEqual(c.run("r2", rank=8, backlog=1), p1)
-    self.assertEqual(c.s.home["r1"], c.s.home["r2"])
+    self.assertEqual(c.s.assignments["r1"], c.s.assignments["r2"])
     c.queue("r1", 0)
     c.queue("r2", 0)
     c.queue("s1", 12)
     c.settle()
-    self.assertEqual((c.s.home["s1"], c.s.made), ([s1], 3))
+    self.assertEqual((c.s.assignments["s1"], c.s.next_worker_id), ([s1], 3))
     check_plan_invariants(self, c.s)
 
   def test_sampling_sessions_share_only_their_kind_and_exclusive_training_run(self):
@@ -270,7 +269,9 @@ class TestCluster(unittest.TestCase):
     self.assertEqual(a, b)
     self.assertEqual(x, y)
     self.assertEqual(len({a, b, fft, x, y, z}), 4)
-    self.assertNotEqual(c.s.home["X"], c.s.home["Z"])  # exclusive LoRA runs on one base still get a trainer each
+    self.assertNotEqual(
+      c.s.assignments["X"], c.s.assignments["Z"]
+    )  # exclusive LoRA runs on one base still get a trainer each
 
   def test_a_sampling_session_without_an_account_bills_its_training_run(self):
     c = Cluster()
@@ -282,7 +283,7 @@ class TestCluster(unittest.TestCase):
   def test_a_proc_is_owed_what_its_ready_runs_are_owed(self):
     jobs = {"a": Job(Spec(lora=True), account="A", backlog=1), "b": Job(Spec(lora=True), account="B")}
     s = State(
-      procs={"p": Proc(Spec(lora=True), "n")}, home={"a": ["p"], "b": ["p"]}, jobs=jobs, lag={"A": 5.0, "B": 9.0}
+      procs={"p": Proc(Spec(lora=True), "n")}, assignments={"a": ["p"], "b": ["p"]}, jobs=jobs, lag={"A": 5.0, "B": 9.0}
     )
     self.assertEqual(s.lag_of("p"), 5.0)
 
@@ -296,7 +297,7 @@ class TestCluster(unittest.TestCase):
     c.run("x", role="sampler", train_run="t", exclusive=True, backlog=9, account="x")  # so is an exclusive sampler
     c.run("s", role="sampler", base="m", backlog=3 * SCALE_BATCH, account="s")  # a shared sampler: a replica per batch
     c.run("big", role="sampler", base="n", backlog=99 * SCALE_BATCH, account="big")  # up to every GPU there is
-    self.assertEqual(scheduler.demand(c.s, 4.0), {"t": 1, "x": 1, "s": 3, "big": 4})
+    self.assertEqual(scheduler.account_demand(c.s, 4.0), {"t": 1, "x": 1, "s": 3, "big": 4})
 
   def test_a_backlogged_shared_sampler_gets_a_replica_per_batch_and_an_exclusive_one_does_not(self):
     c = Cluster()
@@ -305,7 +306,7 @@ class TestCluster(unittest.TestCase):
     c.run("t")
     c.run("x", role="sampler", train_run="t", exclusive=True, backlog=3 * SCALE_BATCH)
     c.run("s", role="sampler", backlog=3 * SCALE_BATCH)
-    self.assertEqual((len(c.s.home["x"]), len(set(c.s.home["s"]))), (1, 3))
+    self.assertEqual((len(c.s.assignments["x"]), len(set(c.s.assignments["s"]))), (1, 3))
 
   def test_scale_out_reuses_an_idle_sampler_but_not_a_busy_one(self):
     c = Cluster()
@@ -313,15 +314,15 @@ class TestCluster(unittest.TestCase):
     c.node("b", 2)
     first = c.run("s", role="sampler")
     c.s.procs["p9"] = Proc(c.s.procs[first].spec, "b")
-    c.runs["o"], c.queues["o"], c.s.home["o"] = dict(c.runs["s"]), 0, ["p9"]
+    c.runs["o"], c.queues["o"], c.s.assignments["o"] = dict(c.runs["s"]), 0, ["p9"]
     c.queue("s", 2 * SCALE_BATCH)
     c.settle()
-    self.assertEqual(c.s.home["s"], [first, "p9"])  # the idle one on b, not a third process
+    self.assertEqual(c.s.assignments["s"], [first, "p9"])  # the idle one on b, not a third process
     c.queue("s", 3 * SCALE_BATCH)
     c.queue("o", 1)
     c.settle()
-    self.assertEqual(len(c.s.home["s"]), 3)  # p9 is busy with `o` now: a new process on b's other GPU
-    self.assertEqual(c.s.procs[c.s.home["s"][2]].node, "b")
+    self.assertEqual(len(c.s.assignments["s"]), 3)  # p9 is busy with `o` now: a new process on b's other GPU
+    self.assertEqual(c.s.procs[c.s.assignments["s"][2]].node, "b")
 
   def test_two_busy_sessions_do_not_split_their_sampler(self):
     c = Cluster()
@@ -331,7 +332,7 @@ class TestCluster(unittest.TestCase):
     c.queue("s1", 1)
     c.queue("s2", 1)
     c.settle()
-    self.assertEqual(c.s.home["s1"], c.s.home["s2"])
+    self.assertEqual(c.s.assignments["s1"], c.s.assignments["s2"])
 
   def test_idle_lora_trainers_stay_split_while_their_node_has_room(self):
     c = Cluster()
@@ -340,7 +341,7 @@ class TestCluster(unittest.TestCase):
     c.queue("r1", 0)
     c.queue("r2", 0)
     c.settle()
-    self.assertNotEqual(c.s.home["r1"], c.s.home["r2"])
+    self.assertNotEqual(c.s.assignments["r1"], c.s.assignments["r2"])
 
   def test_a_busy_lora_trainer_moves_to_a_spare_node_rather_than_merging(self):
     c = Cluster()
@@ -351,7 +352,7 @@ class TestCluster(unittest.TestCase):
     c.settle()
     self.assertEqual((c.s.procs[p1].node, c.s.procs[p2].node), ("a", "a"))
     c.node("c", 1)
-    self.assertEqual((c.s.home["r1"], c.s.home["r2"]), ([p1], [p2]))
+    self.assertEqual((c.s.assignments["r1"], c.s.assignments["r2"]), ([p1], [p2]))
     self.assertEqual({c.s.procs[p1].node, c.s.procs[p2].node}, {"a", "c"})
 
   def test_an_idle_proc_stays_on_a_crowded_node(self):
@@ -373,7 +374,7 @@ class TestCluster(unittest.TestCase):
 
   def test_an_exclusive_proc_holds_its_gpus_whether_or_not_it_is_busy(self):
     jobs = {"r": Job(Spec(exclusive=True), backlog=1)}
-    s = State(nodes={"n": (2, 0)}, procs={"x": Proc(Spec(exclusive=True), "n")}, home={"r": ["x"]}, jobs=jobs)
+    s = State(nodes={"n": (2, 0)}, procs={"x": Proc(Spec(exclusive=True), "n")}, assignments={"r": ["x"]}, jobs=jobs)
     self.assertEqual(s.spare("n"), 1)
 
   def test_crowding_moves_a_shared_proc_and_never_an_exclusive_one(self):
@@ -390,10 +391,10 @@ class TestCluster(unittest.TestCase):
     c.node("a", 1)
     first = c.run("s", role="sampler")
     c.s.procs["p9"] = Proc(c.s.procs[first].spec, None)
-    c.runs["o"], c.queues["o"], c.s.home["o"] = dict(c.runs["s"]), 0, ["p9"]
+    c.runs["o"], c.queues["o"], c.s.assignments["o"] = dict(c.runs["s"]), 0, ["p9"]
     c.queue("s", 2 * SCALE_BATCH)
     c.settle()
-    self.assertEqual(c.s.home["s"], [first])
+    self.assertEqual(c.s.assignments["s"], [first])
 
   def test_rotation_weighs_a_mover_against_the_busy_shared_procs_on_the_other_node(self):
     def target(c_lag: float, n2: int = 1, **extra) -> str | None:
@@ -401,7 +402,11 @@ class TestCluster(unittest.TestCase):
       specs |= {"c": (Spec(lora=True, base="c"), "n2", 1)} | extra
       s = State(nodes={"n1": (1, 0), "n2": (n2, 0)}, lag={"me": 30000.0, "b": 25000.0, "c": c_lag, "x": -50000.0})
       for name, (spec, node, backlog) in specs.items():
-        s.procs[name], s.home[name], s.jobs[name] = Proc(spec, node), [name], Job(spec, account=name, backlog=backlog)
+        s.procs[name], s.assignments[name], s.jobs[name] = (
+          Proc(spec, node),
+          [name],
+          Job(spec, account=name, backlog=backlog),
+        )
       return scheduler.rebalance_target(s, "me")
 
     self.assertEqual(target(5000.0), "n2")  # owed REBALANCE_MS more than `c`, who is owed less than `b`
@@ -414,8 +419,8 @@ class TestCluster(unittest.TestCase):
     c.node("a", 2)
     first = c.run("r1", rank=4)
     c.s.procs["p9"] = Proc(c.s.procs[first].spec, "a")
-    c.runs["r2"], c.queues["r2"], c.s.home["r2"] = dict(c.runs["r1"]), 0, [first]
-    c.runs["r3"], c.queues["r3"], c.s.home["r3"] = dict(c.runs["r1"]), 0, ["p9"]
+    c.runs["r2"], c.queues["r2"], c.s.assignments["r2"] = dict(c.runs["r1"]), 0, [first]
+    c.runs["r3"], c.queues["r3"], c.s.assignments["r3"] = dict(c.runs["r1"]), 0, ["p9"]
     self.assertEqual(c.run("r4", rank=4), "p9")
 
   def test_only_a_trainer_is_owed_room_for_a_sampler(self):
@@ -424,7 +429,7 @@ class TestCluster(unittest.TestCase):
     c.run("q", role="sampler")
     c.node("b", 2)
     c.run("r1", rank=4, base="m1")
-    self.assertEqual([c.s.procs[p].node for p in (c.s.home["q"][0], c.s.home["r1"][0])], ["a", "b"])
+    self.assertEqual([c.s.procs[p].node for p in (c.s.assignments["q"][0], c.s.assignments["r1"][0])], ["a", "b"])
     new = c.run("r2", rank=4, base="m2")
     self.assertEqual(c.s.procs[new].node, "a")
 
@@ -438,8 +443,8 @@ class TestCluster(unittest.TestCase):
     self.assertNotIn("p9", c.s.procs)
 
   def test_sampler_settings_follow_the_node(self):
-    self.assertEqual(scheduler.settings(1, 24 * GIB), {})
-    self.assertEqual(scheduler.settings(2, 80 * GIB), {"TINYRL_WARM_SAMPLER": "1", "TINYRL_KV_BYTES": str(24 * GIB)})
+    self.assertEqual(scheduler.node_env(1, 24 * GIB), {})
+    self.assertEqual(scheduler.node_env(2, 80 * GIB), {"TINYRL_WARM_SAMPLER": "1", "TINYRL_KV_BYTES": str(24 * GIB)})
 
   def test_exclusive_evacuates_squeezed_shareable_procs_and_never_overcommits(self):
     c = Cluster()
@@ -539,7 +544,7 @@ class TestLocalQuantum(unittest.TestCase):
     cluster.run("waiting", account="bob")
     state = cluster.s
     state.lag = {"alice": 10, "bob": 5}
-    state.seen = {"alice": 100}
+    state.billed_service = {"alice": 100}
     state.service = {"alice": 110}
     heads = [
       Cmd("current", "1-0", Op.OPTIM_STEP, b""),
@@ -584,18 +589,18 @@ class TestLocalQuantum(unittest.TestCase):
       }
       for _ in range(100):
         life = rng.choice(list(specs))
-        if life in node.on and rng.random() < 0.5:
+        if life in node.gpu_allocations and rng.random() < 0.5:
           node.release_gpus(life)
         else:
           node.claim_gpus(life, *specs[life])
-        flat = [g for gs in node.on.values() for g in gs]
+        flat = [g for gs in node.gpu_allocations.values() for g in gs]
         self.assertEqual(len(flat), len(set(flat)))
 
   def test_active_quantum_prevents_thrash_and_overtime_hands_off_with_zero_wait(self):
     c = Cluster()
     c.node("n", 1)
     p1 = c.run("a", backlog=1)
-    workers, quanta = {p1: Worker(hold_until=2.0)}, {p1: 2.0}
+    workers, quanta = {p1: GpuSlot(hold_until=2.0)}, {p1: 2.0}
 
     # Lone client enters OVERTIME at t=2s: no switch, timer stays disarmed, the deadline never resets.
     for t in (0.0, 0.5, 1.9, 2.5, 10.0):
@@ -607,7 +612,7 @@ class TestLocalQuantum(unittest.TestCase):
 
     # Late joiner `p2` arrives at t=10s: `p1` is already in overtime -> `p2` gets GPU immediately, held for its quantum.
     p2 = c.run("b", backlog=1)
-    workers[p2], quanta[p2] = Worker(hold_until=2.0), 2.0
+    workers[p2], quanta[p2] = GpuSlot(hold_until=2.0), 2.0
     keep, wake = apply_gpus(workers, quanta, c.s, 1, 10.0)
     self.assertEqual((keep, wake), ({p2: (0,)}, None))
     # Five rapid command boundaries inside [10.0, 12.0) all keep `p2` and arm the quantum timer for t=12.0.
@@ -629,7 +634,7 @@ class TestLocalQuantum(unittest.TestCase):
     pt = c.run("train", backlog=1)
     ps = c.run("samp", role="sampler", backlog=1)
     quanta = {pt: 1.0, ps: 6.0}
-    workers = {p: Worker(hold_until=q) for p, q in quanta.items()}
+    workers = {p: GpuSlot(hold_until=q) for p, q in quanta.items()}
     switches, last, dt = 0, None, 0.5
     for i in range(240):
       keep, _ = apply_gpus(workers, quanta, c.s, 1, i * dt)
@@ -649,7 +654,7 @@ class TestLocalQuantum(unittest.TestCase):
     s1 = c.run("s1", role="sampler", train_run="t1", backlog=1)
     t2 = c.run("t2", session="bob", backlog=1)
     quanta = {p: 1.0 if p != s1 else 4.0 for p in (t1, s1, t2)}
-    workers = {p: Worker(hold_until=q) for p, q in quanta.items()}
+    workers = {p: GpuSlot(hold_until=q) for p, q in quanta.items()}
     for i in range(240):
       keep, _ = apply_gpus(workers, quanta, c.s, 1, i * dt)
       [h] = keep
@@ -669,10 +674,10 @@ class TestLocalQuantum(unittest.TestCase):
     quanta = dict.fromkeys((p1, p2, p3, gang), 2.0)
     # Stagger `p1` (overtime at t=2) and `p2` (active until t=3) while `gang` has highest lag and `p3` waits.
     workers = {
-      p1: Worker(current=(0,), hold_until=2.0),
-      p2: Worker(current=(1,), hold_until=3.0),
-      p3: Worker(hold_until=2.0),
-      gang: Worker(gpus=2, hold_until=2.0),
+      p1: GpuSlot(current=(0,), hold_until=2.0),
+      p2: GpuSlot(current=(1,), hold_until=3.0),
+      p3: GpuSlot(hold_until=2.0),
+      gang: GpuSlot(gpus=2, hold_until=2.0),
     }
     c.s.lag = {"wide": 5000.0, "d": 1000.0, "a": 0.0, "b": 0.0}
     keep, wake = apply_gpus(workers, quanta, c.s, 2, 2.2)
@@ -686,7 +691,7 @@ class TestLocalQuantum(unittest.TestCase):
     c.node("n", 2)
     p1, p2, gang = c.run("a", backlog=1), c.run("b", backlog=1), c.run("wide", gpus=2, backlog=1)
     quanta = dict.fromkeys((p1, p2, gang), 1.0)
-    workers = {p: Worker(gpus=c.s.procs[p].spec.gpus, hold_until=1.0) for p in quanta}
+    workers = {p: GpuSlot(gpus=c.s.procs[p].spec.gpus, hold_until=1.0) for p in quanta}
     both_ticks = gang_ticks = 0
     for i in range(180):
       keep, _ = apply_gpus(workers, quanta, c.s, 2, i * 0.5)
@@ -712,7 +717,7 @@ class TestLocalQuantum(unittest.TestCase):
       for i in range(6):
         w = rng.choice([1, 1, 2]) if total >= 2 else 1
         quanta[f"p{i}"] = q = rng.choice([0.5, 2.0])
-        workers[f"p{i}"] = Worker(gpus=w, exclusive=rng.random() < 0.15, hold_until=q)
+        workers[f"p{i}"] = GpuSlot(gpus=w, exclusive=rng.random() < 0.15, hold_until=q)
       for _ in range(60):
         now += rng.uniform(0.0, 1.5)
         for p, w in list(workers.items()):
@@ -763,7 +768,7 @@ class TestMultiNodeFairness(unittest.TestCase):
 
   def simulate(self, c: Cluster, steps: int, dt: float = 0.5, quantum: float = 1.0) -> int:
     """Co-simulate per-node `plan_gpus` (L1) and cluster `scheduler.step` (L2)."""
-    workers: dict[str, tuple[str, Worker]] = {}
+    workers: dict[str, tuple[str, GpuSlot]] = {}
     moves = 0
     for i in range(steps):
       now = i * dt
@@ -774,9 +779,9 @@ class TestMultiNodeFairness(unittest.TestCase):
             w = (
               workers[p][1]
               if p in workers and workers[p][0] == n
-              else Worker(gpus=pr.spec.gpus, exclusive=pr.spec.exclusive, hold_until=quantum)
+              else GpuSlot(gpus=pr.spec.gpus, exclusive=pr.spec.exclusive, hold_until=quantum)
             )
-            local[p] = replace(w, demand=Demand.READY if c.s.busy(p) else Demand.IDLE)
+            local[p] = replace(w, demand=Demand.READY if c.s.is_busy(p) else Demand.IDLE)
         keep, _ = apply_gpus(local, dict.fromkeys(local, quantum), c.s, c.nodes[n]["gpus"], now)
         for p, w in local.items():
           if keep.get(p) and w.demand != Demand.IDLE:
@@ -900,8 +905,8 @@ class TestMultiNodeExecution(RedisTest):
 
   def live_params(self, run: str) -> dict[str, torch.Tensor]:
     for node in self.nodes:
-      for proc, lf in node.lives.items():
-        if run in lf.owned and proc in node.processes:
+      for proc, lf in node.workers.items():
+        if run in lf.owned_runs and proc in node.processes:
           return node.processes[proc].trainer.model.params[run]
     raise AssertionError(f"no live owner found for {run}")
 
@@ -917,11 +922,11 @@ class TestMultiNodeExecution(RedisTest):
     self.bus.write_plan = record
     await scheduler.tick(self.bus)  # the run gets a process, and the process a node
     await scheduler.tick(self.bus)  # nothing changed
-    await self.bus.r.hincrbyfloat(key("service"), "acct", 5.0)
+    await self.bus.raw.hincrbyfloat(key("service"), "acct", 5.0)
     await scheduler.tick(self.bus)  # only what the account has been served moved
     await self.bus.create_run(Run("r2", "tiny", 4, lora=LORA, account="acct"))
     await scheduler.tick(self.bus)  # a run joined the process: only `home` moved
-    await self.bus.r.hdel(key("nodes"), "n")
+    await self.bus.raw.hdel(key("nodes"), "n")
     await self.bus.node_heartbeat("m", 1)
     await scheduler.tick(self.bus)  # the process changed node: only `procs` moved
     self.assertEqual(writes, [True, False, True, True])
@@ -947,7 +952,7 @@ class TestMultiNodeExecution(RedisTest):
       self.assertTrue((await self.bus.wait_for_reply(b, 10)).ok)
 
     state = from_state(await self.bus.read_state())
-    self.assertEqual({state.procs[state.home[r][0]].node for r in (r1, r2)}, {"node-a", "node-b"})
+    self.assertEqual({state.procs[state.assignments[r][0]].node for r in (r1, r2)}, {"node-a", "node-b"})
 
     ref = Model(tiny)
     ref.create_run(ctrl, "tiny", 0, {})
@@ -975,8 +980,8 @@ class TestMultiNodeExecution(RedisTest):
         return await super().sample(job, name)
 
     with (
-      mock.patch("tinyrl.control.workers.QUANTUM_MS", 15),
-      mock.patch("tinyrl.control.workers.SAMPLE_COMMANDS", 2),
+      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
+      mock.patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 2),
     ):
       await self.add_node("shared", gpus=1, engine=BusySampler)
       self.start_scheduler()
@@ -1017,7 +1022,7 @@ class TestMultiNodeExecution(RedisTest):
       await self.bus.create_run(Run(run, "tiny", 4, lora=LORA, account=account))
       await self.run_cmd(run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode())
     with mock.patch.object(InlineProcess, "call", timed_call):
-      backlog = self.bus.r.pipeline()
+      backlog = self.bus.raw.pipeline()
       for run in accounts:
         for _ in range(100):
           backlog.xadd(key("q", run), {"op": Op.OPTIM_STEP, "body": b'{"adam_params":{}}'})
@@ -1042,7 +1047,7 @@ class TestMultiNodeExecution(RedisTest):
       await self.run_cmd(r, Op.FORWARD_BACKWARD, proto_body(r, 10))
       await self.run_cmd(r, Op.OPTIM_STEP, opt)
     s0 = from_state(await self.bus.read_state())
-    self.assertEqual(s0.home[r1], s0.home[r2])
+    self.assertEqual(s0.assignments[r1], s0.assignments[r2])
 
     await self.add_node("node-b", gpus=1)
     futs = [
@@ -1051,8 +1056,8 @@ class TestMultiNodeExecution(RedisTest):
     ]
     await scheduler.tick(self.bus)
     s1 = from_state(await self.bus.read_state())
-    self.assertNotEqual(s1.home[r1], s1.home[r2])
-    self.assertEqual({s1.procs[s1.home[r][0]].node for r in (r1, r2)}, {"node-a", "node-b"})
+    self.assertNotEqual(s1.assignments[r1], s1.assignments[r2])
+    self.assertEqual({s1.procs[s1.assignments[r][0]].node for r in (r1, r2)}, {"node-a", "node-b"})
     for a, b in futs:
       self.assertTrue((await self.bus.wait_for_reply(a, 10)).ok)
       self.assertTrue((await self.bus.wait_for_reply(b, 10)).ok)
@@ -1063,7 +1068,7 @@ class TestMultiNodeExecution(RedisTest):
 
     async def merged() -> bool:
       st = from_state(await self.bus.read_state())
-      return st.home.get(r1) == st.home.get(r2)
+      return st.assignments.get(r1) == st.assignments.get(r2)
 
     await self.until(merged)
     for r in (r1, r2):
@@ -1095,12 +1100,12 @@ class TestMultiNodeExecution(RedisTest):
     await self.bus.create_run(Run(sid, "tiny", 4, role=Role.SAMPLER, account="team-s"))
     total_cmds = 2 * SCALE_BATCH + 4
     payload = json.dumps(JOB).encode()
-    with mock.patch("tinyrl.control.workers.SAMPLE_COMMANDS", 2):
+    with mock.patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 2):
       reqs = [await self.submit(sid, Op.SAMPLE, payload, cost=50) for _ in range(total_cmds)]
 
       async def scaled_out() -> bool:
         st = from_state(await self.bus.read_state())
-        return len(st.home.get(sid, ())) >= 2 and len(set(served_by)) >= 2
+        return len(st.assignments.get(sid, ())) >= 2 and len(set(served_by)) >= 2
 
       await self.until(scaled_out)
       for req in reqs:
@@ -1109,22 +1114,22 @@ class TestMultiNodeExecution(RedisTest):
         self.assertEqual(len(wire.sample_json(reply.body)["sequences"]), 1)
 
     # Every command is counted and billed in `gpu_ms` once despite concurrent multi-node readers.
-    self.assertEqual(int(await self.bus.r.hget(key("run", sid), "tokens")), total_cmds * 50)
+    self.assertEqual(int(await self.bus.raw.hget(key("run", sid), "tokens")), total_cmds * 50)
     svc_before = (await self.bus.read_state())["service"]["team-s"]
     self.assertGreaterEqual(svc_before, total_cmds * 20.0)
 
     async def scaled_in() -> bool:
-      return len(from_state(await self.bus.read_state()).home.get(sid, ())) == 1
+      return len(from_state(await self.bus.read_state()).assignments.get(sid, ())) == 1
 
     await self.until(scaled_in)
 
     # Deliver the final sample to a crashed replica before a live replica can see it.
     queue = key("q", sid)
-    p = self.bus.r.pipeline()
+    p = self.bus.raw.pipeline()
     p.xadd(queue, {"op": Op.SAMPLE, "body": payload, "cost": 50})
     p.xreadgroup(GROUP, "dead", {queue: ">"}, count=1)
     eid, _ = await p.execute()
-    await self.bus.r.xclaim(queue, GROUP, "dead", 0, [eid], idle=LEASE_MS)
+    await self.bus.raw.xclaim(queue, GROUP, "dead", 0, [eid], idle=LEASE_MS)
     self.assertTrue((await self.bus.wait_for_reply(f"{sid}/{eid.decode()}", 5)).ok)
     self.assertEqual((await self.bus.get_run(sid))["tokens"], (total_cmds + 1) * 50)
     self.assertGreater((await self.bus.read_state())["service"]["team-s"], svc_before)
@@ -1140,14 +1145,14 @@ class TestMultiNodeExecution(RedisTest):
     # Malformed split-brain plan: `r1` assigned to BOTH nodes, `r2` co-placed on 1-GPU `node-a`, `gang` on undersized `node-a`.
     spec1 = {"role": "trainer", "base": "tiny", "lora": False, "exclusive": False, "train_run": None, "gpus": 1}
     bad_plan = {
-      "made": 4,
+      "next_worker_id": 4,
       "procs": {
         "p1": {"spec": spec1, "node": "node-a"},
         "p2": {"spec": spec1, "node": "node-a"},
         "pg": {"spec": spec1 | {"gpus": 2}, "node": "node-a"},
         "p3": {"spec": spec1, "node": "node-b"},
       },
-      "home": {r1: ["p1", "p3"], r2: ["p2"], gang: ["pg"]},
+      "assignments": {r1: ["p1", "p3"], r2: ["p2"], gang: ["pg"]},
       "lag": {},
       "seen": {},
     }
@@ -1161,12 +1166,12 @@ class TestMultiNodeExecution(RedisTest):
 
     for req in futs:
       async with asyncio.timeout(10):
-        while (await self.bus.r.xlen(f"tinyrl:f:{req}")) == 0:
+        while (await self.bus.raw.xlen(f"tinyrl:f:{req}")) == 0:
           for node in (node_a, node_b):
-            flat = [g for gs in node.on.values() for g in gs]
+            flat = [g for gs in node.gpu_allocations.values() for g in gs]
             self.assertEqual(len(flat), len(set(flat)))  # GpuExclusive
-            self.assertTrue(all(not k.startswith("pg@") for k in node.on))  # oversized gang rejected
-          holders = [f"{n.id}:{p}" for n in (node_a, node_b) for p, lf in n.lives.items() if r1 in lf.owned]
+            self.assertTrue(all(not k.startswith("pg@") for k in node.gpu_allocations))  # oversized gang rejected
+          holders = [f"{n.id}:{p}" for n in (node_a, node_b) for p, lf in n.workers.items() if r1 in lf.owned_runs]
           self.assertLessEqual(len(holders), 1)  # SingleWriter
           await asyncio.sleep(0.005)
       self.assertTrue((await self.bus.wait_for_reply(req, 5)).ok)
@@ -1185,8 +1190,8 @@ class TestMultiNodeExecution(RedisTest):
     before = time.monotonic()
     await self.create(a, account="alice")
     await self.run_cmd(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
-    pa = from_state(await self.bus.read_state()).home[a][0]
-    lf_a = node.lives[pa]
+    pa = from_state(await self.bus.read_state()).assignments[a][0]
+    lf_a = node.workers[pa]
     # Push `a` past its minimum quantum (into xOS OVERTIME) without touching `b` yet.
     self.assertGreaterEqual(lf_a.hold_until, before + QUANTUM_MS / 1000)
     lf_a.hold_until = expired = time.monotonic() - 1.0

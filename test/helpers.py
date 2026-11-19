@@ -9,7 +9,7 @@ import uuid
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from tinyrl.bus import Bus, connect, queue_checkpoint
+from tinyrl.bus import Bus, connect, record_checkpoint
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -47,8 +47,8 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   proc: subprocess.Popen | None = None
 
   async def seed_checkpoint(self, uri, size, *, ttl=None, owned=False, version=None):
-    pipeline = self.bus.s.pipeline()
-    queue_checkpoint(pipeline, uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned)
+    pipeline = self.bus.meta.pipeline()
+    record_checkpoint(pipeline, uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned)
     await pipeline.execute()
 
   @classmethod
@@ -69,12 +69,12 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
     self.renewal_tasks = []
     self.bus = Bus(connect(self.url))
-    await self.bus.r.flushall()
+    await self.bus.meta.flushall()
 
   async def worker(self, run: str) -> str:
     """The run's primary process, once every new run is assigned the way the scheduler assigns it."""
     plan = await assign_new_runs(self.bus)
-    return plan["home"][run][0]
+    return plan["assignments"][run][0]
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
@@ -94,11 +94,12 @@ async def assign_new_runs(bus) -> dict:
     **plan.get("procs", {}),
     **{n: v for n, v in scheduler.to_plan(new)["procs"].items() if n not in plan.get("procs", {})},
   }
-  home = {
-    **{r: ps for r, ps in plan.get("home", {}).items() if r in new.jobs},
+  assignments = {
+    **{r: ps for r, ps in plan.get("assignments", {}).items() if r in new.jobs},
     **{b["run"]: [b["proc"]] for k, b in changes if k == "assigned"},
   }
-  merged = {**plan, "made": max(plan.get("made", 0), new.made), "procs": procs, "home": home}
+  next_id = max(plan.get("next_worker_id", 0), new.next_worker_id)
+  merged = {**plan, "next_worker_id": next_id, "procs": procs, "assignments": assignments}
   if merged != plan:
     await bus.write_plan(merged, [c for c in changes if c[0] == "assigned"])
   return merged

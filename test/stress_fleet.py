@@ -139,11 +139,11 @@ class StressNode(TestNode):
     self.processes[proc] = process
     return process
 
-  def dispatch(self):
+  def reap_workers(self):
     for proc, task in self.tasks.items():
       if task.done() and not task.cancelled() and (err := task.exception()):
         self.errors.append(f"{self.id}/{proc}: {err!r}")
-    super().dispatch()
+    super().reap_workers()
 
 
 class Stress(RedisTest):
@@ -194,7 +194,7 @@ class Stress(RedisTest):
     await node.close(graceful=graceful)
     if task := node.sweeping:
       task.cancel()
-    await self.bus.r.hdel(key("nodes"), name)
+    await self.bus.meta.hdel(key("nodes"), name)
     await node.bus.aclose()
 
   async def cut_node(self, name: str) -> None:
@@ -203,7 +203,7 @@ class Stress(RedisTest):
     node = self.nodes.pop(name)
     self.loops.pop(name).cancel()
     await node.bus.aclose()
-    node.bus.r = node.bus.s = Unreachable()
+    node.bus.raw = node.bus.meta = Unreachable()
     for task in node.tasks.values():
       task.cancel()
     await asyncio.gather(*node.tasks.values(), return_exceptions=True)
@@ -274,27 +274,27 @@ class Stress(RedisTest):
   async def dump(self, run: str, request: str) -> None:
     """Where a command that got no reply is stuck."""
     raw = await self.bus.read_state()
-    row = {
-      k.decode(): v.decode()[:80] for k, v in (await self.bus.r.hgetall(key("run", run))).items() if k != b"record"
-    }
+    row = {k: v[:80] for k, v in (await self.bus.meta.hgetall(key("run", run))).items() if k != "record"}
     plan, out = raw["plan"], [f"--- {request} at {time.monotonic() - self.started:.1f}s", f"row {row}"]
     out.append(f"queue {await self.bus.queued_and_in_flight(run)}")
     out.append(
-      f"home {plan.get('home', {}).get(run)} procs { {n: p['node'] for n, p in plan.get('procs', {}).items()} }"
+      f"assigned {plan.get('assignments', {}).get(run)} procs { {n: p['node'] for n, p in plan.get('procs', {}).items()} }"
     )
     out.append(
       f"lag { {a: round(v) for a, v in plan.get('lag', {}).items()} } service { {a: round(v) for a, v in raw['service'].items()} }"
     )
     for node in self.nodes.values():
-      out.append(f"{node.id}: gpus={node.gpus} on={node.on} physical={node.occ.on} draining={node.draining}")
-      for proc, lf in node.lives.items():
-        heads = [(c.run[:4], c.op.value) for c in lf.heads.values()]
-        owned = [r[:4] for r in getattr(lf, "owned", ())]
+      out.append(
+        f"{node.id}: gpus={node.gpus} alloc={node.gpu_allocations} physical={node.occ.on} draining={node.draining}"
+      )
+      for proc, w in node.workers.items():
+        heads = [(c.run[:4], c.op.value) for c in w.heads.values()]
+        owned = [r[:4] for r in w.owned_runs]
         out.append(
-          f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} demand={lf.demand.value} wanted={lf.wanted()} "
-          f"owned={owned} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
-          f"reader={'none' if lf.reader is None else 'done' if lf.reader.done() else 'reading'} "
-          f"task={'done' if node.tasks[proc].done() else 'running'} quantum_left={lf.hold_until - time.monotonic():.2f}s"
+          f"  {proc} {w.worker_id[-6:]} role={w.spec.role.value} gpus={w.spec.gpus} demand={w.demand.value} "
+          f"should_run={w.should_run()} owned={owned} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
+          f"watch={'none' if w.watch_task is None else 'done' if w.watch_task.done() else 'watching'} "
+          f"task={'done' if node.tasks[proc].done() else 'running'} quantum_left={w.hold_until - time.monotonic():.2f}s"
         )
     print("\n".join(out), file=sys.stderr)
 
@@ -415,11 +415,11 @@ class Stress(RedisTest):
     self.started = started
     self.abandoned, self.finished = [], []
     patches = [
-      mock.patch("tinyrl.control.workers.QUANTUM_MS", 100),
+      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 100),
       mock.patch("tinyrl.control.scheduler.REBALANCE_MS", 1000),
     ]
     if CHAOS:  # so that a node cut off from Redis is given up on in seconds
-      patches += [mock.patch(f"tinyrl.{m}.LEASE_MS", 3000) for m in ("bus", "control.workers")]
+      patches += [mock.patch(f"tinyrl.{m}.LEASE_MS", 3000) for m in ("bus", "control.node_daemon")]
       patches.append(mock.patch("tinyrl.bus.NODE_MS", 4000))
     for p in patches:
       p.start()
@@ -450,28 +450,28 @@ class Stress(RedisTest):
 
     # Delete everything, then nothing may be left behind.
     for run in trainers:
-      if await self.bus.r.sismember(key("runs"), run):
+      if await self.bus.meta.sismember(key("runs"), run):
         await self.call(run, Op.DELETE_MODEL, b"{}")
     for session in samplers:
       await self.bus.delete_run(session)
     try:
       async with asyncio.timeout(30):
-        while (await self.bus.read_state())["plan"].get("procs") or any(n.lives for n in self.nodes.values()):
+        while (await self.bus.read_state())["plan"].get("procs") or any(n.workers for n in self.nodes.values()):
           await asyncio.sleep(0.05)
     except TimeoutError:
       plan = (await self.bus.read_state())["plan"]
-      lives = {n.id: sorted(n.lives) for n in self.nodes.values()}
+      workers = {n.id: sorted(n.workers) for n in self.nodes.values()}
       self.problems.append(
-        f"did not settle after deleting every run: procs {sorted(plan.get('procs', {}))} lives {lives}"
+        f"did not settle after deleting every run: procs {sorted(plan.get('procs', {}))} workers {workers}"
       )
     # A node cut off from Redis cannot drop its leases. They must carry an expiry, and then they lapse by themselves.
-    cut, leases = {n.id for n in self.cut}, [k.decode() async for k in self.bus.r.scan_iter(match=key("lease", "*"))]
-    lapsing = [k for k in leases if k.split("@")[-1].rsplit("-", 1)[0] in cut and await self.bus.r.pttl(k) != -1]
+    cut, leases = {n.id for n in self.cut}, [k async for k in self.bus.meta.scan_iter(match=key("lease", "*"))]
+    lapsing = [k for k in leases if k.split("@")[-1].rsplit("-", 1)[0] in cut and await self.bus.meta.pttl(k) != -1]
     left = {
       "leases": sorted(set(leases) - set(lapsing)),
-      "queues": [k.decode() async for k in self.bus.r.scan_iter(match=key("q", "*"))],
-      "writing": sorted(k.decode() for k in await self.bus.r.hkeys(key("writing"))),
-      "owners": [r for r in trainers if await self.bus.r.hget(key("run", r), "owner")],
+      "queues": [k async for k in self.bus.meta.scan_iter(match=key("q", "*"))],
+      "writing": sorted(await self.bus.meta.hkeys(key("writing"))),
+      "owners": [r for r in trainers if await self.bus.meta.hget(key("run", r), "owner")],
       "on GPUs": {n.id: dict(n.occ.on) for n in self.nodes.values() if n.occ.on},
     }
     self.problems += [f"left behind {what}: {found}" for what, found in left.items() if found]

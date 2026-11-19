@@ -100,8 +100,6 @@ services, stop the nodes gracefully and restart the scheduler and node daemons t
 | Variable | Default | Controls |
 |---|---|---|
 | `QUANTUM_MS` | 2000 | Minimum busy GPU turn, checked between commands or waves |
-| `MAX_QUANTUM_MS` | 15000 | Upper bound on adaptive turn quantum so large PCIe parks cannot starve peers |
-| `SWITCH_BUDGET` | 0.1 | Target ratio of measured park and resume time to useful time in a turn |
 | `CYCLE_GRACE_MS` | 100 | How long a trainer keeps its turn after a command, waiting for its client's next one |
 | `SAMPLE_RUNS` | 3 | LoRA sessions in a sampling wave; full fine-tunes use one |
 | `SAMPLE_COMMANDS` | 128 | Commands from each session in a wave |
@@ -199,8 +197,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 | [tinyrl/control/fairness.py](tinyrl/control/fairness.py) | account service balances, GPU turns and run selection within a turn |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | the cluster's assignment: runs to workers, workers to nodes |
 | [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | monotonic GPU-time measurement across overlapping calls |
-| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | node heartbeats, local GPU ownership table and worker supervision |
-| [tinyrl/control/workers.py](tinyrl/control/workers.py) | trainer and sampler lifecycle runners, lease keepalive and GPU turns |
+| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | node daemon and unified `Worker` loop (leases, local GPU turns, recovery) |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | private model IPC and parent-owned process groups |
 | [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | model memory and GPU-width estimates |
 | [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | synchronous model commands and checkpoint metadata |
@@ -219,7 +216,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 Settings are environment variables: `REDIS_URL`, `PORT`, `MODEL_CACHE` (where a node keeps base models it fetched), `MODEL_MIRROR` (a folder or bucket nodes read hub models from first), `CKPT` (the
 checkpoint directory or bucket the trainers and samplers share), `CKPT_CACHE` (where a node keeps the checkpoints it saved or downloaded, in front of a bucket `CKPT`), `CKPT_CACHE_BYTES` (the most it keeps, least recently read first, 0 for half its disk), `TOKEN_BUDGET` (padded tokens per pass; unset, each call sizes its passes to the free
 GPU memory), `CHUNK`, `GRAD_CKPT`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE`, `LEASE_MS`, `GPUS`, `QUANTUM_MS`,
-`MAX_QUANTUM_MS`, `SWITCH_BUDGET`, `CYCLE_GRACE_MS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `SCALE_BATCH`, `REBALANCE_MS`,
+`CYCLE_GRACE_MS`, `SAMPLE_RUNS`, `SAMPLE_COMMANDS`, `SCALE_BATCH`, `REBALANCE_MS`,
 `IDLE_MS`, `TICK`, `TICK_MS`, `SWEEP_S`, `SHARD_BYTES`, `GPU_MEMORY_MIB`, `DRAIN_S`,
 `ENGINE`, `VLLM_ARGS`, `CKPT_TTL` (the TTL, at least 3600 s, of a checkpoint saved without one; 0 keeps it until deleted), `TINYRL_SNAPSHOTS` (where a node keeps vLLM snapshots; unset, samplers boot vLLM every time) and `DEBUG=1`.
 

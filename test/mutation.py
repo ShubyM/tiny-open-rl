@@ -26,10 +26,10 @@ CASES = [
   (FAIRNESS, "select_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
   (FAIRNESS, "select_runs", "[:width]", "[:1]", ORDER),
   (FAIRNESS, "select_runs", 'tuple(map(int, cmd.entry_id.split("-")))', "cmd.entry_id", ORDER),
-  (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
+  (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.billed_service.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (BUS, "finish_cmd", "if acct and charge.gpu_ms:", "if reply.ok and acct and charge.gpu_ms:", BILLING),
+  (BUS, "finish_command", "if acct and charge.gpu_ms:", "if reply.ok and acct and charge.gpu_ms:", BILLING),
   (BUS, "claim_trainer", 'await p.hget(k, "owner") != token.encode()', "False", CLAIM),
   (
     BUS,

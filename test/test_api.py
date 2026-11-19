@@ -246,12 +246,12 @@ class TestAPI(RedisTest):
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 
     stale = {session_id: time.time() - bus.SESSION_GRACE - 1}
-    await self.bus.r.zadd(bus.key("seen"), stale)
+    await self.bus.meta.zadd(bus.key("seen"), stale)
     await self.post("session_heartbeat", json={"session_id": session_id})  # a heartbeat in time keeps it
     await asyncio.sleep(0.3)
     self.assertTrue((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
 
-    await self.bus.r.zadd(bus.key("seen"), stale)  # its last heartbeat, longer ago than the grace
+    await self.bus.meta.zadd(bus.key("seen"), stale)  # its last heartbeat, longer ago than the grace
     await self.scheduling_until(lambda d: samp_id not in d["state"]["jobs"])
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])

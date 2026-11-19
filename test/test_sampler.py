@@ -201,8 +201,8 @@ class TestSampler(RedisTest):
       [error] = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
       self.assertIsInstance(error, RuntimeError)
       self.assertIsNone(sampler.running)
-      self.assertNotIn(lf.life, node.on)
-      self.assertFalse(await self.bus.r.exists(key("lease", lf.life)))
+      self.assertFalse(lf.has_gpus)
+      self.assertFalse(await self.bus.meta.exists(key("lease", lf.worker_id)))
       self.assertIsNone(await self.bus.wait_for_reply(future, 0))
       self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
     finally:
@@ -262,7 +262,7 @@ class TestSampler(RedisTest):
     try:
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
-      await self.until(lambda: bool(waiting.ready()[0]))
+      await self.until(lambda: bool(waiting.ready_heads()[0]))
       broken = await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode())
       reply = await self.bus.wait_for_reply(broken, 3)
       self.assertIsNotNone(reply, "a healthy head waiting for GPU must not hold up a preparation error")
@@ -293,14 +293,14 @@ class TestSampler(RedisTest):
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
     await node.announce_node()
     with (
-      mock.patch("tinyrl.control.workers.QUANTUM_MS", 15),
-      mock.patch("tinyrl.control.workers.SAMPLE_COMMANDS", 1),
+      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
+      mock.patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 1),
     ):
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode(), cost=10)
       self.pump(node, sched=True)
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode(), cost=10)
-      await self.until(lambda: "ready" in node.state.home and node.state.home["ready"][0] in node.lives)
+      await self.until(lambda: "ready" in node.state.assignments and node.state.assignments["ready"][0] in node.workers)
       tail = [
         await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [p]}).encode(), cost=10)
         for p in (33, 44, 55)
@@ -329,7 +329,7 @@ class TestSampler(RedisTest):
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
     self.assertGreater(queued[0], 0, "ready work waited for the whole invalid backlog")
     self.assertFalse((await self.bus.wait_for_reply(requests[-1], 5)).ok)
-    self.assertEqual(int(await self.bus.r.hget(key("run", "broken"), "failed")), len(requests))
+    self.assertEqual(int(await self.bus.meta.hget(key("run", "broken"), "failed")), len(requests))
 
 
 if __name__ == "__main__":

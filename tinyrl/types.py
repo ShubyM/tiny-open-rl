@@ -84,8 +84,8 @@ class Event:
   body: dict
 
 
-def unpack_snap(snap: str) -> tuple[str, str]:
-  uri, version = snap.split("\n", 1)
+def unpack_snapshot(snapshot: str) -> tuple[str, str]:
+  uri, version = snapshot.split("\n", 1)
   return uri, version
 
 

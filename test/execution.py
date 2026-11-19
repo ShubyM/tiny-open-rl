@@ -74,11 +74,11 @@ class TestNode(NodeDaemon):
     self.state = await self.read_state()
 
   async def bind(self, proc: str, *runs: str):
-    """Create or update `proc` in `tinyrl:plan` hosting `runs` on this node, then start its `Lifetime`."""
+    """Create or update `proc` in `tinyrl:plan` hosting `runs` on this node, then start its `Worker`."""
     state = scheduler.from_state(await self.bus.read_state())
     for r in runs:
       state.procs.setdefault(proc, scheduler.Proc(state.jobs[r].spec))
-      state.home[r] = [proc]
+      state.assignments[r] = [proc]
     await self.bus.write_plan(scheduler.to_plan(state))
     return await self.add(proc)
 
@@ -86,21 +86,21 @@ class TestNode(NodeDaemon):
     self.unpinned.discard(proc)
     self.pinned.add(proc)
     await self.sync()
-    self.dispatch()
-    if proc in self.lives:
+    self.reap_workers()
+    if proc in self.workers:
       self.notify()
-      return self.lives[proc]
-    task = self.tasks.get(proc) or self.start(proc)
+      return self.workers[proc]
+    task = self.tasks.get(proc) or self.start_worker(proc)
     async with asyncio.timeout(5):
-      while proc not in self.lives:
+      while proc not in self.workers:
         if task.done():
           task.result()
           raise AssertionError(f"could not start {proc}")
         await asyncio.sleep(0.001)
-    return self.lives[proc]
+    return self.workers[proc]
 
   def drop_local(self, proc: str):
-    """Unplace a locally pinned process so its `Lifetime` detaches its runs and exits."""
+    """Unplace a locally pinned worker so it detaches its runs and exits."""
     self.pinned.discard(proc)
     self.unpinned.add(proc)
     if p := self.state.procs.get(proc):
@@ -110,11 +110,11 @@ class TestNode(NodeDaemon):
   async def worker_for(self, run: str) -> str | None:
     await assign_new_runs(self.bus)
     await self.sync()
-    ps = self.state.home.get(run)
+    ps = self.state.assignments.get(run)
     return ps[0] if ps else None
 
   async def drain(self, run: str):
-    """Let real `Lifetime` coroutines execute every queued command for `run`'s process."""
+    """Let real `Worker` coroutines execute every queued command for `run`'s process."""
     if (proc := await self.worker_for(run)) is None:
       return None
     await self.add(proc)
@@ -126,7 +126,7 @@ class TestNode(NodeDaemon):
         if not any(q.get("queued") or q.get("in_flight") for q in queues):
           break
         await asyncio.sleep(0.002)
-    return self.lives.get(proc)
+    return self.workers.get(proc)
 
   async def aclose(self):
     await self.close(graceful=False)

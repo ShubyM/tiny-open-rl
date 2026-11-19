@@ -10,7 +10,7 @@ import unittest
 
 from test.helpers import RedisTest, new_id, tiny
 from test.test_process import require_unix
-from tinyrl.bus import Op, Reply, Run, key, unpack_snap
+from tinyrl.bus import Op, Reply, Run, key, unpack_snapshot
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 
@@ -107,7 +107,7 @@ class TestLease(RedisTest):
       await self.until(pending)
       first.send_signal(signal.SIGSTOP)
       os.killpg(model_pid, signal.SIGCONT)  # the child may run while its parent cannot publish a result
-      await self.bus.r.hdel(key("nodes"), first_node)  # its heartbeat ran out
+      await self.bus.meta.hdel(key("nodes"), first_node)  # its heartbeat ran out
       expected = await self.bus.wait_for_reply(request, 30)
       self.assertFalse(expected.ok)
       self.assertIn("lost ownership", json.loads(expected.body)["error"])
@@ -120,7 +120,7 @@ class TestLease(RedisTest):
 
     async def first_reaped():
       nodes = await self.bus.live_nodes(details=True)
-      return first_node in nodes and not nodes[first_node]["pids"] and not nodes[first_node]["on"]
+      return first_node in nodes and not nodes[first_node]["pids"] and not nodes[first_node]["gpu_allocations"]
 
     await self.until(first_reaped)
     self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
@@ -143,7 +143,7 @@ class TestLease(RedisTest):
     self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
     info = await self.bus.get_run(run)
     self.assertIsNone(info.get("owner"))
-    uri, version = unpack_snap(info["snap"])
+    uri, version = unpack_snapshot(info["snapshot"])
     tensors, meta = self.store.get(version)
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])

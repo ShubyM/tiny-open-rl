@@ -23,7 +23,7 @@ class TestEvents(RedisTest):
     home = {}
     for _ in range(100):
       state = scheduler.from_state(await self.bus.read_state())
-      home = state.home
+      home = state.assignments
       if all(home.get(r) for r in ("a", "b", "f")):
         break
       await asyncio.sleep(0.02)

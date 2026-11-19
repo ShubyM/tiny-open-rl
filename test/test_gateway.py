@@ -24,7 +24,7 @@ class TestGatewayDedupe(RedisTest):
     self.assertEqual(r2.status_code, 200)
     self.assertEqual(r1.json()["model_id"], r2.json()["model_id"])
 
-    runs = await self.bus.r.smembers("tinyrl:runs")
+    runs = await self.bus.meta.smembers("tinyrl:runs")
     self.assertEqual(len(runs), 1)
 
   async def test_b2_save_weights_for_sampler_dedupes(self):
@@ -40,8 +40,8 @@ class TestGatewayDedupe(RedisTest):
     self.assertEqual(s2.status_code, 200)
     self.assertEqual(s1.json()["request_id"], s2.json()["request_id"])
 
-    runs = await self.bus.r.smembers("tinyrl:runs")
-    samplers = [r for r in runs if r.decode().startswith("samp-")]
+    runs = await self.bus.meta.smembers("tinyrl:runs")
+    samplers = [r for r in runs if r.startswith("samp-")]
     self.assertEqual(len(samplers), 1)
 
   async def test_zero_or_negative_gpus_is_rejected(self):

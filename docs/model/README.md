@@ -6,9 +6,9 @@ These specifications model and exhaustively verify the `tinyrl` control plane ac
 
 | Module | Truth / Hint | Code mapping |
 | --- | --- | --- |
-| `PagedFleet.tla` | Ground truth: `on` (node GPU table), `run` (`owner`, `epoch`, `pos`, `snap`, `claimed`), `lease`. Pure hints: `procs`, `home`. | `tinyrl/bus.py`, `tinyrl/control/node_daemon.py`, `tinyrl/control/workers.py` |
-| `ConvPaged.tla` | Finite termination rank proving deadlock-free convergence to any well-formed `(procs, home)` once crashes/plan edits stop. | `NodeDaemon.tick`, `Runner.run` |
-| `Lag.tla` | EEVDF `lag` updated from monotone `service - seen` deltas (`gpu_ms`) with minimum-quantum switch amortization `c / eps`. | `fairness.py` (`waterfill`, `update_lag`, `plan_gpus`), `scheduler.py` (`rebalance_target`), `workers.py` (`promote`) |
+| `PagedFleet.tla` | Ground truth: `gpu_allocations` (node GPU table), `run` (`owner`, `epoch`, `last_cmd_id`, `snapshot`, `claimed`), `lease`. Hints: `procs`, `assignments`. | `tinyrl/bus.py`, `tinyrl/control/node_daemon.py` |
+| `ConvPaged.tla` | Finite termination rank proving deadlock-free convergence to any well-formed `(procs, assignments)` once crashes/plan edits stop. | `NodeDaemon.tick`, `Worker.run` |
+| `Lag.tla` | EEVDF `lag` updated from monotone `service - billed_service` deltas (`gpu_ms`) with minimum-quantum switch amortization. | `fairness.py` (`waterfill`, `update_lag`, `plan_gpus`), `scheduler.py` (`rebalance_target`), `node_daemon.py` (`acquire_gpus`) |
 
 ## Verified Properties and Rule Necessity
 

@@ -323,11 +323,11 @@ class TestTrainer(RedisTest):
   async def until(self, predicate):
     async with asyncio.timeout(10):
       while not predicate():
-        self.node.dispatch()
+        self.node.reap_workers()
         await asyncio.sleep(0.01)
 
   async def finish_worker(self, proc):
-    await self.until(lambda: proc not in self.node.lives)
+    await self.until(lambda: proc not in self.node.workers)
 
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
@@ -356,19 +356,19 @@ class TestTrainer(RedisTest):
       await self.finish_worker(f"p-{rank}")
       info = await self.bus.get_run(run)
       self.assertIsNone(info.get("owner"))
-      parked = info["snap"].partition("\n")[0]
+      parked = info["snapshot"].partition("\n")[0]
       self.assertIsNotNone(await self.bus.get_checkpoint(parked))
       # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
       await self.node.drain(run)
       self.assertFalse((await self.bus.wait_for_reply(invalid, 1)).ok)
-      self.assertEqual((await self.bus.get_run(run))["snap"].partition("\n")[0], parked)
+      self.assertEqual((await self.bus.get_run(run))["snapshot"].partition("\n")[0], parked)
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
-      self.assertIsNone((await self.bus.get_run(run)).get("snap"))
+      self.assertIsNone((await self.bus.get_run(run)).get("snapshot"))
       self.assertIsNone(await self.bus.get_checkpoint(parked))  # recovery cannot replay old state after a crash
 
   async def test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure(self):
@@ -385,7 +385,7 @@ class TestTrainer(RedisTest):
     for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
       self.node.drop_local("p")
       await self.finish_worker("p")
-      parked = (await self.bus.get_run(run))["snap"].partition("\n")[0]
+      parked = (await self.bus.get_run(run))["snapshot"].partition("\n")[0]
       [request] = await self.submit(run, command)
       await self.node.drain(run)
       reply = await self.bus.wait_for_reply(request, 1)
@@ -393,8 +393,8 @@ class TestTrainer(RedisTest):
       if command == step:
         self.assertIn("accumulated gradients were discarded", reply.body.decode())
       info = await self.bus.get_run(run)
-      self.assertEqual(info["pos"], request.rsplit("/", 1)[1])
-      self.assertIsNone(info.get("snap"))
+      self.assertEqual(info["last_cmd_id"], request.rsplit("/", 1)[1])
+      self.assertIsNone(info.get("snapshot"))
       self.assertIsNone(await self.bus.get_checkpoint(parked))
 
     self.node.drop_local("p")

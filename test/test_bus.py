@@ -5,7 +5,7 @@ import time
 import unittest
 
 from test.helpers import RedisTest, new_id, start_redis
-from tinyrl.bus import GROUP, Bus, Cmd, Op, Reply, Role, Run, connect, key, unpack_snap
+from tinyrl.bus import GROUP, Bus, Cmd, Op, Reply, Role, Run, connect, key, unpack_snapshot
 from tinyrl.control.accounting import Charge
 
 
@@ -42,7 +42,7 @@ class TestBus(RedisTest):
 
     run = await self.bus.get_run(run_id)
     self.assertEqual(
-      (run["base"], run["rank"], run["steps"], run["tokens"], run["pos"]), ("base", 8, 1, 42, cmd.entry_id)
+      (run["base"], run["rank"], run["steps"], run["tokens"], run["last_cmd_id"]), ("base", 8, 1, 42, cmd.entry_id)
     )
     self.assertEqual((run["wait_ms"], run["busy_ms"]), (12, 50))
     self.assertEqual((await self.bus.read_state())["service"]["alice"], 100.5)
@@ -81,11 +81,11 @@ class TestBus(RedisTest):
   async def test_a_retried_call_is_queued_once_even_if_its_seq_key_is_gone(self):
     run_id = await self.new_run()
     first = await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=5)
-    await self.bus.r.delete(key("seq", run_id, "5"))
+    await self.bus.raw.delete(key("seq", run_id, "5"))
     self.assertEqual(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=5), first)
-    self.assertEqual(await self.bus.r.get(key("seq", run_id, "5")), first.encode())
+    self.assertEqual(await self.bus.raw.get(key("seq", run_id, "5")), first.encode())
     self.assertNotEqual(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=6), first)
-    self.assertEqual(await self.bus.r.xlen(key("q", run_id)), 2)
+    self.assertEqual(await self.bus.raw.xlen(key("q", run_id)), 2)
 
   async def test_a_retry_after_its_run_was_deleted_gets_the_first_request_id(self):
     run_id = await self.new_run()
@@ -101,7 +101,7 @@ class TestBus(RedisTest):
     await self.bus.delete_run(run_id)
     self.assertIsNone(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b""))
     self.assertEqual(await self.bus.queued_and_in_flight(run_id), {"live": False})
-    self.assertFalse(await self.bus.r.exists(key("q", run_id)))
+    self.assertFalse(await self.bus.raw.exists(key("q", run_id)))
 
   async def test_delete_removes_owned_checkpoints_and_keeps_saved_weights(self):
     run = await self.new_run()
@@ -109,16 +109,16 @@ class TestBus(RedisTest):
     for uri in (owned, saved):
       await self.seed_checkpoint(uri, 1, ttl=60, owned=uri == owned)
     self.assertTrue(await self.bus.detach_run(run, self.tokens[run], None, f"{owned}\nv1"))
-    token, _, snap = await self.bus.acquire_run(run, "w0")
-    self.assertEqual(unpack_snap(snap), (owned, "v1"))
+    token, _, snapshot = await self.bus.acquire_run(run, "w0")
+    self.assertEqual(unpack_snapshot(snapshot), (owned, "v1"))
     request = await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
     cmd = await self.bus.claim_trainer(run, token)
     self.assertTrue(await self.bus.commit_reply(cmd, ok(), token))
     self.assertEqual(await self.bus.wait_for_reply(request, 5), ok())
-    self.assertFalse(await self.bus.r.exists(key("q", run)))
-    self.assertIsNone((await self.bus.get_run(run)).get("snap"))
+    self.assertFalse(await self.bus.meta.exists(key("q", run)))
+    self.assertIsNone((await self.bus.get_run(run)).get("snapshot"))
     self.assertIsNone((await self.bus.get_run(run)).get("owner"))
-    self.assertFalse(await self.bus.r.sismember(key("runs"), run))
+    self.assertFalse(await self.bus.meta.sismember(key("runs"), run))
     self.assertIsNone(await self.bus.get_checkpoint(owned))
     self.assertIsNotNone(await self.bus.get_checkpoint(saved))
     self.assertEqual([c["tinker_path"] for c in (await self.bus.page_of_checkpoints(10, 0))[0]], [saved])
@@ -157,9 +157,10 @@ class TestBus(RedisTest):
 
     claimed = await self.bus.claim_trainer(a, self.tokens[a])
     self.assertEqual(claimed, by_run[a])
-    next_heads = await self.bus.peek_trainer([a, b], after={a: claimed.entry_id})
-    self.assertEqual({cmd.run: cmd.request_id for cmd in next_heads}, {a: second, b: other})
     self.assertEqual([c["request_id"] for c in (await self.bus.queued_and_in_flight(a))["in_flight"]], [first])
+    self.assertTrue(await self.bus.commit_reply(claimed, ok(), self.tokens[a]))
+    next_heads = await self.bus.peek_trainer([a, b])
+    self.assertEqual({cmd.run: cmd.request_id for cmd in next_heads}, {a: second, b: other})
 
   async def test_a_new_owner_fails_what_a_dead_one_took_and_stale_tokens_are_fenced(self):
     run_id = await self.new_run()
@@ -216,7 +217,7 @@ class TestBus(RedisTest):
 
     stale = {"uri": uri, "size": 10, "ttl": 60, "version": "old"}
     self.assertFalse(await self.bus.commit_reply(abandoned, ok(), old, checkpoint=stale))
-    await self.bus.r.pexpire(key("f", request), 0)
+    await self.bus.raw.pexpire(key("f", request), 0)
     self.assertFalse(await self.bus.commit_reply(cmd, ok(), current, checkpoint=stale))
     self.assertEqual(await self.bus.checkpoint_version(uri), "new")
     self.assertIsNone((await self.bus.get_checkpoint(uri))["expires_at"])
@@ -252,19 +253,19 @@ class TestBus(RedisTest):
     await self.bus.submit_command(run_id, Op.SAVE_WEIGHTS, b"{}")
     ro = await self.bus.claim_trainer(run_id, token2)
     self.assertTrue(await self.bus.commit_reply(ro, ok(), token2, mutates=False))
-    self.assertEqual((await self.bus.get_run(run_id))["snap"], snap2)
+    self.assertEqual((await self.bus.get_run(run_id))["snapshot"], snap2)
     self.assertIsNotNone(await self.bus.get_checkpoint(parked_uri))
 
     await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
     mut = await self.bus.claim_trainer(run_id, token2)
     self.assertTrue(await self.bus.commit_reply(mut, ok(), token2, mutates=True))
-    self.assertIsNone((await self.bus.get_run(run_id)).get("snap"))
+    self.assertIsNone((await self.bus.get_run(run_id)).get("snapshot"))
     self.assertIsNone(await self.bus.get_checkpoint(parked_uri))
 
   async def test_unreaped_lease_recovery_preserves_epoch_token(self):
     run_id = await self.new_run()
     token = self.tokens[run_id]
-    await self.bus.r.pexpire(key("lease", "w0"), 0)
+    await self.bus.raw.pexpire(key("lease", "w0"), 0)
     self.assertFalse(await self.bus.renew_lease("w0"))
     self.assertTrue(await self.bus.renew_lease("w0", recover=True))  # recovered before anyone acquired
     await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
@@ -286,7 +287,7 @@ class TestBus(RedisTest):
     service = (await self.bus.read_state())["service"]["bob"]
     self.assertEqual(service, 40.5 + winner)
 
-    await self.bus.r.pexpire(key("f", req), 0)
+    await self.bus.raw.pexpire(key("f", req), 0)
     self.assertFalse(await self.bus.commit_sample(cmd, ok(late=True), "bob", Charge(busy_ms=100, gpu_ms=100)))
     self.assertIsNone(await self.bus.wait_for_reply(req, 0))
     self.assertEqual(await self.bus.get_run(sid), run)
@@ -298,7 +299,7 @@ class TestBus(RedisTest):
     taken = await self.bus.claim_samples([session], "w0")
     self.assertEqual([cmd.request_id for cmd in taken], requests)
     # However long a sample runs, another replica leaves it alone while its replica holds a lease.
-    await self.bus.r.xclaim(key("q", session), GROUP, "w0", 0, [cmd.entry_id for cmd in taken], idle=3_600_000)
+    await self.bus.raw.xclaim(key("q", session), GROUP, "w0", 0, [cmd.entry_id for cmd in taken], idle=3_600_000)
     self.assertEqual(await self.bus.claim_samples([session], "other"), [])
     self.assertEqual(await self.bus.peek_samples([session]), [])
 
@@ -310,7 +311,7 @@ class TestBus(RedisTest):
 
   async def test_a_dead_node_daemon_stops_counting(self):
     await self.bus.node_heartbeat("node-a", 2)
-    await self.bus.r.hset("tinyrl:nodes", "node-b", '{"gpus": 8, "until": 0}')
+    await self.bus.raw.hset("tinyrl:nodes", "node-b", '{"gpus": 8, "until": 0}')
     self.assertEqual(await self.bus.live_nodes(), {"node-a": 2})
 
   async def test_sessions(self):
@@ -325,14 +326,14 @@ class TestBus(RedisTest):
     await self.bus.heartbeat_session("s")
     run_id = await self.new_run(session="s")
     await self.bus.end_session("s")
-    self.assertEqual(len(await self.bus.r.xrange(key("q", run_id))), 1)
-    self.assertIsNotNone(await self.bus.r.zscore(key("seen"), "s"))
-    await self.bus.r.xtrim(key("q", run_id), maxlen=0)
+    self.assertEqual(len(await self.bus.raw.xrange(key("q", run_id))), 1)
+    self.assertIsNotNone(await self.bus.raw.zscore(key("seen"), "s"))
+    await self.bus.raw.xtrim(key("q", run_id), maxlen=0)
     await self.bus.end_session("s")
-    self.assertEqual(len(await self.bus.r.xrange(key("q", run_id))), 1)
+    self.assertEqual(len(await self.bus.raw.xrange(key("q", run_id))), 1)
     await self.bus.delete_run(run_id)
     await self.bus.end_session("s")
-    self.assertIsNone(await self.bus.r.zscore(key("seen"), "s"))
+    self.assertIsNone(await self.bus.raw.zscore(key("seen"), "s"))
 
   async def test_a_deleted_run_does_not_hide_another_runs_command(self):
     s, gone = await self.new_run(role=Role.SAMPLER), await self.new_run(role=Role.SAMPLER)

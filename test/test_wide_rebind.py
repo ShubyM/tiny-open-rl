@@ -10,15 +10,15 @@ from test.execution import TestNode
 from test.helpers import RedisTest, new_id
 from test.test_api import proto_body
 from tinyrl.bus import Op, Run
-from tinyrl.control.fairness import Demand, Worker, plan_gpus
+from tinyrl.control.fairness import Demand, GpuSlot, plan_gpus
 from tinyrl.storage.store import Store
 
 
 class TestWideSelection(unittest.TestCase):
   def test_exclusive_prefers_to_leave_a_parked_gangs_block_available(self):
-    workers = {"gang": Worker(gpus=2, bound=(0, 1), gang=True), "other": Worker(exclusive=True)}
-    self.assertEqual(plan_gpus(workers, 4, 1)[0], {"other": (2,), "gang": (0, 1)})
-    self.assertEqual(plan_gpus(workers, 2, 1)[0], {"other": (0,)})
+    slots = {"gang": GpuSlot(gpus=2, bound=(0, 1), is_trainer=True), "other": GpuSlot(exclusive=True)}
+    self.assertEqual(plan_gpus(slots, 4, 1)[0], {"other": (2,), "gang": (0, 1)})
+    self.assertEqual(plan_gpus(slots, 2, 1)[0], {"other": (0,)})
 
 
 class TestWideRebind(RedisTest):
@@ -32,17 +32,17 @@ class TestWideRebind(RedisTest):
           await node.bind(name, name)
           request = await self.bus.submit_command(name, Op.CREATE_MODEL, b'{"base_model":"tiny","rank":0,"lora":{}}')
           self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
-        gang = node.lives[run]
-        self.assertNotIn(gang.life, node.on)
+        gang = node.workers[run]
+        self.assertFalse(gang.has_gpus)
         request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
         async with asyncio.timeout(5):
           while gang.demand == Demand.IDLE:
             await node.changed.wait()
-        self.assertTrue(gang.wanted())
+        self.assertTrue(gang.should_run())
         self.assertEqual(node.select_gpus(run), ())
         node.drop_local(exclusive)
         self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
-        self.assertEqual(node.on, {gang.life: (0, 1)})
+        self.assertEqual(node.gpu_allocations, {gang.worker_id: (0, 1)})
       finally:
         await node.aclose()
 
@@ -70,24 +70,24 @@ class TestWideRebind(RedisTest):
         await command(run, Op.FORWARD_BACKWARD, proto_body(run))
         await command(run, Op.OPTIM_STEP, {"adam_params": {}})
         await command(run, Op.FORWARD_BACKWARD, proto_body(run))
-        self.assertEqual(node.on[gang.life], (0, 1))
+        self.assertEqual(node.gpu_allocations[gang.worker_id], (0, 1))
         child = gang.model
         expected, _ = child.trainer.model.training_state(run)
 
         sibling = await node.bind("neighbor", neighbor)
         await command(neighbor, Op.CREATE_MODEL, create)
-        self.assertEqual(node.on[sibling.life], (2, 3))
+        self.assertEqual(node.gpu_allocations[sibling.worker_id], (2, 3))
         pin = await node.bind("exclusive", exclusive)
         await command(exclusive, Op.CREATE_MODEL, create)
-        self.assertEqual(node.on[pin.life], (0,))
-        self.assertNotIn(gang.life, node.on)
+        self.assertEqual(node.gpu_allocations[pin.worker_id], (0,))
+        self.assertFalse(gang.has_gpus)
 
         # Parked gang saves its dirty state directly from host memory without reclaiming GPUs or disturbing `pin`.
         old_call, queued = child.call, []
 
         async def check_detach(method, *args):
-          self.assertNotIn(gang.life, node.on)
-          self.assertEqual(node.on.get(pin.life), (0,))
+          self.assertFalse(gang.has_gpus)
+          self.assertEqual(node.gpu_allocations.get(pin.worker_id), (0,))
           if method == "save_run":
             queued.append(await self.bus.submit_command(exclusive, Op.OPTIM_STEP, b'{"adam_params":{}}'))
             body = json.dumps({"uri": f"tinker://{run}/weights/queued"}).encode()
@@ -103,8 +103,8 @@ class TestWideRebind(RedisTest):
           self.assertIsNotNone(reply)
           self.assertTrue(reply.ok, reply.body)
         self.assertTrue(child.closed)
-        replacement = node.lives["wide"]
-        self.assertEqual(node.on, {replacement.life: (2, 3), pin.life: (0,)})
+        replacement = node.workers["wide"]
+        self.assertEqual(node.gpu_allocations, {replacement.worker_id: (2, 3), pin.worker_id: (0,)})
         actual, _ = replacement.model.trainer.model.training_state(run)
         self.assertEqual(actual.keys(), expected.keys())
         for key in expected:

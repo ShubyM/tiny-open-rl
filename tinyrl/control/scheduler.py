@@ -1,7 +1,7 @@
-"""Cluster planner: places, scales, and rebalances processes across nodes (`run -> procs -> node`).
+"""Cluster planner: places, scales, and rebalances workers across nodes (`run -> procs -> node`).
 
-Nodes time-slice their own GPUs locally on wall-clock quanta and enforce all safety via `on`, `run.owner`, and `lease`.
-`tinyrl:plan` stores only process placement, run assignment, and per-account EEVDF `lag` (in `gpu_ms`).
+Nodes time-slice their own GPUs locally on wall-clock quanta and enforce safety via `gpu_allocations`, `owner`, and `lease`.
+`tinyrl:plan` stores only worker placement, run `assignments`, and per-account EEVDF `lag` (in `gpu_ms`).
 """
 
 from __future__ import annotations
@@ -65,27 +65,27 @@ def owner_of(token: str | None) -> tuple[str, str]:
 
 @dataclass
 class State:
-  made: int = 0
+  next_worker_id: int = 0
   nodes: dict[str, tuple[int, int]] = field(default_factory=dict)
   procs: dict[str, Proc] = field(default_factory=dict)
-  home: dict[str, list[str]] = field(default_factory=dict)
+  assignments: dict[str, list[str]] = field(default_factory=dict)
   jobs: dict[str, Job] = field(default_factory=dict)
   lag: dict[str, float] = field(default_factory=dict)
-  seen: dict[str, float] = field(default_factory=dict)
+  billed_service: dict[str, float] = field(default_factory=dict)
   service: dict[str, float] = field(default_factory=dict)
   weights: dict[str, float] = field(default_factory=dict)
 
   def runs(self, proc: str) -> list[str]:
-    return [r for r, ps in sorted(self.home.items()) if proc in ps]
+    return [r for r, ps in sorted(self.assignments.items()) if proc in ps]
 
   def procs_on(self, node: str, skip: str = "") -> list[tuple[str, Proc]]:
     return [(n, p) for n, p in self.procs.items() if p.node == node and n != skip]
 
-  def ready(self, run: str) -> bool:
+  def has_backlog(self, run: str) -> bool:
     return self.jobs[run].backlog > 0
 
-  def busy(self, proc: str) -> bool:
-    return any(self.ready(r) for r in self.runs(proc))
+  def is_busy(self, proc: str) -> bool:
+    return any(self.has_backlog(r) for r in self.runs(proc))
 
   def account(self, run: str) -> str:
     if (job := self.jobs.get(run)) is None:
@@ -93,12 +93,12 @@ class State:
     return job.account or (self.account(job.train_run) if job.train_run in self.jobs else run)
 
   def lag_of(self, proc: str) -> float:
-    return max((self.ready_lag(r) for r in self.runs(proc) if self.ready(r)), default=0.0)
+    return max((self.ready_lag(r) for r in self.runs(proc) if self.has_backlog(r)), default=0.0)
 
   def ready_lag(self, run: str) -> float:
-    """The account's lag, less service completed since the planner's last update."""
+    """Account lag minus GPU service billed since the planner's last tick."""
     account = self.account(run)
-    return self.lag.get(account, 0.0) - max(0.0, self.service.get(account, 0.0) - self.seen.get(account, 0.0))
+    return self.lag.get(account, 0.0) - max(0.0, self.service.get(account, 0.0) - self.billed_service.get(account, 0.0))
 
   def used(self, node: str) -> int:
     return sum(p.spec.gpus for _, p in self.procs_on(node))
@@ -107,7 +107,7 @@ class State:
     return sum(p.spec.gpus for _, p in self.procs_on(node, skip) if p.spec.exclusive)
 
   def busy_gpus(self, node: str, skip: str = "") -> int:
-    return sum(p.spec.gpus for n, p in self.procs_on(node, skip) if not p.spec.exclusive and self.busy(n))
+    return sum(p.spec.gpus for n, p in self.procs_on(node, skip) if not p.spec.exclusive and self.is_busy(n))
 
   def spare(self, node: str) -> int:
     return self.nodes[node][0] - self.excl_used(node) - self.busy_gpus(node)
@@ -119,8 +119,8 @@ class State:
     return (self.used(node) if spare else self.excl_used(node, skip)) + spec.gpus <= self.nodes[node][0]
 
   def add_proc(self, spec: Spec) -> str:
-    self.made = next(n for n in itertools.count(self.made + 1) if f"p{n}" not in self.procs)
-    name = f"p{self.made}"
+    self.next_worker_id = next(n for n in itertools.count(self.next_worker_id + 1) if f"p{n}" not in self.procs)
+    name = f"p{self.next_worker_id}"
     self.procs[name] = Proc(spec)
     return name
 
@@ -131,33 +131,29 @@ def from_state(raw: dict) -> State:
   jobs = {}
   for r, info in raw.get("runs", {}).items():
     rec = info["record"]
-    exclusive, train_run, role = bool(rec.get("exclusive")), rec.get("train_run"), Role(rec.get("role", "trainer"))
-    spec = Spec(
-      role,
-      rec.get("base", ""),
-      rec.get("rank", 0) > 0,
-      exclusive,
-      train_run if exclusive else None,
-      int(rec.get("gpus", 1)),
-    )
-    account = rec.get("account") or ("" if train_run else rec.get("session", ""))
-    jobs[r] = Job(spec, train_run, account, info.get("owner"), queues.get(r, 0))
+    excl, tr, role = bool(rec.get("exclusive")), rec.get("train_run"), Role(rec.get("role", "trainer"))
+    spec = Spec(role, rec.get("base", ""), rec.get("rank", 0) > 0, excl, tr if excl else None, int(rec.get("gpus", 1)))
+    account = rec.get("account") or ("" if tr else rec.get("session", ""))
+    jobs[r] = Job(spec, tr, account, info.get("owner"), queues.get(r, 0))
   jobs = {r: j for r, j in jobs.items() if not j.spec.train_run or j.spec.train_run in jobs}
   procs = {
     n: Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
     for n, p in plan.get("procs", {}).items()
   }
-  home = {r: list(ps) for r, ps in plan.get("home", {}).items() if r in jobs}
-  lag, seen, weights = ({a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights"))
-  return State(int(plan.get("made", 0)), nodes, procs, home, jobs, lag, seen, dict(raw.get("service", {})), weights)
+  assignments = {r: list(ps) for r, ps in plan.get("assignments", {}).items() if r in jobs}
+  floats = lambda k: {a: float(v) for a, v in plan.get(k, {}).items()}  # noqa: E731
+  next_id, service = int(plan.get("next_worker_id", 0)), dict(raw.get("service", {}))
+  return State(
+    next_id, nodes, procs, assignments, jobs, floats("lag"), floats("billed_service"), service, floats("weights")
+  )
 
 
 def to_plan(s: State) -> dict:
-  procs = {n: dataclasses.asdict(p) for n, p in s.procs.items()}
-  return {"made": s.made, "procs": procs, "home": s.home, "lag": s.lag, "seen": s.seen, "weights": s.weights}
+  head = {"next_worker_id": s.next_worker_id, "procs": {n: dataclasses.asdict(p) for n, p in s.procs.items()}}
+  return {**head, "assignments": s.assignments, "lag": s.lag, "billed_service": s.billed_service, "weights": s.weights}
 
 
-def settings(gpus: int, gpu_bytes: int) -> dict[str, str]:
+def node_env(gpus: int, gpu_bytes: int) -> dict[str, str]:
   env = {"TINYRL_WARM_SAMPLER": "1"} if gpus >= 2 else {}
   return env | ({"TINYRL_KV_BYTES": str(24 * 2**30)} if gpu_bytes >= 64 * 2**30 else {})
 
@@ -166,9 +162,9 @@ def settings(gpus: int, gpu_bytes: int) -> dict[str, str]:
 
 
 def choose_node(s: State, proc: str, only_spare: bool = False) -> str | None:
-  """A node that can host `proc`: one with room for it and its sampler, then its trainer's node, then the least used."""
+  """Pick a node for `proc`: prefer room for its paired sampler, then its trainer's node, then least loaded."""
   spec = s.procs[proc].spec
-  near = {s.procs[p].node for r in s.runs(proc) for p in s.home.get(s.jobs[r].train_run, ())}
+  near = {s.procs[p].node for r in s.runs(proc) for p in s.assignments.get(s.jobs[r].train_run, ())}
   sampled = {j.train_run for j in s.jobs.values()}
 
   def placement_rank(node: str) -> tuple:
@@ -185,57 +181,61 @@ def choose_node(s: State, proc: str, only_spare: bool = False) -> str | None:
 def rebalance_target(s: State, name: str) -> str | None:
   """Move busy `name` off an oversubscribed node: to a spare node, or across nodes once lag reaches `REBALANCE_MS`."""
   p = s.procs[name]
-  if not s.busy(name) or s.spare(p.node) >= 0:
+  if not s.is_busy(name) or s.spare(p.node) >= 0:
     return None
   fit = [n for n in sorted(s.nodes) if s.can_host(n, p.spec)]
   if spare := [n for n in fit if s.spare(n) >= p.spec.gpus]:
     return min(spare, key=lambda n: s.used(n) / s.nodes[n][0])
 
-  def floor(node: str) -> float:
-    return min((s.lag_of(h) for h, q in s.procs_on(node) if not q.spec.exclusive and s.busy(h)), default=float("inf"))
+  def min_lag(node: str) -> float:
+    return min(
+      (s.lag_of(h) for h, q in s.procs_on(node) if not q.spec.exclusive and s.is_busy(h)), default=float("inf")
+    )
 
-  here = (round(s.load(p.node, name), 6), round(floor(p.node), 3))
-  opts = [(round(s.load(n), 6), round(floor(n), 3), n) for n in fit if s.lag_of(name) - floor(n) >= REBALANCE_MS - 1e-9]
+  here = (round(s.load(p.node, name), 6), round(min_lag(p.node), 3))
+  opts = [
+    (round(s.load(n), 6), round(min_lag(n), 3), n) for n in fit if s.lag_of(name) - min_lag(n) >= REBALANCE_MS - 1e-9
+  ]
   return min((o for o in opts if o[:2] < here), default=(0, 0, None))[2]
 
 
-def demand(s: State, cap: float) -> dict[str, float]:
-  """The GPUs each account could use now: one run's worth per ready run, more for a backlogged elastic sampler."""
+def account_demand(s: State, cap: float) -> dict[str, float]:
+  """GPUs each account could use now: one run's width per backlogged run, more for an elastic sampler."""
   biggest = max((g for g, _ in s.nodes.values()), default=0)
   want = {}
   for r, j in s.jobs.items():
-    if s.ready(r) and j.spec.gpus <= biggest:
+    if s.has_backlog(r) and j.spec.gpus <= biggest:
       reps = min(int(cap) // j.spec.gpus, j.want_replicas) if j.spec.elastic else 1
       account = s.account(r)
       want[account] = want.get(account, 0.0) + reps * j.spec.gpus
   return want
 
 
-def spawn(s: State, out: list, run: str, spec: Spec, node: str, rule: str, append: bool = False) -> None:
+def place_new_proc(s: State, out: list, run: str, spec: Spec, node: str, rule: str, append: bool = False) -> None:
   q = s.add_proc(spec)
   s.procs[q].node = node
-  s.home[run] = [*s.home[run], q] if append else [q]
+  s.assignments[run] = [*s.assignments[run], q] if append else [q]
   out.append((Ev.ASSIGNED, {"run": run, "proc": q}))
   out.append((Ev.PLACED, {"proc": q, "node": node, "rule": rule}))
 
 
 def drop_lost(s: State, out: list) -> None:
-  """Unplace processes whose node vanished or no longer has room for them, and drop sampler replicas past the backlog."""
+  """Unplace workers on lost/full nodes, and trim excess sampler replicas once backlog shrinks."""
   for name, p in sorted(s.procs.items()):
     if p.node and (p.node not in s.nodes or not s.can_host(p.node, p.spec, name)):
       p.node = None
       out.append((Ev.UNPLACED, {"proc": name, "rule": "place.node_lost"}))
-  for r, ps in list(s.home.items()):
-    s.home[r] = list(dict.fromkeys(ps))[: s.jobs[r].want_replicas]
+  for r, ps in list(s.assignments.items()):
+    s.assignments[r] = list(dict.fromkeys(ps))[: s.jobs[r].want_replicas]
 
 
 def assign(s: State, out: list) -> None:
-  """Give every homeless run a process: the matching one with the fewest runs, or a new one."""
+  """Assign every unassigned run to the least-loaded matching shareable worker, or create a new one."""
   for r, j in sorted(s.jobs.items()):
-    if not s.home.get(r):
+    if not s.assignments.get(r):
       match = [n for n, p in sorted(s.procs.items()) if j.spec.shareable and p.spec == j.spec]
       target = min(match, key=lambda n: len(s.runs(n))) if match else s.add_proc(j.spec)
-      s.home[r] = [target]
+      s.assignments[r] = [target]
       out.append((Ev.ASSIGNED, {"run": r, "proc": target}))
 
 
@@ -244,34 +244,34 @@ def merge_and_split(s: State, out: list) -> None:
   for name, p in sorted(list(s.procs.items())):
     if p.spec.role != Role.TRAINER or not p.spec.shareable or not p.node:
       continue
-    idle_dup = not s.busy(name) and s.used(p.node) > s.nodes[p.node][0]
+    idle_dup = not s.is_busy(name) and s.used(p.node) > s.nodes[p.node][0]
     busy_dup = s.spare(p.node) < 0 and not any(s.spare(n) >= p.spec.gpus for n in s.nodes)
     twins = [q for q, pr in sorted(s.procs.items()) if q != name and pr.spec == p.spec]
     if (idle_dup or busy_dup) and twins:
       for r in s.runs(name):
-        s.home[r] = [twins[0]]
+        s.assignments[r] = [twins[0]]
         out.append((Ev.ASSIGNED, {"run": r, "proc": twins[0]}))
       continue
-    while len(busy := [r for r in s.runs(name) if s.ready(r)]) >= 2 and (spot := choose_node(s, name, True)):
-      spawn(s, out, busy[-1], p.spec, spot, "place.split")
+    while len(busy := [r for r in s.runs(name) if s.has_backlog(r)]) >= 2 and (spot := choose_node(s, name, True)):
+      place_new_proc(s, out, busy[-1], p.spec, spot, "place.split")
 
 
 def scale_out(s: State, out: list) -> None:
-  """Give a backlogged sampler more replicas: idle matching processes first, then new ones on spare GPUs."""
+  """Give a backlogged sampler more replicas: idle matching workers first, then new ones on spare GPUs."""
   for r, j in sorted(s.jobs.items()):
-    while len(s.home[r]) < j.want_replicas:
+    while len(s.assignments[r]) < j.want_replicas:
       pool = [q for q, p in sorted(s.procs.items()) if p.spec == j.spec and p.node]
-      if idle := [q for q in pool if not s.busy(q)]:
-        s.home[r].append(idle[0])
+      if idle := [q for q in pool if not s.is_busy(q)]:
+        s.assignments[r].append(idle[0])
         out.append((Ev.ASSIGNED, {"run": r, "proc": idle[0]}))
-      elif spot := choose_node(s, s.home[r][0], True):
-        spawn(s, out, r, j.spec, spot, "place.scale_out", append=True)
+      elif spot := choose_node(s, s.assignments[r][0], True):
+        place_new_proc(s, out, r, j.spec, spot, "place.scale_out", append=True)
       else:
         break
 
 
 def collect_and_place(s: State, out: list) -> None:
-  """Remove empty unheld processes, then place the unplaced ones."""
+  """Remove empty unowned workers, then place unplaced ones."""
   held = {owner_of(j.owner)[0] for j in s.jobs.values() if owner_of(j.owner)[1] in s.nodes}
   for name in [n for n in sorted(s.procs) if not s.runs(n) and n not in held]:
     if s.procs.pop(name).node:
@@ -283,7 +283,7 @@ def collect_and_place(s: State, out: list) -> None:
 
 
 def rebalance(s: State, out: list) -> None:
-  """Fill spare nodes, evacuate exclusive-squeezed processes, or rotate across nodes once lag reaches `REBALANCE_MS`."""
+  """Fill spare nodes, evacuate exclusive-squeezed workers, or rotate across nodes once lag reaches `REBALANCE_MS`."""
   for name, p in sorted(s.procs.items()):
     if p.node and not p.spec.exclusive and (target := rebalance_target(s, name)):
       p.node = target
@@ -291,10 +291,10 @@ def rebalance(s: State, out: list) -> None:
 
 
 def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
-  """Pure planner transition: update lag, then run the placement phases in order."""
+  """Pure planner transition: update account lag, then run placement phases in order."""
   s, out = copy.deepcopy(state), []
   cap = float(sum(g for g, _ in s.nodes.values()))
-  s.lag, s.seen = update_lag(s.lag, s.seen, s.service, cap, demand(s, cap), s.weights)
+  s.lag, s.billed_service = update_lag(s.lag, s.billed_service, s.service, cap, account_demand(s, cap), s.weights)
   for phase in (drop_lost, assign, merge_and_split, scale_out, collect_and_place, rebalance):
     phase(s, out)
   return s, out
@@ -311,7 +311,7 @@ async def tick(bus: Bus) -> list[tuple[Ev, dict]]:
   old, (new, changes) = raw["plan"], step(from_state(raw))
   plan = to_plan(new)
   if plan != old:
-    wake = plan["procs"] != old.get("procs") or plan["home"] != old.get("home")
+    wake = plan["procs"] != old.get("procs") or plan["assignments"] != old.get("assignments")
     await bus.write_plan(plan, changes, notify_nodes=wake)
   return changes
 

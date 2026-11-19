@@ -174,7 +174,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     state = dataclasses.asdict(scheduler.from_state(raw))
     for proc, placed in state["procs"].items():
       heartbeat = raw["nodes"].get(placed["node"], {})
-      for src, field in (("pids", "pid"), ("on", "gpus")):
+      for src, field in (("pids", "pid"), ("gpu_allocations", "gpus")):
         if proc in heartbeat.get(src, {}):
           placed[field] = heartbeat[src][proc]
     return {"nodes": {n: v["gpus"] for n, v in raw["nodes"].items()}, "state": state}
@@ -421,7 +421,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
     run = await require_run(run_id)
-    procs = (await bus.read_plan()).get("home", {}).get(run_id, [])
+    procs = (await bus.read_plan()).get("assignments", {}).get(run_id, [])
     extra = {"procs": procs, **({"worker": procs[0]} if procs else {})}
     return {**run, **extra, **await bus.queued_and_in_flight(run_id)}
 

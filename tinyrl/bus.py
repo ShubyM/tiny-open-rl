@@ -1,9 +1,9 @@
 """Redis control state and command streams.
 
-Metadata lives as plain UTF-8 strings and JSON (`self.s`); only command and reply streams carry raw protobuf bytes
-(`self.r`). Safety rests on two facts (plus each node's local `on` table):
-  tinyrl:run:<r>       a training run's single-writer `(owner, epoch, pos, snap, claimed)`, fenced on claim/commit/detach
-  tinyrl:lease:<life>  each worker incarnation's TTL; `acquire_run` replaces `owner` only after its lease expires
+Metadata lives as plain UTF-8 strings and JSON (`self.meta`); only command and reply streams carry raw protobuf bytes
+(`self.raw`). Safety rests on two facts (plus each node's local `gpu_allocations` table):
+  tinyrl:run:<r>          a training run's single-writer `(owner, epoch, last_cmd_id, snapshot, claimed)`, fenced on write
+  tinyrl:lease:<worker>   each worker instance's TTL; `acquire_run` replaces `owner` only after its lease expires
 Trainer runs are single-writer FIFO streams (no consumer group). Sampling sessions are stateless multi-replica readers
 sharing consumer group `sampler` on `q:<s>`, with `commit_sample` answering and billing each entry once.
 """
@@ -22,24 +22,24 @@ from redis.backoff import ExponentialBackoff
 
 from tinyrl.control.accounting import Charge
 from tinyrl.helpers import getenv
-from tinyrl.types import Cmd, Ev, Event, Op, Reply, Role, Run, parse_uri, unpack_snap  # noqa: F401
+from tinyrl.types import Cmd, Ev, Event, Op, Reply, Role, Run, parse_uri, unpack_snapshot  # noqa: F401
 
 GROUP = "sampler"
 LIVE_SECONDS, SESSION_GRACE = 30, getenv("SESSION_GRACE", 60)
 REPLY_TTL, READ_REPLY_TTL, SESSION_TTL = getenv("REPLY_TTL", 3600), 60, getenv("SESSION_TTL", 7 * 24 * 3600)
 LEASE_MS, NODE_MS = getenv("LEASE_MS", 10000), 30000
-RUN_META = frozenset(("record", "owner", "epoch", "pos", "snap", "claimed"))
+RUN_META = frozenset(("record", "owner", "epoch", "last_cmd_id", "snapshot", "claimed"))
 
 
 def key(*parts: str) -> str:
   return ":".join(("tinyrl", *parts))
 
 
-def life_of(token: str) -> str:
+def worker_id_of(token: str) -> str:
   return token.rsplit(":", 1)[0]
 
 
-def wake(p, stream: str = "wake") -> None:
+def notify_stream(p, stream: str = "wake") -> None:
   p.xadd(key(stream), {"t": 1}, maxlen=1, approximate=False)
 
 
@@ -56,7 +56,7 @@ def is_missing_stream(err: Exception) -> bool:
   return "NOGROUP" in msg or "no such key" in msg
 
 
-def queue_checkpoint(p, uri: str, size: int, *, version: str, ttl=None, owned=False) -> None:
+def record_checkpoint(p, uri: str, size: int, *, version: str, ttl=None, owned=False) -> None:
   """Write a checkpoint entry into the single `tinyrl:ckpts` hash inside the caller's transaction."""
   _, cid = parse_uri(uri)
   raw_kind, now = cid.split("/", 1)[0], time.time()
@@ -69,17 +69,17 @@ def queue_checkpoint(p, uri: str, size: int, *, version: str, ttl=None, owned=Fa
   )
 
 
-def queue_delete(p, run_id: str) -> None:
+def record_run_delete(p, run_id: str) -> None:
   p.srem(key("runs"), run_id)
   p.delete(key("q", run_id))
-  p.hdel(key("run", run_id), "owner", "snap", "claimed")
+  p.hdel(key("run", run_id), "owner", "snapshot", "claimed")
   p.expire(key("run", run_id), SESSION_TTL)
   p.expire(key("clients", run_id), SESSION_TTL)
   p.hdel(key("writing"), run_id)
   log_event(p, Ev.RUN_DELETED, {"run": run_id})
 
 
-def finish_cmd(p, cmd: Cmd, reply: Reply, acct: str, charge: Charge | None, *, grouped: bool) -> None:
+def finish_command(p, cmd: Cmd, reply: Reply, acct: str, charge: Charge | None, *, grouped: bool) -> None:
   q, fk = key("q", cmd.run), key("f", cmd.request_id)
   if grouped:
     p.xack(q, GROUP, cmd.entry_id)
@@ -95,7 +95,7 @@ def finish_cmd(p, cmd: Cmd, reply: Reply, acct: str, charge: Charge | None, *, g
       p.hincrbyfloat(key("service"), acct, charge.gpu_ms)
   for name, n in counts.items():
     p.hincrby(key("run", cmd.run), name, n)
-  wake(p)
+  notify_stream(p)
 
 
 def connect(url: str, *, decode: bool = False) -> redis.Redis:
@@ -104,18 +104,18 @@ def connect(url: str, *, decode: bool = False) -> redis.Redis:
 
 
 class Bus:
-  def __init__(self, r: redis.Redis | None = None):
-    self.r = r if r is not None else connect(getenv("REDIS_URL", "redis://localhost:6379"))
-    pool = self.r.connection_pool
+  def __init__(self, raw_client: redis.Redis | None = None):
+    self.raw = raw_client if raw_client is not None else connect(getenv("REDIS_URL", "redis://localhost:6379"))
+    pool = self.raw.connection_pool
     kw = pool.connection_kwargs | {"decode_responses": True, "max_connections": pool.max_connections}
-    self.s = redis.Redis(connection_pool=redis.ConnectionPool(connection_class=pool.connection_class, **kw))
+    self.meta = redis.Redis(connection_pool=redis.ConnectionPool(connection_class=pool.connection_class, **kw))
 
   async def aclose(self) -> None:
-    await self.s.aclose()
-    await self.r.aclose()
+    await self.meta.aclose()
+    await self.raw.aclose()
 
-  async def transact(self, fn, *keys: str, raw: bool = False):
-    client = self.r if raw else self.s
+  async def transact(self, fn, *keys: str, binary: bool = False):
+    client = self.raw if binary else self.meta
     while True:
       try:
         async with client.pipeline(transaction=True) as p:
@@ -127,7 +127,7 @@ class Bus:
   # ***** sessions *****
 
   async def heartbeat_session(self, session_id: str, metadata: dict | None = None) -> None:
-    k, now, p = key("sess", session_id), time.time(), self.s.pipeline()
+    k, now, p = key("sess", session_id), time.time(), self.meta.pipeline()
     p.hsetnx(k, "created", now)
     if metadata:
       p.hset(k, "metadata", json.dumps(metadata))
@@ -138,7 +138,7 @@ class Bus:
     await p.execute()
 
   async def get_session(self, session_id: str) -> dict | None:
-    p = self.s.pipeline()
+    p = self.meta.pipeline()
     p.hgetall(key("sess", session_id))
     p.smembers(key("sess", session_id, "runs"))
     record, runs = await p.execute()
@@ -149,29 +149,31 @@ class Bus:
     return {**base, "live": time.time() - seen < LIVE_SECONDS, "runs": sorted(runs), "metadata": meta}
 
   async def expired_sessions(self) -> list[str]:
-    return await self.s.zrangebyscore(key("seen"), 0, time.time() - SESSION_GRACE)
+    return await self.meta.zrangebyscore(key("seen"), 0, time.time() - SESSION_GRACE)
 
   async def finish_session(self, session_id: str) -> None:
-    p = self.s.pipeline()
+    p = self.meta.pipeline()
     p.zadd(key("seen"), {session_id: 0}, xx=True)
-    wake(p)
+    notify_stream(p)
     await p.execute()
 
   async def end_session(self, session_id: str) -> None:
     deleting = False
     for run_id in (await self.get_session(session_id) or {}).get("runs", []):
-      if not await self.s.sismember(key("runs"), run_id):
+      if not await self.meta.sismember(key("runs"), run_id):
         continue
       if (await self.get_run(run_id))["role"] == Role.SAMPLER:
         await self.delete_run(run_id)
       else:
         deleting = bool(await self.submit_command(run_id, Op.DELETE_MODEL, b"{}")) or deleting
-    await (self.s.zadd(key("seen"), {session_id: time.time()}) if deleting else self.s.zrem(key("seen"), session_id))
+    await (
+      self.meta.zadd(key("seen"), {session_id: time.time()}) if deleting else self.meta.zrem(key("seen"), session_id)
+    )
 
   # ***** runs, nodes, and cluster plan *****
 
   async def create_run(self, run: Run) -> None:
-    q, p = key("q", run.id), self.s.pipeline(transaction=True)
+    q, p = key("q", run.id), self.meta.pipeline(transaction=True)
     zero = dict.fromkeys(("steps", "failed", "cmds", "tokens", "busy_ms", "wait_ms"), 0)
     if run.role == Role.SAMPLER:
       p.xgroup_create(q, GROUP, id="0", mkstream=True)
@@ -186,29 +188,29 @@ class Bus:
       p.expire(key("sess", run.session, "runs"), SESSION_TTL)
     fields = ("role", "base", "rank", "exclusive", "train_run", "gpus")
     log_event(p, Ev.RUN_CREATED, {"run": run.id, **{k: getattr(run, k) for k in fields}})
-    wake(p)
+    notify_stream(p)
     await p.execute()
 
   async def get_run(self, run_id: str) -> dict | None:
-    if not (f := await self.s.hgetall(key("run", run_id))) or "record" not in f:
+    if not (f := await self.meta.hgetall(key("run", run_id))) or "record" not in f:
       return None
-    meta = {n: f[n] for n in ("owner", "pos", "snap") if f.get(n)}
+    meta = {n: f[n] for n in ("owner", "last_cmd_id", "snapshot") if f.get(n)}
     counts = {k: int(v) for k, v in f.items() if k not in RUN_META}
     return {**json.loads(f["record"]), **meta, **counts}
 
   async def delete_run(self, run_id: str) -> None:
-    p = self.s.pipeline(transaction=True)
-    queue_delete(p, run_id)
-    wake(p)
+    p = self.meta.pipeline(transaction=True)
+    record_run_delete(p, run_id)
+    notify_stream(p)
     await p.execute()
 
   async def join_sampling_session(self, run_id: str) -> int:
-    return int(await self.s.incr(key("clients", run_id)))
+    return int(await self.meta.incr(key("clients", run_id)))
 
   async def read_state(self, *, backlogs: bool = True) -> dict:
     """Cluster snapshot: live nodes, runs, plan, account `gpu_ms` service, and (for the scheduler) queue depths."""
-    nodes, runs = await self.live_nodes(details=True), sorted(await self.s.smembers(key("runs")))
-    p = self.s.pipeline(transaction=False)
+    nodes, runs = await self.live_nodes(details=True), sorted(await self.meta.smembers(key("runs")))
+    p = self.meta.pipeline(transaction=False)
     for r in runs:
       p.hmget(key("run", r), "record", "owner")
       if backlogs:
@@ -227,44 +229,44 @@ class Bus:
     return {"nodes": nodes, "runs": out_runs, "queues": queues, "plan": json.loads(plan or "{}"), "service": svc}
 
   async def read_plan(self) -> dict:
-    return json.loads(await self.s.get(key("plan")) or "{}")
+    return json.loads(await self.meta.get(key("plan")) or "{}")
 
   async def account_service(self) -> dict[str, float]:
-    return {k: float(v) for k, v in (await self.s.hgetall(key("service"))).items()}
+    return {k: float(v) for k, v in (await self.meta.hgetall(key("service"))).items()}
 
   async def write_plan(self, plan: dict, changes: list[tuple[Ev, dict]] = (), notify_nodes: bool = True) -> None:
-    p = self.s.pipeline(transaction=True)
+    p = self.meta.pipeline(transaction=True)
     p.set(key("plan"), json.dumps(plan))
     for kind, body in changes:
       log_event(p, kind, body)
     if notify_nodes:
-      wake(p, "plan_wake")
+      notify_stream(p, "plan_wake")
     await p.execute()
 
   async def run_counters(self) -> dict[tuple[str, str], dict]:
-    runs, p = sorted(await self.s.smembers(key("runs"))), self.s.pipeline()
+    runs, p = sorted(await self.meta.smembers(key("runs"))), self.meta.pipeline()
     for r in runs:
       p.hgetall(key("run", r))
     p.get(key("plan"))
     *rows, plan_raw = await p.execute()
-    home = json.loads(plan_raw or "{}").get("home", {})
+    assignments = json.loads(plan_raw or "{}").get("assignments", {})
     counts = lambda f: {k: int(v) for k, v in f.items() if k not in RUN_META}  # noqa: E731
-    return {(ps[0], r): counts(f) for r, f in zip(runs, rows) if "record" in f and (ps := home.get(r))}
+    return {(ps[0], r): counts(f) for r, f in zip(runs, rows) if "record" in f and (ps := assignments.get(r))}
 
   async def node_heartbeat(self, node: str, gpus: int, memory: int = 0, **info) -> None:
     body = json.dumps({"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, **info})
-    await self.s.hset(key("nodes"), node, body)
+    await self.meta.hset(key("nodes"), node, body)
 
   async def live_nodes(self, details: bool = False) -> dict:
-    nodes = {k: json.loads(v) for k, v in (await self.s.hgetall(key("nodes"))).items()}
+    nodes = {k: json.loads(v) for k, v in (await self.meta.hgetall(key("nodes"))).items()}
     if dead := [k for k, v in nodes.items() if v["until"] < time.time()]:
-      await self.s.hdel(key("nodes"), *dead)
+      await self.meta.hdel(key("nodes"), *dead)
     return {k: v if details else v["gpus"] for k, v in nodes.items() if k not in dead}
 
   # ***** submitting commands and reading replies *****
 
   async def seen_request(self, run_id: str, seq_id: int | None) -> str | None:
-    return await self.s.get(key("seq", run_id, str(seq_id))) if seq_id is not None else None
+    return await self.meta.get(key("seq", run_id, str(seq_id))) if seq_id is not None else None
 
   async def submit_command(
     self, run_id: str, op: Op, body: bytes, seq_id: int | None = None, cost: int = 1
@@ -273,80 +275,81 @@ class Bus:
       return first
     seq = [] if seq_id is None else ["IDMP", run_id, seq_id]
     args = ["NOMKSTREAM", *seq, "*", "op", op, "body", body, "cost", cost]
-    if (entry_id := await self.r.execute_command("XADD", key("q", run_id), *args)) is None:
+    if (entry_id := await self.raw.execute_command("XADD", key("q", run_id), *args)) is None:
       return None
-    request_id, p = f"{run_id}/{entry_id.decode()}", self.s.pipeline()
+    request_id, p = f"{run_id}/{entry_id.decode()}", self.meta.pipeline()
     if seq:
       p.set(key("seq", run_id, str(seq_id)), request_id, ex=SESSION_TTL)
-    wake(p)
+    notify_stream(p)
     await p.execute()
     return request_id
 
   async def wait_for_reply(self, request_id: str, timeout: float) -> Reply | None:
     fk = key("f", request_id)
-    if not (got := await self.r.xread({fk: "0-0"}, count=1, block=int(timeout * 1000) or None)):
+    if not (got := await self.raw.xread({fk: "0-0"}, count=1, block=int(timeout * 1000) or None)):
       return None
     _, fields = got[0][1][0]
-    await self.s.expire(fk, min(REPLY_TTL, READ_REPLY_TTL), lt=True)
+    await self.meta.expire(fk, min(REPLY_TTL, READ_REPLY_TTL), lt=True)
     return Reply(fields[b"ok"] == b"1", fields[b"content_type"].decode(), fields[b"body"])
 
   async def queued_and_in_flight(self, run_id: str) -> dict:
     q = key("q", run_id)
-    if not await self.s.exists(q):
+    if not await self.meta.exists(q):
       return {"live": False}
 
     def entry(eid: str, who: str, sec: float = 0.0, n: int = 1) -> dict:
       return {"request_id": f"{run_id}/{eid}", "trainer": who, "seconds": sec, "deliveries": n}
 
     if (await self.get_run(run_id) or {}).get("role") == Role.SAMPLER:
-      groups = await self.s.xinfo_groups(q)
-      pending = await self.s.xpending_range(q, GROUP, min="-", max="+", count=100)
+      groups = await self.meta.xinfo_groups(q)
+      pending = await self.meta.xpending_range(q, GROUP, min="-", max="+", count=100)
       active = [
         entry(e["message_id"], e["consumer"], e["time_since_delivered"] / 1000, e["times_delivered"]) for e in pending
       ]
       return {"live": True, "queued": groups[0]["lag"], "in_flight": active}
-    total = await self.s.xlen(q)
-    claimed, owner = await self.s.hmget(key("run", run_id), "claimed", "owner")
-    in_flight = [entry(claimed, life_of(owner or ""))] if claimed else []
+    total = await self.meta.xlen(q)
+    claimed, owner = await self.meta.hmget(key("run", run_id), "claimed", "owner")
+    in_flight = [entry(claimed, worker_id_of(owner or ""))] if claimed else []
     return {"live": True, "queued": max(0, total - len(in_flight)), "in_flight": in_flight}
 
   # ***** trainer ownership and single-writer commands *****
 
-  async def open_lease(self, life: str) -> bool:
-    return bool(await self.s.set(key("lease", life), 1, nx=True, px=LEASE_MS))
+  async def open_lease(self, worker_id: str) -> bool:
+    return bool(await self.meta.set(key("lease", worker_id), 1, nx=True, px=LEASE_MS))
 
-  async def renew_lease(self, life: str, recover: bool = False) -> bool:
-    return bool(await self.s.set(key("lease", life), 1, xx=not recover, px=LEASE_MS))
+  async def renew_lease(self, worker_id: str, recover: bool = False) -> bool:
+    return bool(await self.meta.set(key("lease", worker_id), 1, xx=not recover, px=LEASE_MS))
 
-  async def drop_lease(self, life: str) -> None:
-    await self.s.delete(key("lease", life))
+  async def drop_lease(self, worker_id: str) -> None:
+    await self.meta.delete(key("lease", worker_id))
 
-  async def acquire_run(self, run_id: str, life: str) -> tuple[str, str | None, str | None] | None:
-    """Acquire `run_id` under a fresh epoch iff `life`'s lease is live and any prior owner's lease has expired."""
-    k, lk = key("run", run_id), key("lease", life)
+  async def acquire_run(self, run_id: str, worker_id: str) -> tuple[str, str | None, str | None] | None:
+    """Acquire `run_id` under a fresh epoch iff `worker_id`'s lease is live and any prior owner's lease has expired."""
+    k, lease_key = key("run", run_id), key("lease", worker_id)
 
     async def op(p):
-      rec, owner, epoch, pos, snap = await p.hmget(k, "record", "owner", "epoch", "pos", "snap")
-      if not rec or not await p.exists(lk):
+      rec, owner, epoch, last_cmd_id, snapshot = await p.hmget(k, "record", "owner", "epoch", "last_cmd_id", "snapshot")
+      if not rec or not await p.exists(lease_key):
         return None
       if owner:
-        await p.watch(old_lease := key("lease", life_of(owner)))
+        await p.watch(old_lease := key("lease", worker_id_of(owner)))
         if await p.exists(old_lease):
           return None
-      n, token = int(epoch or 0) + 1, f"{life}:{int(epoch or 0) + 1}"
+      new_epoch = int(epoch or 0) + 1
+      token = f"{worker_id}:{new_epoch}"
       p.multi()
-      p.hset(k, mapping={"owner": token, "epoch": n})
+      p.hset(k, mapping={"owner": token, "epoch": new_epoch})
       p.hdel(key("writing"), run_id)
       await p.execute()
-      return token, pos, snap
+      return token, last_cmd_id, snapshot
 
-    return await self.transact(op, k, lk)
+    return await self.transact(op, k, lease_key)
 
-  async def peek_trainer(self, runs: list[str], block_ms: int = 0, after: dict[str, str] | None = None) -> list[Cmd]:
+  async def peek_trainer(self, runs: list[str], block_ms: int = 0) -> list[Cmd]:
     """Read the next unexecuted command on each training run without claiming it."""
     if not runs:
       return await asyncio.sleep(block_ms / 1000) or []
-    got = await self.r.xread({key("q", r): (after or {}).get(r, "0-0") for r in runs}, count=1, block=block_ms or None)
+    got = await self.raw.xread({key("q", r): "0-0" for r in runs}, count=1, block=block_ms or None)
     return [parse_cmd(s.decode().removeprefix(key("q", "")), *entries[0]) for s, entries in got]
 
   async def claim_trainer(self, run: str, token: str) -> Cmd | None:
@@ -364,7 +367,7 @@ class Bus:
       await p.execute()
       return cmd
 
-    return await self.transact(op, k, q, raw=True)
+    return await self.transact(op, k, q, binary=True)
 
   async def begin_checkpoint(self, run: str, token: str) -> str:
     """Pin a fresh checkpoint version against GC until this owner commits, detaches, or loses its lease."""
@@ -380,20 +383,22 @@ class Bus:
 
     return await self.transact(op, k)
 
-  async def detach_run(self, run_id: str, token: str, pos: str | None, snap: str | None, checkpoint=None) -> bool:
-    """Release `run_id` and record its parked snapshot `snap` iff `token` still owns it at exact `pos`."""
+  async def detach_run(
+    self, run_id: str, token: str, last_cmd_id: str | None, snapshot: str | None, checkpoint=None
+  ) -> bool:
+    """Release `run_id` and save its parked `snapshot` iff `token` still owns it at exact `last_cmd_id`."""
     k = key("run", run_id)
 
     async def op(p):
-      if await p.hmget(k, "owner", "pos") != [token, pos]:
+      if await p.hmget(k, "owner", "last_cmd_id") != [token, last_cmd_id]:
         return False
       p.multi()
       if checkpoint:
-        queue_checkpoint(p, **checkpoint)
+        record_checkpoint(p, **checkpoint)
       p.hdel(k, "owner")
       p.hdel(key("writing"), run_id)
-      p.hset(k, "snap", snap) if snap else p.hdel(k, "snap")
-      wake(p)
+      p.hset(k, "snapshot", snapshot) if snapshot else p.hdel(k, "snapshot")
+      notify_stream(p)
       return bool(await p.execute())
 
     return bool(await self.transact(op, k))
@@ -401,12 +406,12 @@ class Bus:
   async def commit_reply(
     self, cmd: Cmd, reply: Reply, token: str, acct="", mutates=False, charge=None, checkpoint=None
   ):
-    """Atomically publish a trainer reply, bill `gpu_ms`, and advance `pos` (clearing `snap`) iff `token` owns it."""
+    """Atomically publish a trainer reply, bill `gpu_ms`, and advance `last_cmd_id` (clearing `snapshot`) under `token`."""
     k, ck, deleting = key("run", cmd.run), key("ckpts"), cmd.op == Op.DELETE_MODEL and reply.ok
     prefix = f"tinker://{cmd.run}/".encode()
 
     async def op(p):
-      owner, old_snap, claimed = await p.hmget(k, "owner", "snap", "claimed")
+      owner, old_snapshot, claimed = await p.hmget(k, "owner", "snapshot", "claimed")
       if owner != token.encode() or not await p.xrange(key("q", cmd.run), cmd.entry_id, cmd.entry_id):
         return False
       all_ckpts = await p.hgetall(ck) if deleting else {}
@@ -416,25 +421,25 @@ class Bus:
       if claimed == cmd.entry_id.encode():
         p.hdel(k, "claimed")
       if checkpoint and reply.ok:
-        queue_checkpoint(p, **checkpoint)
-      finish_cmd(p, cmd, reply, acct, charge, grouped=False)
+        record_checkpoint(p, **checkpoint)
+      finish_command(p, cmd, reply, acct, charge, grouped=False)
       if mutates:
-        p.hset(k, "pos", cmd.entry_id)
-        p.hdel(k, "snap")
-        if old_snap:
-          p.hdel(ck, unpack_snap(old_snap.decode())[0])
+        p.hset(k, "last_cmd_id", cmd.entry_id)
+        p.hdel(k, "snapshot")
+        if old_snapshot:
+          p.hdel(ck, unpack_snapshot(old_snapshot.decode())[0])
       elif deleting:
         if owned:
           p.hdel(ck, *owned)
-        queue_delete(p, cmd.run)
+        record_run_delete(p, cmd.run)
       return bool(await p.execute())
 
-    return bool(await self.transact(op, k, key("f", cmd.request_id), *([ck] if deleting else []), raw=True))
+    return bool(await self.transact(op, k, key("f", cmd.request_id), *([ck] if deleting else []), binary=True))
 
   async def fail_stranded_commands(self, run_id: str, token: str) -> None:
-    """Fail any command left claimed by a dead trainer incarnation before serving new ones."""
-    eid = await self.s.hget(key("run", run_id), "claimed")
-    if eid and (rows := await self.r.xrange(key("q", run_id), eid, eid)):
+    """Fail any command left claimed by a dead trainer instance before serving new ones."""
+    eid = await self.meta.hget(key("run", run_id), "claimed")
+    if eid and (rows := await self.raw.xrange(key("q", run_id), eid, eid)):
       cmd = parse_cmd(run_id, *rows[0])
       err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {cmd.op}"))
       await self.commit_reply(cmd, err, token)
@@ -444,14 +449,14 @@ class Bus:
   async def _abandoned_samples(self, session: str) -> list[str]:
     """Pending sample IDs whose consumer lease has expired (never touches slow live replicas)."""
     try:
-      rows = await self.s.xpending_range(key("q", session), GROUP, "-", "+", count=1000)
+      rows = await self.meta.xpending_range(key("q", session), GROUP, "-", "+", count=1000)
     except redis.ResponseError as e:
       if is_missing_stream(e):
         return []
       raise
     if not rows:
       return []
-    holders, p = sorted({row["consumer"] for row in rows}), self.s.pipeline(transaction=False)
+    holders, p = sorted({row["consumer"] for row in rows}), self.meta.pipeline(transaction=False)
     for holder in holders:
       p.exists(key("lease", holder))
     dead = {holder for holder, live in zip(holders, await p.execute()) if not live}
@@ -459,13 +464,13 @@ class Bus:
 
   async def _first_abandoned(self, session: str) -> Cmd | None:
     for eid in await self._abandoned_samples(session):
-      if rows := await self.r.xrange(key("q", session), eid, eid):
+      if rows := await self.raw.xrange(key("q", session), eid, eid):
         return parse_cmd(session, *rows[0])
     return None
 
   async def peek_samples(self, sessions: list[str], block_ms: int = 0) -> list[Cmd]:
     """Read one ready head per sampling session: dead-replica pending entries first, else next undelivered."""
-    p = self.s.pipeline(transaction=False)
+    p = self.meta.pipeline(transaction=False)
     for s in sessions:
       p.xinfo_groups(key("q", s))
     cursors, check_dead = {}, []
@@ -483,7 +488,7 @@ class Bus:
     for cmd in cmds:
       cursors.pop(key("q", cmd.run), None)
     if cursors:
-      got = await self.r.xread(cursors, count=1, block=None if cmds else block_ms or None)
+      got = await self.raw.xread(cursors, count=1, block=None if cmds else block_ms or None)
       cmds.extend(parse_cmd(s.decode().removeprefix(key("q", "")), *entries[0]) for s, entries in got)
     return cmds
 
@@ -494,7 +499,9 @@ class Bus:
       if ids := (await self._abandoned_samples(s))[:count]:
         # Require 1s idle so two replicas reclaiming at once don't immediately re-steal each other's claim.
         try:
-          taken = [parse_cmd(s, eid, f) for eid, f in await self.r.xclaim(key("q", s), GROUP, consumer, 1000, ids) if f]
+          taken = [
+            parse_cmd(s, eid, f) for eid, f in await self.raw.xclaim(key("q", s), GROUP, consumer, 1000, ids) if f
+          ]
         except redis.ResponseError as e:
           if is_missing_stream(e):
             continue
@@ -503,7 +510,7 @@ class Bus:
         rem[s] -= len(taken)
     if not (fresh := [s for s in sessions if rem[s] > 0]):
       return cmds
-    p = self.r.pipeline(transaction=False)
+    p = self.raw.pipeline(transaction=False)
     for s in fresh:
       p.xreadgroup(GROUP, consumer, {key("q", s): ">"}, count=rem[s])
     for s, got in zip(fresh, await p.execute(raise_on_error=False)):
@@ -522,16 +529,16 @@ class Bus:
       if not await p.xrange(key("q", cmd.run), cmd.entry_id, cmd.entry_id):
         return False
       p.multi()
-      finish_cmd(p, cmd, reply, account, charge, grouped=True)
+      finish_command(p, cmd, reply, account, charge, grouped=True)
       return bool(await p.execute())
 
-    return bool(await self.transact(op, fk, raw=True))
+    return bool(await self.transact(op, fk, binary=True))
 
   # ***** checkpoints (single `tinyrl:ckpts` hash: uri -> json) *****
 
   async def get_checkpoint(self, uri: str) -> dict | None:
     parse_uri(uri)
-    raw = await self.s.hget(key("ckpts"), uri)
+    raw = await self.meta.hget(key("ckpts"), uri)
     return json.loads(raw) if raw else None
 
   async def checkpoint_version(self, uri: str) -> str:
@@ -540,7 +547,7 @@ class Bus:
     raise ValueError(f"no checkpoint at {uri}")
 
   async def _all_checkpoints(self) -> list[dict]:
-    return [json.loads(v) for v in await self.s.hvals(key("ckpts"))]
+    return [json.loads(v) for v in await self.meta.hvals(key("ckpts"))]
 
   async def _visible_checkpoints(self, prefix: str = "") -> list[dict]:
     items = await self._all_checkpoints()
@@ -569,7 +576,7 @@ class Bus:
   async def unregister_checkpoints(self, *uris: str) -> int:
     for uri in uris:
       parse_uri(uri)
-    return int(await self.s.hdel(key("ckpts"), *uris)) if uris else 0
+    return int(await self.meta.hdel(key("ckpts"), *uris)) if uris else 0
 
   async def expired_checkpoints(self) -> list[str]:
     now = time.time()
@@ -577,22 +584,22 @@ class Bus:
 
   async def sweep(self, store, grace: float) -> None:
     """Reclaim store versions that are neither in-flight writes nor published checkpoints."""
-    unused, writing = await asyncio.to_thread(store.versions), await self.s.hvals(key("writing"))
+    unused, writing = await asyncio.to_thread(store.versions), await self.meta.hvals(key("writing"))
     published = (v.partition("@")[0] for c in await self._all_checkpoints() if (v := c.get("version")))
     await asyncio.to_thread(store.sweep, unused.difference(writing, published), grace)
 
   # ***** events and wakeups *****
 
   async def append_event(self, _kind: Ev, **body) -> str:
-    p = self.s.pipeline()
+    p = self.meta.pipeline()
     log_event(p, _kind, body)
-    wake(p)
+    notify_stream(p)
     return (await p.execute())[0]
 
   async def wait_wake(self, wake_id: str, block_ms: int, stream: str = "wake") -> str:
-    got = await self.s.xread({key(stream): wake_id}, count=1, block=block_ms or None)
+    got = await self.meta.xread({key(stream): wake_id}, count=1, block=block_ms or None)
     return got[0][1][-1][0] if got else wake_id
 
   async def read_events(self, after: str = "0-0", count: int = 10_000) -> list[Event]:
-    rows = got[0][1] if (got := await self.s.xread({key("events"): after}, count=count)) else ()
+    rows = got[0][1] if (got := await self.meta.xread({key("events"): after}, count=count)) else ()
     return [Event(eid, int(eid.split("-")[0]) / 1000, f["kind"], json.loads(f["body"])) for eid, f in rows]

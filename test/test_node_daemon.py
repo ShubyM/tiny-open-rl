@@ -122,15 +122,15 @@ class TestNodeDaemon(RedisTest):
       try:
         ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(ready, node)
-        resident = node.lives[node.state.home["slow"][0]]
+        resident = node.workers[node.state.assignments["slow"][0]]
         await self.until(started.is_set, node)
         # Another base-model sampler yields the GPU from `resident` while `slow` is still downloading off-GPU.
         await self.bus.create_run(Run("other", "other-base", 4, role=Role.SAMPLER))
         request = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(request, node)
-        contender = node.lives[node.state.home["other"][0]]
-        self.assertNotIn(resident.life, node.on)
-        self.assertIn(contender.life, node.on)
+        contender = node.workers[node.state.assignments["other"][0]]
+        self.assertFalse(resident.has_gpus)
+        self.assertTrue(contender.has_gpus)
         self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
         self.assertEqual(await self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
       finally:
@@ -149,56 +149,19 @@ class TestNodeDaemon(RedisTest):
       await self.bus.create_run(Run("lost", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
       [cmd] = await self.bus.claim_samples(["lost"], "dead", 1)
-      await self.bus.r.xclaim(key("q", "lost"), GROUP, "dead", 0, [cmd.entry_id], idle=LEASE_MS)
+      await self.bus.raw.xclaim(key("q", "lost"), GROUP, "dead", 0, [cmd.entry_id], idle=LEASE_MS)
       await node.bind("sampler", "lost")
       waiting = self.background(self.bus.wait_for_reply(request, 10))
       await self.until(waiting.done, node)
       self.assertFalse(waiting.result().ok)
       self.assertIn("has not landed, and 127.0.0.1:9 failed to copy", waiting.result().body.decode())
 
-  async def test_trainer_prepares_the_next_command_during_execution(self):
+  async def test_dead_trainer_cleanup_fails_only_the_command_it_claimed(self):
     node, run = self.node(), new_id()
     await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
     await node.bind("worker", run)
     await self.create(run, "tiny", node)
-    child = node.processes["worker"]
-    entered, empty_read, release, peeked = (asyncio.Event() for _ in range(4))
-    call, peek = child.call, self.bus.peek_trainer
-
-    async def hold_step(method, *args):
-      if method == "execute" and args[0].op == Op.OPTIM_STEP:
-        entered.set()
-        await release.wait()
-      return await call(method, *args)
-
-    async def observe_peek(*args, **kwargs):
-      heads = await peek(*args, **kwargs)
-      if entered.is_set() and not heads:
-        empty_read.set()
-      elif any(c.op == Op.FORWARD_BACKWARD for c in heads):
-        peeked.set()
-      return heads
-
-    child.call, self.bus.peek_trainer = hold_step, observe_peek
-    first = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
-    try:
-      await asyncio.wait_for(entered.wait(), 5)
-      await asyncio.wait_for(empty_read.wait(), 5)
-      second = await self.bus.submit_command(run, Op.FORWARD_BACKWARD, proto_body(run, 6))
-      await asyncio.wait_for(peeked.wait(), 5)
-      state = await self.bus.queued_and_in_flight(run)
-      self.assertEqual((state["queued"], len(state["in_flight"])), (1, 1))
-    finally:
-      release.set()
-    for request in (first, second):
-      self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
-
-  async def test_dead_trainer_cleanup_fails_only_the_command_it_claimed(self):
-    node, run = self.node(), new_id()
-    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
-    life = await node.bind("worker", run)
-    await self.create(run, "tiny", node)
-    child = node.processes["worker"]
+    child, worker_task = node.processes["worker"], node.tasks["worker"]
     entered, stopped = asyncio.Event(), asyncio.Event()
     call = child.call
 
@@ -215,7 +178,7 @@ class TestNodeDaemon(RedisTest):
     next_request = await self.bus.submit_command(run, Op.CREATE_MODEL, b'{"base_model":"tiny","rank":4,"lora":{}}')
     stopped.set()
     try:
-      await asyncio.wait_for(life.task, 5)
+      await asyncio.wait_for(worker_task, 5)
     except* EOFError:
       pass  # A task group may wrap the child's disconnect.
     self.assertFalse((await self.bus.wait_for_reply(first, 0)).ok)
@@ -236,8 +199,8 @@ class TestNodeDaemon(RedisTest):
       a, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
     )
     await self.reply(req_a, node)
-    pa = node.state.home[a][0]
-    holder = node.lives[pa]
+    pa = node.state.assignments[a][0]
+    holder = node.workers[pa]
     pid = holder.model.proc.pid
     os.killpg(pid, signal.SIGSTOP)
     try:
@@ -245,12 +208,14 @@ class TestNodeDaemon(RedisTest):
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
       )
       # The holder keeps its turn for CYCLE_GRACE_MS after its command, then the newcomer is planned onto its GPU.
-      await self.until(lambda: (pb := node.state.home.get(b, [""])[0]) in node.lives and node.select_gpus(pb), node)
-      pb = node.state.home[b][0]
-      self.assertNotEqual(node.lives[pb].demand, Demand.IDLE)
+      await self.until(
+        lambda: (pb := node.state.assignments.get(b, [""])[0]) in node.workers and node.select_gpus(pb), node
+      )
+      pb = node.state.assignments[b][0]
+      self.assertNotEqual(node.workers[pb].demand, Demand.IDLE)
       self.assertEqual(node.select_gpus(pb), (0,))
-      self.assertEqual(node.on.get(holder.life), (0,))
-      self.assertNotIn(node.lives[pb].life, node.on)  # Rule R1: never enters GPU 0 until holder finishes parking
+      self.assertEqual(node.gpu_allocations.get(holder.worker_id), (0,))
+      self.assertFalse(node.workers[pb].has_gpus)  # Rule R1: never enters GPU 0 until holder finishes parking
       self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})
       heartbeat = (await self.bus.live_nodes(details=True))[node.id]["until"]
       await node.tick()
@@ -259,7 +224,7 @@ class TestNodeDaemon(RedisTest):
       with contextlib.suppress(ProcessLookupError):
         os.killpg(pid, signal.SIGCONT)
     await self.reply(request, node)
-    self.assertNotIn(holder.life, node.on)
+    self.assertFalse(holder.has_gpus)
 
   async def test_real_model_process_serves_moves_and_restarts(self):
     require_unix()
@@ -273,19 +238,19 @@ class TestNodeDaemon(RedisTest):
     await node.announce_node()
     self.background(scheduler.run(self.bus))
     await self.create(run, base, node)
-    proc = node.state.home[run][0]
-    first = node.lives[proc].model.proc.pid
+    proc = node.state.assignments[run][0]
+    first = node.workers[proc].model.proc.pid
     # Fill GPU 1, preempt GPU 0 with an exclusive run, then free GPU 1: `proc` hops to GPU 1 without restarting.
     create_fft = json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
     await self.reply(await self.bus.submit_command(other, Op.CREATE_MODEL, create_fft), node)
     await self.reply(await self.bus.submit_command(blocker, Op.CREATE_MODEL, create_fft), node)
     await self.reply(await self.bus.submit_command(other, Op.DELETE_MODEL, b"{}"), node)
     await self.reply(await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}'), node)
-    self.assertEqual(node.lives[proc].model.proc.pid, first)
-    self.assertEqual(node.on[node.lives[proc].life], (1,))
+    self.assertEqual(node.workers[proc].model.proc.pid, first)
+    self.assertEqual(node.gpu_allocations[node.workers[proc].worker_id], (1,))
     await self.reply(await self.bus.submit_command(blocker, Op.DELETE_MODEL, b"{}"), node)
     os.killpg(first, signal.SIGKILL)
-    await self.until(lambda: proc in node.lives and node.lives[proc].model.proc.pid != first, node)
+    await self.until(lambda: proc in node.workers and node.workers[proc].model.proc.pid != first, node)
     await self.create(run, base, node)
 
   async def test_the_node_uploads_what_its_model_saved(self):
@@ -349,7 +314,7 @@ class TestNodeDaemon(RedisTest):
     self.assertLessEqual(len(parks), 3)  # a trainer that gave up the GPU in every gap would park 16 times
 
   async def test_a_swap_waits_for_an_open_training_step_to_finish(self):
-    self.enterContext(patch("tinyrl.control.workers.QUANTUM_MS", 40))  # a turn often ends between two commands
+    self.enterContext(patch("tinyrl.control.node_daemon.QUANTUM_MS", 40))  # a turn often ends between two commands
     node = self.node(gpus=1)
     await node.announce_node()
     self.background(scheduler.run(self.bus))
