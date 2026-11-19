@@ -17,7 +17,7 @@ import torch
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Ev, Op, Reply, Role, unpack_snap
 from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge, Wave
-from tinyrl.control.fairness import Demand, blocks, plan_gpus, select_runs
+from tinyrl.control.fairness import Demand, Worker, blocks, plan_gpus, select_runs
 from tinyrl.control.process import Process
 from tinyrl.helpers import DEBUG, getenv
 from tinyrl.storage.store import Store
@@ -100,8 +100,9 @@ class NodeDaemon:
 
   def select_gpus(self, proc: str) -> tuple[int, ...]:
     draining = {g for block in self.drains.values() for g in block}
-    lives = {p: lf for p, lf in self.lives.items() if lf.life not in self.drains}
-    keep, wake_at = plan_gpus(lives, self.on, self.gpus, now := time.monotonic(), draining)
+    occupied = set().union(*self.on.values())
+    workers = {p: lf.worker() for p, lf in self.lives.items() if lf.life not in self.drains and lf.wanted()}
+    keep, wake_at = plan_gpus(workers, self.gpus, now := time.monotonic(), draining, occupied)
     if self.timer:
       self.timer.cancel()
     self.timer = asyncio.get_running_loop().call_later(max(0.0, wake_at - now), self.notify) if wake_at else None
@@ -206,6 +207,19 @@ class Lifetime:
     s = self.node.state
     runs = [c.run for c in self.ready()[0] if c.run in s.jobs] or [r for r in self.streams() if r in s.jobs]
     return max(map(s.ready_lag, runs), default=-self.gpu_ms)
+
+  def worker(self) -> Worker:
+    return Worker(
+      gpus=self.spec.gpus,
+      exclusive=self.spec.exclusive,
+      demand=self.demand,
+      current=self.node.on.get(self.life, ()),
+      bound=self.bound_gpus,
+      gang=not self.sampling,
+      hold_until=self.hold_until,
+      lag=self.ready_lag(),
+      gpu_ms=self.gpu_ms,
+    )
 
   async def run(self) -> None:
     self.task = asyncio.current_task()
@@ -466,7 +480,7 @@ class Lifetime:
     for c in candidates:
       self.run_service[c.run] = max(self.run_service.get(c.run, self.service_floor), self.service_floor)
     width = SAMPLE_RUNS if self.sampling and self.spec.lora else 1
-    runs = select_runs(self.node.state, candidates, self.run_service, width)
+    runs = select_runs(candidates, self.node.state.account, self.node.state.ready_lag, self.run_service, width)
     inputs = {c.run: self.prepared[c.request_id][1].result() for c in candidates if c.run in runs}
     bad = any(isinstance(v, Exception) for v in inputs.values())
     await self.stop_reader()

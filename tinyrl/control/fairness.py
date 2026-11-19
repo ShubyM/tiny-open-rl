@@ -1,4 +1,4 @@
-"""GPU fairness from fleet service to one dispatch.
+"""GPU fairness from fleet service to one dispatch — pure data in, pure data out.
 
 update_lag compares each account's fair share with its billed GPU time.
 plan_gpus assigns GPU blocks to workers. select_runs picks one account for a worker's batch.
@@ -6,20 +6,30 @@ plan_gpus assigns GPU blocks to workers. select_runs picks one account for a wor
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
 
-from tinyrl.bus import Cmd, Role
-
-if TYPE_CHECKING:
-  from tinyrl.control.node_daemon import Lifetime
-  from tinyrl.control.scheduler import State
+from tinyrl.bus import Cmd
 
 
-class Demand(Enum):
+class Demand(StrEnum):
   IDLE = "idle"
   READY = "ready"
   FINISH_STEP = "finish_step"  # The trainer may keep its GPUs across the optimizer-step boundary.
+
+
+@dataclass(frozen=True)
+class Worker:
+  gpus: int = 1
+  exclusive: bool = False
+  demand: Demand = Demand.READY
+  current: tuple[int, ...] = ()
+  bound: tuple[int, ...] = ()
+  gang: bool = False
+  hold_until: float = 0.0
+  lag: float = 0.0
+  gpu_ms: float = 0.0
 
 
 def waterfill(capacity: float, demand: dict[str, float], weights: dict[str, float] | None = None) -> dict[str, float]:
@@ -59,19 +69,24 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
   return {a: v for a, v in lag.items() if a in rates or v < -1e-9}, seen
 
 
-def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width: int) -> list[str]:
+def select_runs(
+  heads: list[Cmd],
+  account: Callable[[str], str],
+  ready_lag: Callable[[str], float],
+  service: dict[str, float],
+  width: int,
+) -> list[str]:
   """Choose one ready account, then batch up to `width` of its least-served runs."""
   ready = {cmd.run: cmd for cmd in reversed(heads)}
   floor = min((service[run] for run in ready if run in service), default=0.0)
 
   def rank(cmd: Cmd) -> tuple:
-    return -state.ready_lag(cmd.run), service.get(cmd.run, floor), tuple(map(int, cmd.entry_id.split("-")))
+    return round(-ready_lag(cmd.run), 3), service.get(cmd.run, floor), tuple(map(int, cmd.entry_id.split("-")))
 
-  runs = [cmd.run for cmd in sorted(ready.values(), key=rank)]
-  if not runs:
+  if not (runs := [cmd.run for cmd in sorted(ready.values(), key=rank)]):
     return []
-  account = state.account(runs[0])
-  return [run for run in runs if state.account(run) == account][:width]
+  chosen = account(runs[0])
+  return [run for run in runs if account(run) == chosen][:width]
 
 
 def blocks(total: int, width: int) -> list[tuple[int, ...]]:
@@ -80,57 +95,52 @@ def blocks(total: int, width: int) -> list[tuple[int, ...]]:
 
 
 def plan_gpus(
-  lives: dict[str, Lifetime], on: dict[str, tuple[int, ...]], total: int, now: float, draining: set[int] = frozenset()
+  workers: dict[str, Worker],
+  total: int,
+  now: float,
+  draining: set[int] = frozenset(),
+  occupied: set[int] = frozenset(),
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
   """Return desired blocks and the next contested quantum deadline. The node enforces the handoff."""
-  current = {p: on.get(life.life, ()) for p, life in lives.items()}
-  occupied = set().union(*on.values())
-  pinned = {
-    g for life in lives.values() if life.spec.role == Role.TRAINER and life.spec.gpus > 1 for g in life.bound_gpus
-  }
-  exclusive_waiting = any(
-    life.spec.exclusive and life.demand != Demand.IDLE and not current[p] for p, life in lives.items()
-  )
-  eligible = {p: life for p, life in lives.items() if life.wanted()}
+  held = occupied | {g for w in workers.values() for g in w.current}
+  pinned = {g for w in workers.values() if w.gang for g in w.bound}
+  exclusive_waiting = any(w.exclusive and w.demand != Demand.IDLE and not w.current for w in workers.values())
 
   # Keep exclusive residents. Other busy residents finish their quantum or training step unless an exclusive needs in.
   keep, deadlines = {}, []
-  for p, life in eligible.items():
-    block = current[p]
-    if not block or not draining.isdisjoint(block):
+  for name, w in workers.items():
+    if not w.current or not draining.isdisjoint(w.current):
       continue
-    protected = life.demand != Demand.IDLE and not exclusive_waiting
-    if protected and life.hold_until > now:
-      deadlines.append(life.hold_until)
-    if life.spec.exclusive or protected and (life.hold_until > now or life.demand == Demand.FINISH_STEP):
-      keep[p] = block
+    protected = w.demand != Demand.IDLE and not exclusive_waiting
+    if protected and w.hold_until > now:
+      deadlines.append(w.hold_until)
+    if w.exclusive or (protected and (w.hold_until > now or w.demand == Demand.FINISH_STEP)):
+      keep[name] = w.current
 
   taken = set(draining).union(*keep.values())
-  exclusive_gpus = {g for p, block in keep.items() if lives[p].spec.exclusive for g in block}
-  reserved_for_waiters = set()
+  exclusive_gpus = {g for name, block in keep.items() if workers[name].exclusive for g in block}
+  reserved, waiting = set(), False
 
-  def priority(p: str) -> tuple:
-    life = eligible[p]
-    return life.spec.exclusive, round(life.ready_lag(), 3), round(-life.gpu_ms, 3), bool(current[p]), p
+  def priority(name: str) -> tuple:
+    w = workers[name]
+    return w.exclusive, round(w.lag, 3), round(-w.gpu_ms, 3), bool(w.current), name
 
-  waiting = False
-  contenders = [p for p, life in eligible.items() if p not in keep and life.demand != Demand.IDLE]
-  for p in sorted(contenders, key=priority, reverse=True):
-    life = eligible[p]
-    options = [life.bound_gpus] if life.bound_gpus else blocks(total, life.spec.gpus)
-    free = [b for b in options if taken.isdisjoint(b) and (b == current[p] or reserved_for_waiters.isdisjoint(b))]
-    if free:
-      avoid = pinned if life.spec.exclusive else set()
-      block = min(free, key=lambda b: (b != current[p], not avoid.isdisjoint(b), not occupied.isdisjoint(b), b))
-      keep[p] = block
+  contenders = [name for name, w in workers.items() if name not in keep and w.demand != Demand.IDLE]
+  for name in sorted(contenders, key=priority, reverse=True):
+    w = workers[name]
+    options = [w.bound] if w.bound else blocks(total, w.gpus)
+    if free := [b for b in options if taken.isdisjoint(b) and (b == w.current or reserved.isdisjoint(b))]:
+      avoid = pinned if w.exclusive else set()
+      block = min(free, key=lambda b: (b != w.current, not avoid.isdisjoint(b), not held.isdisjoint(b)))
+      keep[name] = block
       taken.update(block)
-      if life.spec.exclusive:
+      if w.exclusive:
         exclusive_gpus.update(block)
     else:
       waiting = True
       # Leave room for this gang to assemble before another waiter can take part of its block.
-      reserved_for_waiters.update(next((b for b in options if exclusive_gpus.isdisjoint(b)), ()))
+      reserved.update(next((b for b in options if exclusive_gpus.isdisjoint(b)), ()))
 
   # An uncontested resident can stay warm even after its turn expires.
-  keep.update((p, current[p]) for p in eligible if p not in keep and current[p] and taken.isdisjoint(current[p]))
+  keep.update((name, w.current) for name, w in workers.items() if w.current and taken.isdisjoint(w.current))
   return keep, min(deadlines, default=None) if waiting else None

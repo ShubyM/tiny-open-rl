@@ -5,6 +5,7 @@ import tempfile
 import time
 import types
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import torch
@@ -17,7 +18,7 @@ from test.test_trainer import LORA, counting
 from tinyrl.api import wire
 from tinyrl.bus import GROUP, LEASE_MS, Bus, Cmd, Ev, Op, Role, Run, connect, key
 from tinyrl.control import scheduler
-from tinyrl.control.fairness import Demand, plan_gpus, select_runs, update_lag, waterfill
+from tinyrl.control.fairness import Demand, Worker, plan_gpus, select_runs, update_lag, waterfill
 from tinyrl.control.node_daemon import QUANTUM_MS, NodeDaemon
 from tinyrl.control.scheduler import (
   REBALANCE_MS,
@@ -80,39 +81,24 @@ class Cluster:
     self.queues.pop(run, None)
 
 
-class FakeLife:
-  """Minimal stand-in for `Lifetime` to drive the pure L1 `plan_gpus` selector with a simulated clock."""
-
-  def __init__(self, proc: str, spec: Spec, state: State, quantum: float = 2.0, bound: tuple[int, ...] = ()):
-    self.proc, self.life, self.spec, self.state = proc, f"{proc}@n-1", spec, state
-    self.demand, self.bound_gpus, self.hold_until, self.quantum, self.gpu_ms = (
-      Demand.READY,
-      bound,
-      quantum,
-      quantum,
-      0.0,
-    )
-
-  def wanted(self) -> bool:
-    return True
-
-  def ready_lag(self) -> float:
-    s = self.state
-    return max((s.ready_lag(r) for r in s.runs(self.proc) if s.ready(r)), default=-self.gpu_ms)
-
-
 def apply_gpus(
-  lives: dict[str, FakeLife], on: dict[str, tuple[int, ...]], total: int, now: float, draining: set[int] = frozenset()
+  workers: dict[str, Worker],
+  quanta: dict[str, float],
+  state: State,
+  total: int,
+  now: float,
+  draining: set[int] = frozenset(),
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
-  """Run `plan_gpus` and commit transitions into `on`, resetting the deadline ONLY when owner/slot changes."""
-  keep, wake_at = plan_gpus(lives, on, total, now, draining)  # type: ignore[arg-type]
-  for p, lf in lives.items():
-    prev, want = on.get(lf.life, ()), keep.get(p, ())
-    if prev and prev != want:
-      on.pop(lf.life, None)
-    if want and prev != want:
-      on[lf.life] = want
-      lf.hold_until = now + lf.quantum
+  """Drive pure `plan_gpus` on `Worker` snapshots, resetting `hold_until` only when a worker's block changes."""
+  ranked = {
+    p: replace(w, lag=max((state.ready_lag(r) for r in state.runs(p) if state.ready(r)), default=-w.gpu_ms))
+    for p, w in workers.items()
+  }
+  keep, wake_at = plan_gpus(ranked, total, now, draining)
+  for p, w in list(workers.items()):
+    want = keep.get(p, ())
+    until = now + quanta[p] if want and want != w.current else w.hold_until
+    workers[p] = replace(w, current=want, hold_until=until)
   return keep, wake_at
 
 
@@ -130,12 +116,12 @@ def check_plan_invariants(test: unittest.TestCase, s: State) -> None:
 
 
 def check_gpu_invariants(
-  test: unittest.TestCase, keep: dict, lives: dict, total: int, draining: set[int] = frozenset()
+  test: unittest.TestCase, keep: dict, workers: dict[str, Worker], total: int, draining: set[int] = frozenset()
 ) -> None:
   seen = list(draining)
   for p, gs in keep.items():
-    test.assertEqual(len(gs), lives[p].spec.gpus)
-    test.assertEqual(len(set(gs)), lives[p].spec.gpus)
+    test.assertEqual(len(gs), workers[p].gpus)
+    test.assertEqual(len(set(gs)), workers[p].gpus)
     test.assertTrue(all(0 <= g < total for g in gs))
     seen.extend(gs)
   test.assertEqual(len(seen), len(set(seen)))
@@ -528,8 +514,9 @@ class TestLocalQuantum(unittest.TestCase):
   def test_ready_runs_share_service_even_when_commands_have_different_costs(self):
     heads = [Cmd(run, "1-0", Op.FORWARD_BACKWARD, b"") for run in ("slow", "fast")]
     service = {"slow": 0.0, "fast": 0.0}
+    state = State()
     for _ in range(11):
-      [run] = select_runs(State(), heads, service, 1)
+      [run] = select_runs(heads, state.account, state.ready_lag, service, 1)
       service[run] += 10 if run == "slow" else 1
     self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
 
@@ -540,7 +527,12 @@ class TestLocalQuantum(unittest.TestCase):
       Cmd("first", "9-2", Op.OPTIM_STEP, b""),
     ]
     state = State(jobs={cmd.run: Job(Spec(), account="alice") for cmd in heads})
-    self.assertEqual(select_runs(state, heads, {}, width=3), ["first", "same_ms_later", "later"])
+    self.assertEqual(
+      select_runs(heads, state.account, state.ready_lag, {}, width=3), ["first", "same_ms_later", "later"]
+    )
+    # Sub-microsecond float drift from split waves must not outrank run service or arrival order.
+    tiny_drift = {"later": 1e-12, "same_ms_later": 0.0, "first": 0.0}
+    self.assertEqual(select_runs(heads, lambda r: r, tiny_drift.__getitem__, {}, width=1), ["first"])
 
   def test_account_lag_precedes_run_service_and_arrival(self):
     cluster = Cluster()
@@ -556,8 +548,8 @@ class TestLocalQuantum(unittest.TestCase):
       Cmd("save", "2-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""),
       Cmd("waiting", "3-0", Op.OPTIM_STEP, b""),
     ]
-    self.assertEqual(select_runs(state, heads, {"waiting": 1000}, width=1), ["waiting"])
-    self.assertEqual(select_runs(state, heads, {"waiting": 1000}, width=3), ["waiting"])
+    self.assertEqual(select_runs(heads, state.account, state.ready_lag, {"waiting": 1000}, width=1), ["waiting"])
+    self.assertEqual(select_runs(heads, state.account, state.ready_lag, {"waiting": 1000}, width=3), ["waiting"])
 
   def test_continuous_sampler_saves_share_a_trainer_with_training_work(self):
     cluster = Cluster()
@@ -566,7 +558,7 @@ class TestLocalQuantum(unittest.TestCase):
     heads = [Cmd("saving", "1-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""), Cmd("training", "2-0", Op.OPTIM_STEP, b"")]
     service = {"saving": 0, "training": 0}
     for _ in range(12):
-      [run] = select_runs(cluster.s, heads, service, width=1)
+      [run] = select_runs(heads, cluster.s.account, cluster.s.ready_lag, service, width=1)
       service[run] += 3 if run == "saving" else 1
     self.assertEqual(service, {"saving": 9, "training": 9})
 
@@ -602,116 +594,112 @@ class TestLocalQuantum(unittest.TestCase):
         self.assertEqual(len(flat), len(set(flat)))
 
   def test_active_quantum_prevents_thrash_and_overtime_hands_off_with_zero_wait(self):
-    c, on = Cluster(), {}
+    c = Cluster()
     c.node("n", 1)
     p1 = c.run("a", backlog=1)
-    lives = {p1: FakeLife(p1, c.s.procs[p1].spec, c.s, quantum=2.0)}
+    workers, quanta = {p1: Worker(hold_until=2.0)}, {p1: 2.0}
 
     # Lone client enters OVERTIME at t=2s: no switch, timer stays disarmed, the deadline never resets.
     for t in (0.0, 0.5, 1.9, 2.5, 10.0):
-      keep, wake = apply_gpus(lives, on, 1, t)
-      self.assertEqual((keep, wake, lives[p1].hold_until), ({p1: (0,)}, None, 2.0))
-      lives[p1].gpu_ms += 500.0
+      keep, wake = apply_gpus(workers, quanta, c.s, 1, t)
+      self.assertEqual((keep, wake, workers[p1].hold_until), ({p1: (0,)}, None, 2.0))
+      workers[p1] = replace(workers[p1], gpu_ms=workers[p1].gpu_ms + 500.0)
       c.serve("a", 500.0)
       c.settle()
-      lives[p1].state = c.s
 
     # Late joiner `p2` arrives at t=10s: `p1` is already in overtime -> `p2` gets GPU immediately, held for its quantum.
     p2 = c.run("b", backlog=1)
-    lives[p1].state = c.s
-    lives[p2] = FakeLife(p2, c.s.procs[p2].spec, c.s, quantum=2.0)
-    keep, wake = apply_gpus(lives, on, 1, 10.0)
+    workers[p2], quanta[p2] = Worker(hold_until=2.0), 2.0
+    keep, wake = apply_gpus(workers, quanta, c.s, 1, 10.0)
     self.assertEqual((keep, wake), ({p2: (0,)}, None))
     # Five rapid command boundaries inside [10.0, 12.0) all keep `p2` and arm the quantum timer for t=12.0.
     for t in (10.1, 10.4, 10.9, 11.5, 11.9):
-      keep, wake = apply_gpus(lives, on, 1, t)
-      self.assertEqual((keep, wake, lives[p2].hold_until), ({p2: (0,)}, 12.0, 12.0))
+      keep, wake = apply_gpus(workers, quanta, c.s, 1, t)
+      self.assertEqual((keep, wake, workers[p2].hold_until), ({p2: (0,)}, 12.0, 12.0))
     # If `p2` goes idle early (RL ping-pong), `p1` takes GPU immediately; if both idle, last owner stays warm.
-    lives[p2].demand = Demand.IDLE
-    keep, wake = apply_gpus(lives, on, 1, 11.95)
+    workers[p2] = replace(workers[p2], demand=Demand.IDLE)
+    keep, wake = apply_gpus(workers, quanta, c.s, 1, 11.95)
     self.assertEqual((keep, wake), ({p1: (0,)}, None))
-    lives[p1].demand = Demand.IDLE
-    keep, wake = apply_gpus(lives, on, 1, 12.1)
+    workers[p1] = replace(workers[p1], demand=Demand.IDLE)
+    keep, wake = apply_gpus(workers, quanta, c.s, 1, 12.1)
     self.assertEqual((keep, wake), ({p1: (0,)}, None))
 
   def test_asymmetric_switch_cost_and_account_grouping_share_gpu_ms_fairly(self):
     # Trainer (quantum=1s) vs slow-waking sampler (quantum=6s): trainer stays across overtime to catch up with few swaps.
-    c, on = Cluster(), {}
+    c = Cluster()
     c.node("n", 1)
     pt = c.run("train", backlog=1)
     ps = c.run("samp", role="sampler", backlog=1)
-    lives = {
-      pt: FakeLife(pt, c.s.procs[pt].spec, c.s, quantum=1.0),
-      ps: FakeLife(ps, c.s.procs[ps].spec, c.s, quantum=6.0),
-    }
+    quanta = {pt: 1.0, ps: 6.0}
+    workers = {p: Worker(hold_until=q) for p, q in quanta.items()}
     switches, last, dt = 0, None, 0.5
     for i in range(240):
-      keep, _ = apply_gpus(lives, on, 1, i * dt)
+      keep, _ = apply_gpus(workers, quanta, c.s, 1, i * dt)
       [h] = keep
       switches += h != last
       last = h
-      lives[h].gpu_ms += dt * 1000
+      workers[h] = replace(workers[h], gpu_ms=workers[h].gpu_ms + dt * 1000)
       c.serve(c.s.runs(h)[0], dt * 1000)
       c.settle()
-      for lf in lives.values():
-        lf.state = c.s
     self.assertAlmostEqual(c.service["train"] / sum(c.service.values()), 0.5, delta=0.05)
     self.assertLessEqual(switches, 24)  # switches once per ~6s sampler quantum, not every 1s trainer quantum
 
     # Account grouping: Alice's trainer + sampler pair splits 50/50 against Bob's solo trainer (25/25/50).
-    c, on = Cluster(), {}
+    c = Cluster()
     c.node("n", 1)
     t1 = c.run("t1", session="alice", backlog=1)
     s1 = c.run("s1", role="sampler", train_run="t1", backlog=1)
     t2 = c.run("t2", session="bob", backlog=1)
-    lives = {p: FakeLife(p, c.s.procs[p].spec, c.s, quantum=1.0 if p != s1 else 4.0) for p in (t1, s1, t2)}
+    quanta = {p: 1.0 if p != s1 else 4.0 for p in (t1, s1, t2)}
+    workers = {p: Worker(hold_until=q) for p, q in quanta.items()}
     for i in range(240):
-      keep, _ = apply_gpus(lives, on, 1, i * dt)
+      keep, _ = apply_gpus(workers, quanta, c.s, 1, i * dt)
       [h] = keep
-      lives[h].gpu_ms += dt * 1000
+      workers[h] = replace(workers[h], gpu_ms=workers[h].gpu_ms + dt * 1000)
       c.serve(c.s.runs(h)[0], dt * 1000)
       c.settle()
-      for lf in lives.values():
-        lf.state = c.s
     self.assertAlmostEqual(c.service["alice"] / (c.service["alice"] + c.service["bob"]), 0.5, delta=0.06)
-    self.assertAlmostEqual(lives[t1].gpu_ms / (lives[t1].gpu_ms + lives[s1].gpu_ms), 0.5, delta=0.08)
+    self.assertAlmostEqual(workers[t1].gpu_ms / (workers[t1].gpu_ms + workers[s1].gpu_ms), 0.5, delta=0.08)
 
   def test_gang_hold_prevents_leapfrog_starvation_and_achieves_waterfill_shares(self):
-    c, on = Cluster(), {}
+    c = Cluster()
     c.node("n", 2)
     p1 = c.run("a", backlog=1)
     p2 = c.run("b", backlog=1)
     p3 = c.run("d", rank=4, backlog=1)
     gang = c.run("wide", gpus=2, backlog=1)
-    lives = {p: FakeLife(p, c.s.procs[p].spec, c.s, quantum=2.0) for p in (p1, p2, p3, gang)}
+    quanta = dict.fromkeys((p1, p2, p3, gang), 2.0)
     # Stagger `p1` (overtime at t=2) and `p2` (active until t=3) while `gang` has highest lag and `p3` waits.
-    on[lives[p1].life], on[lives[p2].life] = (0,), (1,)
-    lives[p1].hold_until, lives[p2].hold_until = 2.0, 3.0
+    workers = {
+      p1: Worker(current=(0,), hold_until=2.0),
+      p2: Worker(current=(1,), hold_until=3.0),
+      p3: Worker(hold_until=2.0),
+      gang: Worker(gpus=2, hold_until=2.0),
+    }
     c.s.lag = {"wide": 5000.0, "d": 1000.0, "a": 0.0, "b": 0.0}
-    keep, wake = apply_gpus(lives, on, 2, 2.2)
+    keep, wake = apply_gpus(workers, quanta, c.s, 2, 2.2)
     # `p3` is blocked from leapfrogging onto GPU 0; overtime `p1` keeps computing without clock reset until `p2` ends at 3.0.
-    self.assertEqual((keep, wake, lives[p1].hold_until), ({p1: (0,), p2: (1,)}, 3.0, 2.0))
-    keep, _ = apply_gpus(lives, on, 2, 3.0)
+    self.assertEqual((keep, wake, workers[p1].hold_until), ({p1: (0,), p2: (1,)}, 3.0, 2.0))
+    keep, _ = apply_gpus(workers, quanta, c.s, 2, 3.0)
     self.assertEqual(keep, {gang: (0, 1)})
 
     # Steady-state 2 singles + 1 gang on 2 GPUs -> exact 1/3 `gpu_ms` each (waterfill C=2, d=(1,1,2)).
-    c, on = Cluster(), {}
+    c = Cluster()
     c.node("n", 2)
     p1, p2, gang = c.run("a", backlog=1), c.run("b", backlog=1), c.run("wide", gpus=2, backlog=1)
-    lives = {p: FakeLife(p, c.s.procs[p].spec, c.s, quantum=1.0) for p in (p1, p2, gang)}
+    quanta = dict.fromkeys((p1, p2, gang), 1.0)
+    workers = {p: Worker(gpus=c.s.procs[p].spec.gpus, hold_until=1.0) for p in quanta}
     both_ticks = gang_ticks = 0
     for i in range(180):
-      keep, _ = apply_gpus(lives, on, 2, i * 0.5)
-      check_gpu_invariants(self, keep, lives, 2)
+      keep, _ = apply_gpus(workers, quanta, c.s, 2, i * 0.5)
+      check_gpu_invariants(self, keep, workers, 2)
       gang_ticks += keep == {gang: (0, 1)}
       both_ticks += p1 in keep and p2 in keep
       for h, gs in keep.items():
         ms = 500.0 * len(gs)
-        lives[h].gpu_ms += ms
+        workers[h] = replace(workers[h], gpu_ms=workers[h].gpu_ms + ms)
         c.serve(c.s.runs(h)[0], ms)
       c.settle()
-      for lf in lives.values():
-        lf.state = c.s
     self.assertGreater(gang_ticks, 25)
     self.assertGreater(both_ticks, 25)
     total = sum(c.service.values())
@@ -720,22 +708,22 @@ class TestLocalQuantum(unittest.TestCase):
 
   def test_random_local_quantum_schedules_never_overlap_or_violate_exclusives(self):
     for seed in range(100):
-      rng, s, on, now = random.Random(seed), State(), {}, 0.0
+      rng, s, now = random.Random(seed), State(), 0.0
       total = rng.choice([1, 2, 4])
-      lives = {}
+      workers, quanta = {}, {}
       for i in range(6):
         w = rng.choice([1, 1, 2]) if total >= 2 else 1
-        excl = rng.random() < 0.15
-        lives[f"p{i}"] = FakeLife(f"p{i}", Spec(gpus=w, exclusive=excl), s, quantum=rng.choice([0.5, 2.0]))
+        quanta[f"p{i}"] = q = rng.choice([0.5, 2.0])
+        workers[f"p{i}"] = Worker(gpus=w, exclusive=rng.random() < 0.15, hold_until=q)
       for _ in range(60):
         now += rng.uniform(0.0, 1.5)
         draining = {rng.randrange(total)} if rng.random() < 0.1 else set()
-        for lf in lives.values():
-          lf.demand = Demand.READY if rng.random() < 0.7 else Demand.IDLE
-          if lf.life in on:
-            lf.gpu_ms += rng.uniform(10.0, 500.0)
-        keep, wake = apply_gpus(lives, on, total, now, draining)
-        check_gpu_invariants(self, keep, lives, total, draining)
+        for p, w in list(workers.items()):
+          demand = Demand.READY if rng.random() < 0.7 else Demand.IDLE
+          ms = w.gpu_ms + (rng.uniform(10.0, 500.0) if w.current else 0.0)
+          workers[p] = replace(w, demand=demand, gpu_ms=ms)
+        keep, wake = apply_gpus(workers, quanta, s, total, now, draining)
+        check_gpu_invariants(self, keep, workers, total, draining)
         if wake is not None:
           self.assertGreater(wake, now)
 
@@ -778,28 +766,27 @@ class TestMultiNodeFairness(unittest.TestCase):
 
   def simulate(self, c: Cluster, steps: int, dt: float = 0.5, quantum: float = 1.0) -> int:
     """Co-simulate per-node `plan_gpus` (L1) and cluster `scheduler.step` (L2)."""
-    ons = {n: {} for n in c.nodes}
-    lives: dict[str, tuple[str, FakeLife]] = {}
+    workers: dict[str, tuple[str, Worker]] = {}
     moves = 0
     for i in range(steps):
       now = i * dt
       for n in c.nodes:
         local = {}
-        for p, pr in c.s.procs.items():
-          if pr.node == n and c.s.runs(p):
-            if p not in lives or lives[p][0] != n:
-              if p in lives:
-                ons[lives[p][0]].pop(lives[p][1].life, None)
-              lives[p] = (n, FakeLife(p, pr.spec, c.s, quantum=quantum))
-            lf = lives[p][1]
-            lf.state, lf.demand = c.s, Demand.READY if c.s.busy(p) else Demand.IDLE
-            local[p] = lf
-        keep, _ = apply_gpus(local, ons[n], c.nodes[n]["gpus"], now)
-        for p, gs in keep.items():
-          if local[p].demand != Demand.IDLE:
-            ms = dt * 1000.0 * len(gs)
-            local[p].gpu_ms += ms
+        for p, pr in c.s.procs_on(n):
+          if c.s.runs(p):
+            w = (
+              workers[p][1]
+              if p in workers and workers[p][0] == n
+              else Worker(gpus=pr.spec.gpus, exclusive=pr.spec.exclusive, hold_until=quantum)
+            )
+            local[p] = replace(w, demand=Demand.READY if c.s.busy(p) else Demand.IDLE)
+        keep, _ = apply_gpus(local, dict.fromkeys(local, quantum), c.s, c.nodes[n]["gpus"], now)
+        for p, w in local.items():
+          if keep.get(p) and w.demand != Demand.IDLE:
+            ms = dt * 1000.0 * len(keep[p])
+            w = replace(w, gpu_ms=w.gpu_ms + ms)
             c.serve(c.s.runs(p)[0], ms)
+          workers[p] = (n, w)
       moves += sum(1 for ev, body in c.settle() if ev == Ev.PLACED and body.get("rule") == "place.rebalance")
     return moves
 

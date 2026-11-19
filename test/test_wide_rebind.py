@@ -9,21 +9,16 @@ import torch
 from test.execution import TestNode
 from test.helpers import RedisTest, new_id
 from test.test_api import proto_body
-from test.test_scheduler import FakeLife
 from tinyrl.bus import Op, Run
-from tinyrl.control.fairness import Demand, plan_gpus
-from tinyrl.control.scheduler import Spec, State
+from tinyrl.control.fairness import Demand, Worker, plan_gpus
 from tinyrl.storage.store import Store
 
 
 class TestWideSelection(unittest.TestCase):
   def test_exclusive_prefers_to_leave_a_parked_gangs_block_available(self):
-    state, on = State(), {}
-    gang = FakeLife("gang", Spec(gpus=2), state, bound=(0, 1))
-    other = FakeLife("other", Spec(exclusive=True), state)
-    lives = {"gang": gang, "other": other}
-    self.assertEqual(plan_gpus(lives, on, 4, 1)[0], {"other": (2,), "gang": (0, 1)})
-    self.assertEqual(plan_gpus(lives, on, 2, 1)[0], {"other": (0,)})
+    workers = {"gang": Worker(gpus=2, bound=(0, 1), gang=True), "other": Worker(exclusive=True)}
+    self.assertEqual(plan_gpus(workers, 4, 1)[0], {"other": (2,), "gang": (0, 1)})
+    self.assertEqual(plan_gpus(workers, 2, 1)[0], {"other": (0,)})
 
 
 class TestWideRebind(RedisTest):
