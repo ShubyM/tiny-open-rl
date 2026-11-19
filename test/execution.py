@@ -87,12 +87,12 @@ class TestNode(NodeDaemon):
     self.pinned.add(proc)
     await self.sync()
     self.reap_workers()
-    if proc in self.workers:
-      self.notify()
+    if proc in self.workers and self.workers[proc].lease._task:
+      self.gpu_scheduler.notify()
       return self.workers[proc]
     task = self.tasks.get(proc) or self.start_worker(proc)
     async with asyncio.timeout(5):
-      while proc not in self.workers:
+      while not self.workers[proc].lease._task:
         if task.done():
           task.result()
           raise AssertionError(f"could not start {proc}")
@@ -105,7 +105,7 @@ class TestNode(NodeDaemon):
     self.unpinned.add(proc)
     if p := self.state.procs.get(proc):
       p.node = None
-    self.notify()
+    self.gpu_scheduler.notify()
 
   async def worker_for(self, run: str) -> str | None:
     await assign_new_runs(self.bus)

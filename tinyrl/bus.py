@@ -62,11 +62,8 @@ def record_checkpoint(p, uri: str, size: int, *, version: str, ttl=None, owned=F
   raw_kind, now = cid.split("/", 1)[0], time.time()
   kind = {"weights": "training", "sampler_weights": "sampler"}.get(raw_kind, raw_kind)
   info = {"checkpoint_id": cid, "checkpoint_type": kind, "time": now, "tinker_path": uri, "size_bytes": size}
-  p.hset(
-    key("ckpts"),
-    uri,
-    json.dumps({**info, "expires_at": now + ttl if ttl else None, "owned": owned, "version": version}),
-  )
+  entry = {**info, "expires_at": now + ttl if ttl else None, "owned": owned, "version": version}
+  p.hset(key("ckpts"), uri, json.dumps(entry))
 
 
 def record_run_delete(p, run_id: str) -> None:
@@ -160,15 +157,13 @@ class Bus:
   async def end_session(self, session_id: str) -> None:
     deleting = False
     for run_id in (await self.get_session(session_id) or {}).get("runs", []):
-      if not await self.meta.sismember(key("runs"), run_id):
-        continue
-      if (await self.get_run(run_id))["role"] == Role.SAMPLER:
-        await self.delete_run(run_id)
-      else:
-        deleting = bool(await self.submit_command(run_id, Op.DELETE_MODEL, b"{}")) or deleting
-    await (
-      self.meta.zadd(key("seen"), {session_id: time.time()}) if deleting else self.meta.zrem(key("seen"), session_id)
-    )
+      if await self.meta.sismember(key("runs"), run_id):
+        if (await self.get_run(run_id))["role"] == Role.SAMPLER:
+          await self.delete_run(run_id)
+        else:
+          deleting = bool(await self.submit_command(run_id, Op.DELETE_MODEL, b"{}")) or deleting
+    seen = key("seen")
+    await (self.meta.zadd(seen, {session_id: time.time()}) if deleting else self.meta.zrem(seen, session_id))
 
   # ***** runs, nodes, and cluster plan *****
 
@@ -268,9 +263,7 @@ class Bus:
   async def seen_request(self, run_id: str, seq_id: int | None) -> str | None:
     return await self.meta.get(key("seq", run_id, str(seq_id))) if seq_id is not None else None
 
-  async def submit_command(
-    self, run_id: str, op: Op, body: bytes, seq_id: int | None = None, cost: int = 1
-  ) -> str | None:
+  async def submit_command(self, run_id: str, op: Op, body: bytes, seq_id: int | None = None, cost=1) -> str | None:
     if first := await self.seen_request(run_id, seq_id):
       return first
     seq = [] if seq_id is None else ["IDMP", run_id, seq_id]
@@ -302,9 +295,9 @@ class Bus:
 
     if (await self.get_run(run_id) or {}).get("role") == Role.SAMPLER:
       groups = await self.meta.xinfo_groups(q)
-      pending = await self.meta.xpending_range(q, GROUP, min="-", max="+", count=100)
+      rows = await self.meta.xpending_range(q, GROUP, min="-", max="+", count=100)
       active = [
-        entry(e["message_id"], e["consumer"], e["time_since_delivered"] / 1000, e["times_delivered"]) for e in pending
+        entry(e["message_id"], e["consumer"], e["time_since_delivered"] / 1000, e["times_delivered"]) for e in rows
       ]
       return {"live": True, "queued": groups[0]["lag"], "in_flight": active}
     total = await self.meta.xlen(q)
@@ -335,8 +328,7 @@ class Bus:
         await p.watch(old_lease := key("lease", worker_id_of(owner)))
         if await p.exists(old_lease):
           return None
-      new_epoch = int(epoch or 0) + 1
-      token = f"{worker_id}:{new_epoch}"
+      new_epoch, token = int(epoch or 0) + 1, f"{worker_id}:{int(epoch or 0) + 1}"
       p.multi()
       p.hset(k, mapping={"owner": token, "epoch": new_epoch})
       p.hdel(key("writing"), run_id)
@@ -383,9 +375,7 @@ class Bus:
 
     return await self.transact(op, k)
 
-  async def detach_run(
-    self, run_id: str, token: str, last_cmd_id: str | None, snapshot: str | None, checkpoint=None
-  ) -> bool:
+  async def detach_run(self, run_id: str, token: str, last_cmd_id: str | None, snapshot: str | None, ckpt=None) -> bool:
     """Release `run_id` and save its parked `snapshot` iff `token` still owns it at exact `last_cmd_id`."""
     k = key("run", run_id)
 
@@ -393,8 +383,8 @@ class Bus:
       if await p.hmget(k, "owner", "last_cmd_id") != [token, last_cmd_id]:
         return False
       p.multi()
-      if checkpoint:
-        record_checkpoint(p, **checkpoint)
+      if ckpt:
+        record_checkpoint(p, **ckpt)
       p.hdel(k, "owner")
       p.hdel(key("writing"), run_id)
       p.hset(k, "snapshot", snapshot) if snapshot else p.hdel(k, "snapshot")
@@ -475,13 +465,11 @@ class Bus:
       p.xinfo_groups(key("q", s))
     cursors, check_dead = {}, []
     for s, groups in zip(sessions, await p.execute(raise_on_error=False)):
-      if isinstance(groups, Exception):
-        if not is_missing_stream(groups):
-          raise groups
-      else:
+      if not isinstance(groups, Exception):
         cursors[key("q", s)] = groups[0]["last-delivered-id"]
-        if groups[0]["pending"]:
-          check_dead.append(s)
+        check_dead += [s] if groups[0]["pending"] else []
+      elif not is_missing_stream(groups):
+        raise groups
     if not cursors:
       return await asyncio.sleep(block_ms / 1000) or []
     cmds = [c for c in await asyncio.gather(*(self._first_abandoned(s) for s in check_dead)) if c]
@@ -499,13 +487,12 @@ class Bus:
       if ids := (await self._abandoned_samples(s))[:count]:
         # Require 1s idle so two replicas reclaiming at once don't immediately re-steal each other's claim.
         try:
-          taken = [
-            parse_cmd(s, eid, f) for eid, f in await self.raw.xclaim(key("q", s), GROUP, consumer, 1000, ids) if f
-          ]
+          raw = await self.raw.xclaim(key("q", s), GROUP, consumer, 1000, ids)
         except redis.ResponseError as e:
           if is_missing_stream(e):
             continue
           raise
+        taken = [parse_cmd(s, eid, f) for eid, f in raw if f]
         cmds.extend(taken)
         rem[s] -= len(taken)
     if not (fresh := [s for s in sessions if rem[s] > 0]):
@@ -514,11 +501,10 @@ class Bus:
     for s in fresh:
       p.xreadgroup(GROUP, consumer, {key("q", s): ">"}, count=rem[s])
     for s, got in zip(fresh, await p.execute(raise_on_error=False)):
-      if isinstance(got, Exception):
-        if not is_missing_stream(got):
-          raise got
-      else:
+      if not isinstance(got, Exception):
         cmds.extend(parse_cmd(s, eid, fields) for _, entries in got for eid, fields in entries)
+      elif not is_missing_stream(got):
+        raise got
     return cmds
 
   async def commit_sample(self, cmd: Cmd, reply: Reply, account="", charge: Charge | None = None) -> bool:
@@ -538,26 +524,22 @@ class Bus:
 
   async def get_checkpoint(self, uri: str) -> dict | None:
     parse_uri(uri)
-    raw = await self.meta.hget(key("ckpts"), uri)
-    return json.loads(raw) if raw else None
+    return json.loads(raw) if (raw := await self.meta.hget(key("ckpts"), uri)) else None
 
   async def checkpoint_version(self, uri: str) -> str:
     if version := (await self.get_checkpoint(uri) or {}).get("version"):
       return version
     raise ValueError(f"no checkpoint at {uri}")
 
-  async def _all_checkpoints(self) -> list[dict]:
-    return [json.loads(v) for v in await self.meta.hvals(key("ckpts"))]
-
-  async def _visible_checkpoints(self, prefix: str = "") -> list[dict]:
-    items = await self._all_checkpoints()
-    return [c for c in items if c["tinker_path"].startswith(prefix) and c["checkpoint_type"] != "parked"]
+  async def _checkpoints(self, prefix: str = "", *, visible: bool = False) -> list[dict]:
+    cs = [json.loads(v) for v in await self.meta.hvals(key("ckpts"))]
+    return [c for c in cs if c["tinker_path"].startswith(prefix) and (not visible or c["checkpoint_type"] != "parked")]
 
   async def checkpoints_of_run(self, run: str) -> list[dict]:
-    return sorted(await self._visible_checkpoints(f"tinker://{run}/"), key=lambda c: c["time"])
+    return sorted(await self._checkpoints(f"tinker://{run}/", visible=True), key=lambda c: c["time"])
 
   async def page_of_checkpoints(self, limit: int, offset: int) -> tuple[list[dict], int]:
-    visible = sorted(await self._visible_checkpoints(), key=lambda c: -c["time"])
+    visible = sorted(await self._checkpoints(visible=True), key=lambda c: -c["time"])
     return visible[offset : offset + limit], len(visible)
 
   async def set_checkpoint_ttl(self, uri: str, ttl: int | None) -> bool:
@@ -580,12 +562,12 @@ class Bus:
 
   async def expired_checkpoints(self) -> list[str]:
     now = time.time()
-    return [c["tinker_path"] for c in await self._all_checkpoints() if c["expires_at"] and c["expires_at"] <= now]
+    return [c["tinker_path"] for c in await self._checkpoints() if c["expires_at"] and c["expires_at"] <= now]
 
   async def sweep(self, store, grace: float) -> None:
     """Reclaim store versions that are neither in-flight writes nor published checkpoints."""
     unused, writing = await asyncio.to_thread(store.versions), await self.meta.hvals(key("writing"))
-    published = (v.partition("@")[0] for c in await self._all_checkpoints() if (v := c.get("version")))
+    published = (v.partition("@")[0] for c in await self._checkpoints() if (v := c.get("version")))
     await asyncio.to_thread(store.sweep, unused.difference(writing, published), grace)
 
   # ***** events and wakeups *****

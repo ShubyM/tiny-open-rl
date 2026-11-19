@@ -209,11 +209,12 @@ class TestNodeDaemon(RedisTest):
       )
       # The holder keeps its turn for CYCLE_GRACE_MS after its command, then the newcomer is planned onto its GPU.
       await self.until(
-        lambda: (pb := node.state.assignments.get(b, [""])[0]) in node.workers and node.select_gpus(pb), node
+        lambda: (pb := node.state.assignments.get(b, [""])[0]) in node.workers and node.gpu_scheduler.plan().get(pb),
+        node,
       )
       pb = node.state.assignments[b][0]
       self.assertNotEqual(node.workers[pb].demand, Demand.IDLE)
-      self.assertEqual(node.select_gpus(pb), (0,))
+      self.assertEqual(node.gpu_scheduler.plan().get(pb, ()), (0,))
       self.assertEqual(node.gpu_allocations.get(holder.worker_id), (0,))
       self.assertFalse(node.workers[pb].has_gpus)  # Rule R1: never enters GPU 0 until holder finishes parking
       self.assertEqual(await self.bus.queued_and_in_flight(b), {"live": True, "queued": 1, "in_flight": []})

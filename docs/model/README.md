@@ -8,7 +8,7 @@ These specifications model and exhaustively verify the `tinyrl` control plane ac
 | --- | --- | --- |
 | `PagedFleet.tla` | Ground truth: `gpu_allocations` (node GPU table), `run` (`owner`, `epoch`, `last_cmd_id`, `snapshot`, `claimed`), `lease`. Hints: `procs`, `assignments`. | `tinyrl/bus.py`, `tinyrl/control/node_daemon.py` |
 | `ConvPaged.tla` | Finite termination rank proving deadlock-free convergence to any well-formed `(procs, assignments)` once crashes/plan edits stop. | `NodeDaemon.tick`, `Worker.run` |
-| `Lag.tla` | EEVDF `lag` updated from monotone `service - billed_service` deltas (`gpu_ms`) with minimum-quantum switch amortization. | `fairness.py` (`waterfill`, `update_lag`, `plan_gpus`), `scheduler.py` (`rebalance_target`), `node_daemon.py` (`acquire_gpus`) |
+| `Lag.tla` | EEVDF `lag` updated from monotone `service - billed_service` deltas (`gpu_ms`) with minimum-quantum switch amortization. | `fairness.py` (`waterfill`, `update_lag`, `plan_gpus`), `scheduler.py` (`rebalance_target`), `node_daemon.py` (`GpuScheduler.turn`) |
 
 ## Verified Properties and Rule Necessity
 

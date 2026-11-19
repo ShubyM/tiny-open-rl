@@ -84,9 +84,8 @@ class Event:
   body: dict
 
 
-def unpack_snapshot(snapshot: str) -> tuple[str, str]:
-  uri, version = snapshot.split("\n", 1)
-  return uri, version
+def unpack_snapshot(snapshot: str | None) -> tuple[str, str | None]:
+  return tuple(snapshot.split("\n", 1)) if snapshot else ("", None)
 
 
 def parse_uri(uri: str) -> tuple[str, str]:

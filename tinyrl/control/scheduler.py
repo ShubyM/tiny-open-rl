@@ -136,16 +136,12 @@ def from_state(raw: dict) -> State:
     account = rec.get("account") or ("" if tr else rec.get("session", ""))
     jobs[r] = Job(spec, tr, account, info.get("owner"), queues.get(r, 0))
   jobs = {r: j for r, j in jobs.items() if not j.spec.train_run or j.spec.train_run in jobs}
-  procs = {
-    n: Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
-    for n, p in plan.get("procs", {}).items()
-  }
+  mk_proc = lambda p: Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))  # noqa: E731
+  procs = {n: mk_proc(p) for n, p in plan.get("procs", {}).items()}
   assignments = {r: list(ps) for r, ps in plan.get("assignments", {}).items() if r in jobs}
-  floats = lambda k: {a: float(v) for a, v in plan.get(k, {}).items()}  # noqa: E731
+  fl = lambda k: {a: float(v) for a, v in plan.get(k, {}).items()}  # noqa: E731
   next_id, service = int(plan.get("next_worker_id", 0)), dict(raw.get("service", {}))
-  return State(
-    next_id, nodes, procs, assignments, jobs, floats("lag"), floats("billed_service"), service, floats("weights")
-  )
+  return State(next_id, nodes, procs, assignments, jobs, fl("lag"), fl("billed_service"), service, fl("weights"))
 
 
 def to_plan(s: State) -> dict:
@@ -187,10 +183,8 @@ def rebalance_target(s: State, name: str) -> str | None:
   if spare := [n for n in fit if s.spare(n) >= p.spec.gpus]:
     return min(spare, key=lambda n: s.used(n) / s.nodes[n][0])
 
-  def min_lag(node: str) -> float:
-    return min(
-      (s.lag_of(h) for h, q in s.procs_on(node) if not q.spec.exclusive and s.is_busy(h)), default=float("inf")
-    )
+  def min_lag(n: str) -> float:
+    return min((s.lag_of(h) for h, q in s.procs_on(n) if not q.spec.exclusive and s.is_busy(h)), default=float("inf"))
 
   here = (round(s.load(p.node, name), 6), round(min_lag(p.node), 3))
   opts = [

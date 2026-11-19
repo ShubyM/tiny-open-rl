@@ -16,7 +16,9 @@ class TestAccounting(RedisTest):
     state = scheduler.from_state(await self.bus.read_state())
     state.procs["worker"] = scheduler.Proc(state.jobs[runs[0]].spec)
     state.assignments = dict.fromkeys(runs, ["worker"])
-    node = SimpleNamespace(id="node", bus=self.bus, store=None, state=state, notify=Mock(), gpu_allocations={})
+    node = SimpleNamespace(
+      id="node", bus=self.bus, store=None, state=state, gpu_scheduler=SimpleNamespace(notify=Mock()), gpu_allocations={}
+    )
     worker = Worker(node, "worker")
     await self.bus.open_lease(worker.worker_id)
     if role == Role.TRAINER:

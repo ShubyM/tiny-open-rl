@@ -566,22 +566,22 @@ class TestLocalQuantum(unittest.TestCase):
     self.assertEqual(service, {"saving": 9, "training": 9})
 
   def test_claim_gpus_enforces_exclusivity_and_exact_gang_width(self):
-    node = self.make_daemon(2)
-    self.assertFalse(node.claim_gpus("wide@n-1", (0,), 2))
-    self.assertFalse(node.claim_gpus("dup@n-1", (0, 0), 2))
-    self.assertFalse(node.claim_gpus("oob@n-1", (2,), 1))
-    self.assertTrue(node.claim_gpus("a@n-1", (0,), 1))
-    self.assertFalse(node.claim_gpus("b@n-1", (0,), 1))
-    self.assertFalse(node.claim_gpus("wide@n-1", (0, 1), 2))
-    self.assertTrue(node.claim_gpus("c@n-1", (1,), 1))
-    node.release_gpus("a@n-1")
-    self.assertFalse(node.claim_gpus("wide@n-1", (0, 1), 2))
-    node.release_gpus("c@n-1")
-    self.assertTrue(node.claim_gpus("wide@n-1", (0, 1), 2))
+    sched = self.make_daemon(2).gpu_scheduler
+    self.assertFalse(sched.claim("wide@n-1", (0,), 2))
+    self.assertFalse(sched.claim("dup@n-1", (0, 0), 2))
+    self.assertFalse(sched.claim("oob@n-1", (2,), 1))
+    self.assertTrue(sched.claim("a@n-1", (0,), 1))
+    self.assertFalse(sched.claim("b@n-1", (0,), 1))
+    self.assertFalse(sched.claim("wide@n-1", (0, 1), 2))
+    self.assertTrue(sched.claim("c@n-1", (1,), 1))
+    sched.release("a@n-1")
+    self.assertFalse(sched.claim("wide@n-1", (0, 1), 2))
+    sched.release("c@n-1")
+    self.assertTrue(sched.claim("wide@n-1", (0, 1), 2))
 
   def test_random_claims_and_releases_never_overcommit_a_gpu(self):
     for seed in range(300):
-      rng, node = random.Random(seed), self.make_daemon(4)
+      rng, sched = random.Random(seed), self.make_daemon(4).gpu_scheduler
       specs = {
         f"p{i}@n-1": (tuple(range(first := rng.randrange(5 - w), first + w)), w)
         for i in range(10)
@@ -589,11 +589,11 @@ class TestLocalQuantum(unittest.TestCase):
       }
       for _ in range(100):
         life = rng.choice(list(specs))
-        if life in node.gpu_allocations and rng.random() < 0.5:
-          node.release_gpus(life)
+        if life in sched.allocations and rng.random() < 0.5:
+          sched.release(life)
         else:
-          node.claim_gpus(life, *specs[life])
-        flat = [g for gs in node.gpu_allocations.values() for g in gs]
+          sched.claim(life, *specs[life])
+        flat = [g for gs in sched.allocations.values() for g in gs]
         self.assertEqual(len(flat), len(set(flat)))
 
   def test_active_quantum_prevents_thrash_and_overtime_hands_off_with_zero_wait(self):

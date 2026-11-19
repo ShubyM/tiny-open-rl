@@ -37,9 +37,9 @@ class TestWideRebind(RedisTest):
         request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
         async with asyncio.timeout(5):
           while gang.demand == Demand.IDLE:
-            await node.changed.wait()
+            await node.gpu_scheduler.changed.wait()
         self.assertTrue(gang.should_run())
-        self.assertEqual(node.select_gpus(run), ())
+        self.assertEqual(node.gpu_scheduler.plan().get(run, ()), ())
         node.drop_local(exclusive)
         self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
         self.assertEqual(node.gpu_allocations, {gang.worker_id: (0, 1)})
