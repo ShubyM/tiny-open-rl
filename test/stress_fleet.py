@@ -288,13 +288,11 @@ class Stress(RedisTest):
     for node in self.nodes.values():
       out.append(f"{node.id}: gpus={node.gpus} on={node.on} physical={node.occ.on} draining={node.draining}")
       for proc, lf in node.lives.items():
-        raw_heads = lf.heads.values() if isinstance(lf.heads, dict) else lf.heads
-        heads = [(c.run[:4], c.op.value) for c in raw_heads]
+        heads = [(c.run[:4], c.op.value) for c in lf.heads.values()]
         owned = [r[:4] for r in getattr(lf, "owned", ())]
         out.append(
           f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} active={lf.active} wanted={lf.wanted()} "
           f"owned={owned} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
-          f"reader={'none' if lf.reader is None else 'done' if lf.reader.done() else 'reading'} "
           f"task={'done' if node.tasks[proc].done() else 'running'} q={lf.quantum:.2f} granted={time.monotonic() - lf.granted_at:.1f}s ago"
         )
     print("\n".join(out), file=sys.stderr)
@@ -457,7 +455,9 @@ class Stress(RedisTest):
       await self.bus.delete_run(session)
     try:
       async with asyncio.timeout(30):
-        while (await self.bus.read_state())["plan"].get("procs") or any(n.lives for n in self.nodes.values()):
+        while (await self.bus.read_state())["plan"].get("procs") or any(
+          n.lives or n.tasks for n in self.nodes.values()
+        ):
           await asyncio.sleep(0.05)
     except TimeoutError:
       plan = (await self.bus.read_state())["plan"]

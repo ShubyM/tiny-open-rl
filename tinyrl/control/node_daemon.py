@@ -188,7 +188,7 @@ class NodeDaemon:
     while pending and time.monotonic() < deadline:
       _, pending = await asyncio.wait(pending, timeout=min(LEASE_MS / 4000, deadline - time.monotonic()))
       with contextlib.suppress(Exception):
-        await self.bus.touch_leases(*(lf.life for lf in self.lives.values() if not lf.closing))
+        await self.bus.touch_leases(*(lf.life for lf in self.lives.values() if not lf.closing), xx=True)
     for task in pending:
       task.cancel()
     if self.tasks:
@@ -223,8 +223,10 @@ class Lifetime:
     self.spec = node.state.procs[proc].spec
     self.life = f"{proc}@{node.id}-{os.urandom(6).hex()}"
     self.task = self.model = self.closing = self.reader = None
-    self.bound_gpus, self.active, self.step_ready = (), False, False
+    self.reader_streams: list[str] = []
+    self.bound_gpus, self.active = (), False
     self.granted_at, self.quantum, self.park_s, self.gpu_ms = 0.0, QUANTUM_MS / 1000, 0.0, 0.0
+    self.heads: dict[str, Cmd] = {}
     self.service: dict[str, float] = {}
 
   def exited(self) -> bool:
@@ -252,7 +254,13 @@ class Lifetime:
     try:
       if self.node.draining:
         return
-      await self.bus.touch_leases(self.life)
+      opening = asyncio.create_task(self.bus.touch_leases(self.life))
+      try:
+        await asyncio.shield(opening)
+      except BaseException:
+        with contextlib.suppress(Exception):
+          await opening
+        raise
       self.node.lives[self.proc] = self
       await self.loop()
     finally:
@@ -267,11 +275,33 @@ class Lifetime:
           if self.closing.cancelled():
             self.closing = asyncio.create_task(self.cleanup())
 
+  def start_reader(self, peek, streams: list[str], delay: float = 0) -> None:
+    if self.reader is not None or not streams:
+      return
+    self.reader_streams = list(streams)
+
+    async def read() -> list[Cmd]:
+      if delay:
+        await asyncio.sleep(delay)
+      return await peek(streams, IDLE_MS)
+
+    self.reader = asyncio.create_task(read())
+    self.reader.add_done_callback(lambda _: self.node.notify())
+
   async def stop_reader(self) -> None:
     if self.reader:
       self.reader.cancel()
       await asyncio.gather(self.reader, return_exceptions=True)
-      self.reader = None
+      self.reader, self.reader_streams = None, []
+
+  async def poll_reader(self, peek, streams: list[str], fetch: bool = True) -> list[Cmd] | None:
+    if self.reader and self.reader.done():
+      res, self.reader, self.reader_streams = self.reader.result(), None, []
+      return res
+    if self.reader and self.reader_streams == streams:
+      return None
+    await self.stop_reader()
+    return await peek(streams, 0) if fetch and streams else None
 
   async def sync_gpus(self, has_work: bool) -> None:
     if self.exited():
@@ -326,9 +356,11 @@ class Lifetime:
         print(f"{self.proc} could not close, retrying: {e!r}", file=sys.stderr, flush=True)
         await asyncio.sleep(TICK)
     self.node.release_gpus(self.life)
-    for r, (token, _, _) in list(getattr(self, "owned", {}).items()):
-      await self.bus.fail_stranded_commands(r, token)
-    await self.bus.drop_lease(self.life)
+    try:
+      for r, (token, _, _) in list(getattr(self, "owned", {}).items()):
+        await self.bus.fail_stranded_commands(r, token)
+    finally:
+      await self.bus.drop_lease(self.life)
 
 
 class TrainerLife(Lifetime):
@@ -336,7 +368,7 @@ class TrainerLife(Lifetime):
 
   def __init__(self, node: NodeDaemon, proc: str):
     super().__init__(node, proc)
-    self.owned, self.loaded, self.open_grads, self.heads, self.idle_since = {}, set(), set(), {}, 0.0
+    self.owned, self.loaded, self.open_grads, self.step_ready, self.idle_since = {}, set(), set(), False, 0.0
 
   def streams(self) -> list[str]:
     return sorted(self.owned)
@@ -399,8 +431,9 @@ class TrainerLife(Lifetime):
         await self.model.call("drop_run", run)
 
   async def collect(self) -> None:
-    if missing := [r for r in sorted(self.owned) if r not in self.heads]:
-      self.heads |= {c.run: c for c in await self.bus.peek_trainer(missing, 0)}
+    missing = [r for r in sorted(self.owned) if r not in self.heads]
+    if cmds := await self.poll_reader(self.bus.peek_trainer, missing):
+      self.heads |= {c.run: c for c in cmds if c.run in self.owned}
     self.service = {r: self.service[r] for r in self.heads if r in self.service}
 
   async def execute_one(self, ready: list[Cmd]) -> Cmd | None:
@@ -469,19 +502,11 @@ class TrainerLife(Lifetime):
         if (cmd := await self.execute_one(ready)) and cmd.op == Op.DELETE_MODEL and not self.spec.lora:
           break
       else:
-        waiters = [asyncio.create_task(changed.wait())]
-        if missing := [r for r in sorted(self.owned) if r not in self.heads]:
-          waiters.append(asyncio.create_task(self.bus.peek_trainer(missing, IDLE_MS)))
-        done, pending = await asyncio.wait(
-          waiters, timeout=grace if linger else None, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-          t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        self.heads |= {
-          c.run: c for t in done if isinstance(res := t.result(), list) for c in res if c.run in self.owned
-        }
+        self.start_reader(self.bus.peek_trainer, [r for r in sorted(self.owned) if r not in self.heads])
+        with contextlib.suppress(TimeoutError):
+          await asyncio.wait_for(changed.wait(), grace if linger else None)
     self.active = False
+    await self.stop_reader()
     for r in list(self.owned):
       await self.detach(r, drop=False)
 
@@ -491,7 +516,7 @@ class SamplerLife(Lifetime):
 
   def __init__(self, node: NodeDaemon, proc: str):
     super().__init__(node, proc)
-    self.warm, self.heads, self.inputs, self.staged = False, [], {}, {}
+    self.warm, self.inputs, self.staged = False, {}, {}
 
   async def park_model(self) -> None:
     await self.model.park()
@@ -515,22 +540,12 @@ class SamplerLife(Lifetime):
       except Exception as e:
         return e
 
-  def start_reader(self, delay: float = 0) -> None:
-    async def read() -> list[Cmd]:
-      await asyncio.sleep(delay)
-      while True:
-        if (cmds := await self.bus.peek_sampler(self.streams(), IDLE_MS)) or self.heads:
-          return cmds
-
-    self.reader = asyncio.create_task(read())
-    self.reader.add_done_callback(lambda _: self.node.notify())
-
   def ready(self) -> tuple[list[Cmd], list[Cmd]]:
     live = set(self.streams())
     done = [
       (c, v.result() if isinstance(v, asyncio.Task) else v)
-      for c in self.heads
-      if c.run in live and c.run in self.inputs and (not isinstance(v := self.inputs[c.run], asyncio.Task) or v.done())
+      for r, c in self.heads.items()
+      if r in live and r in self.inputs and (not isinstance(v := self.inputs[r], asyncio.Task) or v.done())
     ]
     return [c for c, v in done if not isinstance(v, Exception)], [c for c, v in done if isinstance(v, Exception)]
 
@@ -538,28 +553,30 @@ class SamplerLife(Lifetime):
     return [c.run for c in self.ready()[0]]
 
   async def collect(self) -> None:
-    if not self.reader or not self.reader.done():
+    live, jobs = sorted(self.streams()), self.node.state.jobs
+    live_set = set(live)
+    self.heads = {r: c for r, c in self.heads.items() if r in live_set}
+    if (cmds := await self.poll_reader(self.bus.peek_sampler, live, not self.heads)) is None:
       return
-    live, jobs = set(self.streams()), self.node.state.jobs
-    self.heads, self.reader = [c for c in self.reader.result() if c.run in live], None
-    uris = sorted({p for c in self.heads if (j := jobs.get(c.run)) and (p := j.record.get("model_path"))})
+    self.heads = {c.run: c for c in cmds if c.run in live_set}
+    uris = sorted({p for r in self.heads if (j := jobs.get(r)) and (p := j.record.get("model_path"))})
     got = await self.bus.checkpoint_versions(uris)
     self.inputs = {}
-    for c in self.heads:
-      if not (p := jobs[c.run].record.get("model_path")):
-        self.inputs[c.run] = None
+    for r in self.heads:
+      if not (p := jobs[r].record.get("model_path")):
+        self.inputs[r] = None
       elif isinstance(v := got[p], str):
         if v not in self.staged:
           (task := asyncio.create_task(self.stage(v))).add_done_callback(lambda _: self.node.notify())
           self.staged[v] = task
-        self.inputs[c.run] = self.staged[v]
+        self.inputs[r] = self.staged[v]
       else:
-        self.inputs[c.run] = v
+        self.inputs[r] = v
     active = set(self.inputs.values())
     for v in list(self.staged):
       if len(self.staged) > 64 and self.staged[v].done() and self.staged[v] not in active:
         del self.staged[v]
-    self.service = {c.run: self.service[c.run] for c in self.heads if c.run in self.service}
+    self.service = {r: self.service[r] for r in self.heads if r in self.service}
 
   async def execute_wave(self, candidates: list[Cmd], failed: bool = False) -> None:
     floor = min((self.service[c.run] for c in candidates if c.run in self.service), default=0.0)
@@ -571,8 +588,8 @@ class SamplerLife(Lifetime):
     await self.stop_reader()
     with span("node.claim"):
       cmds = await self.bus.take_commands(runs, self.life, 1 if failed else SAMPLE_COMMANDS)
-    self.heads = [c for c in self.heads if c.run not in runs]
-    self.start_reader()
+    for r in runs:
+      self.heads.pop(r, None)
     if not cmds:
       return
     for ckpt in ({inputs[c.run] for c in cmds} - {None}) if not failed else ():
@@ -599,7 +616,6 @@ class SamplerLife(Lifetime):
   async def loop(self) -> None:
     e = self.env(tuple(range(self.node.gpus)))
     self.model, self.warm = self.node.open_sampler(self.proc, self.spec, e), e.get("TINYRL_WARM_SAMPLER", "0") != "0"
-    self.start_reader()
     while self.wanted():
       changed = self.node.changed
       await self.collect()
@@ -615,8 +631,7 @@ class SamplerLife(Lifetime):
       if ready and self.life in self.node.on:
         await self.execute_wave(ready)
       else:
-        if self.reader is None:
-          self.start_reader(IDLE_MS / 1000 if self.heads else 0)
+        self.start_reader(self.bus.peek_sampler, sorted(self.streams()), IDLE_MS / 1000 if self.heads else 0)
         await changed.wait()
     self.active = False
     await self.stop_reader()

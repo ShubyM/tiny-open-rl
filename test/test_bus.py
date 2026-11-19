@@ -281,6 +281,14 @@ class TestBus(RedisTest):
     [cmd] = await self.bus.take_commands([run_id], "w0", 1)
     self.assertEqual(await self.bus.commit_reply(cmd, ok(alive=1), token, mutates=True), (True, None))
 
+  async def test_lease_renewal_does_not_resurrect_dropped_lease(self):
+    await self.bus.touch_leases("live", "dropped")
+    await self.bus.drop_lease("dropped")
+    await self.bus.node_heartbeat("node-a", 1, leases=("live", "dropped"))
+    await self.bus.touch_leases("live", "dropped", xx=True)
+    self.assertTrue(await self.bus.r.exists(key("lease", "live")))
+    self.assertFalse(await self.bus.r.exists(key("lease", "dropped")))
+
   async def test_competing_sampler_replicas_answer_and_charge_exactly_once(self):
     sid = await self.new_run(role=Role.SAMPLER, account="bob")
     req = await self.bus.submit_command(sid, Op.SAMPLE, b"{}", cost=100)

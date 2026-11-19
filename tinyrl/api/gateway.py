@@ -246,22 +246,21 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   # ***** training *****
 
+  async def submit_fb(data: dict, forward_only: bool = False) -> dict[str, str]:
+    body = wire.from_json(data, forward_only=forward_only)
+    return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"), wire.cost(wire.parse(body)))
+
   @api.post("/api/v1/forward_backward")
   async def forward_backward(request: Request):
     body = await request.body()
     if request.headers.get("content-type", "").startswith(wire.PROTO):
       parsed = wire.parse(body)
       return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
-
-    data = json.loads(body)
-    body = wire.from_json(data)
-    return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"), wire.cost(wire.parse(body)))
+    return await submit_fb(json.loads(body))
 
   @api.post("/api/v1/forward")  # SDKs before 0.25
   async def forward(request: Request):
-    data = await request.json()
-    body = wire.from_json(data, forward_only=True)
-    return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"), wire.cost(wire.parse(body)))
+    return await submit_fb(await request.json(), forward_only=True)
 
   @api.post("/api/v1/optim_step")
   async def optim_step(req: OptimStepRequest):

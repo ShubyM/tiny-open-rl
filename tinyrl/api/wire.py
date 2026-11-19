@@ -159,6 +159,12 @@ class SampleOut:
   topk: tuple[np.ndarray, np.ndarray] | None = None
 
 
+def pack_topk(dst, topk: tuple[np.ndarray, np.ndarray]) -> None:
+  tk_ids, tk_lps = topk
+  dst.token_ids, dst.logprobs = tk_ids.astype(np.int32).tobytes(), tk_lps.astype(np.float32).tobytes()
+  dst.k, dst.length = tk_ids.shape[-1], tk_ids.shape[0]
+
+
 def sample_output(
   sequences: list[SampleOut],
   prompt_logprobs: np.ndarray | None = None,
@@ -168,38 +174,25 @@ def sample_output(
   for s in sequences:
     seq = out.sequences.add()
     seq.stop_reason = pb.STOP_REASON_STOP if s.stop else pb.STOP_REASON_LENGTH
-    seq.tokens = s.tokens.astype(np.int32).tobytes()
-    seq.logprobs = s.logprobs.astype(np.float32).tobytes()
+    seq.tokens, seq.logprobs = s.tokens.astype(np.int32).tobytes(), s.logprobs.astype(np.float32).tobytes()
     if s.topk:
-      tk_ids, tk_lps = s.topk
-      seq.topk_sampled_logprobs.token_ids = tk_ids.astype(np.int32).tobytes()
-      seq.topk_sampled_logprobs.logprobs = tk_lps.astype(np.float32).tobytes()
-      seq.topk_sampled_logprobs.k = tk_ids.shape[-1]
-      seq.topk_sampled_logprobs.length = tk_ids.shape[0]
-
+      pack_topk(seq.topk_sampled_logprobs, s.topk)
   if prompt_logprobs is not None:
     out.prompt_logprobs = prompt_logprobs.astype(np.float32).tobytes()
   if topk_prompt is not None:
-    tk_ids, tk_lps = topk_prompt
-    out.topk_prompt_logprobs.token_ids = tk_ids.astype(np.int32).tobytes()
-    out.topk_prompt_logprobs.logprobs = tk_lps.astype(np.float32).tobytes()
-    out.topk_prompt_logprobs.k = tk_ids.shape[-1]
-    out.topk_prompt_logprobs.length = tk_ids.shape[0]
-
+    pack_topk(out.topk_prompt_logprobs, topk_prompt)
   return out.SerializeToString()
 
 
 def _format_topk(tk_pb):
-  k, length = tk_pb.k, tk_pb.length
-  ids = np.frombuffer(tk_pb.token_ids, np.int32).reshape(length, k)
-  lps = np.frombuffer(tk_pb.logprobs, np.float32).reshape(length, k)
-  res = []
-  for i in range(length):
-    if ids[i, 0] == 0 and lps[i, 0] == -99999.0:
-      res.append(None)
-    else:
-      res.append([[int(tid), float(lp)] for tid, lp in zip(ids[i], lps[i]) if not (tid == 0 and lp == -99999.0)])
-  return res
+  ids = np.frombuffer(tk_pb.token_ids, np.int32).reshape(tk_pb.length, tk_pb.k)
+  lps = np.frombuffer(tk_pb.logprobs, np.float32).reshape(tk_pb.length, tk_pb.k)
+  return [
+    None
+    if ids[i, 0] == 0 and lps[i, 0] == -99999.0
+    else [[int(tid), float(lp)] for tid, lp in zip(ids[i], lps[i]) if not (tid == 0 and lp == -99999.0)]
+    for i in range(tk_pb.length)
+  ]
 
 
 def sample_json(raw: bytes) -> dict:

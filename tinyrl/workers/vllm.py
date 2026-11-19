@@ -10,7 +10,6 @@ import os
 import shlex
 import shutil
 import socket
-import struct
 import subprocess
 import sys
 import traceback
@@ -19,6 +18,7 @@ import aiohttp
 
 from tinyrl.control.process import launch, reap, target_pid
 from tinyrl.storage import models
+from tinyrl.storage.store import header
 from tinyrl.trace import span
 from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
@@ -212,14 +212,9 @@ class VLLM:
     if name in self.loaded:
       return
     if not self.lora and self.clean and os.path.isdir(path):
-      files = sorted(glob.glob(f"{path}/*.safetensors"))
-      if files:
-        with open(files[0], "rb") as f:
-          n = struct.unpack("<Q", f.read(8))[0]
-          meta = json.loads(json.loads(f.read(n)).get("__metadata__", {}).get("meta", "{}"))
-        if meta.get("untouched"):
-          self.loaded = {name}
-          return
+      if (files := sorted(glob.glob(f"{path}/*.safetensors"))) and header(files[0]).get("untouched"):
+        self.loaded = {name}
+        return
     if self.lora:
       await self.post("/v1/load_lora_adapter", json={"lora_name": name, "lora_path": path})
       self.loaded.add(name)
@@ -238,15 +233,9 @@ class VLLM:
   async def sample(self, job: dict, name: str | None) -> Out:
     strs, ids = split_stop(job["stop"])
     scored = job["prompt_logprobs"] or job["topk_prompt"] > 0
-    req = {
+    req = {k: job[k] for k in ("prompt", "max_tokens", "temperature", "top_k", "top_p", "seed")} | {
       "model": name if self.lora and name else self.base,
-      "prompt": job["prompt"],
       "n": job["num_samples"],
-      "max_tokens": job["max_tokens"],
-      "temperature": job["temperature"],
-      "top_k": job["top_k"],
-      "top_p": job["top_p"],
-      "seed": job["seed"],
       "stop": strs,
       "stop_token_ids": ids,
       "logprobs": max(1, job["topk_sample"]),

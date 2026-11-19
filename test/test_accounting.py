@@ -22,18 +22,14 @@ class TestAccounting(RedisTest):
     if role == Role.TRAINER:
       for run in runs:
         life.owned[run] = await self.bus.acquire_run(run, life.life)
-    self.addAsyncCleanup(life.stop_reader)
     return life
 
   async def execute(self, life):
+    await life.collect()
     if isinstance(life, SamplerLife):
-      life.reader = asyncio.create_task(self.bus.peek_sampler(life.streams(), 0))
-      await life.reader
-      await life.collect()
       await asyncio.gather(*life.staged.values())
       ready, _ = life.ready()
       return await life.execute_wave(ready)
-    await life.collect()
     return await life.execute_one(list(life.heads.values()))
 
   async def test_sampler_shares_busy_time_until_the_short_request_fails(self):

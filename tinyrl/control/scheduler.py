@@ -65,20 +65,16 @@ class State:
   def runs(self, proc: str) -> list[str]:
     if not (p := self.procs.get(proc)):
       return []
-    return (
-      [r for r, j in sorted(self.jobs.items()) if j.spec == p.spec]
-      if p.spec.role == Role.SAMPLER
-      else [r for r, o in sorted(self.home.items()) if o == proc]
-    )
+    if p.spec.role == Role.SAMPLER:
+      return [r for r, j in sorted(self.jobs.items()) if j.spec == p.spec]
+    return [r for r, o in sorted(self.home.items()) if o == proc]
 
   def procs_of(self, run: str) -> list[str]:
     if not (j := self.jobs.get(run)):
       return []
-    return (
-      [n for n, p in sorted(self.procs.items()) if p.spec == j.spec]
-      if j.spec.role == Role.SAMPLER
-      else ([p] if (p := self.home.get(run)) in self.procs else [])
-    )
+    if j.spec.role == Role.SAMPLER:
+      return [n for n, p in sorted(self.procs.items()) if p.spec == j.spec]
+    return [p] if (p := self.home.get(run)) in self.procs else []
 
   def ready(self, run: str) -> bool:
     return self.jobs[run].backlog > 0
@@ -118,9 +114,9 @@ class State:
   def can_host(self, node: str, spec: Spec, skip: str = "", spare: bool = False) -> bool:
     return (self.used(node) if spare else self.excl_used(node, skip)) + spec.gpus <= self.nodes[node][0]
 
-  def add_proc(self, spec: Spec) -> str:
+  def add_proc(self, spec: Spec, node: str | None = None) -> str:
     self.made = next(n for n in itertools.count(self.made + 1) if f"p{n}" not in self.procs)
-    self.procs[name := f"p{self.made}"] = Proc(spec)
+    self.procs[name := f"p{self.made}"] = Proc(spec, node)
     return name
 
 
@@ -279,8 +275,7 @@ def merge_and_split(s: State, out: list) -> None:
         out.append((Ev.ASSIGNED, {"run": r, "proc": twins[0]}))
       continue
     while len(busy := [r for r in s.runs(name) if s.ready(r)]) >= 2 and (spot := choose_node(s, name, True)):
-      q = s.add_proc(p.spec)
-      s.procs[q].node = spot
+      q = s.add_proc(p.spec, spot)
       s.home[busy[-1]] = q
       out.append((Ev.ASSIGNED, {"run": busy[-1], "proc": q}))
       out.append((Ev.PLACED, {"proc": q, "node": spot, "rule": "place.split"}))
@@ -301,9 +296,7 @@ def size_samplers(s: State, out: list) -> None:
       if name not in keep and s.procs.pop(name).node:
         out.append((Ev.UNPLACED, {"proc": name, "rule": "place.scale_in"}))
     while len(keep) < want and (spot := choose_node(s, keep[0], True)):
-      q = s.add_proc(spec)
-      s.procs[q].node = spot
-      keep.append(q)
+      keep.append(q := s.add_proc(spec, spot))
       out.append((Ev.PLACED, {"proc": q, "node": spot, "rule": "place.scale_out"}))
 
 

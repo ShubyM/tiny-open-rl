@@ -428,12 +428,12 @@ class Bus:
 
   # ***** single-writer ownership, detachment, stateless sample commit, and process leases *****
 
-  async def touch_leases(self, *lives: str) -> None:
+  async def touch_leases(self, *lives: str, xx: bool = False) -> None:
     if not lives:
       return
     p = self.r.pipeline(transaction=False)
     for life in lives:
-      p.set(key("lease", life), 1, px=LEASE_MS)
+      p.set(key("lease", life), 1, px=LEASE_MS, xx=xx)
     await p.execute()
 
   async def drop_lease(self, life: str) -> None:
@@ -641,7 +641,7 @@ class Bus:
       key("nodes"), node, json.dumps({"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, **info})
     )
     for life in leases:
-      p.set(key("lease", life), 1, px=LEASE_MS)
+      p.set(key("lease", life), 1, px=LEASE_MS, xx=True)
     await p.execute()
 
   async def live_nodes(self, details: bool = False) -> dict:

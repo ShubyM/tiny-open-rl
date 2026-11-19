@@ -83,11 +83,10 @@ def as_bytes(t: torch.Tensor) -> torch.Tensor:
   return t.detach().contiguous().reshape(-1).view(torch.uint8)
 
 
-def header(path: str) -> dict:
-  import safetensors
-
-  with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-    return json.loads((f.metadata() or {}).get("meta", "{}"))
+def header(path: str | Path) -> dict:
+  with open(path, "rb") as f:
+    n = int.from_bytes(f.read(8), "little")
+    return json.loads(json.loads(f.read(n)).get("__metadata__", {}).get("meta", "{}"))
 
 
 def parallel(fn, *xs):
@@ -95,10 +94,6 @@ def parallel(fn, *xs):
     return [fn(*x) for x in zip(*xs)]
   with concurrent.futures.ThreadPoolExecutor(max_workers=len(xs[0])) as pool:
     return list(pool.map(fn, *xs))
-
-
-def chunks(n: int, size: int) -> list[slice]:
-  return [slice(i, min(i + size, n)) for i in range(0, n, size)]
 
 
 def fetch(url: str, path: str) -> None:
@@ -203,12 +198,13 @@ class Store:
           continue
         stream.wait_stream(torch.cuda.current_stream())
         src.record_stream(stream)
-        for piece in chunks(len(src), STREAM_CHUNK):
+        for start in range(0, len(src), STREAM_CHUNK):
+          end = min(start + STREAM_CHUNK, len(src))
           flush(1)  # write out the buffer this piece is about to reuse
           buf, j = bufs[j % 2], j + 1
           with torch.cuda.stream(stream):
-            buf[: piece.stop - piece.start].copy_(src[piece], non_blocking=True)
-            pending.append((torch.cuda.Event(), piece.stop - piece.start, buf))
+            buf[: end - start].copy_(src[start:end], non_blocking=True)
+            pending.append((torch.cuda.Event(), end - start, buf))
             pending[-1][0].record(stream)
       flush(0)
 
@@ -295,7 +291,9 @@ class Store:
     if not self.fs.exists(f"{dest}/manifest.json"):
       raise ValueError(f"version {version} has not landed" + (f", and {peer} failed to copy" if peer else ""))
     names = json.loads(self.fs.cat_file(f"{dest}/manifest.json"))
-    return atomic_dir(folder, lambda tmp: self.download_files(dest, names, tmp)), version
+    return atomic_dir(
+      folder, lambda tmp: parallel(lambda n: self.fs.get_file(f"{dest}/{n}", f"{tmp}/{n}"), names)
+    ), version
 
   def copy_from(self, peer: str, version: str) -> str | None:
     """A version copied from the node that saved it, which keeps it until it has uploaded. None if the copy fails: that node is gone, or no longer has it."""
@@ -307,9 +305,6 @@ class Store:
       )
     except Exception:  # the bucket has it, or it's lost
       return None
-
-  def download_files(self, src: str, names: list[str], folder: str) -> None:
-    parallel(lambda n: self.fs.get_file(f"{src}/{n}", f"{folder}/{n}"), names)
 
   def weight_files(self, version: str) -> list[Path]:
     folder, _ = self.local_folder(version)
@@ -335,12 +330,8 @@ class Store:
     """Allow in-flight reads a grace period after a version first becomes unreachable."""
     now = time.monotonic()
     self.unreferenced = {v: self.unreferenced.get(v, now) for v in unused}
-    self.discard_versions({v for v, since in self.unreferenced.items() if now - since >= grace})
-    self.trim_cache()
-
-  def discard_versions(self, versions: set[str]) -> None:
     with self.uploading:
-      for version in versions:
+      for version in [v for v, since in self.unreferenced.items() if now - since >= grace]:
         path = f"{self.base}/objects/{version}"
         with contextlib.suppress(FileNotFoundError):
           self.fs.rm(path, recursive=True)
@@ -350,6 +341,7 @@ class Store:
             shutil.rmtree(Path(self.cache, version + suffix), ignore_errors=True)
         else:
           shutil.rmtree(path + ".writing", ignore_errors=True)
+    self.trim_cache()
 
   def trim_cache(self) -> None:
     """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the bucket has: a version still uploading stays."""

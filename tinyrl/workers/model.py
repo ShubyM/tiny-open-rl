@@ -180,8 +180,7 @@ def full_tensor(t: torch.Tensor, cpu_pg=None, dtype: torch.dtype | None = None) 
     return local
   assert len(t.placements) == 1, f"unsupported placements {t.placements}"
   dim, world = t.placements[0].dim, dist.get_world_size(cpu_pg)
-  shapes: list = [None] * world
-  dist.all_gather_object(shapes, tuple(local.shape), group=cpu_pg)
+  dist.all_gather_object(shapes := [None] * world, tuple(local.shape), group=cpu_pg)
   size = max(math.prod(s) for s in shapes)
   buf = torch.empty(size, dtype=local.dtype)
   buf[: local.numel()].copy_(local.reshape(-1))
