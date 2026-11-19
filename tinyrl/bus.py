@@ -2,7 +2,7 @@
 
 Safety rests on two Redis facts (plus each node's local `on` table):
   tinyrl:run:<r>       a training run's single-writer `(owner, epoch, pos, snap)`, fenced on every commit and detach
-  tinyrl:lease:<life>  each live process incarnation's TTL; `reap_run` clears `owner` only after its lease expires
+  tinyrl:lease:<life>  each live process incarnation's TTL; `acquire_run` replaces `owner` only after its lease expires
 Sampling sessions are stateless readers: replicas share consumer group `q:<s>` and `commit_sample` answers & bills once.
 """
 
@@ -166,6 +166,13 @@ def queue_checkpoint(p, uri: str, size: int, *, version: str, ttl=None, owned=Fa
   if kind != "parked":
     p.zadd(key("ckpts"), {uri: now})
   p.zadd(key("expiry"), {uri: expires}) if expires else p.zrem(key("expiry"), uri)
+
+
+def queue_unregister_checkpoint(p, uri: str) -> None:
+  run, cid = uri.removeprefix("tinker://").split("/", 1)
+  p.hdel(key("ckpt", run), cid)
+  p.zrem(key("ckpts"), uri)
+  p.zrem(key("expiry"), uri)
 
 
 def connect(url: str) -> redis.Redis:
@@ -437,34 +444,24 @@ class Bus:
   async def drop_lease(self, life: str) -> None:
     await self.r.delete(key("lease", life))
 
-  async def reap_run(self, run_id: str, token: str) -> bool:
-    """Clear a dead process's ownership iff `token` still owns `run_id` and its lease has expired."""
-    k, lk = key("run", run_id), key("lease", token.rsplit(":", 1)[0])
-
-    async def op(p):
-      if await p.hget(k, "owner") != token.encode() or await p.exists(lk):
-        return None
-      p.multi()
-      p.hdel(k, "owner")
-      p.hdel(key("writing"), run_id)
-      wake(p)
-      return bool(await p.execute())
-
-    return bool(await self.transact(op, k, lk))
-
   async def acquire_run(self, run_id: str, life: str) -> tuple[str, str | None, str | None] | None:
     """Claim an unowned (or expired-owner) training run under a fresh epoch token if `life`'s lease is live."""
     k, lk = key("run", run_id), key("lease", life)
-    if (stale := await self.r.hget(k, "owner")) and not await self.reap_run(run_id, stale.decode()):
-      return None
 
     async def op(p):
       rec, owner, epoch, pos, snap = await p.hmget(k, "record", "owner", "epoch", "pos", "snap")
-      if not rec or owner is not None or not await p.exists(lk):
+      if not rec or not await p.exists(lk):
         return None
+      if owner is not None:
+        old_lk = key("lease", owner.decode().rsplit(":", 1)[0])
+        await p.watch(old_lk)
+        if await p.hget(k, "owner") != owner or await p.exists(old_lk):
+          return None
       n = int(epoch or 0) + 1
       p.multi()
       p.hset(k, mapping={"owner": f"{life}:{n}", "epoch": n})
+      if owner is not None:
+        p.hdel(key("writing"), run_id)
       await p.execute()
       return f"{life}:{n}", pos and pos.decode(), snap and snap.decode()
 
@@ -529,10 +526,7 @@ class Bus:
         p.hdel(k, "snap")
       elif deleting:
         for cid in [c for c, d in ckpts.items() if json.loads(d)["owned"]]:
-          uri = f"tinker://{cmd.run}/{cid.decode()}"
-          p.hdel(ck, cid)
-          p.zrem(key("ckpts"), uri)
-          p.zrem(key("expiry"), uri)
+          queue_unregister_checkpoint(p, f"tinker://{cmd.run}/{cid.decode()}")
         queue_delete(p, cmd.run)
       await p.execute()
       return old_snap.decode() if old_snap and mutates and not deleting else ""
@@ -559,6 +553,69 @@ class Bus:
       err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {cmd.op}"))
       if not (await self.commit_reply(cmd, err, token))[0]:
         return
+
+  # ***** checkpoints *****
+
+  async def get_checkpoint(self, uri: str) -> dict | None:
+    run, cid = uri.removeprefix("tinker://").split("/", 1)
+    info = await self.r.hget(key("ckpt", run), cid)
+    return json.loads(info) if info else None
+
+  async def checkpoint_version(self, uri: str) -> str:
+    """The version to read a checkpoint by."""
+    if version := (await self.get_checkpoint(uri) or {}).get("version"):
+      return version
+    raise ValueError(f"no checkpoint at {uri}")
+
+  async def checkpoints_of_run(self, run: str) -> list[dict]:
+    found = [json.loads(v) for v in (await self.r.hgetall(key("ckpt", run))).values()]
+    return sorted((c for c in found if c["checkpoint_type"] != "parked"), key=lambda c: c["time"])
+
+  async def page_of_checkpoints(self, limit: int, offset: int) -> tuple[list[dict], int]:
+    """A page of every run's checkpoints, newest first, and how many there are."""
+    uris = [u.decode() for u in await self.r.zrevrange(key("ckpts"), offset, offset + limit - 1)]
+    found = [await self.get_checkpoint(u) for u in uris]
+    return [c for c in found if c], await self.r.zcard(key("ckpts"))
+
+  async def set_checkpoint_ttl(self, uri: str, ttl: int | None) -> bool:
+    """Make a checkpoint expire ttl seconds from now, or never with None."""
+    run, cid = uri.removeprefix("tinker://").split("/", 1)
+    k = key("ckpt", run)
+
+    async def update(p):
+      if not (data := await p.hget(k, cid)):
+        return False
+      expires = time.time() + ttl if ttl else None
+      p.multi()
+      p.hset(k, cid, json.dumps(json.loads(data) | {"expires_at": expires}))
+      p.zadd(key("expiry"), {uri: expires}) if ttl else p.zrem(key("expiry"), uri)
+      return bool(await p.execute())
+
+    return await self.transact(update, k)
+
+  async def unregister_checkpoints(self, *uris: str) -> int:
+    """Take checkpoints out of the registry. The node daemons' sweeps then delete their files."""
+    if not uris:
+      return 0
+    p = self.r.pipeline(transaction=True)
+    for uri in uris:
+      queue_unregister_checkpoint(p, uri)
+    return sum((await p.execute())[::3])
+
+  async def expired_checkpoints(self) -> list[str]:
+    """The checkpoints whose TTL has run out."""
+    return [u.decode() for u in await self.r.zrangebyscore(key("expiry"), 0, time.time())]
+
+  async def sweep_checkpoints(self, store, grace: float) -> None:
+    # Enumerate candidates first, then inspect write intents before published references. A commit moves a
+    # version atomically from one to the other, so even a slow save stays protected throughout publication.
+    unused = await asyncio.to_thread(store.versions)
+    unused.difference_update(v.decode() for v in await self.r.hvals(key("writing")))
+    async for k in self.r.scan_iter(match=key("ckpt", "*")):
+      for info in map(json.loads, await self.r.hvals(k)):
+        if version := info.get("version"):
+          unused.discard(version.partition("@")[0])
+    await asyncio.to_thread(store.sweep, unused, grace)
 
   # ***** nodes, replies, events *****
 

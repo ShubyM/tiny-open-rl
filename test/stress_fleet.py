@@ -33,7 +33,6 @@ from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
 from tinyrl.bus import Bus, Op, Role, Run, connect, key
 from tinyrl.control import scheduler
-from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import Model
 from tinyrl.workers.trainer import Trainer
@@ -204,7 +203,7 @@ class Stress(RedisTest):
     node = self.nodes.pop(name)
     self.loops.pop(name).cancel()
     await node.bus.r.aclose()
-    node.bus.r = node.registry.r = Unreachable()
+    node.bus.r = Unreachable()
     for task in node.tasks.values():
       task.cancel()
     await asyncio.gather(*node.tasks.values(), return_exceptions=True)
@@ -216,7 +215,7 @@ class Stress(RedisTest):
 
     async def loop():
       while True:
-        await scheduler.tick(bus, Registry(bus))
+        await scheduler.tick(bus)
         await asyncio.sleep(0.01)
 
     self.loops["scheduler"] = asyncio.create_task(loop())
@@ -377,7 +376,7 @@ class Stress(RedisTest):
     self.finished.append(run)
 
   async def compare(self, run: str, uri: str, ref: Model) -> None:
-    version = await self.registry.version(uri)
+    version = await self.bus.checkpoint_version(uri)
     want, _ = ref.training_state(run)
     for _ in range(100):  # the save may still be on its way from the node that made it to the bucket
       for node in list(self.nodes.values()):

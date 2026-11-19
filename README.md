@@ -188,7 +188,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for local GPU selection, wor
 
 | File | Responsibility |
 |---|---|
-| [tinyrl/bus.py](tinyrl/bus.py) | runs, sessions, command streams, fenced replies and leases |
+| [tinyrl/bus.py](tinyrl/bus.py) | runs, sessions, command streams, fenced replies, leases and checkpoint registry |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy arrays |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | the cluster's assignment: runs to workers, workers to nodes |
@@ -202,7 +202,6 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for local GPU selection, wor
 | [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | vLLM startup, loading, completions and sleep/wake |
 | [tinyrl/workers/snapshot.py](tinyrl/workers/snapshot.py) | CRIU snapshots and isolated restores |
 | [tinyrl/storage/store.py](tinyrl/storage/store.py) | safetensors, chunked saves, uploads and caching |
-| [tinyrl/storage/registry.py](tinyrl/storage/registry.py) | checkpoint owners, versions, TTLs and cleanup of unregistered files |
 | [tinyrl/storage/models.py](tinyrl/storage/models.py) | base-model fetching and caching |
 | [tinyrl/trace.py](tinyrl/trace.py) | NVTX ranges for Nsight Systems |
 

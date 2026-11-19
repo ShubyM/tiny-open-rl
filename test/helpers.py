@@ -10,7 +10,6 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from tinyrl.bus import Bus, connect, queue_checkpoint
-from tinyrl.storage.registry import Registry
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -70,7 +69,6 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
     self.renewal_tasks = []
     self.bus = Bus(connect(self.url))
-    self.registry = Registry(self.bus)
     await self.bus.r.flushall()
 
   async def worker(self, run: str) -> str:

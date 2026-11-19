@@ -140,7 +140,9 @@ class TestAPI(RedisTest):
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
     self.assertEqual(sampler["path"], f"tinker://{run_id}/sampler_weights/step-0")
-    with open(f"{self.store.local_folder(await self.registry.version(sampler['path']))[0]}/adapter_config.json") as f:
+    with open(
+      f"{self.store.local_folder(await self.bus.checkpoint_version(sampler['path']))[0]}/adapter_config.json"
+    ) as f:
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}
@@ -166,7 +168,7 @@ class TestAPI(RedisTest):
     final = f"/api/v1/training_runs/{run_id}/checkpoints/weights/final"
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": 60})).status_code, 400)
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": None})).status_code, 200)
-    self.assertEqual(await self.registry.expired_checkpoints(), [])
+    self.assertEqual(await self.bus.expired_checkpoints(), [])
     self.assertEqual((await self.http.delete(final)).status_code, 200)
     self.assertEqual((await self.http.delete(final)).status_code, 404)
 
@@ -179,10 +181,10 @@ class TestAPI(RedisTest):
     await self.seed_checkpoint("tinker://r/weights/later", 10, ttl=3600)
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     for _ in range(100):
-      if await self.registry.get_checkpoint("tinker://r/weights/soon") is None:
+      if await self.bus.get_checkpoint("tinker://r/weights/soon") is None:
         break
       await asyncio.sleep(0.05)
-    self.assertEqual([c["checkpoint_id"] for c in await self.registry.checkpoints_of_run("r")], ["weights/later"])
+    self.assertEqual([c["checkpoint_id"] for c in await self.bus.checkpoints_of_run("r")], ["weights/later"])
 
   async def test_errors(self):
     run_id = await self.create_model()
@@ -300,7 +302,7 @@ class TestAPI(RedisTest):
 
     saved = (await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final_pin"}))).json()
 
-    folder = self.store.local_folder(await self.registry.version(saved["path"]))[0]
+    folder = self.store.local_folder(await self.bus.checkpoint_version(saved["path"]))[0]
     files = os.listdir(folder)
     self.assertTrue(all(f.endswith(".safetensors") for f in files), f"Found non-safetensors files: {files}")
 
@@ -319,7 +321,7 @@ class TestAPI(RedisTest):
     saved = (
       await self.result(await self.post("save_weights_for_sampler", json={"model_id": run, "path": "sampler"}))
     ).json()
-    files = glob.glob(f"{self.store.local_folder(await self.registry.version(saved['path']))[0]}/*.safetensors")
+    files = glob.glob(f"{self.store.local_folder(await self.bus.checkpoint_version(saved['path']))[0]}/*.safetensors")
     self.assertTrue(files)
     for path in files:
       self.assertTrue(all(t.dtype == torch.bfloat16 for t in safetensors.torch.load_file(path).values()))

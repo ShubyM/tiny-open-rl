@@ -977,7 +977,7 @@ class TestMultiNodeExecution(RedisTest):
       # A newly assigned owner can still be waiting to load its checkpoint. Read through the normal command path.
       uri = f"tinker://{r}/weights/after-rebalance"
       await self.run_cmd(r, Op.SAVE_WEIGHTS, json.dumps({"uri": uri}).encode())
-      version = await self.registry.version(uri)
+      version = await self.bus.checkpoint_version(uri)
       actual, _ = await asyncio.to_thread(self.nodes[0].store.get, version)
       torch.testing.assert_close(actual, expected)
 

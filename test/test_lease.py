@@ -147,7 +147,7 @@ class TestLease(RedisTest):
     tensors, meta = self.store.get(version)
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])
-    self.assertIsNotNone(await self.registry.get_checkpoint(uri))
+    self.assertIsNotNone(await self.bus.get_checkpoint(uri))
 
 
 if __name__ == "__main__":

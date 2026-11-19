@@ -22,7 +22,6 @@ from tinyrl.api import wire
 from tinyrl.bus import Bus, Op, Role, Run, key
 from tinyrl.control import estimator, scheduler
 from tinyrl.helpers import getenv
-from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
@@ -115,7 +114,6 @@ def checkpoint_uri(run: str, kind: str, name: str) -> str:
 
 def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   bus = bus if bus is not None else Bus()
-  registry = Registry(bus)
   store = store if store is not None else Store()
   api = FastAPI(title="tiny-open-rl")
 
@@ -149,7 +147,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       if train.get("base"):
         base, lora = train["base"], train["rank"] > 0
       else:
-        meta = await asyncio.to_thread(store.read_meta, await registry.version(uri))
+        meta = await asyncio.to_thread(store.read_meta, await bus.checkpoint_version(uri))
         base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
       if not base:
         raise ValueError("could not resolve base_model")
@@ -298,7 +296,9 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     """What the SDK asks before it resumes from a checkpoint: how to create a run like the one that saved it. The checkpoint
     says so itself, as its run is deleted soon after its client stops."""
     try:
-      meta = await asyncio.to_thread(store.read_meta, await registry.version(checkpoint_uri("", "", req.tinker_path)))
+      meta = await asyncio.to_thread(
+        store.read_meta, await bus.checkpoint_version(checkpoint_uri("", "", req.tinker_path))
+      )
     except (OSError, IndexError, ValueError):
       meta = {}
     if "base" not in meta:
@@ -396,11 +396,11 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.get("/api/v1/training_runs/{run}/checkpoints")
   async def list_checkpoints(run: str):
-    return {"checkpoints": [public(c) for c in await registry.checkpoints_of_run(run)]}
+    return {"checkpoints": [public(c) for c in await bus.checkpoints_of_run(run)]}
 
   @api.get("/api/v1/checkpoints")
   async def list_user_checkpoints(limit: int = 100, offset: int = 0):
-    found, total = await registry.page_of_checkpoints(limit, offset)
+    found, total = await bus.page_of_checkpoints(limit, offset)
     return {
       "checkpoints": [public(c) for c in found],
       "cursor": {"offset": offset, "limit": limit, "total_count": total},
@@ -408,12 +408,12 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.delete("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}")
   async def delete_checkpoint(run: str, checkpoint_id: str):
-    if not await registry.unregister_checkpoints(f"tinker://{run}/{checkpoint_id}"):  # its files go with the next sweep
+    if not await bus.unregister_checkpoints(f"tinker://{run}/{checkpoint_id}"):  # its files go with the next sweep
       raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
 
   @api.put("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}/ttl")
   async def set_checkpoint_ttl(run: str, checkpoint_id: str, req: TTLRequest):
-    if not await registry.set_checkpoint_ttl(f"tinker://{run}/{checkpoint_id}", ttl(req.ttl_seconds)):
+    if not await bus.set_checkpoint_ttl(f"tinker://{run}/{checkpoint_id}", ttl(req.ttl_seconds)):
       raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
 
   # ***** inspection *****

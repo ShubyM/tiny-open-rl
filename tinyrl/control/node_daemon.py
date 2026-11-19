@@ -22,7 +22,6 @@ from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge, Wave
 from tinyrl.control.process import Process
 from tinyrl.helpers import DEBUG, getenv
-from tinyrl.storage.registry import Registry
 from tinyrl.storage.store import Store
 from tinyrl.trace import span
 from tinyrl.workers.sampler import Sampler
@@ -89,7 +88,7 @@ class NodeDaemon:
   def __init__(
     self, bus: Bus, gpus: int = GPUS, node: str = "", gpu_mib: int | None = None, store: Store | None = None
   ):
-    self.bus, self.registry = bus, Registry(bus)
+    self.bus = bus
     self.store = store if store is not None else Store()
     self.store.start()
     self.gpus, self.id = gpus, node or f"{socket.gethostname()}-{os.getpid()}"
@@ -152,7 +151,8 @@ class NodeDaemon:
         if p.node == self.id and proc not in self.tasks and self.state.runs(proc):
           self.start(proc)
     if time.time() - self.swept > SWEEP_S and (self.sweeping is None or self.sweeping.done()):
-      self.swept, self.sweeping = time.time(), asyncio.create_task(self.registry.sweep(self.store, SWEEP_GRACE_S))
+      self.swept = time.time()
+      self.sweeping = asyncio.create_task(self.bus.sweep_checkpoints(self.store, SWEEP_GRACE_S))
     self.notify()
 
   def dispatch(self) -> None:
@@ -234,7 +234,7 @@ class Lifetime:
   """One process incarnation: reconciles local GPU quantum residency and run ownership toward `node.state`."""
 
   def __init__(self, node: NodeDaemon, proc: str):
-    self.node, self.bus, self.registry, self.store, self.proc = node, node.bus, node.registry, node.store, proc
+    self.node, self.bus, self.store, self.proc = node, node.bus, node.store, proc
     self.spec, self.sampling = (sp := node.state.procs[proc].spec), sp.role == Role.SAMPLER
     self.life = f"{proc}@{node.id}-{os.urandom(6).hex()}"
     self.task = self.model = self.closing = self.reader = None
@@ -466,7 +466,7 @@ class Lifetime:
           raise ValueError(f"no sampling session {cmd.run}")
         if not (uri := run.get("model_path")):
           return None
-        return await asyncio.to_thread(self.store.local_folder, await self.registry.version(uri))
+        return await asyncio.to_thread(self.store.local_folder, await self.bus.checkpoint_version(uri))
       except Exception as e:
         return e
 
@@ -520,7 +520,7 @@ class Lifetime:
     if cmd.op == Op.LOAD_WEIGHTS:
       # Resolve at dispatch: a preceding save can still be executing while this command is prefetched.
       try:
-        version = await self.registry.version(json.loads(cmd.body)["uri"])
+        version = await self.bus.checkpoint_version(json.loads(cmd.body)["uri"])
       except (KeyError, ValueError) as exc:
         return Reply.error(exc), {}
     elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
@@ -557,7 +557,7 @@ class Lifetime:
         elif mutates:
           self.owned[cmd.run] = (token, cmd.entry_id, None)
           if old:
-            await self.registry.unregister_checkpoints(unpack_snap(old)[0])
+            await self.bus.unregister_checkpoints(unpack_snap(old)[0])
         self.open_grads.discard(cmd.run)
         if cmd.op == Op.FORWARD_BACKWARD and reply.ok:
           self.open_grads.add(cmd.run)

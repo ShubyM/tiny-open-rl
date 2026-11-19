@@ -121,8 +121,8 @@ class TestBus(RedisTest):
     self.assertIsNone((await self.bus.get_run(run)).get("snap"))
     self.assertIsNone((await self.bus.get_run(run)).get("owner"))
     self.assertFalse(await self.bus.r.sismember(key("runs"), run))
-    self.assertIsNone(await self.registry.get_checkpoint(owned))
-    self.assertIsNotNone(await self.registry.get_checkpoint(saved))
+    self.assertIsNone(await self.bus.get_checkpoint(owned))
+    self.assertIsNotNone(await self.bus.get_checkpoint(saved))
     for index in ("ckpts", "expiry"):
       self.assertIsNone(await self.bus.r.zscore(key(index), owned))
       self.assertIsNotNone(await self.bus.r.zscore(key(index), saved))
@@ -171,19 +171,18 @@ class TestBus(RedisTest):
       await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"")
     taken = await self.bus.take_commands([run_id], "w0", block_ms=10)
 
-    # Reap refuses while lease is live, and succeeds once lease expires.
-    self.assertFalse(await self.bus.reap_run(run_id, old_token))
+    # Acquire refuses while the current owner's lease is live, and succeeds once it expires.
     await self.bus.touch_leases("new")
     self.assertIsNone(await self.bus.acquire_run(run_id, "new"))
     await self.bus.drop_lease("w0")
     new_token, _, _ = await self.bus.acquire_run(run_id, "new")
     self.assertNotEqual(new_token, old_token)
 
-    # Stale token cannot commit, detach, reap, or fail stranded commands — even if w0 re-opens a lease (epoch ABA).
+    # Stale token cannot commit, detach, re-acquire, or fail stranded commands — even if w0 re-opens a lease (ABA).
     await self.bus.touch_leases("w0")
+    self.assertIsNone(await self.bus.acquire_run(run_id, "w0"))
     self.assertEqual(await self.bus.commit_reply(taken[0], ok(by="zombie"), old_token), (False, None))
     self.assertFalse(await self.bus.detach_run(run_id, old_token, None, "tinker://x/parked/1\nv1"))
-    self.assertFalse(await self.bus.reap_run(run_id, old_token))
     await self.bus.fail_stranded_commands(run_id, old_token)
     self.assertIsNone(await self.bus.wait_for_reply(taken[0].request_id, 0))
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 0)
@@ -233,12 +232,12 @@ class TestBus(RedisTest):
     self.assertFalse((await self.bus.commit_reply(abandoned, ok(), old, checkpoint=stale))[0])
     await self.bus.r.pexpire(key("f", request), 0)
     self.assertFalse((await self.bus.commit_reply(cmd, ok(), current, checkpoint=stale))[0])
-    self.assertEqual(await self.registry.version(uri), "new")
+    self.assertEqual(await self.bus.checkpoint_version(uri), "new")
     self.assertIsNone(await self.bus.r.zscore(key("expiry"), uri))
     parked = {"uri": f"tinker://{run}/parked/late", "size": 12, "owned": True}
     self.assertFalse(await self.bus.detach_run(run, old, None, parked["uri"], parked))
     self.assertFalse(await self.bus.detach_run(run, current, "0-1", parked["uri"], parked))
-    self.assertIsNone(await self.registry.get_checkpoint(parked["uri"]))
+    self.assertIsNone(await self.bus.get_checkpoint(parked["uri"]))
 
   async def test_concurrent_acquires_pick_one_winner_and_detach_fences_exact_pos(self):
     run_id = await self.new_run(claim=False)
