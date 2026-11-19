@@ -471,6 +471,18 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")
         for name in expected:
           torch.testing.assert_close(actual[name], expected[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")
+        # Parked 2-rank trainer gathers weights, open gradients, and AdamW moments over CPU gloo.
+        for run in (r1, r2):
+          fb = Cmd(run, "9", Op.FORWARD_BACKWARD, proto_body(run))
+          reply, _ = single.execute(fb) if run == r1 else await asyncio.wait_for(multi.call("execute", fb), 90)
+          self.assertTrue(reply.ok, reply.body)
+        await multi.park()
+        s_park = single.save_run(r1, new_id().replace("-", ""))
+        m_park = await asyncio.wait_for(multi.call("save_run", r2, new_id().replace("-", "")), 90)
+        exp_state, act_state = store.get(s_park["version"])[0], store.get(m_park["version"])[0]
+        self.assertEqual(exp_state.keys(), act_state.keys(), f"parked rank {rank}")
+        for name in exp_state:
+          torch.testing.assert_close(act_state[name], exp_state[name], atol=1e-5, rtol=1e-5, msg=f"parked {name}")
       finally:
         await multi.close()
 

@@ -14,6 +14,7 @@ import torch.distributed as dist
 import transformers
 from peft import LoraConfig
 from peft.helpers import disable_input_dtype_casting
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.utils.checkpoint import checkpoint
@@ -169,7 +170,13 @@ def local_tensor(t: torch.Tensor) -> torch.Tensor:
 
 
 def full_tensor(t: torch.Tensor) -> torch.Tensor:
-  return t.full_tensor() if isinstance(t, DTensor) else t
+  if not isinstance(t, DTensor):
+    return t
+  if not t._local_tensor.is_cuda:
+    # Parked shards and host-offloaded AdamW moments gather over gloo without touching the GPU.
+    mesh = DeviceMesh.from_group(t.device_mesh.get_group(), "cpu")
+    t = DTensor.from_local(t._local_tensor, mesh, t.placements, shape=t.shape, stride=t.stride())
+  return t.full_tensor()
 
 
 def like_param(t: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
