@@ -91,16 +91,23 @@ async def assign_new_runs(bus) -> dict:
 
   raw = await bus.read_state()
   new, changes = scheduler.step(scheduler.from_state(raw | {"nodes": {}}))
+  published = scheduler.to_plan(new)
   plan = raw.get("plan") or {}
   procs = {
     **plan.get("procs", {}),
-    **{n: v for n, v in scheduler.to_plan(new)["procs"].items() if n not in plan.get("procs", {})},
+    **{n: v for n, v in published["procs"].items() if n not in plan.get("procs", {})},
   }
   home = {
     **{r: p for r, p in plan.get("home", {}).items() if r in new.jobs},
     **{b["run"]: b["proc"] for k, b in changes if k == "assigned"},
   }
-  merged = {**plan, "made": max(plan.get("made", 0), new.made), "procs": procs, "home": home}
+  merged = {
+    **plan,
+    "made": max(plan.get("made", 0), new.made),
+    "procs": procs,
+    "home": home,
+    "records": published["records"],
+  }
   if merged != plan:
     await bus.write_plan(merged, [c for c in changes if c[0] == "assigned"])
   return merged

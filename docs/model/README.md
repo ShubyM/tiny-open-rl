@@ -19,9 +19,9 @@ Every safety and accounting rule has a boolean flag in the model; flipping any s
 | `ClearAfterExit` | Release `node.on[life]` only after `park()` or child exit | `GpuExclusive` |
 | `OwnerFencesWrite` | `commit_reply` and `detach_run` require exact `owner == token` | `MemoryMatchesPos` |
 | `ExactSnapOnly` | `detach_run` records `snap` iff `run.pos == pos`; mutation clears superseded `snap` | `MemoryMatchesPos` |
-| `ReapChecksLease` | `reap_run` clears `owner` only inside `WATCH run, lease` when the lease key is gone | `LiveOwnerKept` |
+| `ReapChecksLease` | `acquire_run` checks the previous owner's lease and installs a new ownership token in one watched transaction | `LiveOwnerKept` |
 | `SerializeRunOps` | Ownership checks and state mutations run in one Redis `WATCH`/`MULTI` transaction | `MemoryMatchesPos` |
-| `SampleSetNX` | Stateless sampler replicas publish `f:<req>` and bill `service` once (`xlen == 0`) | `SampleChargedOnce` |
+| `SampleSetNX` | `commit_sample` checks that the command still exists, then removes it, publishes the reply, and bills the account atomically | `SampleChargedOnce` |
 | `UseDelta` | Planner advances `lag` from `service[a] - seen[a]` (never overwriting `service`) | `ExactAccounting` |
 | `KeepNegLag` | Sleeping preserves negative debt (decaying only as active peers receive work) and zeros positive idle credit | `NoFlickerGain` |
 | `AmortizeCost` | Preemption requires `ran >= holder.cost` and `lag[waiter] - lag[holder] >= switch_cost` | `GoodputBounded` |

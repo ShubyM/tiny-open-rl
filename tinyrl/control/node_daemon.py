@@ -72,7 +72,7 @@ class NodeDaemon:
 
   async def serve(self) -> None:
     await self.announce_node()
-    wake_id = "$"
+    wake_id = "0-0"
     try:
       while True:
         await self.tick()
@@ -116,9 +116,7 @@ class NodeDaemon:
           print(f"{proc} stopped: {err!r}", file=sys.stderr, flush=True)
         del self.tasks[proc]
         self.lives.pop(proc, None)
-      elif not task.cancelling() and (
-        self.id not in self.state.nodes or ((lf := self.lives.get(proc)) and not lf.closing and lf.exited())
-      ):
+      elif not task.cancelling() and (lf := self.lives.get(proc)) and not lf.closing and lf.exited():
         task.cancel()
 
   def select_gpus(self, proc: str) -> tuple[int, ...]:
@@ -163,7 +161,8 @@ class NodeDaemon:
     await asyncio.to_thread(self.store.close)
 
   async def read_state(self) -> scheduler.State:
-    return scheduler.from_state(await self.bus.read_state(backlogs=False))
+    plan, service = await asyncio.gather(self.bus.read_plan(), self.bus.account_service())
+    return scheduler.from_plan(plan, service)
 
   def notify(self) -> None:
     changed, self.changed = self.changed, asyncio.Event()

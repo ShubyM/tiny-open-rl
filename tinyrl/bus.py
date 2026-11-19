@@ -61,6 +61,16 @@ def is_missing_stream(err: Exception) -> bool:
   return "NOGROUP" in (msg := str(err)) or "no such key" in msg
 
 
+async def read_stream(command) -> list:
+  """A run can be deleted after a worker receives its assignment."""
+  try:
+    return await command
+  except redis.ResponseError as e:
+    if not is_missing_stream(e):
+      raise
+    return []
+
+
 def finish_cmd(p, cmd: Cmd, reply: Reply, acct: str, charge: Charge | None) -> None:
   q, fk = key("q", cmd.run), key("f", cmd.request_id)
   p.xack(q, GROUP, cmd.entry_id)
@@ -179,9 +189,7 @@ class Bus:
 
   async def end_session(self, session_id: str) -> None:
     left = False
-    for run_id in (await self.get_session(session_id) or {}).get("runs", []):
-      if not await self.s.sismember(key("runs"), run_id):
-        continue
+    for run_id in sorted(await self.s.sinter(key("runs"), key("sess", session_id, "runs"))):
       if (await self.get_run(run_id) or {}).get("role") == Role.SAMPLER:
         await self.delete_run(run_id)
       else:
@@ -203,13 +211,20 @@ class Bus:
     fields = ("role", "base", "rank", "exclusive", "train_run", "gpus")
     queue_event(p, Ev.RUN_CREATED, {"run": run.id, **{k: getattr(run, k) for k in fields}})
     wake(p)
-    if run.role == Role.SAMPLER:
-      wake(p, "plan_wake")
     await p.execute()
 
-  async def read_state(self, *, backlogs: bool = True, counters: bool = False) -> dict:
-    """Cluster snapshot: live nodes, runs `(record, owner)`, plan, `gpu_ms` service, and optional stream backlogs."""
-    nodes, runs = await self.live_nodes(details=True), sorted(await self.s.smembers(key("runs")))
+  async def read_plan(self) -> dict:
+    return json.loads(await self.s.get(key("plan")) or "{}")
+
+  async def account_service(self) -> dict[str, float]:
+    return {a: float(v) for a, v in (await self.s.hgetall(key("service"))).items()}
+
+  async def observations(self, *, backlogs: bool = True, counters: bool = False) -> dict:
+    """Current machine capacities, registered runs, queue depths and billed GPU time."""
+    nodes, ids, service = await asyncio.gather(
+      self.live_nodes(details=True), self.s.smembers(key("runs")), self.account_service()
+    )
+    runs = sorted(ids)
     p = self.s.pipeline(transaction=False)
     fields = ("record", "owner", *COUNTERS) if counters else ("record", "owner")
     for r in runs:
@@ -217,9 +232,7 @@ class Bus:
     if backlogs:
       for r in runs:
         p.xlen(key("q", r))
-    p.get(key("plan"))
-    p.hgetall(key("service"))
-    *rows, plan, service = await p.execute()
+    rows = await p.execute()
     out_runs = {}
     for r, (rec, owner, *values) in zip(runs, rows):
       if rec:
@@ -227,8 +240,11 @@ class Bus:
         if counters:
           out_runs[r]["counters"] = {k: int(v) for k, v in zip(COUNTERS, values) if v is not None}
     queues = dict(zip(runs, rows[len(runs) :]))
-    svc = {k: float(v) for k, v in service.items()}
-    return {"nodes": nodes, "runs": out_runs, "queues": queues, "plan": json.loads(plan or "{}"), "service": svc}
+    return {"nodes": nodes, "runs": out_runs, "queues": queues, "service": service}
+
+  async def read_state(self, *, backlogs: bool = True, counters: bool = False) -> dict:
+    observed, plan = await asyncio.gather(self.observations(backlogs=backlogs, counters=counters), self.read_plan())
+    return observed | {"plan": plan}
 
   async def write_plan(self, plan: dict, changes: list[tuple[Ev, dict]] = (), notify_nodes: bool = True) -> None:
     p = self.s.pipeline(transaction=True)
@@ -288,12 +304,9 @@ class Bus:
     p = self.s.pipeline()
     p.xinfo_groups(q)
     p.xpending_range(q, GROUP, "-", "+", count=100)
-    groups, pending = await p.execute(raise_on_error=False)
-    if isinstance(groups, redis.ResponseError) and is_missing_stream(groups):
+    if not (status := await read_stream(p.execute())):
       return {"live": False}
-    for result in (groups, pending):
-      if isinstance(result, Exception):
-        raise result
+    groups, pending = status
     in_flight = [
       {
         "request_id": f"{run_id}/{e['message_id']}",
@@ -308,8 +321,6 @@ class Bus:
   # ***** single-writer trainer ownership & leases *****
 
   async def touch_leases(self, *lives: str, xx: bool = False) -> None:
-    if not lives:
-      return
     p = self.s.pipeline(transaction=False)
     for life in lives:
       p.set(key("lease", life), 1, px=LEASE_MS, xx=xx)
@@ -324,7 +335,8 @@ class Bus:
 
     async def op(p):
       rec, owner, epoch, pos, snap = await p.hmget(k, "record", "owner", "epoch", "pos", "snap")
-      if not rec or not await p.exists(lk):
+      # Deletion drops the queue and updates the watched run hash, which survives for inspection.
+      if not rec or await p.exists(lk, key("q", run_id)) != 2:
         return None
       if owner:
         await p.watch(old_lk := key("lease", life_of(owner)))
@@ -436,12 +448,7 @@ class Bus:
           return
 
   async def pending(self, run: str, start: str = "-", count: int = 1000) -> list[dict]:
-    try:
-      return await self.s.xpending_range(key("q", run), GROUP, start, "+", count=count)
-    except redis.ResponseError as e:
-      if is_missing_stream(e):
-        return []
-      raise
+    return await read_stream(self.s.xpending_range(key("q", run), GROUP, start, "+", count=count))
 
   # ***** stateless sampler consumer groups *****
 
@@ -450,10 +457,9 @@ class Bus:
     rows = await self.pending(run)
     if not rows:
       return []
-    holders, p = sorted({row["consumer"] for row in rows}), self.s.pipeline(transaction=False)
-    for holder in holders:
-      p.exists(key("lease", holder))
-    dead = {holder for holder, live in zip(holders, await p.execute()) if not live}
+    holders = sorted({row["consumer"] for row in rows})
+    leases = await self.s.mget([key("lease", holder) for holder in holders])
+    dead = {holder for holder, live in zip(holders, leases) if live is None}
     return [row["message_id"] for row in rows if row["consumer"] in dead]
 
   async def peek_sampler(self, runs: list[str], block_ms: int = 0) -> list[Cmd]:
@@ -489,12 +495,7 @@ class Bus:
     for r in runs:
       if ids := (await self.abandoned(r))[:count]:
         # Idle for a second so two live replicas reclaiming at once don't take the same entries from each other.
-        try:
-          got = await self.r.xclaim(key("q", r), GROUP, consumer, 1000, ids)
-        except redis.ResponseError as e:
-          if is_missing_stream(e):
-            continue
-          raise
+        got = await read_stream(self.r.xclaim(key("q", r), GROUP, consumer, 1000, ids))
         taken = [parse_cmd(r, eid, fields) for eid, fields in got if fields]
         cmds.extend(taken)
         rem[r] -= len(taken)

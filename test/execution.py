@@ -63,8 +63,10 @@ class TestNode(NodeDaemon):
     return sampler
 
   async def read_state(self):
-    state = scheduler.from_state(await self.bus.read_state())
-    if not self.announced:
+    if self.announced:
+      state = await super().read_state()
+    else:
+      state = scheduler.from_state(await self.bus.read_state())
       state.nodes.setdefault(self.id, (self.gpus, self.gpu_mib * 2**20))
     for proc in list(self.pinned):
       if proc in state.procs and proc not in self.unpinned:

@@ -103,6 +103,12 @@ class TestBus(RedisTest):
     self.assertEqual(await self.bus.queued_and_in_flight(run_id), {"live": False})
     self.assertFalse(await self.bus.r.exists(key("q", run_id)))
 
+  async def test_stale_assignment_cannot_acquire_a_deleted_run(self):
+    run = await self.new_run()
+    await self.bus.delete_run(run)
+    self.assertIsNone(await self.bus.acquire_run(run, "w0"))
+    self.assertEqual(await self.bus.s.hmget(key("run", run), "owner", "epoch"), [None, "1"])
+
   async def test_delete_removes_owned_checkpoints_and_keeps_saved_weights(self):
     run = await self.new_run()
     owned, saved = [f"tinker://{run}/{path}" for path in ("sampler_weights/session", "weights/save")]

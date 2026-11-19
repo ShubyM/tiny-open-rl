@@ -2,10 +2,11 @@
 
 **Current implementation.** The cluster scheduler groups runs and places workers on nodes. Each node daemon owns
 worker leases, command preparation, GPU reservations and process lifetime. Each worker runs in one coroutine with its
-executor and ready queue local to that lifetime. GPU admission uses the node's actual reservations and waiting order;
-state changes wake waiting coroutines directly. Trainers are synchronous model processes; sampling controllers run
-in the node and drive isolated engines. Only cluster assignments use the event log. Portable checkpoints, multi-node
-placement, single-node FSDP, host parking, background uploads and node-loss recovery are built.
+executor and ready queue local to that lifetime. GPU admission uses the node's actual reservations and waiting order.
+State changes wake waiting coroutines directly. Trainers are synchronous model processes. Sampling controllers run
+in the node and drive isolated engines. Nodes read assignments from the published plan. The event log records
+placement decisions for inspection. Portable checkpoints, multi-node placement, single-node FSDP, host parking,
+background uploads and node-loss recovery are built.
 See the [README](../README.md) and [node_daemon.py](../tinyrl/control/node_daemon.py) for the running system.
 
 **Roadmap below.** Live run migration between healthy nodes, adaptive worker sharding, `/dev/shm` + peer Store tiers,
@@ -15,7 +16,7 @@ Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest
 
 ## The idea
 
-**Kubernetes supplies GPUs. Redis decides who runs where. A fast state store lets any trainer or sampler resume anywhere.**
+**Kubernetes supplies GPUs. The scheduler places workers. The checkpoint store lets them resume on another node.**
 
 ```mermaid
 flowchart LR

@@ -1,4 +1,4 @@
-# Exactly one scheduler decides GPU turns for every node daemon. Recreate, so a rollout never runs two at once.
+# One scheduler publishes worker placements. Recreate keeps a single writer during rollouts.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

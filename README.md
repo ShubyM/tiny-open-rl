@@ -34,29 +34,35 @@ Run one `node_daemon` per GPU machine (set `GPUS`, default `1`) and one `schedul
 
 ## Architecture
 
+The scheduler decides where workers belong. Each node decides when those workers get its GPUs. Redis carries the published plan and the commands, replies, and ownership records shared across machines.
+
 ```mermaid
 flowchart TD
-  G["Gateway"] -->|Commands| R[("Redis")]
-  S["Cluster scheduler"] -->|Node placements| R
-  R -->|Assignments & commands| N["Node daemon"]
+  G["Gateway"] -->|Run command| R[("Redis")]
+  R -->|Live nodes, runs, backlog, GPU time| S["Cluster scheduler"]
+  S -->|Published plan| R
+  R -->|Plan, GPU time, commands| N["Node daemon"]
   N -->|Unix IPC| T["Trainer ranks"]
   N -->|Engine calls| V["vLLM"]
   T -->|Checkpoints| C[("Store")]
   N -->|Fenced replies| R
 ```
 
-Every training or sampling call is a command on its run's Redis stream, and its reply is a one-entry stream keyed by the request.
+1. **Submit.** The gateway appends a training or sampling command to the run's Redis stream and returns a request ID. The SDK uses that ID to retrieve the reply.
+2. **Place.** The scheduler loads its last published plan on startup. It keeps that plan in memory and reconciles it with live nodes, registered runs, queue depths, and billed GPU time. Its Python `step()` assigns trainer homes, places workers, and sizes sampler pools. When the result changes, it publishes the placements, run configurations, and fairness balances together. Compatible LoRA runs can share a trainer. A sampler can serve any session matching its pool.
+3. **Execute.** Each node reads the plan and current billed GPU time, starts its assigned workers, and chooses the next local GPU turn. A worker keeps its GPUs until it parks or exits. A sampling wave serves one account and shares the cost of loading weights across the requests using them.
+4. **Commit.** The node publishes the reply and bills the GPU time together. A trainer must still hold the run's ownership token to commit an update. A sampler replica can reclaim an abandoned request and bill it once. Queues, replies, and ownership survive a scheduler restart.
 
-- **Cluster placement.** Each training run has one trainer home. Compatible LoRA runs can share a trainer. Sampler sessions use any replica in a pool with the same model and worker configuration. The scheduler sizes each pool from its combined backlog and available GPUs.
-- **GPU turns.** Each node grants local GPUs to one worker at a time and releases them after the worker parks or exits. A sampling wave serves one account. Its requests share the GPU time spent loading their weights and executing samples. The cluster tracks each account’s share, and nodes use billed GPU time to choose subsequent turns.
 - **Trainers & samplers:** Trainers run as isolated synchronous PyTorch/PEFT processes (FSDP via `torchrun` across multiple GPUs) with bf16 forward, fp32 master weights + AdamW state, chunked logprobs, and pinned host-memory parking when yielding a GPU. Samplers drive isolated vLLM processes (or a custom `ENGINE=module:Class`).
 - **Checkpoints:** Pure `safetensors` via [store.py](tinyrl/storage/store.py) (`put`/`get`), committed atomically under the worker's ownership token. Bucket saves stage in `CKPT_CACHE` and upload asynchronously; other nodes can fetch pending versions directly from the writer node.
-- **Reliability:** Retried calls with the same `seq_id` execute once; replies and step counters commit atomically under lease fencing. On `SIGTERM`, a node drains its current batch and saves state within `DRAIN_S`; crashed work fails fast rather than replaying uncertain updates.
+- **Recovery.** Retries with the same `seq_id` return the original request ID. On `SIGTERM`, a node drains its current batch and saves state within `DRAIN_S`. If a trainer dies after claiming a command, its replacement fails that request and resumes at the next queued command.
 - **Wire format:** Protobuf end-to-end from SDK to trainer, with JSON conversion at the gateway for older clients.
 
 ## Code layout
 
-`tinyrl/` is kept small (`python sz.py` counts token-bearing lines; CI caps it at 3,400). Start with [bus.py](tinyrl/bus.py).
+To follow a placement decision, start at `scheduler.step()`. Follow `NodeDaemon.tick()` to see how a node acts on the plan, and `plan_gpus()` for the turn-by-turn GPU policy. [scheduler.py](tinyrl/control/scheduler.py) · [node_daemon.py](tinyrl/control/node_daemon.py) · [fairness.py](tinyrl/control/fairness.py)
+
+`python sz.py` counts token-bearing lines in `tinyrl/`. CI caps the total at 3,400.
 
 | File | Responsibility |
 |---|---|
@@ -93,7 +99,7 @@ All settings are environment variables:
 
 ## Upgrading an existing cluster
 
-Stop the old scheduler and drain the old nodes before starting the new control plane. Keep Redis, checkpoint storage, and the node caches. The scheduler reads the old trainer placements and writes one worker ID per trainer on its next tick. Sampler membership is derived from the pool configuration. Existing streams retain their pending commands and checkpoint names keep their versions.
+Stop the old scheduler and drain the old nodes. Keep Redis, checkpoint storage, and the node caches. On its first tick the new scheduler reads the existing run records and placements, converts each trainer's home to a single worker ID, and publishes the run configurations in the plan. New nodes wait for that plan before starting workers. Existing streams retain pending commands and checkpoint names keep their versions.
 
 ## Observability
 

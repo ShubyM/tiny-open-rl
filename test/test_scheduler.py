@@ -1136,8 +1136,10 @@ class TestMultiNodeExecution(RedisTest):
 
     # Split-brain plans: `node-a` and `node-b` each believe they own `r1`, `r2` is co-placed on `node-a`, and `gang` is oversized.
     spec1 = {"role": "trainer", "base": "tiny", "lora": False, "exclusive": False, "train_run": None, "gpus": 1}
+    runs = (await self.bus.read_state())["runs"]
     base_plan = {
       "made": 4,
+      "records": {r: info["record"] for r, info in runs.items()},
       "procs": {
         "p1": {"spec": spec1, "node": "node-a"},
         "p2": {"spec": spec1, "node": "node-a"},

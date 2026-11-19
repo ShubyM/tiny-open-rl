@@ -417,7 +417,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
     run = await require_run(run_id)
-    procs = scheduler.from_state(await bus.read_state(backlogs=False)).procs_of(run_id)
+    procs = scheduler.from_plan(await bus.read_plan(), {}).procs_of(run_id)
     extra = {"procs": procs, **({"worker": procs[0]} if procs else {})}
     return {**run, **extra, **await bus.queued_and_in_flight(run_id)}
 
@@ -432,7 +432,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def metrics():
     """Every run's counters, account service and node loop lag for Prometheus."""
     raw = await bus.read_state(backlogs=False, counters=True)
-    state = scheduler.from_state(raw)
+    state = scheduler.from_plan(raw["plan"], raw["service"])
     lines = []
     for run, info in raw["runs"].items():
       if ps := state.procs_of(run):

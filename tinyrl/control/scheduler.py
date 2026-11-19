@@ -1,7 +1,7 @@
 """Cluster planner: places, scales, and rebalances processes across nodes (`run -> procs -> node`).
 
 Nodes time-slice their own GPUs locally on wall-clock quanta and enforce all safety via `on`, `run.owner`, and `lease`.
-`tinyrl:plan` stores only process placement, run assignment, and per-account EEVDF `lag` (in `gpu_ms`).
+The published plan contains worker placements, run settings and the fairness baseline for local GPU turns.
 """
 
 from __future__ import annotations
@@ -132,16 +132,14 @@ class State:
     return name
 
 
-def from_state(raw: dict) -> State:
-  plan, queues, rnodes = raw["plan"], raw.get("queues", {}), raw.get("nodes", {})
-  nodes = {n: (int(v["gpus"]), int(v.get("memory", 0))) for n, v in rnodes.items()}
+def from_plan(plan: dict, service: dict) -> State:
+  """Decode everything a worker needs to follow the published plan."""
   jobs, procs = {}, {}
-  for r, info in raw.get("runs", {}).items():
-    rec = info["record"]
+  for r, rec in plan.get("records", {}).items():
     excl, tr, role = bool(rec.get("exclusive")), rec.get("train_run"), Role(rec.get("role", "trainer"))
     spec = Spec(role, rec.get("base", ""), rec.get("rank", 0) > 0, excl, tr if excl else None, int(rec.get("gpus", 1)))
     acct = rec.get("account") or ("" if tr else rec.get("session", ""))
-    jobs[r] = Job(spec, tr, acct, info.get("owner"), queues.get(r, 0), rec)
+    jobs[r] = Job(spec, tr, acct, record=rec)
   jobs = {r: j for r, j in jobs.items() if not j.spec.train_run or j.spec.train_run in jobs}
   for n, p in plan.get("procs", {}).items():
     procs[n] = Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
@@ -151,13 +149,26 @@ def from_state(raw: dict) -> State:
     for r, p in plan.get("home", {}).items()
     if p and r in jobs and jobs[r].spec.role == Role.TRAINER
   }
-  fv = [{a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights")]
-  return State(int(plan.get("made", 0)), nodes, procs, home, jobs, fv[0], fv[1], dict(raw.get("service", {})), fv[2])
+  fairness = {k: {a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights")}
+  return State(made=int(plan.get("made", 0)), procs=procs, home=home, jobs=jobs, service=service.copy(), **fairness)
+
+
+def from_state(raw: dict) -> State:
+  """Reconcile the previous placements against live runs, machine capacities, owners and queues."""
+  runs = raw.get("runs", {})
+  records = {r: info["record"] for r, info in runs.items()}
+  s = from_plan(raw["plan"] | {"records": records}, raw.get("service", {}))
+  s.nodes = {n: (int(v["gpus"]), int(v.get("memory", 0))) for n, v in raw.get("nodes", {}).items()}
+  for r, job in s.jobs.items():
+    job.owner, job.backlog = runs[r].get("owner"), raw.get("queues", {}).get(r, 0)
+  return s
 
 
 def to_plan(s: State) -> dict:
   procs = {n: dataclasses.asdict(p) for n, p in s.procs.items()}
-  return {"made": s.made, "procs": procs, "home": s.home, "lag": s.lag, "seen": s.seen, "weights": s.weights}
+  records = {r: j.record for r, j in s.jobs.items()}
+  assignments = {"procs": procs, "home": s.home, "records": records}
+  return assignments | {"made": s.made, "lag": s.lag, "seen": s.seen, "weights": s.weights}
 
 
 def settings(gpus: int, gpu_bytes: int) -> dict[str, str]:
@@ -303,23 +314,29 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
 # ***** loop *****
 
 
-async def tick(bus: Bus) -> list[tuple[Ev, dict]]:
+async def reconcile(bus: Bus, previous: dict) -> tuple[dict, list[tuple[Ev, dict]]]:
   for session in await bus.expired_sessions():
     await bus.end_session(session)
   await bus.expire_checkpoints()
-  raw = await bus.read_state()
-  old, (new, changes) = raw["plan"], step(from_state(raw))
+  observed = await bus.observations()
+  new, changes = step(from_state(observed | {"plan": previous}))
   plan = to_plan(new)
-  if plan != old:
-    wake = plan["procs"] != old.get("procs") or plan["home"] != old.get("home")
+  if plan != previous:
+    wake = any(plan[k] != previous.get(k) for k in ("procs", "home", "records"))
     await bus.write_plan(plan, changes, notify_nodes=wake)
+  return plan, changes
+
+
+async def tick(bus: Bus) -> list[tuple[Ev, dict]]:
+  """Run a single reconciliation from the saved plan."""
+  _, changes = await reconcile(bus, await bus.read_plan())
   return changes
 
 
 async def run(bus: Bus) -> None:
-  wake_id = "$"
+  plan, wake_id = await bus.read_plan(), "0-0"
   while True:
-    await tick(bus)
+    plan, _ = await reconcile(bus, plan)
     wake_id = await bus.wait_wake(wake_id, TICK_MS)
 
 

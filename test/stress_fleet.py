@@ -212,13 +212,7 @@ class Stress(RedisTest):
   def start_scheduler(self) -> None:
     bus = Bus(connect(self.url))
     self.addAsyncCleanup(bus.aclose)
-
-    async def loop():
-      while True:
-        await scheduler.tick(bus)
-        await asyncio.sleep(0.01)
-
-    self.loops["scheduler"] = asyncio.create_task(loop())
+    self.loops["scheduler"] = asyncio.create_task(scheduler.run(bus))
 
   async def chaos(self) -> None:
     while True:
