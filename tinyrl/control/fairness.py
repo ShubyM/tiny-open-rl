@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from tinyrl.bus import Cmd
+from tinyrl.types import Cmd
 
 
 class Demand(StrEnum):
@@ -88,7 +88,7 @@ def blocks(total: int, width: int) -> list[tuple[int, ...]]:
 
 
 def plan_gpus(
-  workers: dict[str, Worker], total: int, now: float, draining: set[int] = frozenset(), occupied: set[int] = frozenset()
+  workers: dict[str, Worker], total: int, now: float, occupied: set[int] = frozenset()
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
   """Return desired blocks and the next contested quantum deadline. The node enforces the handoff."""
   held = occupied | {g for w in workers.values() for g in w.current}
@@ -98,7 +98,7 @@ def plan_gpus(
   # Keep exclusive residents. Other busy residents finish their quantum or training step unless an exclusive needs in.
   keep, deadlines = {}, []
   for name, w in workers.items():
-    if not w.current or not draining.isdisjoint(w.current):
+    if not w.current:
       continue
     protected = w.demand != Demand.IDLE and not exclusive_waiting
     if protected and w.hold_until > now:
@@ -106,7 +106,7 @@ def plan_gpus(
     if w.exclusive or (protected and (w.hold_until > now or w.demand == Demand.FINISH_STEP)):
       keep[name] = w.current
 
-  taken = set(draining).union(*keep.values())
+  taken = set().union(*keep.values())
   exclusive_gpus = {g for name, block in keep.items() if workers[name].exclusive for g in block}
   reserved, waiting = set(), False
 

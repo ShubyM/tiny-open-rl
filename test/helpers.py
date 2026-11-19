@@ -47,7 +47,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
   proc: subprocess.Popen | None = None
 
   async def seed_checkpoint(self, uri, size, *, ttl=None, owned=False, version=None):
-    pipeline = self.bus.r.pipeline()
+    pipeline = self.bus.s.pipeline()
     queue_checkpoint(pipeline, uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned)
     await pipeline.execute()
 
@@ -80,7 +80,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
     for task in self.renewal_tasks:
       task.cancel()
     await asyncio.gather(*self.renewal_tasks, return_exceptions=True)
-    await self.bus.r.aclose()
+    await self.bus.aclose()
 
 
 async def assign_new_runs(bus) -> dict:

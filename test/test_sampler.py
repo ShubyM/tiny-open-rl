@@ -62,7 +62,7 @@ class TestSampler(RedisTest):
           await node.tick()
           wid = await wbus.wait_wake(wid, 10)
       finally:
-        await wbus.r.aclose()
+        await wbus.aclose()
 
     self.tasks.append(asyncio.create_task(run()))
 
@@ -293,8 +293,8 @@ class TestSampler(RedisTest):
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
     await node.announce_node()
     with (
-      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
-      mock.patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 1),
+      mock.patch("tinyrl.control.workers.QUANTUM_MS", 15),
+      mock.patch("tinyrl.control.workers.SAMPLE_COMMANDS", 1),
     ):
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode(), cost=10)
       self.pump(node, sched=True)

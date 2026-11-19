@@ -5,11 +5,11 @@ from unittest.mock import AsyncMock, Mock, patch
 from test.helpers import RedisTest
 from tinyrl.bus import Op, Reply, Role, Run
 from tinyrl.control import scheduler
-from tinyrl.control.node_daemon import Lifetime
+from tinyrl.control.workers import SamplerRunner, TrainerRunner
 
 
 class TestAccounting(RedisTest):
-  async def lifetime(self, role, **accounts):
+  async def runner(self, role, **accounts):
     runs = list(accounts)
     for run, account in accounts.items():
       await self.bus.create_run(Run(run, "base", 4, role=role, account=account, gpus=2))
@@ -17,7 +17,7 @@ class TestAccounting(RedisTest):
     state.procs["worker"] = scheduler.Proc(state.jobs[runs[0]].spec)
     state.home = dict.fromkeys(runs, ["worker"])
     node = SimpleNamespace(id="node", bus=self.bus, store=None, state=state, notify=Mock())
-    life = Lifetime(node, "worker")
+    life = (SamplerRunner if role == Role.SAMPLER else TrainerRunner)(node, "worker")
     await self.bus.open_lease(life.life)
     if role == Role.TRAINER:
       for run in runs:
@@ -27,11 +27,12 @@ class TestAccounting(RedisTest):
 
   async def execute(self, life):
     cmds = await life.peek(0)
-    await asyncio.gather(*(task for _, task in life.heads.values()))
-    return await life.execute(cmds)
+    if life.staging:
+      await asyncio.gather(*life.staging.values())
+    return await life.dispatch(cmds)
 
   async def test_sampler_shares_busy_time_until_the_short_request_fails(self):
-    life = await self.lifetime(Role.SAMPLER, short="alice", long="alice")
+    life = await self.runner(Role.SAMPLER, short="alice", long="alice")
     finished = asyncio.Event()
 
     async def sample(cmd, *_):
@@ -58,7 +59,7 @@ class TestAccounting(RedisTest):
 
   async def test_three_sampler_sessions_get_the_same_gpu_time_as_one(self):
     accounts = {"a1": "alice", "a2": "alice", "a3": "alice", "b": "bob"}
-    life = await self.lifetime(Role.SAMPLER, **accounts)
+    life = await self.runner(Role.SAMPLER, **accounts)
     for run in accounts:
       for _ in range(6):
         await self.bus.submit_command(run, Op.SAMPLE, b"{}")
@@ -73,7 +74,7 @@ class TestAccounting(RedisTest):
 
     life.model = SimpleNamespace(execute=sample)
     with (
-      patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 1),
+      patch("tinyrl.control.workers.SAMPLE_COMMANDS", 1),
       patch("tinyrl.control.accounting.monotonic_ns", lambda: now),
     ):
       for _ in range(6):
@@ -85,16 +86,15 @@ class TestAccounting(RedisTest):
     self.assertEqual(life.run_service, {"a1": 24, "a2": 24, "a3": 24, "b": 72})
 
   async def test_trainer_bills_only_the_failure_that_entered_the_model(self):
-    life = await self.lifetime(Role.TRAINER, run="run-account")
+    life = await self.runner(Role.TRAINER, run="run-account")
     failure = ValueError("bad input")
-    life.prepare = AsyncMock(return_value=failure)
     life.model = SimpleNamespace(call=AsyncMock(return_value=(Reply.error(failure), {})))
-    await self.bus.submit_command("run", Op.OPTIM_STEP, b"{}")
+    await self.bus.submit_command("run", Op.LOAD_WEIGHTS, b'{"uri":"tinker://run/weights/missing"}')
     await self.execute(life)
     life.model.call.assert_not_awaited()
     self.assertEqual(life.gpu_ms, 0)
     self.assertEqual((await self.bus.read_state())["service"], {})
-    life.prepare.return_value = ({}, None)
+    await life.stop_reader()
     await self.bus.submit_command("run", Op.OPTIM_STEP, b"{}")
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=[0, 250_000]):
       await self.execute(life)

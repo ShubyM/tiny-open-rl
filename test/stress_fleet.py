@@ -164,7 +164,7 @@ class Stress(RedisTest):
     await asyncio.gather(*self.loops.values(), return_exceptions=True)
     for node in self.nodes.values():
       await node.aclose()
-      await node.bus.r.aclose()
+      await node.bus.aclose()
     for node in self.cut:
       await asyncio.to_thread(node.store.close)
     await super().asyncTearDown()
@@ -195,15 +195,15 @@ class Stress(RedisTest):
     if task := node.sweeping:
       task.cancel()
     await self.bus.r.hdel(key("nodes"), name)
-    await node.bus.r.aclose()
+    await node.bus.aclose()
 
   async def cut_node(self, name: str) -> None:
     """The node loses Redis for good, mid-work: none of its replies, releases or lease drops arrive. Its leases and
     heartbeat run out by themselves. Its store goes on uploading, so the saves it acknowledged are not lost."""
     node = self.nodes.pop(name)
     self.loops.pop(name).cancel()
-    await node.bus.r.aclose()
-    node.bus.r = Unreachable()
+    await node.bus.aclose()
+    node.bus.r = node.bus.s = Unreachable()
     for task in node.tasks.values():
       task.cancel()
     await asyncio.gather(*node.tasks.values(), return_exceptions=True)
@@ -211,7 +211,7 @@ class Stress(RedisTest):
 
   def start_scheduler(self) -> None:
     bus = Bus(connect(self.url))
-    self.addAsyncCleanup(bus.r.aclose)
+    self.addAsyncCleanup(bus.aclose)
 
     async def loop():
       while True:
@@ -286,14 +286,13 @@ class Stress(RedisTest):
       f"lag { {a: round(v) for a, v in plan.get('lag', {}).items()} } service { {a: round(v) for a, v in raw['service'].items()} }"
     )
     for node in self.nodes.values():
-      out.append(
-        f"{node.id}: gpus={node.gpus} on={node.on} drains={node.drains} physical={node.occ.on} draining={node.draining}"
-      )
+      out.append(f"{node.id}: gpus={node.gpus} on={node.on} physical={node.occ.on} draining={node.draining}")
       for proc, lf in node.lives.items():
-        heads = [(c.run[:4], c.op.value, t.done()) for c, t in lf.heads.values()]
+        heads = [(c.run[:4], c.op.value) for c in lf.heads.values()]
+        owned = [r[:4] for r in getattr(lf, "owned", ())]
         out.append(
           f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} demand={lf.demand.value} wanted={lf.wanted()} "
-          f"owned={[r[:4] for r in lf.owned]} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
+          f"owned={owned} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
           f"reader={'none' if lf.reader is None else 'done' if lf.reader.done() else 'reading'} "
           f"task={'done' if node.tasks[proc].done() else 'running'} quantum_left={lf.hold_until - time.monotonic():.2f}s"
         )
@@ -416,11 +415,11 @@ class Stress(RedisTest):
     self.started = started
     self.abandoned, self.finished = [], []
     patches = [
-      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 100),
+      mock.patch("tinyrl.control.workers.QUANTUM_MS", 100),
       mock.patch("tinyrl.control.scheduler.REBALANCE_MS", 1000),
     ]
     if CHAOS:  # so that a node cut off from Redis is given up on in seconds
-      patches += [mock.patch(f"tinyrl.{m}.LEASE_MS", 3000) for m in ("bus", "control.node_daemon")]
+      patches += [mock.patch(f"tinyrl.{m}.LEASE_MS", 3000) for m in ("bus", "control.workers")]
       patches.append(mock.patch("tinyrl.bus.NODE_MS", 4000))
     for p in patches:
       p.start()

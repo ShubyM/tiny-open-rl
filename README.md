@@ -150,13 +150,12 @@ flowchart TD
 Every training or sampling call is a command on its run's Redis stream, and its reply is a stream with one entry, named by the request. That's the
 whole design. Redis does the bookkeeping that would otherwise take a database, a ledger and a heartbeat.
 
-* **The queue reads itself.** Peeking and preparation leave commands unclaimed. The node claims executable batches through
-  the worker's consumer group after GPU admission; preparation failures are claimed and answered without a GPU.
-  `XINFO GROUPS` says what's queued and `XPENDING` says what's in flight, under which owner, and for how long.
-  `GET /api/v1/runs/<id>` just asks.
-* **A dead trainer fails fast.** The current owner reads pending entries with `XPENDING` and fails each under its
-  ownership token before executing new commands. A sampler replica takes over a pending sample once the replica that
-  claimed it has lost its lease, even if the client never submits another request.
+* **The queue reads itself.** Peeking and staging leave commands unclaimed. A training run is a single-writer FIFO
+  stream with its active entry recorded on `tinyrl:run:<r>`; sampling sessions share a consumer group across stateless
+  replicas, and `GET /api/v1/runs/<id>` reads queued and in-flight work directly from the stream and run record.
+* **A dead trainer fails fast.** Once an owner's lease expires, `acquire_run` atomically bumps the run's epoch and the
+  new owner fails any claimed in-flight command under its fresh token before serving queued work. A sampler replica
+  reclaims a pending sample once the replica that claimed it has lost its lease.
 * **A stopping trainer saves its runs.** On node SIGTERM, the node finishes the current batch and saves weights, pending gradients
   and Adam state within the grace period. Unclaimed work stays queued. The replacement trainer restores the published checkpoint
   before its next command.
@@ -193,13 +192,15 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 
 | File | Responsibility |
 |---|---|
-| [tinyrl/bus.py](tinyrl/bus.py) | runs, sessions, command streams, checkpoints, fenced replies and leases |
+| [tinyrl/types.py](tinyrl/types.py) | stdlib domain records (`Run`, `Cmd`, `Reply`, `Event`, `Op`, `Role`) and checkpoint URIs |
+| [tinyrl/bus.py](tinyrl/bus.py) | Redis control state, single-writer trainer streams, sampler groups, checkpoints and leases |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy arrays |
 | [tinyrl/control/fairness.py](tinyrl/control/fairness.py) | account service balances, GPU turns and run selection within a turn |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | the cluster's assignment: runs to workers, workers to nodes |
 | [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | monotonic GPU-time measurement across overlapping calls |
-| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | worker lifetimes, leases, ready work, GPU reservations and recovery |
+| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | node heartbeats, local GPU ownership table and worker supervision |
+| [tinyrl/control/workers.py](tinyrl/control/workers.py) | trainer and sampler lifecycle runners, lease keepalive and GPU turns |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | private model IPC and parent-owned process groups |
 | [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | model memory and GPU-width estimates |
 | [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | synchronous model commands and checkpoint metadata |

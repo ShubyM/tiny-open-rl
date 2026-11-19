@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from tinyrl.api import wire
-from tinyrl.bus import Cmd, Reply
+from tinyrl.types import Cmd, Reply
 
 
 @dataclass(frozen=True)

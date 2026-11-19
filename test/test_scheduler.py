@@ -19,7 +19,7 @@ from tinyrl.api import wire
 from tinyrl.bus import GROUP, LEASE_MS, Bus, Cmd, Ev, Op, Role, Run, connect, key
 from tinyrl.control import scheduler
 from tinyrl.control.fairness import Demand, Worker, plan_gpus, select_runs, update_lag, waterfill
-from tinyrl.control.node_daemon import QUANTUM_MS, NodeDaemon
+from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.control.scheduler import (
   REBALANCE_MS,
   SCALE_BATCH,
@@ -31,6 +31,7 @@ from tinyrl.control.scheduler import (
   step,
   to_plan,
 )
+from tinyrl.control.workers import QUANTUM_MS
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import Model
 
@@ -87,14 +88,13 @@ def apply_gpus(
   state: State,
   total: int,
   now: float,
-  draining: set[int] = frozenset(),
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
   """Drive pure `plan_gpus` on `Worker` snapshots, resetting `hold_until` only when a worker's block changes."""
   ranked = {
     p: replace(w, lag=max((state.ready_lag(r) for r in state.runs(p) if state.ready(r)), default=-w.gpu_ms))
     for p, w in workers.items()
   }
-  keep, wake_at = plan_gpus(ranked, total, now, draining)
+  keep, wake_at = plan_gpus(ranked, total, now)
   for p, w in list(workers.items()):
     want = keep.get(p, ())
     until = now + quanta[p] if want and want != w.current else w.hold_until
@@ -115,10 +115,8 @@ def check_plan_invariants(test: unittest.TestCase, s: State) -> None:
       test.assertIn(proc, s.procs)
 
 
-def check_gpu_invariants(
-  test: unittest.TestCase, keep: dict, workers: dict[str, Worker], total: int, draining: set[int] = frozenset()
-) -> None:
-  seen = list(draining)
+def check_gpu_invariants(test: unittest.TestCase, keep: dict, workers: dict[str, Worker], total: int) -> None:
+  seen = []
   for p, gs in keep.items():
     test.assertEqual(len(gs), workers[p].gpus)
     test.assertEqual(len(set(gs)), workers[p].gpus)
@@ -717,13 +715,12 @@ class TestLocalQuantum(unittest.TestCase):
         workers[f"p{i}"] = Worker(gpus=w, exclusive=rng.random() < 0.15, hold_until=q)
       for _ in range(60):
         now += rng.uniform(0.0, 1.5)
-        draining = {rng.randrange(total)} if rng.random() < 0.1 else set()
         for p, w in list(workers.items()):
           demand = Demand.READY if rng.random() < 0.7 else Demand.IDLE
           ms = w.gpu_ms + (rng.uniform(10.0, 500.0) if w.current else 0.0)
           workers[p] = replace(w, demand=demand, gpu_ms=ms)
-        keep, wake = apply_gpus(workers, quanta, s, total, now, draining)
-        check_gpu_invariants(self, keep, workers, total, draining)
+        keep, wake = apply_gpus(workers, quanta, s, total, now)
+        check_gpu_invariants(self, keep, workers, total)
         if wake is not None:
           self.assertGreater(wake, now)
 
@@ -853,7 +850,7 @@ class TestMultiNodeExecution(RedisTest):
     await asyncio.gather(*self.tasks, return_exceptions=True)
     for node in self.nodes:
       await node.aclose()
-      await node.bus.r.aclose()
+      await node.bus.aclose()
     await super().asyncTearDown()
 
   async def add_node(self, name: str, gpus: int = 1, engine=FakeEngine) -> TestNode:
@@ -872,7 +869,7 @@ class TestMultiNodeExecution(RedisTest):
 
   def start_scheduler(self) -> None:
     bus = Bus(connect(self.url))
-    self.addAsyncCleanup(bus.r.aclose)
+    self.addAsyncCleanup(bus.aclose)
 
     async def loop():
       while True:
@@ -978,8 +975,8 @@ class TestMultiNodeExecution(RedisTest):
         return await super().sample(job, name)
 
     with (
-      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
-      mock.patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 2),
+      mock.patch("tinyrl.control.workers.QUANTUM_MS", 15),
+      mock.patch("tinyrl.control.workers.SAMPLE_COMMANDS", 2),
     ):
       await self.add_node("shared", gpus=1, engine=BusySampler)
       self.start_scheduler()
@@ -1098,7 +1095,7 @@ class TestMultiNodeExecution(RedisTest):
     await self.bus.create_run(Run(sid, "tiny", 4, role=Role.SAMPLER, account="team-s"))
     total_cmds = 2 * SCALE_BATCH + 4
     payload = json.dumps(JOB).encode()
-    with mock.patch("tinyrl.control.node_daemon.SAMPLE_COMMANDS", 2):
+    with mock.patch("tinyrl.control.workers.SAMPLE_COMMANDS", 2):
       reqs = [await self.submit(sid, Op.SAMPLE, payload, cost=50) for _ in range(total_cmds)]
 
       async def scaled_out() -> bool:

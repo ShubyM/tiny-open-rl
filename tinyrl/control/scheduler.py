@@ -12,9 +12,10 @@ import dataclasses
 import itertools
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus, Ev, Role
+from tinyrl.bus import Bus
 from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
+from tinyrl.types import Ev, Role
 
 REBALANCE_MS = getenv("REBALANCE_MS", 20_000)
 SCALE_BATCH, TICK_MS = getenv("SCALE_BATCH", 4), getenv("TICK_MS", 100)
