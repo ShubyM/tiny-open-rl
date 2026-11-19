@@ -17,7 +17,6 @@ import os
 import shutil
 import socket
 import sys
-import tempfile
 import threading
 import time
 import urllib.request
@@ -31,7 +30,7 @@ import fsspec
 if TYPE_CHECKING:
   import torch
 
-from tinyrl.helpers import getenv
+from tinyrl.helpers import atomic_dir, getenv
 from tinyrl.trace import span
 
 CKPT = getenv("CKPT", "/tmp/tinyrl")
@@ -213,8 +212,8 @@ class Store:
             pending[-1][0].record(stream)
       flush(0)
 
-  def write_checkpoint_files(self, folder: str, tensors: dict[str, torch.Tensor], info: dict) -> list[str]:
-    """Write a checkpoint into folder, and return its file names, with the weights last."""
+  def write_checkpoint_files(self, folder: str, tensors: dict[str, torch.Tensor], info: dict) -> None:
+    """Write a checkpoint into folder."""
     lora, cfg, total = info.get("lora"), info.get("config"), sum(map(nbytes, tensors.values()))
     n = max(1, min(MAX_SHARDS, len(tensors))) if not lora and total >= SHARD_BYTES else 1
     stem = ("adapter_model" if lora else "model") if cfg else "state"
@@ -238,7 +237,6 @@ class Store:
     parallel(
       lambda i, name, shard: self.write_safetensors(i, f"{folder}/{name}", shard, meta), range(n), weights, shards
     )
-    return [*files, *weights]
 
   @span("store.put")
   def put(self, tensors: dict[str, torch.Tensor], meta: dict | None = None, *, version: str | None = None) -> str:
@@ -251,12 +249,10 @@ class Store:
     folder.mkdir()
     try:
       with self.lock:
-        names = self.write_checkpoint_files(str(folder), tensors, meta or {})
-      folder.rename(parent / version)
+        self.write_checkpoint_files(str(folder), tensors, meta or {})
       if self.remote:
-        job = parent / f"{version}.uploading"
-        job.write_text(json.dumps(names))
-        job.rename(parent / f"{version}.upload")
+        (parent / f"{version}.upload").touch()  # present before rename so trim_cache never drops an unuploaded save
+      folder.rename(parent / version)
     finally:
       shutil.rmtree(folder, ignore_errors=True)
     return f"{version}@{self.peer}" if self.remote and self.peer else version
@@ -269,12 +265,13 @@ class Store:
       for job in Path(self.cache).glob("*.upload"):
         version = job.stem
         folder = Path(self.cache, version)
+        if not folder.is_dir():
+          continue
         dest = f"{self.base}/objects/{version}"
         try:
-          names = json.loads(job.read_text())
+          names = sorted(os.listdir(folder))
           parallel(self.fs.put_file, [str(folder / n) for n in names], [f"{dest}/{n}" for n in names])
           self.fs.pipe_file(f"{dest}/manifest.json", json.dumps(names).encode())
-          Path(f"{folder}.uploaded").touch()
           job.unlink()
         except Exception as exc:
           print(f"upload failed for {version}, trying again: {exc!r}", file=sys.stderr, flush=True)
@@ -298,34 +295,18 @@ class Store:
     if not self.fs.exists(f"{dest}/manifest.json"):
       raise ValueError(f"version {version} has not landed" + (f", and {peer} failed to copy" if peer else ""))
     names = json.loads(self.fs.cat_file(f"{dest}/manifest.json"))
-    return self.cached_folder(version, lambda tmp: self.download_files(dest, names, tmp)), version
+    return atomic_dir(folder, lambda tmp: self.download_files(dest, names, tmp)), version
 
   def copy_from(self, peer: str, version: str) -> str | None:
     """A version copied from the node that saved it, which keeps it until it has uploaded. None if the copy fails: that node is gone, or no longer has it."""
     url = f"http://{peer}/{version}"
     try:
       names = json.load(urllib.request.urlopen(f"{url}/", timeout=10))
-      return self.cached_folder(version, lambda tmp: parallel(lambda n: fetch(f"{url}/{n}", f"{tmp}/{n}"), names))
+      return atomic_dir(
+        f"{self.cache}/{version}", lambda tmp: parallel(lambda n: fetch(f"{url}/{n}", f"{tmp}/{n}"), names)
+      )
     except Exception:  # the bucket has it, or it's lost
       return None
-
-  def cached_folder(self, version: str, fill) -> str:
-    """This node's folder for a version, which fill(folder) makes the first time."""
-    folder = f"{self.cache}/{version}"
-    if not os.path.isdir(folder):
-      os.makedirs(self.cache, exist_ok=True)
-      tmp = tempfile.mkdtemp(dir=self.cache)
-      try:
-        fill(tmp)
-        try:
-          os.rename(tmp, folder)
-        except OSError:
-          if not os.path.isdir(folder):
-            raise
-        open(f"{folder}.uploaded", "w").close()  # the bucket has it, so trim_cache() may drop it here
-      finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    return folder
 
   def download_files(self, src: str, names: list[str], folder: str) -> None:
     parallel(lambda n: self.fs.get_file(f"{src}/{n}", f"{folder}/{n}"), names)
@@ -364,8 +345,7 @@ class Store:
         with contextlib.suppress(FileNotFoundError):
           self.fs.rm(path, recursive=True)
         if self.remote:
-          for suffix in (".upload", ".uploading", ".uploaded"):
-            Path(self.cache, version + suffix).unlink(missing_ok=True)
+          Path(self.cache, f"{version}.upload").unlink(missing_ok=True)
           for suffix in ("", ".writing"):
             shutil.rmtree(Path(self.cache, version + suffix), ignore_errors=True)
         else:
@@ -376,12 +356,13 @@ class Store:
     if not os.path.isdir(self.cache):
       return
     limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2
-    found = [e for e in os.scandir(self.cache) if e.is_dir() and os.path.exists(f"{e.path}.uploaded")]
+    found = [
+      e for e in os.scandir(self.cache) if e.is_dir() and object_id(e.name) and not os.path.exists(f"{e.path}.upload")
+    ]
     size = {e.path: sum(f.stat().st_size for f in os.scandir(e.path)) for e in found}
     total = sum(size.values())
     for e in sorted(found, key=lambda e: e.stat().st_mtime):
       if total <= limit:
         break
       shutil.rmtree(e.path, ignore_errors=True)
-      os.unlink(f"{e.path}.uploaded")
       total -= size[e.path]

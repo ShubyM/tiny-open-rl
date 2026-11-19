@@ -202,6 +202,19 @@ class TestStore(unittest.TestCase):
     saver.upload_pending_saves()
     self.assertTrue(torch.equal(loader.get(version)[0]["w"], torch.ones(4)))
 
+  def test_trim_cache_keeps_unuploaded_saves_and_evicts_oldest_uploaded(self):
+    from unittest.mock import patch
+
+    root = f"memory://tinyrl-test/{uuid.uuid4()}"
+    store = Store(root, cache=tempfile.mkdtemp())
+    old = store.put({"w": torch.ones(64)})
+    store.upload_pending_saves()
+    pending = store.put({"w": torch.ones(64)})
+    with patch("tinyrl.storage.store.CACHE_BYTES", 1):
+      store.trim_cache()
+    self.assertFalse(os.path.exists(f"{store.cache}/{old}"))
+    self.assertTrue(os.path.isdir(f"{store.cache}/{pending}"))
+
 
 class TestRegistry(RedisTest):
   async def test_deletion_wins_over_concurrent_ttl_updates(self):
