@@ -47,7 +47,7 @@ class TestAccounting(RedisTest):
       await self.bus.submit_command(run, Op.SAMPLE, b"{}", cost=999)
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=[0, 0, 10_000_000, 30_000_000]):
       await self.execute(life)
-    self.assertEqual(life.service, {"short": 10, "long": 50})
+    self.assertEqual(life.run_service, {"short": 10, "long": 50})
     self.assertEqual(life.gpu_ms, 60)
     expected = {"alice": 60}
     self.assertEqual(life.node.state.service, expected)
@@ -82,7 +82,7 @@ class TestAccounting(RedisTest):
         await self.execute(life)
 
     self.assertEqual((await self.bus.read_state())["service"], {"alice": 72, "bob": 72})
-    self.assertEqual(life.service, {"a1": 24, "a2": 24, "a3": 24, "b": 72})
+    self.assertEqual(life.run_service, {"a1": 24, "a2": 24, "a3": 24, "b": 72})
 
   async def test_trainer_bills_only_the_failure_that_entered_the_model(self):
     life = await self.lifetime(Role.TRAINER, run="run-account")
@@ -98,7 +98,7 @@ class TestAccounting(RedisTest):
     await self.bus.submit_command("run", Op.OPTIM_STEP, b"{}")
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=[0, 250_000]):
       await self.execute(life)
-    self.assertEqual(life.service, {"run": 0.5})
+    self.assertEqual(life.run_service, {"run": 0.5})
     self.assertEqual(life.gpu_ms, 0.5)
     self.assertEqual(life.node.state.service, {"run-account": 0.5})
     self.assertEqual((await self.bus.read_state())["service"], life.node.state.service)
