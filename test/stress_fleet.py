@@ -287,9 +287,7 @@ class Stress(RedisTest):
       f"lag { {a: round(v) for a, v in plan.get('lag', {}).items()} } service { {a: round(v) for a, v in raw['service'].items()} }"
     )
     for node in self.nodes.values():
-      out.append(
-        f"{node.id}: gpus={node.gpus} on={node.on} drains={node.drains} physical={node.occ.on} draining={node.draining}"
-      )
+      out.append(f"{node.id}: gpus={node.gpus} on={node.on} physical={node.occ.on} draining={node.draining}")
       for proc, lf in node.lives.items():
         heads = [
           (c.run[:4], c.op.value, c.request_id in lf.prepared and lf.prepared[c.request_id][1].done()) for c in lf.heads

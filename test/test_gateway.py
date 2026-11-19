@@ -68,7 +68,7 @@ class TestEstimator(unittest.TestCase):
     self.assertEqual(vllm_gpus, 1)
     self.assertGreater(vllm_bytes, 16_000_000_000)
 
-    check = "import sys, tinyrl.api.gateway; assert not ({'torch', 'transformers', 'peft'} & sys.modules.keys())"
+    check = "import sys, tinyrl.api.gateway, tinyrl.control.node_daemon; assert not ({'torch', 'transformers', 'peft'} & sys.modules.keys())"
     res = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True)
     self.assertEqual(res.returncode, 0, res.stderr)
 

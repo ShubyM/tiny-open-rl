@@ -16,7 +16,7 @@ import transformers
 from peft import LoraConfig
 from peft.helpers import disable_input_dtype_casting
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
@@ -169,8 +169,25 @@ def local_tensor(t: torch.Tensor) -> torch.Tensor:
   return t._local_tensor if isinstance(t, DTensor) else t
 
 
-def full_tensor(t: torch.Tensor) -> torch.Tensor:
-  return t.full_tensor() if isinstance(t, DTensor) else t
+def full_tensor(t: torch.Tensor, cpu_pg=None, dtype: torch.dtype | None = None) -> torch.Tensor:
+  if not isinstance(t, DTensor):
+    return t.to(dtype) if dtype else t
+  local = t._local_tensor
+  if local.is_cuda:
+    return (t.to(dtype) if dtype else t).full_tensor()
+  local = local.to(dtype) if dtype else local
+  if not any(isinstance(p, Shard) for p in t.placements):
+    return local
+  assert len(t.placements) == 1, f"unsupported placements {t.placements}"
+  dim, world = t.placements[0].dim, dist.get_world_size(cpu_pg)
+  shapes: list = [None] * world
+  dist.all_gather_object(shapes, tuple(local.shape), group=cpu_pg)
+  size = max(math.prod(s) for s in shapes)
+  buf = torch.empty(size, dtype=local.dtype)
+  buf[: local.numel()].copy_(local.reshape(-1))
+  parts = [torch.empty(size, dtype=local.dtype) for _ in range(world)] if dist.get_rank(cpu_pg) == 0 else None
+  dist.gather(buf, parts, dst=0, group=cpu_pg)
+  return local if parts is None else torch.cat([p[: math.prod(s)].view(s) for p, s in zip(parts, shapes)], dim=dim)
 
 
 def like_param(t: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
@@ -218,8 +235,8 @@ class GradientRecoveryError(RuntimeError):
 class Model:
   """A base model and the runs training on it: a LoRA adapter per run, or the whole model for one full fine-tune."""
 
-  def __init__(self, load: Callable[[str], PreTrainedModel] = load):
-    self.load, self.lm, self.base, self.lora, self.dtype = load, None, "", True, torch.float32
+  def __init__(self, load: Callable[[str], PreTrainedModel] = load, cpu_pg=None):
+    self.load, self.cpu_pg, self.lm, self.base, self.lora, self.dtype = load, cpu_pg, None, "", True, torch.float32
     self.params: dict[str, dict[str, torch.nn.Parameter]] = {}  # canonical name -> trainable parameter
     self.optimizers: dict[str, torch.optim.AdamW] = {}
     self.pinned: dict[int, torch.Tensor] = {}
@@ -373,12 +390,12 @@ class Model:
     self.activate_run(run)
     tensors, optim = {}, self.optimizers.get(run)
     for name, p in self.params[run].items():
-      tensors[name] = full_tensor(p.detach())
+      tensors[name] = full_tensor(p.detach(), self.cpu_pg)
       if p.grad is not None:
-        tensors[f"{name}.grad"] = full_tensor(p.grad.detach())
+        tensors[f"{name}.grad"] = full_tensor(p.grad.detach(), self.cpu_pg)
       if optim and p in optim.state:
         for k in ("exp_avg", "exp_avg_sq", "step"):
-          tensors[f"{name}.{k}"] = full_tensor(optim.state[p][k].detach())
+          tensors[f"{name}.{k}"] = full_tensor(optim.state[p][k].detach(), self.cpu_pg)
     # the base model and the adapter's shape, for a client that resumes from this after its run is gone
     adapter = self.lm.peft_config[run] if self.lora else None
     made = sorted({t.rsplit(".", 1)[-1] for t in adapter.target_modules}) if adapter else []
@@ -389,7 +406,9 @@ class Model:
     """Sampler weights in the base model's compute dtype (bf16 on GPU), plus the config vLLM or PEFT reads."""
     lm = self.activate_run(run)
     prefix = "base_model.model." if self.lora else ""
-    tensors = {f"{prefix}{name}": full_tensor(p.detach().to(self.dtype)) for name, p in self.params[run].items()}
+    tensors = {
+      f"{prefix}{name}": full_tensor(p.detach(), self.cpu_pg, self.dtype) for name, p in self.params[run].items()
+    }
     if self.lora:
       cfg = {k: sorted(v) if isinstance(v, set) else v for k, v in lm.peft_config[run].to_dict().items()}
     else:
@@ -490,7 +509,7 @@ class Model:
     """Copy every GPU tensor to pinned host memory and free the GPU, for another trainer's turn. resume_on_gpu() undoes it."""
     self.move_tensors(self.gpu_tensors(), "cpu")
     if dist.is_initialized():
-      dist.barrier()  # every rank has freed its GPU before rank 0 tells the node
+      dist.barrier(group=self.cpu_pg)  # every rank has freed its GPU before rank 0 tells the node
 
   def resume_on_gpu(self) -> None:
     self.move_tensors(self.gpu_tensors(optim=self.lora), "cuda")

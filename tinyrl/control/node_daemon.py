@@ -17,8 +17,6 @@ import subprocess
 import sys
 import time
 
-import torch
-
 from tinyrl.bus import LEASE_MS, Bus, Cmd, Ev, Op, Reply, Role, unpack_snap
 from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge, Wave
@@ -52,7 +50,7 @@ def blocks(total: int, width: int) -> list[tuple[int, ...]]:
 
 
 def plan_gpus(
-  lives: dict[str, Lifetime], on: dict[str, tuple[int, ...]], total: int, now: float, draining: set[int] = frozenset()
+  lives: dict[str, Lifetime], on: dict[str, tuple[int, ...]], total: int, now: float
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
   """Select active GPU blocks: hold `ACTIVE_QUANTUM`, fill rest by `(exclusive, lag, -gpu_ms)`, keep idle warm."""
   cur = {p: on.get(lf.life, ()) for p, lf in lives.items()}
@@ -60,12 +58,12 @@ def plan_gpus(
   pinned = {g for lf in lives.values() if lf.spec.role == Role.TRAINER and lf.spec.gpus > 1 for g in lf.bound_gpus}
   want_excl = any(lf.spec.exclusive and lf.active and not cur[p] for p, lf in lives.items())
   # 1. Exclusive residents and busy residents inside ACTIVE_QUANTUM stay put without switching.
-  residents = {p: lf for p, lf in lives.items() if cur[p] and draining.isdisjoint(cur[p]) and lf.wanted()}
+  residents = {p: lf for p, lf in lives.items() if cur[p] and lf.wanted()}
   ends = {p: lf.granted_at + lf.quantum for p, lf in residents.items() if lf.active and not want_excl}
   holding = {p: end for p, end in ends.items() if end > now}
   closing = {p for p in ends if getattr(residents[p], "step_ready", False)}
   keep = {p: cur[p] for p, lf in residents.items() if p in holding or p in closing or lf.spec.exclusive}
-  taken, hold = set(draining).union(*keep.values()), set()
+  taken, hold = set().union(*keep.values()), set()
   excl = {g for p, block in keep.items() if lives[p].spec.exclusive for g in block}
   # 2. OVERTIME residents and ready waiters claim open blocks in priority order; prefer cur[p] or truly empty GPUs.
   waiting = False
@@ -97,7 +95,6 @@ class NodeDaemon:
     self.gpus, self.id = gpus, node or f"{socket.gethostname()}-{os.getpid()}"
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.on: dict[str, tuple[int, ...]] = {}  # life -> occupied GPUs (single source of local GPU truth)
-    self.drains: dict[str, tuple[int, ...]] = {}  # ordered requests for rank-bound checkpoint/restore
     self.lives: dict[str, Lifetime] = {}
     self.tasks: dict[str, asyncio.Task] = {}
     self.timer: asyncio.TimerHandle | None = None
@@ -145,9 +142,7 @@ class NodeDaemon:
         task.cancel()
 
   def select_gpus(self, proc: str) -> tuple[int, ...]:
-    draining = {g for block in self.drains.values() for g in block}
-    lives = {p: lf for p, lf in self.lives.items() if lf.life not in self.drains}
-    keep, wake_at = plan_gpus(lives, self.on, self.gpus, now := time.monotonic(), draining)
+    keep, wake_at = plan_gpus(self.lives, self.on, self.gpus, now := time.monotonic())
     if self.timer:
       self.timer.cancel()
     self.timer = asyncio.get_running_loop().call_later(max(0.0, wake_at - now), self.notify) if wake_at else None
@@ -164,21 +159,6 @@ class NodeDaemon:
 
   def release_gpus(self, life: str) -> None:
     if self.on.pop(life, None) is not None:
-      self.notify()
-
-  async def claim_after_drain(self, life: str, gpus: tuple[int, ...]) -> None:
-    """Reserve a block as its holders park. Overlapping requests claim in arrival order."""
-    devices = set(gpus)
-    self.drains[life] = gpus
-    self.notify()
-    try:
-      while True:
-        first = next(owner for owner, block in self.drains.items() if devices.intersection(block))
-        if first == life and self.claim_gpus(life, gpus, len(gpus)):
-          return
-        await self.changed.wait()
-    finally:
-      del self.drains[life]
       self.notify()
 
   def start(self, proc: str) -> asyncio.Task:
@@ -367,9 +347,6 @@ class Lifetime:
     token, pos, snap = self.owned[run]
     checkpoint = None
     if pos is not None and snap is None and run in self.loaded and self.model is not None:
-      if self.spec.gpus > 1 and self.life not in self.node.on and torch.cuda.is_available():
-        await self.node.claim_after_drain(self.life, self.bound_gpus)
-        await self.model.call("resume", None)
       await self.keep_lease()
       version = await self.bus.begin_checkpoint(run, token)
       if checkpoint := await self.model.call("save_run", run, version):
@@ -400,10 +377,6 @@ class Lifetime:
         await (self.model.park() if self.sampling else self.model.call("park"))
       self.park_s = time.monotonic() - t0
       self.node.release_gpus(self.life)
-      if self.spec.exclusive and self.wanted():
-        # Lend the original devices for checkpointing, including when the exclusive is idle.
-        await self.node.claim_after_drain(self.life, cur)
-        await self.promote(cur)
       await self.node.push_heartbeat()
     elif cur is None and want and has_work and self.node.claim_gpus(self.life, want, self.spec.gpus):
       await self.promote(want)

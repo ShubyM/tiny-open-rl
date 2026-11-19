@@ -26,23 +26,24 @@ def ok(body: dict) -> Reply:
   return Reply(True, wire.JSON, json.dumps(body).encode())
 
 
-def serve_follower(model: Model) -> None:
+def serve_follower(model: Model, cpu_pg=None) -> None:
   while True:
-    dist.broadcast_object_list(msg := [None], src=0)
+    dist.broadcast_object_list(msg := [None], src=0, group=cpu_pg)
     with contextlib.suppress(*RECOVERABLE_ERRORS):  # rejected the same way on every rank, before any collective
       getattr(model, msg[0][0])(*msg[0][1])
 
 
 class Trainer:
-  def __init__(self, model: Model | None = None, store: Store | None = None):
-    self.model = model if model is not None else Model()
+  def __init__(self, model: Model | None = None, store: Store | None = None, cpu_pg=None):
+    self.model = model if model is not None else Model(cpu_pg=cpu_pg)
     self.store = store if store is not None else Store()
+    self.cpu_pg = cpu_pg
     self.world_size = int(os.environ.get("WORLD_SIZE", 1))
 
   def call_model(self, method: str, *args):
     try:
       if self.world_size > 1:
-        dist.broadcast_object_list([(method, args)], src=0)
+        dist.broadcast_object_list([(method, args)], src=0, group=self.cpu_pg)
       with span(f"model.{method}"):
         return getattr(self.model, method)(*args)
     except Exception as e:
@@ -149,14 +150,16 @@ def main(path: str) -> None:
   die_with_parent()  # also for torchrun ranks, whose sessions are outside their launcher's process group
   if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+  cpu_pg = None
   if int(os.environ.get("WORLD_SIZE", 1)) > 1:
     dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
     dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", device_id=dev)
+    cpu_pg = dist.new_group(backend="gloo") if torch.cuda.is_available() else dist.group.WORLD
   try:
     if dist.is_initialized() and dist.get_rank() > 0:
-      serve_follower(Model())
+      serve_follower(Model(cpu_pg=cpu_pg), cpu_pg)
     else:
-      trainer = Trainer()
+      trainer = Trainer(cpu_pg=cpu_pg)
       serve(path, lambda method, *args: getattr(trainer, method)(*args))
   finally:
     if dist.is_initialized():

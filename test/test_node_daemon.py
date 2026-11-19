@@ -276,15 +276,18 @@ class TestNodeDaemon(RedisTest):
     await self.create(run, base, node)
     proc = node.state.home[run][0]
     first = node.lives[proc].model.proc.pid
-    # When GPU 0 is busy (draining/occupied), the 1-GPU trainer hops to GPU 1 without restarting its subprocess.
-    await node.claim_after_drain("checkpoint", (0,))
+    # When GPU 0 is occupied, the parked 1-GPU trainer hops to GPU 1 without restarting its subprocess.
+    life = node.lives[proc]
+    await life.model.call("park")
+    node.release_gpus(life.life)
+    self.assertTrue(node.claim_gpus("other", (0,), 1))
     try:
       request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
       await self.reply(request, node)
       self.assertEqual(node.lives[proc].model.proc.pid, first)
       self.assertEqual(node.on[node.lives[proc].life], (1,))
     finally:
-      node.release_gpus("checkpoint")
+      node.release_gpus("other")
     os.killpg(first, signal.SIGKILL)
     await self.until(lambda: proc in node.lives and node.lives[proc].model.proc.pid != first, node)
     await self.create(run, base, node)

@@ -106,10 +106,10 @@ class FakeLife:
 
 
 def apply_gpus(
-  lives: dict[str, FakeLife], on: dict[str, tuple[int, ...]], total: int, now: float, draining: set[int] = frozenset()
+  lives: dict[str, FakeLife], on: dict[str, tuple[int, ...]], total: int, now: float
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
   """Run `plan_gpus` and commit transitions into `on`, resetting `granted_at` ONLY when owner/slot changes."""
-  keep, wake_at = plan_gpus(lives, on, total, now, draining)  # type: ignore[arg-type]
+  keep, wake_at = plan_gpus(lives, on, total, now)  # type: ignore[arg-type]
   for p, lf in lives.items():
     prev, want = on.get(lf.life, ()), keep.get(p, ())
     if prev and prev != want:
@@ -133,10 +133,8 @@ def check_plan_invariants(test: unittest.TestCase, s: State) -> None:
       test.assertIn(proc, s.procs)
 
 
-def check_gpu_invariants(
-  test: unittest.TestCase, keep: dict, lives: dict, total: int, draining: set[int] = frozenset()
-) -> None:
-  seen = list(draining)
+def check_gpu_invariants(test: unittest.TestCase, keep: dict, lives: dict, total: int) -> None:
+  seen = []
   for p, gs in keep.items():
     test.assertEqual(len(gs), lives[p].spec.gpus)
     test.assertEqual(len(set(gs)), lives[p].spec.gpus)
@@ -733,13 +731,12 @@ class TestLocalQuantum(unittest.TestCase):
         lives[f"p{i}"] = FakeLife(f"p{i}", Spec(gpus=w, exclusive=excl), s, on, quantum=rng.choice([0.5, 2.0]))
       for _ in range(60):
         now += rng.uniform(0.0, 1.5)
-        draining = {rng.randrange(total)} if rng.random() < 0.1 else set()
         for lf in lives.values():
           lf.active = rng.random() < 0.7
           if lf.life in on:
             lf.gpu_ms += rng.uniform(10.0, 500.0)
-        keep, wake = apply_gpus(lives, on, total, now, draining)
-        check_gpu_invariants(self, keep, lives, total, draining)
+        keep, wake = apply_gpus(lives, on, total, now)
+        check_gpu_invariants(self, keep, lives, total)
         if wake is not None:
           self.assertGreater(wake, now)
 
