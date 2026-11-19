@@ -11,13 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import sys
-import tempfile
 
 import fsspec
 
-from tinyrl.helpers import getenv
+from tinyrl.helpers import atomic_dir, getenv
 
 MODEL_CACHE = getenv("MODEL_CACHE", "/tmp/tinyrl-models")
 MODEL_MIRROR = getenv("MODEL_MIRROR", "")
@@ -38,23 +36,14 @@ def local(ref: str) -> str:
     if not MODEL_MIRROR or os.path.isabs(ref) or not exists(f"{mirrored}/config.json"):
       return ref  # a hub id or a local folder, which transformers and vLLM load themselves
     ref = mirrored
-  folder = f"{MODEL_CACHE}/{hashlib.sha256(ref.encode()).hexdigest()[:16]}"
-  if not os.path.isdir(folder):
-    os.makedirs(MODEL_CACHE, exist_ok=True)
+
+  def fetch_model(download: str) -> None:
     fs, path = fsspec.core.url_to_fs(ref)
-    download = tempfile.mkdtemp(dir=MODEL_CACHE)
-    try:
-      fs.get(f"{path.rstrip('/')}/", f"{download}/", recursive=True)
-      if not os.path.exists(f"{download}/config.json"):
-        raise ValueError(f"no model at {ref}: it has no config.json")
-      try:
-        os.rename(download, folder)
-      except OSError:  # another worker on this node fetched it first
-        if not os.path.isdir(folder):
-          raise
-    finally:
-      shutil.rmtree(download, ignore_errors=True)
-  return folder
+    fs.get(f"{path.rstrip('/')}/", f"{download}/", recursive=True)
+    if not os.path.exists(f"{download}/config.json"):
+      raise ValueError(f"no model at {ref}: it has no config.json")
+
+  return atomic_dir(f"{MODEL_CACHE}/{hashlib.sha256(ref.encode()).hexdigest()[:16]}", fetch_model)
 
 
 def mirror(model_id: str) -> str:

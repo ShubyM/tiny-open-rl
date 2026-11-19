@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import glob
 import json
 import os
 import shlex
 import shutil
 import socket
-import struct
 import subprocess
 import sys
 import traceback
+from pathlib import Path
 
 import aiohttp
 
 from tinyrl.control.process import launch, reap, target_pid
 from tinyrl.storage import models
+from tinyrl.storage.store import header
 from tinyrl.trace import span
 from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
@@ -93,15 +93,15 @@ class VLLM:
       "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
     }
     extra = shlex.split(options.get("VLLM_ARGS", ""))
-    if not any(
-      a == "--compilation-config" or a.startswith("--compilation-config=") or a.startswith("-O") for a in extra
-    ):
+
+    def has_flag(flag: str) -> bool:
+      return any(a == flag or a.startswith(f"{flag}=") for a in extra)
+
+    if not has_flag("--compilation-config") and not any(a.startswith("-O") for a in extra):
       extra += ["--compilation-config", CUDAGRAPH_CONFIG]
-    if not any(a == "--kernel-config" or a.startswith("--kernel-config=") for a in extra):
+    if not has_flag("--kernel-config"):
       extra += ["--kernel-config", KERNEL_CONFIG]
-    if (kv := options.get("TINYRL_KV_BYTES")) and not any(
-      a == "--kv-cache-memory-bytes" or a.startswith("--kv-cache-memory-bytes=") for a in extra
-    ):
+    if (kv := options.get("TINYRL_KV_BYTES")) and not has_flag("--kv-cache-memory-bytes"):
       extra += ["--kv-cache-memory-bytes", kv]
     flags += extra
 
@@ -212,14 +212,9 @@ class VLLM:
     if name in self.loaded:
       return
     if not self.lora and self.clean and os.path.isdir(path):
-      files = sorted(glob.glob(f"{path}/*.safetensors"))
-      if files:
-        with open(files[0], "rb") as f:
-          n = struct.unpack("<Q", f.read(8))[0]
-          meta = json.loads(json.loads(f.read(n)).get("__metadata__", {}).get("meta", "{}"))
-        if meta.get("untouched"):
-          self.loaded = {name}
-          return
+      if (files := sorted(Path(path).glob("*.safetensors"))) and header(files[0]).get("untouched"):
+        self.loaded = {name}
+        return
     if self.lora:
       await self.post("/v1/load_lora_adapter", json={"lora_name": name, "lora_path": path})
       self.loaded.add(name)

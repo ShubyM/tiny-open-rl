@@ -17,7 +17,6 @@ import os
 import shutil
 import socket
 import sys
-import tempfile
 import threading
 import time
 import urllib.request
@@ -31,7 +30,7 @@ import fsspec
 if TYPE_CHECKING:
   import torch
 
-from tinyrl.helpers import getenv
+from tinyrl.helpers import atomic_dir, getenv
 from tinyrl.trace import span
 
 CKPT = getenv("CKPT", "/tmp/tinyrl")
@@ -74,21 +73,16 @@ def nbytes(t: torch.Tensor) -> int:
   return t.numel() * t.element_size()
 
 
-def aligned(n: int) -> int:
-  return (n + 7) & ~7  # so a view of the pinned buffer can start any dtype
-
-
 def as_bytes(t: torch.Tensor) -> torch.Tensor:
   import torch
 
   return t.detach().contiguous().reshape(-1).view(torch.uint8)
 
 
-def header(path: str) -> dict:
-  import safetensors
-
-  with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-    return json.loads((f.metadata() or {}).get("meta", "{}"))
+def header(path: str | Path) -> dict:
+  with open(path, "rb") as f:
+    meta = json.loads(f.read(int.from_bytes(f.read(8), "little"))).get("__metadata__") or {}
+  return json.loads(meta.get("meta", "{}"))
 
 
 def parallel(fn, *xs):
@@ -313,18 +307,8 @@ class Store:
     """This node's folder for a version, which fill(folder) makes the first time."""
     folder = f"{self.cache}/{version}"
     if not os.path.isdir(folder):
-      os.makedirs(self.cache, exist_ok=True)
-      tmp = tempfile.mkdtemp(dir=self.cache)
-      try:
-        fill(tmp)
-        try:
-          os.rename(tmp, folder)
-        except OSError:
-          if not os.path.isdir(folder):
-            raise
-        open(f"{folder}.uploaded", "w").close()  # the bucket has it, so trim_cache() may drop it here
-      finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+      atomic_dir(folder, fill)
+      Path(f"{folder}.uploaded").touch()  # the bucket has it, so trim_cache() may drop it here
     return folder
 
   def download_files(self, src: str, names: list[str], folder: str) -> None:
@@ -376,12 +360,15 @@ class Store:
     if not os.path.isdir(self.cache):
       return
     limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2
-    found = [e for e in os.scandir(self.cache) if e.is_dir() and os.path.exists(f"{e.path}.uploaded")]
-    size = {e.path: sum(f.stat().st_size for f in os.scandir(e.path)) for e in found}
+    size = {}
+    for e in os.scandir(self.cache):
+      if e.is_dir() and os.path.exists(f"{e.path}.uploaded"):
+        with contextlib.suppress(FileNotFoundError):
+          size[e] = sum(f.stat().st_size for f in os.scandir(e.path))
     total = sum(size.values())
-    for e in sorted(found, key=lambda e: e.stat().st_mtime):
+    for e in sorted(size, key=lambda e: e.stat().st_mtime if os.path.exists(e.path) else 0):
       if total <= limit:
         break
       shutil.rmtree(e.path, ignore_errors=True)
-      os.unlink(f"{e.path}.uploaded")
-      total -= size[e.path]
+      Path(f"{e.path}.uploaded").unlink(missing_ok=True)
+      total -= size[e]

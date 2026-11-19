@@ -15,6 +15,7 @@ assert sys.byteorder == "little", "the wire format is little endian"
 
 PROTO = "application/x-protobuf"
 JSON = "application/json"
+MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
 
 NUMPY_DTYPES = {
   pb.DTYPE_FLOAT32: np.float32,
@@ -81,7 +82,7 @@ def loss_config(req: pb.ForwardBackwardRequest) -> dict[str, float | str]:
   return dict(req.loss_fn_config)
 
 
-def from_json(body: dict, forward_only: bool = False) -> bytes:
+def from_json(body: dict, forward_only: bool = False) -> pb.ForwardBackwardRequest:
   """Turn the JSON forward_backward that SDKs before 0.25 send into the same protobuf, so the trainer reads one format."""
   fb = body.get("forward_backward_input") or body.get("forward_input") or {}
   req = pb.ForwardBackwardRequest(
@@ -107,7 +108,7 @@ def from_json(body: dict, forward_only: bool = False) -> bytes:
       tensor = pb.Tensor(dense=array.tobytes(), dtype=pb.DTYPE_INT64 if is_int else pb.DTYPE_FLOAT32, shape=array.shape)
       datum.loss_fn_inputs[name].CopyFrom(tensor)
 
-  return req.SerializeToString()
+  return req
 
 
 # ***** outputs *****
@@ -159,6 +160,13 @@ class SampleOut:
   topk: tuple[np.ndarray, np.ndarray] | None = None
 
 
+def _pack_topk(dst, topk: tuple[np.ndarray, np.ndarray]) -> None:
+  tk_ids, tk_lps = topk
+  dst.token_ids = tk_ids.astype(np.int32).tobytes()
+  dst.logprobs = tk_lps.astype(np.float32).tobytes()
+  dst.length, dst.k = tk_ids.shape
+
+
 def sample_output(
   sequences: list[SampleOut],
   prompt_logprobs: np.ndarray | None = None,
@@ -171,34 +179,25 @@ def sample_output(
     seq.tokens = s.tokens.astype(np.int32).tobytes()
     seq.logprobs = s.logprobs.astype(np.float32).tobytes()
     if s.topk:
-      tk_ids, tk_lps = s.topk
-      seq.topk_sampled_logprobs.token_ids = tk_ids.astype(np.int32).tobytes()
-      seq.topk_sampled_logprobs.logprobs = tk_lps.astype(np.float32).tobytes()
-      seq.topk_sampled_logprobs.k = tk_ids.shape[-1]
-      seq.topk_sampled_logprobs.length = tk_ids.shape[0]
+      _pack_topk(seq.topk_sampled_logprobs, s.topk)
 
   if prompt_logprobs is not None:
     out.prompt_logprobs = prompt_logprobs.astype(np.float32).tobytes()
   if topk_prompt is not None:
-    tk_ids, tk_lps = topk_prompt
-    out.topk_prompt_logprobs.token_ids = tk_ids.astype(np.int32).tobytes()
-    out.topk_prompt_logprobs.logprobs = tk_lps.astype(np.float32).tobytes()
-    out.topk_prompt_logprobs.k = tk_ids.shape[-1]
-    out.topk_prompt_logprobs.length = tk_ids.shape[0]
+    _pack_topk(out.topk_prompt_logprobs, topk_prompt)
 
   return out.SerializeToString()
 
 
 def _format_topk(tk_pb):
-  k, length = tk_pb.k, tk_pb.length
-  ids = np.frombuffer(tk_pb.token_ids, np.int32).reshape(length, k)
-  lps = np.frombuffer(tk_pb.logprobs, np.float32).reshape(length, k)
+  ids = np.frombuffer(tk_pb.token_ids, np.int32).reshape(tk_pb.length, tk_pb.k)
+  lps = np.frombuffer(tk_pb.logprobs, np.float32).reshape(tk_pb.length, tk_pb.k)
   res = []
-  for i in range(length):
-    if ids[i, 0] == 0 and lps[i, 0] == -99999.0:
+  for row_ids, row_lps in zip(ids, lps):
+    if row_ids[0] == 0 and row_lps[0] == MASK_LOGPROB:
       res.append(None)
     else:
-      res.append([[int(tid), float(lp)] for tid, lp in zip(ids[i], lps[i]) if not (tid == 0 and lp == -99999.0)])
+      res.append([[int(t), float(lp)] for t, lp in zip(row_ids, row_lps) if not (t == 0 and lp == MASK_LOGPROB)])
   return res
 
 

@@ -6,7 +6,6 @@ import contextlib
 import copy
 import logging
 import math
-import os
 from collections.abc import Callable
 
 import numpy as np
@@ -23,7 +22,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from tinyrl.api import wire
 from tinyrl.helpers import getenv
 from tinyrl.storage import models
-from tinyrl.storage.store import aligned, nbytes, pinned_bytes
+from tinyrl.storage.store import nbytes, pinned_bytes
 
 LigerFusedLinearCrossEntropyLoss = apply_liger = None
 with contextlib.suppress(ImportError):
@@ -34,7 +33,7 @@ with contextlib.suppress(ImportError):
 TOKEN_BUDGET = getenv("TOKEN_BUDGET", 0)  # padded tokens per forward/backward pass. 0 fits it to free GPU memory
 MAX_TOKEN_BUDGET = 16384  # past this, bigger passes stop getting faster and only use more memory
 CHUNK = getenv("CHUNK", 1024)  # positions per output head chunk when computing logprobs
-GRAD_CKPT = getenv("GRAD_CKPT", 1)  # gradient checkpointing
+GRAD_CKPT = getenv("GRAD_CKPT", -1)  # gradient checkpointing (-1 leaves LoRA uncheckpointed on >=64 GiB GPUs)
 
 # ***** losses *****
 #
@@ -71,12 +70,15 @@ LOSSES = {"cross_entropy": cross_entropy, "importance_sampling": importance_samp
 # ***** forward pass *****
 
 
+def free_memory(device: torch.device | None = None) -> int:
+  """GPU bytes available to allocate, counting PyTorch's unused caching-allocator reserve."""
+  return torch.cuda.mem_get_info(device)[0] + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+
+
 def should_checkpoint_layers(lm: PreTrainedModel, lora: bool) -> bool:
-  if "GRAD_CKPT" in os.environ:
-    return bool(int(os.environ["GRAD_CKPT"]))
-  if GRAD_CKPT and lora and lm.device.type == "cuda":
-    return torch.cuda.get_device_properties(lm.device).total_memory < 64 * 1024**3
-  return bool(GRAD_CKPT)
+  if GRAD_CKPT >= 0:
+    return bool(GRAD_CKPT)
+  return not (lora and lm.device.type == "cuda" and torch.cuda.get_device_properties(lm.device).total_memory >= 2**36)
 
 
 def token_budget(lm: PreTrainedModel) -> int:
@@ -86,14 +88,11 @@ def token_budget(lm: PreTrainedModel) -> int:
   if lm.device.type != "cuda":
     return MAX_TOKEN_BUDGET
 
-  free, _ = torch.cuda.mem_get_info(lm.device)
-  free += torch.cuda.memory_reserved(lm.device) - torch.cuda.memory_allocated(lm.device)  # cached by torch, but unused
-
   # with gradient checkpointing, a token keeps about one hidden vector per layer. 6x that covers the layer being recomputed in the backward pass, and leaves a margin.
   config = lm.config.get_text_config()
   scale = 6 if getattr(lm, "is_gradient_checkpointing", False) else 64
   bytes_per_token = scale * config.num_hidden_layers * config.hidden_size * lm.dtype.itemsize
-  return min(MAX_TOKEN_BUDGET, int(free / 2 / bytes_per_token))
+  return min(MAX_TOKEN_BUDGET, int(free_memory(lm.device) / 2 / bytes_per_token))
 
 
 def batches(lengths: list[int], budget: int) -> list[list[int]]:
@@ -442,9 +441,8 @@ class Model:
     """Whether a full fine-tune's AdamW moments stay on the GPU between steps: when what's left free is at least as big as they are, so forward_backward keeps room. Otherwise they cross PCIe twice a step, 2.7 of a 2.8 s step for Gemma E2B."""
     if not torch.cuda.is_available():
       return True
-    size = sum(t.numel() * t.element_size() for t in self.adam_moments() if t.is_cuda)
-    free = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-    return free >= size
+    size = sum(nbytes(t) for t in self.adam_moments() if t.is_cuda)
+    return free_memory() >= size
 
   def adam_moments(self):
     states = (s for o in self.optimizers.values() for s in o.state.values())
@@ -465,10 +463,13 @@ class Model:
     if device == "cpu":
       cuda = [t for t in tensors if t.is_cuda]
       if need := [t for t in cuda if (b := self.pinned.get(id(t))) is None or (b.shape, b.dtype) != (t.shape, t.dtype)]:
-        slab, at = pinned_bytes(sum(aligned(nbytes(t)) for t in need)), 0
+        slab, at = (
+          pinned_bytes(sum((nbytes(t) + 7) & ~7 for t in need)),
+          0,
+        )  # 8-byte aligned so any dtype view starts clean
         for t in need:
           self.pinned[id(t)] = slab[at : at + nbytes(t)].view(t.dtype).view(t.shape)
-          at += aligned(nbytes(t))
+          at += (nbytes(t) + 7) & ~7
     for t in tensors:
       if device == "cpu" and t.is_cuda:
         buf = self.pinned[id(t)]

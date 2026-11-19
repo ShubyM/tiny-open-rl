@@ -16,8 +16,6 @@ import numpy as np
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Reply
 
-MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
-
 
 @dataclass(frozen=True)
 class Seq:
@@ -35,7 +33,7 @@ class Out:
 
 def topk(rows: list[dict[int, float] | None], k: int) -> tuple[np.ndarray, np.ndarray]:
   pairs = [sorted(r.items(), key=lambda kv: -kv[1])[:k] if r else [] for r in rows]
-  pairs = [p + [(0, MASK_LOGPROB)] * (k - len(p)) for p in pairs]
+  pairs = [p + [(0, wire.MASK_LOGPROB)] * (k - len(p)) for p in pairs]
   ids = np.array([[t for t, _ in p] for p in pairs], np.int32).reshape(len(rows), k)
   return ids, np.array([[lp for _, lp in p] for p in pairs], np.float32).reshape(len(rows), k)
 

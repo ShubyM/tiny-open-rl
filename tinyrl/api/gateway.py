@@ -256,14 +256,18 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
       return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
 
     data = json.loads(body)
-    body = wire.from_json(data)
-    return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"), wire.cost(wire.parse(body)))
+    parsed = wire.from_json(data)
+    return await submit(
+      data["model_id"], Op.FORWARD_BACKWARD, parsed.SerializeToString(), data.get("seq_id"), wire.cost(parsed)
+    )
 
   @api.post("/api/v1/forward")  # SDKs before 0.25
   async def forward(request: Request):
     data = await request.json()
-    body = wire.from_json(data, forward_only=True)
-    return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"), wire.cost(wire.parse(body)))
+    parsed = wire.from_json(data, forward_only=True)
+    return await submit(
+      data["model_id"], Op.FORWARD_BACKWARD, parsed.SerializeToString(), data.get("seq_id"), wire.cost(parsed)
+    )
 
   @api.post("/api/v1/optim_step")
   async def optim_step(req: OptimStepRequest):
