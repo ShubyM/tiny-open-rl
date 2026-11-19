@@ -346,7 +346,7 @@ class Bus:
     if cursors:
       got = await self.r.xread(cursors, count=1, block=None if cmds else block_ms or None)
       cmds.extend(parse_cmd(s.decode().removeprefix(key("q", "")), *entries[0]) for s, entries in got)
-    return sorted(cmds, key=lambda c: (*map(int, c.entry_id.split("-")), c.run))
+    return cmds
 
   async def pending_head(self, run: str, idle_ms: int) -> Cmd | None:
     queue, start = key("q", run), "-"
@@ -443,8 +443,8 @@ class Bus:
   async def acquire_run(self, run_id: str, life: str) -> tuple[str, str | None, str | None] | None:
     """Claim an unowned (or expired-owner) training run under a fresh epoch token if `life`'s lease is live."""
     k, lk = key("run", run_id), key("lease", life)
-    if (stale := await self.r.hget(k, "owner")) and not await self.reap_run(run_id, stale.decode()):
-      return None
+    if stale := await self.r.hget(k, "owner"):
+      await self.reap_run(run_id, stale.decode())
 
     async def op(p):
       owner, epoch, pos, snap = await p.hmget(k, "owner", "epoch", "pos", "snap")
@@ -524,7 +524,7 @@ class Bus:
       await p.execute()
       return old_snap.decode() if old_snap and mutates else ""
 
-    res = await self.transact(op, k, key("f", cmd.request_id), *([ck] if deleting else []))
+    res = await self.transact(op, k, key("f", cmd.request_id), ck)
     return (False, None) if res is None else (True, res or None)
 
   async def commit_sample(self, cmd: Cmd, reply: Reply, account="", charge: Charge | None = None) -> bool:
