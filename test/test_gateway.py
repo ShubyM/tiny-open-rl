@@ -1,9 +1,16 @@
+import json
+import subprocess
+import sys
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 
 from test.helpers import RedisTest
 from tinyrl.api import gateway
+from tinyrl.control import estimator
 
 
 class TestGatewayDedupe(RedisTest):
@@ -43,6 +50,27 @@ class TestGatewayDedupe(RedisTest):
     runs = await self.bus.r.smembers("tinyrl:runs")
     samplers = [r for r in runs if r.decode().startswith("samp-")]
     self.assertEqual(len(samplers), 1)
+
+
+class TestEstimator(unittest.TestCase):
+  def test_estimates_full_and_vllm_without_importing_ml_frameworks(self):
+    meta = SimpleNamespace(parameter_count={"BF16": 8_000_000_000})
+    with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+      json.dump({"text_config": {"num_hidden_layers": 32, "hidden_size": 4096, "num_attention_heads": 32}}, f)
+      f.flush()
+      with (
+        patch.object(estimator, "get_safetensors_metadata", return_value=meta),
+        patch.object(estimator, "hf_hub_download", return_value=f.name),
+      ):
+        full_bytes, full_gpus = estimator.estimate("org/model", "full")
+        vllm_bytes, vllm_gpus = estimator.estimate("org/model", "vllm")
+    self.assertEqual((full_bytes, full_gpus), (8_000_000_000 * 16 + estimator.OVERHEAD, 2))
+    self.assertEqual(vllm_gpus, 1)
+    self.assertGreater(vllm_bytes, 16_000_000_000)
+
+    check = "import sys, tinyrl.api.gateway; assert not ({'torch', 'transformers', 'peft'} & sys.modules.keys())"
+    res = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True)
+    self.assertEqual(res.returncode, 0, res.stderr)
 
 
 if __name__ == "__main__":
