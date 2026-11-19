@@ -170,16 +170,8 @@ def queue_checkpoint(p, uri: str, size: int, *, version: str, ttl=None, owned=Fa
   kind, now = cid.split("/", 1)[0], time.time()
   kind = {"weights": "training", "sampler_weights": "sampler"}.get(kind, kind)
   expires = now + ttl if ttl else None
-  info = {
-    "checkpoint_id": cid,
-    "checkpoint_type": kind,
-    "time": now,
-    "tinker_path": uri,
-    "size_bytes": size,
-    "expires_at": expires,
-    "owned": owned,
-    "version": version,
-  }
+  info = {"checkpoint_id": cid, "checkpoint_type": kind, "time": now, "tinker_path": uri, "size_bytes": size}
+  info |= {"expires_at": expires, "owned": owned, "version": version}
   p.hset(key("ckpt", run), cid, json.dumps(info))
   if kind != "parked":
     p.zadd(key("ckpts"), {uri: now})

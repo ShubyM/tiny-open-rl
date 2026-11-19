@@ -61,12 +61,17 @@ class Sampler:
     module, name = self.env.get("ENGINE", "tinyrl.workers.vllm:VLLM").split(":")
     self.engine_type = engine or getattr(importlib.import_module(module), name)
     self.base, self.lora = base, lora
+    self.warm = self.env.get("TINYRL_WARM_SAMPLER", "0") != "0"
     self.running = None
     self.loading = asyncio.Lock()
 
   @property
   def proc(self):
-    return getattr(self.running, "server", None)
+    return self.running.server if self.running else None
+
+  @property
+  def warm_pending(self) -> bool:
+    return self.warm and self.running is None
 
   async def start(self) -> None:
     """Start the engine, once."""
@@ -77,17 +82,21 @@ class Sampler:
   async def execute(self, cmd: Cmd, checkpoint: tuple[str, str] | None) -> Reply:
     try:
       job, name = json.loads(cmd.body), None
-      await self.start()
-      async with self.loading:
-        if checkpoint:
-          path, name = checkpoint
+      if self.running is None:
+        await self.start()
+      if checkpoint:
+        path, name = checkpoint
+        async with self.loading:
           await self.running.load_checkpoint(name, path)
       return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, await self.running.sample(job, name)))
     except Exception as e:
       return Reply.error(e)
 
-  async def resume(self, gpu: int | None = None) -> None:
-    if self.running:
+  async def resume(self, gpus: tuple[int, ...]) -> None:
+    if self.running is None:
+      self.env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+      await self.start()
+    else:
       await self.running.wake()
 
   async def park(self) -> None:

@@ -180,13 +180,14 @@ class Lifetime:
     self.spec, self.sampling = (sp := node.state.procs[proc].spec), sp.role == Role.SAMPLER
     self.life = f"{proc}@{node.id}-{os.urandom(6).hex()}"
     self.task = self.model = self.guard = self.closing = self.reader = None
-    self.bound_gpus, self.warm, self.demand = (), False, Demand.IDLE
+    self.bound_gpus, self.demand = (), Demand.IDLE
     self.hold_until, self.park_s, self.gpu_ms = 0.0, 0.0, 0.0
     self.owned: dict[str, tuple[str, str | None, str | None]] = {}  # run -> (token, pos, snap)
-    self.loaded, self.open_grads = set(), set()
-    self.heads, self.prepared, self.run_service = [], {}, {}
+    self.loaded, self.open_grads, self.records = set(), set(), {}
+    self.heads: dict[str, tuple[Cmd, asyncio.Task]] = {}  # request_id -> (cmd, prepare_task)
     # A newly ready run joins at the least service earned by its active peers.
-    self.renewed, self.service_floor, self.idle_since = time.monotonic(), 0.0, 0.0
+    self.run_service, self.service_floor = {}, 0.0
+    self.renewed, self.idle_since = time.monotonic(), 0.0
 
   def streams(self) -> list[str]:
     return self.node.state.runs(self.proc) if self.sampling else sorted(self.owned)
@@ -209,16 +210,9 @@ class Lifetime:
     return max(map(s.ready_lag, runs), default=-self.gpu_ms)
 
   def worker(self) -> Worker:
+    cur, sp, lag = self.node.on.get(self.life, ()), self.spec, self.ready_lag()
     return Worker(
-      gpus=self.spec.gpus,
-      exclusive=self.spec.exclusive,
-      demand=self.demand,
-      current=self.node.on.get(self.life, ()),
-      bound=self.bound_gpus,
-      gang=not self.sampling,
-      hold_until=self.hold_until,
-      lag=self.ready_lag(),
-      gpu_ms=self.gpu_ms,
+      sp.gpus, sp.exclusive, self.demand, cur, self.bound_gpus, not self.sampling, self.hold_until, lag, self.gpu_ms
     )
 
   async def run(self) -> None:
@@ -229,7 +223,7 @@ class Lifetime:
       while self.wanted():
         changed = self.node.changed
         await self.sync_runs()
-        await self.collect()
+        self.collect()
         ready, failed = self.ready()
         if failed:
           await self.execute(failed)
@@ -275,7 +269,6 @@ class Lifetime:
       env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     open_s, open_t = self.node.open_sampler, self.node.open_trainer
     self.model = open_s(self.proc, self.spec, env) if self.sampling else open_t(self.proc, self.spec.gpus, env)
-    self.warm = self.sampling and env.get("TINYRL_WARM_SAMPLER", "0") != "0"
 
   async def open(self) -> bool:
     if self.node.draining or not await self.bus.open_lease(self.life):
@@ -289,10 +282,7 @@ class Lifetime:
 
   async def keep_lease(self) -> None:
     before = time.monotonic()
-    if not (
-      await self.bus.renew_lease(self.life) or (not self.closing and await self.bus.renew_lease(self.life, True))
-    ):
-      raise RuntimeError(f"lost lease {self.life}")
+    await self.bus.renew_lease(self.life, recover=not self.closing)
     self.renewed = before
 
   async def keepalive(self) -> None:
@@ -330,22 +320,22 @@ class Lifetime:
     """Flush `run` if dirty (0 bytes if clean), release `run.owner` fenced by `(token, pos)`, and drop if requested."""
     token, pos, snap = self.owned[run]
     checkpoint = None
-    if pos is not None and snap is None and run in self.loaded and self.model is not None:
+    if pos is not None and snap is None and run in self.loaded:
       if self.spec.gpus > 1 and self.life not in self.node.on and torch.cuda.is_available():
         await self.node.claim_after_drain(self.life, self.bound_gpus)
-        await self.model.call("resume", None)
+        await self.model.resume(self.bound_gpus)
       await self.keep_lease()
       version = await self.bus.begin_checkpoint(run, token)
       if checkpoint := await self.model.call("save_run", run, version):
         snap = f"{checkpoint['uri']}\n{checkpoint['version']}"
     await self.bus.detach_run(run, token, pos, snap, checkpoint)
     self.owned.pop(run, None)
-    self.heads = [c for c in self.heads if c.run != run]
-    for req in [req for req, (r, _) in self.prepared.items() if r == run]:
-      self.prepared.pop(req)[1].cancel()
+    self.records.pop(run, None)
+    for req in [req for req, (c, _) in self.heads.items() if c.run == run]:
+      self.heads.pop(req)[1].cancel()
     if run in self.loaded:
       self.loaded.discard(run)
-      if drop and self.model is not None:
+      if drop:
         await self.model.call("drop_run", run)
 
   # ***** promote & demote (L1 <-> L0) *****
@@ -355,7 +345,7 @@ class Lifetime:
       any(c.op == Op.OPTIM_STEP and c.run in self.open_grads for c in ready) or (linger and not ready)
     ):
       return Demand.FINISH_STEP
-    if ready or linger or (self.warm and self.model is not None and self.model.running is None):
+    if ready or linger or (self.model is not None and self.model.warm_pending):
       return Demand.READY
     return Demand.IDLE
 
@@ -370,7 +360,7 @@ class Lifetime:
     if cur is not None and want != cur:
       t0 = time.monotonic()
       with span("node.park"):
-        await (self.model.park() if self.sampling else self.model.call("park"))
+        await self.model.park()
       self.park_s = time.monotonic() - t0
       self.node.release_gpus(self.life)
       if self.spec.exclusive and self.wanted():
@@ -378,7 +368,7 @@ class Lifetime:
         await self.node.claim_after_drain(self.life, cur)
         await self.promote(cur)
       await self.node.push_heartbeat()
-    elif cur is None and want and demand != Demand.IDLE and self.node.claim_gpus(self.life, want, self.spec.gpus):
+    elif cur is None and want and self.node.claim_gpus(self.life, want, self.spec.gpus):
       await self.promote(want)
       await self.node.push_heartbeat()
 
@@ -387,17 +377,11 @@ class Lifetime:
       await self.keep_lease()
       t0 = time.monotonic()
       with span("node.resume"):
-        if not self.sampling:
-          if self.model is None:
-            self.bound_gpus = gpus
-            self.spawn_model(gpus)
-          await self.model.call("resume", gpus[0] if self.spec.gpus == 1 else None)
-        elif self.model.running is None:
+        if self.model is None:
+          self.spawn_model(gpus)
+        if not self.bound_gpus and (self.sampling or self.spec.gpus > 1):
           self.bound_gpus = gpus
-          self.model.env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
-          await self.model.start()
-        else:
-          await self.model.resume()
+        await self.model.resume(gpus)
       resumed = time.monotonic()
       sw = (self.park_s + resumed - t0) / max(0.01, SWITCH_BUDGET) if self.park_s else 0.0
       self.hold_until = resumed + min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, sw))
@@ -439,19 +423,24 @@ class Lifetime:
       # Refresh known heads even when another replica drained them. Otherwise keep reading during model execution.
       if cmds or self.heads:
         break
-    for cmd in cmds:
-      if cmd.request_id not in self.prepared:
+    live = set(self.streams())
+    keep = {c.request_id: c for c in cmds if c.run in live}
+    for req in self.heads.keys() - keep.keys():
+      self.heads.pop(req)[1].cancel()
+    for req, cmd in keep.items():
+      if req not in self.heads:
         task = asyncio.create_task(self.prepare(cmd))
         task.add_done_callback(lambda _: self.node.notify())
-        self.prepared[cmd.request_id] = (cmd.run, task)
-    return cmds
+        self.heads[req] = (cmd, task)
+    return list(keep.values())
 
   async def prepare(self, cmd: Cmd):
     with span("node.prepare"):
       try:
-        run = await self.bus.get_run(cmd.run)
+        if (run := self.records.get(cmd.run)) is None and (run := await self.bus.get_run(cmd.run)) is not None:
+          self.records[cmd.run] = run
         if not self.sampling:
-          return run
+          return None if cmd.run in self.loaded else run
         if run is None:
           raise ValueError(f"no sampling session {cmd.run}")
         if not (uri := run.get("model_path")):
@@ -460,34 +449,30 @@ class Lifetime:
       except Exception as e:
         return e
 
-  async def collect(self) -> None:
-    if not self.reader or not self.reader.done():
-      return
-    live = set(self.streams())
-    self.heads, self.reader = [c for c in self.reader.result() if c.run in live], None
-    keep = {c.request_id for c in self.heads}
-    for req in self.prepared.keys() - keep:
-      self.prepared.pop(req)[1].cancel()
-    self.run_service = {c.run: self.run_service.get(c.run, self.service_floor) for c in self.heads}
+  def collect(self) -> None:
+    if self.reader and self.reader.done():
+      self.reader.result()
+      self.reader = None
+      self.run_service = {c.run: self.run_service.get(c.run, self.service_floor) for c, _ in self.heads.values()}
 
   def ready(self) -> tuple[list[Cmd], list[Cmd]]:
     live = set(self.streams())
-    done = [c for c in self.heads if c.run in live and (t := self.prepared.get(c.request_id)) and t[1].done()]
-    failed = [c for c in done if isinstance(self.prepared[c.request_id][1].result(), Exception)]
-    return [c for c in done if c not in failed], failed
+    done = [(c, t.result()) for c, t in self.heads.values() if c.run in live and t.done()]
+    return [c for c, v in done if not isinstance(v, Exception)], [c for c, v in done if isinstance(v, Exception)]
 
   async def execute(self, candidates: list[Cmd]) -> Cmd | None:
     for c in candidates:
       self.run_service[c.run] = max(self.run_service.get(c.run, self.service_floor), self.service_floor)
     width = SAMPLE_RUNS if self.sampling and self.spec.lora else 1
     runs = select_runs(candidates, self.node.state.account, self.node.state.ready_lag, self.run_service, width)
-    inputs = {c.run: self.prepared[c.request_id][1].result() for c in candidates if c.run in runs}
+    inputs = {c.run: self.heads[c.request_id][1].result() for c in candidates if c.run in runs}
     bad = any(isinstance(v, Exception) for v in inputs.values())
     await self.stop_reader()
     await self.keep_lease()
     with span("node.claim"):
       cmds = await self.claim(runs, SAMPLE_COMMANDS if self.sampling and not bad else 1)
-    self.heads = [c for c in self.heads if c.run not in runs]
+    for req in [req for req, (c, _) in self.heads.items() if c.run in runs]:
+      self.heads.pop(req)[1].cancel()
     self.read()
     if not cmds:
       return None
@@ -518,7 +503,7 @@ class Lifetime:
         return Reply.error(exc), {}
     elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
       version = await self.bus.begin_checkpoint(cmd.run, token)
-    saved = unpack_snap(snap)[1] if snap and cmd.run not in self.loaded and cmd.op != Op.LOAD_WEIGHTS else None
+    saved = unpack_snap(snap)[1] if snap else None  # the trainer reads it only for an unloaded run
     await self.keep_lease()
     reply, effects = await wave.run(self.model.call("execute", cmd, run, saved, version), charge)
     self.loaded.add(cmd.run) if effects.get("loaded") else self.loaded.discard(cmd.run)
@@ -548,6 +533,7 @@ class Lifetime:
           raise RuntimeError(f"lost ownership of {cmd.run}")
         if cmd.op == Op.DELETE_MODEL and reply.ok:
           self.owned.pop(cmd.run, None)
+          self.records.pop(cmd.run, None)
         elif mutates:
           self.owned[cmd.run] = (token, cmd.entry_id, None)
           if old:
@@ -566,7 +552,7 @@ class Lifetime:
 
   async def cleanup(self) -> None:
     """Close the child first, then release GPUs (`on`), fail stranded commands, and drop the lease."""
-    futures = [f for f in [self.reader, *(t for _, t in self.prepared.values())] if f]
+    futures = [f for f in [self.reader, *(t for _, t in self.heads.values())] if f]
     for f in futures:
       f.cancel()
     await asyncio.gather(*futures, return_exceptions=True)

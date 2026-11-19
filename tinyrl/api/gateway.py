@@ -224,9 +224,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     run = f"{req.session_id}-{seq}" if req.session_id and seq is not None else str(uuid.uuid4())
 
     base, account = req.base_model, str(metadata.get("openrl.account") or "")
-    raw_gpus = metadata.get("openrl.gpus")
-    default_gpus = 1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")
-    gpus = default_gpus if raw_gpus is None else int(raw_gpus)
+    raw = metadata.get("openrl.gpus")
+    gpus = (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")) if raw is None else int(raw)
     if gpus < 1:
       raise ValueError(f"openrl.gpus must be at least 1, got {gpus}")
     if not await bus.get_run(run):
@@ -249,26 +248,23 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   # ***** training *****
 
+  async def submit_json_fb(data: dict, forward_only: bool = False) -> dict[str, str]:
+    req = wire.from_json(data, forward_only=forward_only)
+    return await submit(
+      data["model_id"], Op.FORWARD_BACKWARD, req.SerializeToString(), data.get("seq_id"), wire.cost(req)
+    )
+
   @api.post("/api/v1/forward_backward")
   async def forward_backward(request: Request):
     body = await request.body()
-    if request.headers.get("content-type", "").startswith(wire.PROTO):
-      parsed = wire.parse(body)
-      return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
-
-    data = json.loads(body)
-    parsed = wire.from_json(data)
-    return await submit(
-      data["model_id"], Op.FORWARD_BACKWARD, parsed.SerializeToString(), data.get("seq_id"), wire.cost(parsed)
-    )
+    if not request.headers.get("content-type", "").startswith(wire.PROTO):
+      return await submit_json_fb(json.loads(body))
+    parsed = wire.parse(body)
+    return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
 
   @api.post("/api/v1/forward")  # SDKs before 0.25
   async def forward(request: Request):
-    data = await request.json()
-    parsed = wire.from_json(data, forward_only=True)
-    return await submit(
-      data["model_id"], Op.FORWARD_BACKWARD, parsed.SerializeToString(), data.get("seq_id"), wire.cost(parsed)
-    )
+    return await submit_json_fb(await request.json(), forward_only=True)
 
   @api.post("/api/v1/optim_step")
   async def optim_step(req: OptimStepRequest):

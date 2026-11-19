@@ -6,7 +6,6 @@ plan_gpus assigns GPU blocks to workers. select_runs picks one account for a wor
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -69,13 +68,7 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
   return {a: v for a, v in lag.items() if a in rates or v < -1e-9}, seen
 
 
-def select_runs(
-  heads: list[Cmd],
-  account: Callable[[str], str],
-  ready_lag: Callable[[str], float],
-  service: dict[str, float],
-  width: int,
-) -> list[str]:
+def select_runs(heads: list[Cmd], account, ready_lag, service: dict[str, float], width: int) -> list[str]:
   """Choose one ready account, then batch up to `width` of its least-served runs."""
   ready = {cmd.run: cmd for cmd in reversed(heads)}
   floor = min((service[run] for run in ready if run in service), default=0.0)
@@ -95,11 +88,7 @@ def blocks(total: int, width: int) -> list[tuple[int, ...]]:
 
 
 def plan_gpus(
-  workers: dict[str, Worker],
-  total: int,
-  now: float,
-  draining: set[int] = frozenset(),
-  occupied: set[int] = frozenset(),
+  workers: dict[str, Worker], total: int, now: float, draining: set[int] = frozenset(), occupied: set[int] = frozenset()
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
   """Return desired blocks and the next contested quantum deadline. The node enforces the handoff."""
   held = occupied | {g for w in workers.values() for g in w.current}

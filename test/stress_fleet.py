@@ -290,9 +290,7 @@ class Stress(RedisTest):
         f"{node.id}: gpus={node.gpus} on={node.on} drains={node.drains} physical={node.occ.on} draining={node.draining}"
       )
       for proc, lf in node.lives.items():
-        heads = [
-          (c.run[:4], c.op.value, c.request_id in lf.prepared and lf.prepared[c.request_id][1].done()) for c in lf.heads
-        ]
+        heads = [(c.run[:4], c.op.value, t.done()) for c, t in lf.heads.values()]
         out.append(
           f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} demand={lf.demand.value} wanted={lf.wanted()} "
           f"owned={[r[:4] for r in lf.owned]} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "

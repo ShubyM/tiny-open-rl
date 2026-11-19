@@ -107,6 +107,8 @@ async def assign_new_runs(bus) -> dict:
 class FakeEngine:
   """A CPU sampling engine: tokens count up from the last prompt token, with logprob -1."""
 
+  server = None
+
   def __init__(self):
     self.loaded: set[str] = set()
     self.lora = True

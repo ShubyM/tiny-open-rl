@@ -10,6 +10,8 @@ from tinyrl.workers.trainer import Trainer
 
 
 class InlineProcess:
+  warm_pending = False
+
   def __init__(self, trainer: Trainer):
     self.trainer, self.proc, self.closed, self.pid = trainer, self, False, None
 
@@ -19,6 +21,12 @@ class InlineProcess:
     result = getattr(self.trainer, method)(*args)
     await asyncio.sleep(0)  # an actual socket call lets other requests and the node loop run
     return result
+
+  async def resume(self, gpus):
+    await self.call("resume", gpus[0] if len(gpus) == 1 else None)
+
+  async def park(self):
+    await self.call("park")
 
   def poll(self):
     return 0 if self.closed else None

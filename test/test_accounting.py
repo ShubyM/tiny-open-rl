@@ -26,9 +26,9 @@ class TestAccounting(RedisTest):
     return life
 
   async def execute(self, life):
-    life.heads = await life.peek(0)
-    await asyncio.gather(*(task for _, task in life.prepared.values()))
-    return await life.execute(life.heads)
+    cmds = await life.peek(0)
+    await asyncio.gather(*(task for _, task in life.heads.values()))
+    return await life.execute(cmds)
 
   async def test_sampler_shares_busy_time_until_the_short_request_fails(self):
     life = await self.lifetime(Role.SAMPLER, short="alice", long="alice")

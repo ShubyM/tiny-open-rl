@@ -73,8 +73,9 @@ move between a node's GPUs without restarting its model.
 Sampling controllers run in the node's event loop and drive isolated vLLM engine processes. On multi-GPU nodes the
 node queues a warm startup at placement; on one GPU it starts the engine for the first request. `ENGINE=module:Class`
 can select another engine implementing async `start(base, lora, env)`, `load_checkpoint(name, path)`, `sample(job, name)`,
-`sleep()`, `wake()` and `close()`. Settings are per engine; loading an already loaded checkpoint name must be idempotent,
-and `close()` must wait for its processes to exit. Engines identify loaded checkpoints by their immutable version IDs.
+`sleep()`, `wake()` and `close()`, with its process (or `None`) in `server`. Settings are per engine; loading an already
+loaded checkpoint name must be idempotent, and `close()` must wait for its processes to exit. Engines identify loaded
+checkpoints by their immutable version IDs.
 
 The node reserves every GPU of a worker together. An idle shared holder yields to a ready waiter. A busy holder
 gets a minimum wall-clock quantum, extended when parking and resuming are expensive. Once that quantum expires,
@@ -192,7 +193,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 
 | File | Responsibility |
 |---|---|
-| [tinyrl/bus.py](tinyrl/bus.py) | runs, sessions, command streams, fenced replies and leases |
+| [tinyrl/bus.py](tinyrl/bus.py) | runs, sessions, command streams, checkpoints, fenced replies and leases |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy arrays |
 | [tinyrl/control/fairness.py](tinyrl/control/fairness.py) | account service balances, GPU turns and run selection within a turn |
@@ -207,7 +208,6 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU
 | [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | vLLM startup, loading, completions and sleep/wake |
 | [tinyrl/workers/snapshot.py](tinyrl/workers/snapshot.py) | CRIU snapshots and isolated restores |
 | [tinyrl/storage/store.py](tinyrl/storage/store.py) | safetensors, chunked saves, uploads and caching |
-| [tinyrl/storage/registry.py](tinyrl/storage/registry.py) | checkpoint owners, versions, TTLs and cleanup of unregistered files |
 | [tinyrl/storage/models.py](tinyrl/storage/models.py) | base-model fetching and caching |
 | [tinyrl/trace.py](tinyrl/trace.py) | NVTX ranges for Nsight Systems |
 

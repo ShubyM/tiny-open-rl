@@ -98,6 +98,8 @@ def serve(path: str, handler) -> None:
 
 
 class Process:
+  warm_pending = False
+
   def __init__(self, cmd: list[str], env: dict[str, str]):
     self.folder = tempfile.TemporaryDirectory(prefix="tinyrl-")
     self.path = f"{self.folder.name}/model.sock"
@@ -130,6 +132,12 @@ class Process:
     if not ok:
       raise RuntimeError(result)
     return result
+
+  async def resume(self, gpus: tuple[int, ...]) -> None:
+    await self.call("resume", gpus[0] if len(gpus) == 1 else None)
+
+  async def park(self) -> None:
+    await self.call("park")
 
   async def close(self) -> None:
     if self.closed:

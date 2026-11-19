@@ -17,8 +17,7 @@ from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
 
 REBALANCE_MS = getenv("REBALANCE_MS", 20_000)
-SCALE_BATCH = getenv("SCALE_BATCH", 4)
-TICK_MS = getenv("TICK_MS", 100)
+SCALE_BATCH, TICK_MS = getenv("SCALE_BATCH", 4), getenv("TICK_MS", 100)
 
 
 @dataclass(frozen=True)
@@ -125,20 +124,13 @@ class State:
     return name
 
 
-def _floats(mapping: dict) -> dict[str, float]:
-  return {k: float(v) for k, v in mapping.items()}
-
-
 def from_state(raw: dict) -> State:
-  plan = raw["plan"]
-  queues = raw.get("queues", {})
+  plan, queues = raw["plan"], raw.get("queues", {})
   nodes = {n: (int(v["gpus"]), int(v.get("memory", 0))) for n, v in raw.get("nodes", {}).items()}
   jobs = {}
   for r, info in raw.get("runs", {}).items():
     rec = info["record"]
-    exclusive = bool(rec.get("exclusive"))
-    train_run = rec.get("train_run")
-    role = Role(rec.get("role", "trainer"))
+    exclusive, train_run, role = bool(rec.get("exclusive")), rec.get("train_run"), Role(rec.get("role", "trainer"))
     spec = Spec(
       role,
       rec.get("base", ""),
@@ -155,17 +147,8 @@ def from_state(raw: dict) -> State:
     for n, p in plan.get("procs", {}).items()
   }
   home = {r: list(ps) for r, ps in plan.get("home", {}).items() if r in jobs}
-  return State(
-    made=int(plan.get("made", 0)),
-    nodes=nodes,
-    procs=procs,
-    home=home,
-    jobs=jobs,
-    lag=_floats(plan.get("lag", {})),
-    seen=_floats(plan.get("seen", {})),
-    service=dict(raw.get("service", {})),
-    weights=_floats(plan.get("weights", {})),
-  )
+  lag, seen, weights = ({a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights"))
+  return State(int(plan.get("made", 0)), nodes, procs, home, jobs, lag, seen, dict(raw.get("service", {})), weights)
 
 
 def to_plan(s: State) -> dict:
