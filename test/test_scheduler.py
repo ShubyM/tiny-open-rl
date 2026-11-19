@@ -88,6 +88,7 @@ class FakeLife:
   def __init__(self, proc: str, spec: Spec, state: State, on: dict, quantum: float = 2.0, bound: tuple[int, ...] = ()):
     self.proc, self.life, self.spec, self.state, self.on = proc, f"{proc}@n-1", spec, state, on
     self.active, self.bound_gpus, self.granted_at, self.quantum, self.gpu_ms = True, bound, 0.0, quantum, 0.0
+    self.step_ready = False
 
   def wanted(self) -> bool:
     return True

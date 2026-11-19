@@ -54,37 +54,56 @@ def blocks(total: int, width: int) -> list[tuple[int, ...]]:
 def plan_gpus(
   lives: dict[str, Lifetime], on: dict[str, tuple[int, ...]], total: int, now: float, draining: set[int] = frozenset()
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
-  """Select active GPU blocks: hold `ACTIVE_QUANTUM`, fill rest by `(exclusive, lag, -gpu_ms)`, keep idle warm."""
+  """Decide which process is on which GPUs. Returns `{proc: gpus}` and when to decide again if anyone is left waiting.
+
+  1. Stay: an exclusive resident, and a busy resident that is inside its quantum or in the middle of a training step.
+  2. Compete: every other busy process, the most owed first, takes a free block, preferring the one it is on.
+  3. Stay warm: an idle resident keeps its GPUs if nobody took them.
+  """
   cur = {p: on.get(lf.life, ()) for p, lf in lives.items()}
-  held = {g for gs in on.values() for g in gs}
-  pinned = {g for lf in lives.values() if lf.spec.role == Role.TRAINER for g in lf.bound_gpus}
-  want_excl = any(lf.spec.exclusive and lf.active and not cur[p] for p, lf in lives.items())
-  # 1. Exclusive residents and busy residents inside ACTIVE_QUANTUM stay put without switching.
-  residents = {p: lf for p, lf in lives.items() if cur[p] and draining.isdisjoint(cur[p]) and lf.wanted()}
-  ends = {p: lf.granted_at + lf.quantum for p, lf in residents.items() if lf.active and not want_excl}
-  holding = {p: end for p, end in ends.items() if end > now}
-  closing = {p for p in ends if getattr(residents[p], "step_ready", False)}
-  keep = {p: cur[p] for p, lf in residents.items() if p in holding or p in closing or lf.spec.exclusive}
-  taken, hold = set(draining).union(*keep.values()), set()
-  excl = {g for p, block in keep.items() if lives[p].spec.exclusive for g in block}
-  # 2. OVERTIME residents and ready waiters claim open blocks in priority order; prefer cur[p] or truly empty GPUs.
-  waiting = False
-  for p, lf in sorted(lives.items(), key=lambda kv: kv[1].priority(), reverse=True):
-    if p in keep or not lf.active or not lf.wanted():
+  wanted = {p for p, lf in lives.items() if lf.wanted()}
+  occupied = {g for gs in on.values() for g in gs}
+  gang_gpus = {g for lf in lives.values() if lf.spec.role == Role.TRAINER for g in lf.bound_gpus}
+  # An exclusive process waiting for GPUs cuts every quantum and open step short.
+  exclusive_waits = any(lf.spec.exclusive and lf.active and not cur[p] for p, lf in lives.items())
+
+  keep, taken, exclusive_gpus, quantum_ends = {}, set(draining), set(), []
+  for p, lf in lives.items():
+    if p not in wanted or not cur[p] or not draining.isdisjoint(cur[p]):
       continue
-    opts = [lf.bound_gpus] if lf.bound_gpus else blocks(total, lf.spec.gpus)
-    if free := [b for b in opts if not (taken & set(b)) and (b == cur[p] or not (hold & set(b)))]:
-      avoid = pinned if lf.spec.exclusive else set()
-      keep[p] = min(free, key=lambda b: (b != cur[p], not avoid.isdisjoint(b), not held.isdisjoint(b)))
+    busy = lf.active and not exclusive_waits
+    in_quantum = busy and lf.granted_at + lf.quantum > now
+    if in_quantum:
+      quantum_ends.append(lf.granted_at + lf.quantum)
+    if lf.spec.exclusive or in_quantum or (busy and lf.step_ready):
+      keep[p] = cur[p]
+      taken |= set(cur[p])
+    if lf.spec.exclusive:
+      exclusive_gpus |= set(cur[p])
+
+  reserved, waiting = set(), False
+  for p, lf in sorted(lives.items(), key=lambda kv: kv[1].priority(), reverse=True):
+    if p in keep or p not in wanted or not lf.active:
+      continue
+    options = [lf.bound_gpus] if lf.bound_gpus else blocks(total, lf.spec.gpus)
+    free = [b for b in options if taken.isdisjoint(b) and (b == cur[p] or reserved.isdisjoint(b))]
+    if free:
+      # Prefer the block it is on, then (for an exclusive) one no gang trainer is bound to, then one nobody occupies.
+      avoid = gang_gpus if lf.spec.exclusive else set()
+      keep[p] = min(free, key=lambda b: (b != cur[p], not avoid.isdisjoint(b), not occupied.isdisjoint(b)))
       taken |= set(keep[p])
-      excl |= set(keep[p]) if lf.spec.exclusive else set()
+      if lf.spec.exclusive:
+        exclusive_gpus |= set(keep[p])
     else:
+      # Nothing is free. Reserve it a block, so that less owed processes not already on that block leave it alone.
       waiting = True
-      if cand := [b for b in opts if not (excl & set(b))]:
-        hold |= set(cand[0])
-  # 3. Idle residents stay warm in VRAM on uncontested GPUs (zero park/resume when alone).
-  keep.update((p, b) for p, b in cur.items() if b and taken.isdisjoint(b) and lives[p].wanted())
-  return keep, min(holding.values(), default=None) if waiting else None
+      if possible := [b for b in options if exclusive_gpus.isdisjoint(b)]:
+        reserved |= set(possible[0])
+
+  for p, gpus in cur.items():
+    if gpus and p in wanted and taken.isdisjoint(gpus):
+      keep[p] = gpus
+  return keep, min(quantum_ends, default=None) if waiting else None
 
 
 class NodeDaemon:
