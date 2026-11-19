@@ -2,12 +2,11 @@
 
 Needs kubectl pointed at a cluster running k8s/ on at least two GPU nodes, and the tinker SDK. It port-forwards the gateway, trains two LoRA runs through the SDK, then injects one failure at a time and checks what the user sees:
 
-  trainer_killed   a trainer's supervisor dies: the node daemon starts another, calls fail cleanly, load_state recovers
-  gateway_deleted  every gateway pod is deleted: the SDK's retries land and no call runs twice
-  redis_restarted  Redis is down past the worker lease: runs survive on its append-only file and training goes on
-  node_drained     a node is drained, as on a Spot notice: its trainer saves the run, which goes on on another node
-  node_died        a node is reset with no notice: its workers move, calls fail cleanly, load_state recovers
-  no_leaks         afterwards, one owned process group per trainer or live engine, and no stray processes or leases
+  trainer_killed     a trainer's supervisor dies: the node daemon starts another, calls fail cleanly, load_state recovers
+  gateway_restarted  the gateway StatefulSet is restarted past the worker lease: metadata survives on SQLite and training goes on
+  node_drained       a node is drained, as on a Spot notice: its trainer saves the run, which goes on on another node
+  node_died          a node is reset with no notice: its workers move, calls fail cleanly, load_state recovers
+  no_leaks           afterwards, one owned process group per trainer or live engine, and no stray processes or leases
 
 python k8s/e2e.py prints one line per check and writes the report to e2e.json.
 """
@@ -20,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,8 +38,9 @@ def kubectl(*args: str, check: bool = True) -> str:
   return out.stdout
 
 
-def redis(*args: str) -> str:
-  return kubectl("exec", "redis-0", "--", "redis-cli", "--raw", *args).strip()
+def gateway_get(path: str) -> dict:
+  with urllib.request.urlopen(f"http://127.0.0.1:{PORT}{path}", timeout=10) as resp:
+    return json.loads(resp.read())
 
 
 def port_forward() -> None:
@@ -61,8 +62,8 @@ def daemons() -> dict[str, str]:
 
 def placements() -> dict[str, str]:
   """Worker -> the node daemon pod the scheduler placed it on. A node daemon's id is its pod name and pid."""
-  workers = json.loads(redis("GET", "tinyrl:state") or "{}").get("workers", {})
-  return {worker: p["node"].rsplit("-", 1)[0] for worker, p in workers.items() if p["node"]}
+  procs = gateway_get("/api/v1/scheduling").get("state", {}).get("procs", {})
+  return {worker: p["node"].rsplit("-", 1)[0] for worker, p in procs.items() if p.get("node")}
 
 
 def serving(worker: str) -> str | None:
@@ -71,16 +72,14 @@ def serving(worker: str) -> str | None:
 
 def live_workers() -> dict[tuple[str, str], dict]:
   """Physical (pod, worker) -> live state, including its owned supervisor PID. Placement may already name another node."""
-  records = redis("HGETALL", "tinyrl:nodes").splitlines()
+  sched = gateway_get("/api/v1/scheduling")
+  procs = sched.get("state", {}).get("procs", {})
   workers = {}
-  for node, raw in zip(records[::2], records[1::2]):
-    info = json.loads(raw)
-    if info["until"] <= time.time():
-      continue
-    for worker, state in info.get("workers", {}).items():
+  for node, info in sched.get("nodes", {}).items():
+    for worker, pid in info.get("pids", {}).items():
       key = node.rsplit("-", 1)[0], worker
       assert key not in workers, f"two live node daemons report {key}"
-      workers[key] = state
+      workers[key] = {"pid": pid, "kind": procs.get(worker, {}).get("spec", {})}
   return workers
 
 
@@ -154,8 +153,8 @@ class Run:
 
   @property
   def worker(self):
-    w = redis("HGET", f"tinyrl:run:{self.run_id}", "worker")
-    return w if w else self.run_id
+    home = gateway_get("/api/v1/scheduling").get("state", {}).get("home", {})
+    return home.get(self.run_id, self.run_id)
 
   def step(self) -> float:
     from tinker import types
@@ -166,7 +165,7 @@ class Run:
     return fb.result().metrics["loss:sum"]
 
   def server_steps(self) -> int:
-    return int(redis("HGET", f"tinyrl:run:{self.run_id}", "steps"))
+    return int(gateway_get(f"/api/v1/runs/{self.run_id}")["steps"])
 
   def fails_cleanly(self) -> str:
     try:
@@ -222,28 +221,24 @@ def main() -> None:
     run.tc.load_state_with_optimizer(checkpoint).result()
     return f"restarted in {restart:.0f} s, then the call failed with the expected error, and load_state recovered"
 
-  def gateway_deleted():
+  def gateway_restarted():
     before = run.server_steps()
-    kubectl("delete", "pods", "-l", "app=gateway", "--wait=false")
-    _, loss = both_step()  # the control steps too, so the two stay comparable
-    assert run.server_steps() == before + 1, (before, run.server_steps())
-    return f"a step during the restart landed once (steps {before} -> {before + 1}), loss {loss:.3f}"
-
-  def redis_restarted():
-    kubectl("scale", "statefulset/redis", "--replicas=0")
-    kubectl("wait", "--for=delete", "pod/redis-0", "--timeout=120s", check=False)
+    kubectl("scale", "statefulset/gateway", "--replicas=0")
+    kubectl("wait", "--for=delete", "pod/gateway-0", "--timeout=120s", check=False)
     time.sleep(15)  # down longer than the 10 s worker lease, so every lease runs out
-    kubectl("scale", "statefulset/redis", "--replicas=1")
+    kubectl("scale", "statefulset/gateway", "--replicas=1")
+    wait(
+      "gateway", lambda: subprocess.run(["curl", "-sf", f"http://127.0.0.1:{PORT}/api/v1/healthz"]).returncode == 0, 120
+    )
     c, r = both_step()
-    assert redis("EXISTS", f"tinyrl:run:{run.run_id}") == "1"
-    return f"runs survived, and both stepped after the restart (losses {c:.3f}, {r:.3f})"
+    assert run.server_steps() == before + 1, (before, run.server_steps())
+    return f"runs survived SQLite restart, both stepped (losses {c:.3f}, {r:.3f})"
 
   def node_drained():
     pod = serving(run.worker)
     node = daemons()[pod]
     kubectl("taint", "node", node, "tinyrl-e2e-drain=true:NoExecute")  # evicts the node daemon, as a Spot notice does
     try:
-      wait("the run parked", lambda: redis("EXISTS", f"tinyrl:parked:{run.run_id}") == "1", 40)
       moved = wait("the worker moved", lambda: serving(run.worker) not in (None, pod), 90)
       c, r = both_step()
       gap = abs(r - c) / c
@@ -276,15 +271,15 @@ def main() -> None:
     placed = placements()
     workers = live_workers()
     procs = {pod: processes(pod) for pod in daemons()}
-    owners = [k.removeprefix("tinyrl:owner:") for k in redis("KEYS", "tinyrl:owner:*").split()]
+    jobs = gateway_get("/api/v1/scheduling").get("state", {}).get("jobs", {})
+    owners = [j["owner"].split("@", 1)[0] for j in jobs.values() if j.get("owner")]
     check_processes(placed, workers, procs, owners)
     engines = sum(s["pid"] is not None for s in workers.values())
     return f"{len(placed)} workers, {engines} owned process groups, and no stray processes or leases"
 
   for name, fn in [
     ("trainer_killed", trainer_killed),
-    ("gateway_deleted", gateway_deleted),
-    ("redis_restarted", redis_restarted),
+    ("gateway_restarted", gateway_restarted),
     ("node_drained", node_drained),
     ("node_died", node_died),
     ("no_leaks", no_leaks),

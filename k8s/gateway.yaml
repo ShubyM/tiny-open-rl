@@ -1,9 +1,10 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: gateway
 spec:
-  replicas: 2
+  serviceName: gateway
+  replicas: 1
   selector:
     matchLabels: {app: gateway}
   template:
@@ -16,12 +17,24 @@ spec:
         command: ["python3", "-m", "tinyrl.api.gateway"]
         envFrom:
         - configMapRef: {name: tinyrl}
+        env:
+        - {name: TINYRL_DB, value: /data/tinyrl.db}
+        - {name: INTERNAL_PORT, value: "8001"}
         ports:
-        - containerPort: 8000
+        - {name: http, containerPort: 8000}
+        - {name: rpc, containerPort: 8001}
         readinessProbe:
           httpGet: {path: /api/v1/healthz, port: 8000}
         resources:
           requests: {cpu: "1", memory: 2Gi}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+  - metadata: {name: data}
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests: {storage: 10Gi}
 ---
 apiVersion: v1
 kind: Service
@@ -30,4 +43,5 @@ metadata:
 spec:
   selector: {app: gateway}
   ports:
-  - port: 8000
+  - {name: http, port: 8000}
+  - {name: rpc, port: 8001}

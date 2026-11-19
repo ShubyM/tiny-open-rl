@@ -29,13 +29,19 @@ CASES = [
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (BUS, "finish_cmd", "if acct and charge.gpu_ms:", "if reply.ok and acct and charge.gpu_ms:", BILLING),
-  (BUS, "claim_trainer", 'await p.hget(k, "owner") != token.encode()', "False", CLAIM),
+  (
+    BUS,
+    "commit_reply",
+    "if acct and charge and charge.gpu_ms",
+    "if reply.ok and acct and charge and charge.gpu_ms",
+    BILLING,
+  ),
+  (BUS, "claim_trainer", 'if not row or row["owner"] != token:', "if False:", CLAIM),
   (
     BUS,
     "commit_sample",
-    'not await p.xrange(key("q", cmd.run), cmd.entry_id, cmd.entry_id)',
-    "await p.exists(fk)",
+    "if not claims or claims.pop(cmd.entry_id, None) is None:",
+    "if cmd.request_id in self.replies:",
     DEDUP,
   ),
   (BUS, "commit_reply", "if mutates and not deleting:", "if reply.ok and mutates and not deleting:", RECOVERY),
@@ -55,7 +61,8 @@ def mutate(source, function, original, replacement):
 
 def run_tests(folder, tests):
   env = os.environ.copy()
-  env.pop("REDIS_URL", None)  # RedisTest starts an isolated server and flushes only that server.
+  env.pop("TINYRL_DB", None)
+  env.pop("CONTROL_URL", None)
   env.pop("PYTHONPATH", None)
   env["TMPDIR"] = str(folder)
   return subprocess.run(

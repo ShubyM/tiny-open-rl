@@ -332,7 +332,8 @@ class Store:
         with contextlib.suppress(FileNotFoundError):
           self.fs.rm(path, recursive=True)
         if self.remote:
-          Path(self.cache, f"{version}.upload").unlink(missing_ok=True)
+          for suffix in (".upload", ".uploaded"):
+            Path(self.cache, version + suffix).unlink(missing_ok=True)
           for suffix in ("", ".writing"):
             shutil.rmtree(Path(self.cache, version + suffix), ignore_errors=True)
         else:

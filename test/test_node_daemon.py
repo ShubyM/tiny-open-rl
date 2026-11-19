@@ -11,11 +11,11 @@ from unittest.mock import patch
 import torch
 
 from test.execution import TestNode
-from test.helpers import RedisTest, new_id, tiny
+from test.helpers import BusTest, new_id, tiny
 from test.test_api import proto_body
 from test.test_process import require_unix
 from test.test_sampler import JOB
-from tinyrl.bus import GROUP, LEASE_MS, Op, Role, Run, key
+from tinyrl.bus import Op, Role, Run
 from tinyrl.control import scheduler
 from tinyrl.control.fairness import Demand
 from tinyrl.control.node_daemon import NodeDaemon
@@ -24,7 +24,7 @@ from tinyrl.storage.store import Store
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
-class TestNodeDaemon(RedisTest):
+class TestNodeDaemon(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.nodes, self.tasks = [], []
@@ -149,7 +149,7 @@ class TestNodeDaemon(RedisTest):
       await self.bus.create_run(Run("lost", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
       [cmd] = await self.bus.take_commands(["lost"], "dead", 1)
-      await self.bus.r.xclaim(key("q", "lost"), GROUP, "dead", 0, [cmd.entry_id], idle=LEASE_MS)
+      self.bus.in_flight["lost"][cmd.entry_id].claimed_at = 0.0
       await node.bind("sampler", "lost")
       waiting = self.background(self.bus.wait_for_reply(request, 10))
       await self.until(waiting.done, node)
@@ -422,6 +422,17 @@ class TestNodeDaemon(RedisTest):
       c.result()
     self.assertGreater(len(parks), 2)
     self.assertNotIn(Op.FORWARD_BACKWARD, parks)  # parking with gradients open moves them too
+
+  async def test_push_heartbeat_cancels_worker_whose_lease_was_lost(self):
+    node, run = self.node(), new_id()
+    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
+    await node.bind("worker", run)
+    await self.create(run, "tiny", node)
+    lf = node.lives["worker"]
+    await self.bus.drop_lease(lf.life)
+    await node.push_heartbeat()
+    self.assertTrue(lf.task.cancelling() or lf.task.done())
+    await self.until(lambda: node.lives.get("worker") is not lf, node)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from transformers import LlamaForCausalLM
 
 import tinyrl.workers.model
 from test.execution import TestNode
-from test.helpers import RedisTest, new_id, tiny
+from test.helpers import BusTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Run
@@ -302,7 +302,7 @@ class TestModel(unittest.TestCase):
       )
 
 
-class TestTrainer(RedisTest):
+class TestTrainer(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.store = Store(root=tempfile.mkdtemp())

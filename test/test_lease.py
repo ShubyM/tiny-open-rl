@@ -8,9 +8,9 @@ import sys
 import tempfile
 import unittest
 
-from test.helpers import RedisTest, new_id, tiny
+from test.helpers import BusTest, new_id, tiny
 from test.test_process import require_unix
-from tinyrl.bus import Op, Reply, Run, key, unpack_snap
+from tinyrl.bus import Op, Reply, Run, serve_bus, unpack_snap
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 
@@ -18,9 +18,10 @@ LEASE_MS = 2000
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
 
-class TestLease(RedisTest):
+class TestLease(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
+    self.runner, self.url = await serve_bus(self.bus, host="127.0.0.1", port=0)
     self.tasks, self.processes = [], []
     self.folder = tempfile.TemporaryDirectory()
     self.addCleanup(self.folder.cleanup)
@@ -40,12 +41,13 @@ class TestLease(RedisTest):
     for task in self.tasks:
       task.cancel()
     await asyncio.gather(*self.tasks, return_exceptions=True)
+    await self.runner.cleanup()
     await super().asyncTearDown()
 
   def daemon(self):
     env = {
       **os.environ,
-      "REDIS_URL": self.url,
+      "CONTROL_URL": self.url,
       "LEASE_MS": str(LEASE_MS),
       "GPUS": "1",
       "GPU_MEMORY_MIB": "0",
@@ -106,7 +108,7 @@ class TestLease(RedisTest):
       await self.until(pending)
       first.send_signal(signal.SIGSTOP)
       os.killpg(model_pid, signal.SIGCONT)  # the child may run while its parent cannot publish a result
-      await self.bus.r.hdel(key("nodes"), first_node)  # its heartbeat ran out
+      self.bus.nodes.pop(first_node, None)  # its heartbeat ran out
       expected = await self.bus.wait_for_reply(request, 30)
       self.assertFalse(expected.ok)
       self.assertIn("lost ownership", json.loads(expected.body)["error"])

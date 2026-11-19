@@ -3,9 +3,22 @@ import json
 import tempfile
 import time
 import unittest
+from unittest import mock
 
-from test.helpers import RedisTest, new_id, start_redis
-from tinyrl.bus import GROUP, Bus, Cmd, Op, Reply, Role, Run, connect, key, unpack_snap
+from test.helpers import BusTest, new_id
+from tinyrl.bus import (
+  BackpressureError,
+  Bus,
+  Cmd,
+  Op,
+  PromiseGoneError,
+  RemoteBus,
+  Reply,
+  Role,
+  Run,
+  serve_bus,
+  unpack_snap,
+)
 from tinyrl.control.accounting import Charge
 
 
@@ -13,7 +26,7 @@ def ok(**body) -> Reply:
   return Reply(True, "application/json", json.dumps(body).encode())
 
 
-class TestBus(RedisTest):
+class TestBus(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     await self.bus.touch_leases("w0")
@@ -71,21 +84,19 @@ class TestBus(RedisTest):
     cmd = await self.bus.claim_trainer(run_id, self.tokens[run_id])
 
     async def answer_late():
-      await asyncio.sleep(5.5)
+      await asyncio.sleep(1.0)
       await self.bus.commit_reply(cmd, ok(n=1), self.tokens[run_id])
 
     answering = asyncio.create_task(answer_late())
     self.assertEqual(await self.bus.wait_for_reply(request_id, 10), ok(n=1))
     await answering
 
-  async def test_a_retried_call_is_queued_once_even_if_its_seq_key_is_gone(self):
+  async def test_a_retried_call_is_queued_once(self):
     run_id = await self.new_run()
     first = await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=5)
-    await self.bus.r.delete(key("seq", run_id, "5"))
     self.assertEqual(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=5), first)
-    self.assertEqual(await self.bus.r.get(key("seq", run_id, "5")), first.encode())
     self.assertNotEqual(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"", seq_id=6), first)
-    self.assertEqual(await self.bus.r.xlen(key("q", run_id)), 2)
+    self.assertEqual((await self.bus.queued_and_in_flight(run_id))["queued"], 2)
 
   async def test_a_retry_after_its_run_was_deleted_gets_the_first_request_id(self):
     run_id = await self.new_run()
@@ -101,7 +112,7 @@ class TestBus(RedisTest):
     await self.bus.delete_run(run_id)
     self.assertIsNone(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b""))
     self.assertEqual(await self.bus.queued_and_in_flight(run_id), {"live": False})
-    self.assertFalse(await self.bus.r.exists(key("q", run_id)))
+    self.assertNotIn(run_id, self.bus.queues)
 
   async def test_delete_removes_owned_checkpoints_and_keeps_saved_weights(self):
     run = await self.new_run()
@@ -115,10 +126,10 @@ class TestBus(RedisTest):
     cmd = await self.bus.claim_trainer(run, token)
     self.assertTrue(await self.bus.commit_reply(cmd, ok(), token))
     self.assertEqual(await self.bus.wait_for_reply(request, 5), ok())
-    self.assertFalse(await self.bus.r.exists(key("q", run)))
+    self.assertNotIn(run, self.bus.queues)
     self.assertIsNone((await self.bus.get_run(run)).get("snap"))
     self.assertIsNone((await self.bus.get_run(run)).get("owner"))
-    self.assertFalse(await self.bus.r.sismember(key("runs"), run))
+    self.assertNotIn(run, (await self.bus.read_state())["runs"])
     self.assertIsNone(await self.bus.get_checkpoint(owned))
     self.assertIsNotNone(await self.bus.get_checkpoint(saved))
     self.assertEqual([c["tinker_path"] for c in (await self.bus.page_of_checkpoints(10, 0))[0]], [saved])
@@ -168,14 +179,12 @@ class TestBus(RedisTest):
     claimed = await self.bus.claim_trainer(run_id, old_token)
     self.assertEqual(claimed.request_id, first)
 
-    # Acquire refuses while the current owner's lease is live, and succeeds once it expires.
     await self.bus.touch_leases("new")
     self.assertIsNone(await self.bus.acquire_run(run_id, "new"))
     await self.bus.drop_lease("w0")
     new_token, _, _ = await self.bus.acquire_run(run_id, "new")
     self.assertNotEqual(new_token, old_token)
 
-    # Stale token cannot commit, detach, re-acquire, or fail stranded commands — even if w0 re-opens a lease (ABA).
     await self.bus.touch_leases("w0")
     self.assertIsNone(await self.bus.acquire_run(run_id, "w0"))
     self.assertFalse(await self.bus.commit_reply(claimed, ok(by="zombie"), old_token))
@@ -189,7 +198,7 @@ class TestBus(RedisTest):
     self.assertFalse(reply.ok)
     self.assertEqual(json.loads(reply.body)["category"], "server")
     self.assertIn(claimed.op, json.loads(reply.body)["error"])
-    self.assertIsNone(await self.bus.wait_for_reply(second, 0))  # unclaimed work stays queued
+    self.assertIsNone(await self.bus.wait_for_reply(second, 0))
     self.assertEqual(await self.bus.queued_and_in_flight(run_id), {"live": True, "queued": 1, "in_flight": []})
     self.assertEqual((await self.bus.get_run(run_id))["failed"], 1)
 
@@ -213,7 +222,7 @@ class TestBus(RedisTest):
 
     stale = {"uri": uri, "size": 10, "ttl": 60, "version": "old"}
     self.assertFalse(await self.bus.commit_reply(abandoned, ok(), old, checkpoint=stale))
-    await self.bus.r.pexpire(key("f", request), 0)
+    self.bus.replies.pop(request, None)
     self.assertFalse(await self.bus.commit_reply(cmd, ok(), current, checkpoint=stale))
     self.assertEqual(await self.bus.checkpoint_version(uri), "new")
     self.assertIsNone((await self.bus.get_checkpoint(uri))["expires_at"])
@@ -230,11 +239,10 @@ class TestBus(RedisTest):
     self.assertEqual(len(winners), 1)
     token = winners[0][0]
 
-    # Advance pos and record a clean detach; then verify mutating commit supersedes snap while read-only keeps it.
     req1 = await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
     c1 = await self.bus.claim_trainer(run_id, token)
     self.assertTrue(await self.bus.commit_reply(c1, ok(), token, mutates=True))
-    self.assertFalse(await self.bus.detach_run(run_id, token, "0-1", "tinker://r/parked/bad\nv0"))  # wrong pos
+    self.assertFalse(await self.bus.detach_run(run_id, token, "0-1", "tinker://r/parked/bad\nv0"))
     parked_uri = f"tinker://{run_id}/parked/1"
     await self.seed_checkpoint(parked_uri, 1, owned=True, version="v1")
     self.assertTrue(await self.bus.detach_run(run_id, token, c1.entry_id, f"{parked_uri}\nv1"))
@@ -244,7 +252,6 @@ class TestBus(RedisTest):
     self.assertEqual((pos2, snap2), (c1.entry_id, f"{parked_uri}\nv1"))
     self.assertIsNotNone(req1)
 
-    # Read-only commit preserves snap; next mutating commit supersedes snap and removes it from checkpoints.
     await self.bus.submit_command(run_id, Op.SAVE_WEIGHTS, b"{}")
     ro = await self.bus.claim_trainer(run_id, token2)
     self.assertTrue(await self.bus.commit_reply(ro, ok(), token2, mutates=False))
@@ -260,10 +267,9 @@ class TestBus(RedisTest):
   async def test_unreaped_lease_recovery_preserves_epoch_token(self):
     run_id = await self.new_run()
     token = self.tokens[run_id]
-    await self.bus.r.pexpire(key("lease", "w0"), 0)
-    self.assertFalse(await self.bus.r.exists(key("lease", "w0")))
-    await self.bus.touch_leases("w0")  # recovered before anyone reaped
-    self.assertTrue(await self.bus.r.exists(key("lease", "w0")))
+    self.bus.leases.pop("w0", None)
+    await self.bus.touch_leases("w0")
+    self.assertIn("w0", self.bus.leases)
     await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
     cmd = await self.bus.claim_trainer(run_id, token)
     self.assertTrue(await self.bus.commit_reply(cmd, ok(alive=1), token, mutates=True))
@@ -271,10 +277,11 @@ class TestBus(RedisTest):
   async def test_lease_renewal_does_not_resurrect_dropped_lease(self):
     await self.bus.touch_leases("live", "dropped")
     await self.bus.drop_lease("dropped")
-    await self.bus.node_heartbeat("node-a", 1, leases=("live", "dropped"))
+    lost = await self.bus.node_heartbeat("node-a", 1, leases=("live", "dropped"))
+    self.assertEqual(lost, ["dropped"])
     await self.bus.touch_leases("live", "dropped", xx=True)
-    self.assertTrue(await self.bus.r.exists(key("lease", "live")))
-    self.assertFalse(await self.bus.r.exists(key("lease", "dropped")))
+    self.assertIn("live", self.bus.leases)
+    self.assertNotIn("dropped", self.bus.leases)
 
   async def test_competing_sampler_replicas_answer_and_charge_exactly_once(self):
     sid = await self.new_run(role=Role.SAMPLER, account="bob")
@@ -291,23 +298,33 @@ class TestBus(RedisTest):
     service = (await self.bus.read_state())["service"]["bob"]
     self.assertEqual(service, 40.5 + winner)
 
-    await self.bus.r.pexpire(key("f", req), 0)
+    self.bus.replies.pop(req, None)
     self.assertFalse(await self.bus.commit_sample(cmd, ok(late=True), "bob", Charge(busy_ms=100, gpu_ms=100)))
-    self.assertIsNone(await self.bus.wait_for_reply(req, 0))
+    with self.assertRaises(PromiseGoneError):
+      await self.bus.wait_for_reply(req, 0)
     self.assertEqual(await self.bus.get_run(sid), run)
     self.assertEqual((await self.bus.read_state())["service"]["bob"], service)
+
+  async def test_sampling_backpressure_and_unknown_promise_raise_typed_errors(self):
+    sid = await self.new_run(role=Role.SAMPLER)
+    with mock.patch("tinyrl.bus.SAMPLE_QUEUE_BYTES", 16):
+      await self.bus.submit_command(sid, Op.SAMPLE, b"0123456789")
+      with self.assertRaises(BackpressureError):
+        await self.bus.submit_command(sid, Op.SAMPLE, b"0123456789")
+    with self.assertRaises(PromiseGoneError):
+      await self.bus.wait_for_reply("samp-missing/1-1", 0)
 
   async def test_a_sample_in_flight_is_reclaimed_only_from_a_dead_replica(self):
     session = await self.new_run(role=Role.SAMPLER)
     requests = [await self.bus.submit_command(session, Op.SAMPLE, b"{}") for _ in range(2)]
     taken = await self.bus.take_commands([session], "w0")
     self.assertEqual([cmd.request_id for cmd in taken], requests)
-    # However long a sample runs, another replica leaves it alone while its replica holds a lease.
-    await self.bus.r.xclaim(key("q", session), GROUP, "w0", 0, [cmd.entry_id for cmd in taken], idle=3_600_000)
+    for claim in self.bus.in_flight[session].values():
+      claim.claimed_at = 0.0
     self.assertEqual(await self.bus.take_commands([session], "other"), [])
     self.assertEqual(await self.bus.peek_sampler([session]), [])
 
-    await self.bus.drop_lease("w0")  # its process died
+    await self.bus.drop_lease("w0")
     [head] = await self.bus.peek_sampler([session])
     self.assertEqual(head.request_id, requests[0])
     reclaimed = await self.bus.take_commands([session], "other")
@@ -315,7 +332,7 @@ class TestBus(RedisTest):
 
   async def test_a_dead_node_daemon_stops_counting(self):
     await self.bus.node_heartbeat("node-a", 2)
-    await self.bus.r.hset("tinyrl:nodes", "node-b", '{"gpus": 8, "until": 0}')
+    self.bus.nodes["node-b"] = {"gpus": 8, "memory": 0, "until": 0}
     self.assertEqual(await self.bus.live_nodes(), {"node-a": 2})
 
   async def test_sessions(self):
@@ -330,14 +347,14 @@ class TestBus(RedisTest):
     await self.bus.heartbeat_session("s")
     run_id = await self.new_run(session="s")
     await self.bus.end_session("s")
-    self.assertEqual(len(await self.bus.r.xrange(key("q", run_id))), 1)
-    self.assertIsNotNone(await self.bus.r.zscore(key("seen"), "s"))
-    await self.bus.r.xtrim(key("q", run_id), maxlen=0)
+    self.assertEqual((await self.bus.queued_and_in_flight(run_id))["queued"], 1)
+    self.assertTrue(self.bus.sessions["s"]["active"])
+    self.bus.queues[run_id].clear()
     await self.bus.end_session("s")
-    self.assertEqual(len(await self.bus.r.xrange(key("q", run_id))), 1)
+    self.assertEqual((await self.bus.queued_and_in_flight(run_id))["queued"], 1)
     await self.bus.delete_run(run_id)
     await self.bus.end_session("s")
-    self.assertIsNone(await self.bus.r.zscore(key("seen"), "s"))
+    self.assertFalse(self.bus.sessions["s"]["active"])
 
   async def test_a_deleted_run_does_not_hide_another_runs_command(self):
     run_id, gone = await self.new_run(role=Role.SAMPLER), await self.new_run(role=Role.SAMPLER)
@@ -348,27 +365,53 @@ class TestBus(RedisTest):
     self.assertEqual(await self.bus.take_commands([run_id], "o"), [])
 
 
-class TestRedisRestart(unittest.IsolatedAsyncioTestCase):
-  async def test_a_call_waits_out_a_redis_restart(self):
-    sock = f"{tempfile.mkdtemp()}/redis.sock"
-    proc = start_redis(sock)
-    bus = Bus(connect(f"unix://{sock}"))
-    try:
-      await bus.node_heartbeat("node-a", 1)
-      proc.terminate()
-      proc.wait()
+class TestControlRestart(unittest.IsolatedAsyncioTestCase):
+  async def test_remote_bus_waits_out_control_server_restart_and_preserves_durable_state(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      db_path = f"{tmp}/tinyrl.db"
+      bus = Bus(db_path)
+      runner, url = await serve_bus(bus, host="127.0.0.1", port=0)
+      port = int(url.rsplit(":", 1)[1])
+      remote = RemoteBus(url)
+      try:
+        await remote.touch_leases("n1")
+        await remote.heartbeat_session("s1", {"sdk": "0.39"})
+        await remote.create_run(Run("tr-1", "base", 4, session="s1", account="alice"))
+        token, _, _ = await remote.acquire_run("tr-1", "n1")
+        await remote.submit_command("tr-1", Op.SAVE_WEIGHTS, b"\x00\xff", cost=5)
+        cmd = await remote.claim_trainer("tr-1", token)
+        self.assertEqual(cmd.body, b"\x00\xff")
+        ckpt = {"uri": "tinker://tr-1/weights/v1", "size": 99, "version": "ver1"}
+        self.assertTrue(await remote.commit_reply(cmd, ok(done=1), token, "alice", True, checkpoint=ckpt))
+        await remote.node_heartbeat("node-a", 1, leases=("n1",))
 
-      async def restart():
-        await asyncio.sleep(2)
-        return start_redis(sock)
+        await runner.cleanup()
+        await bus.aclose()
 
-      restarting = asyncio.create_task(restart())
-      await bus.node_heartbeat("node-a", 1)
-      proc = await restarting
-      self.assertEqual(await bus.live_nodes(), {"node-a": 1})
-    finally:
-      await bus.aclose()
-      proc.terminate()
+        async def restart():
+          await asyncio.sleep(0.4)
+          new_bus = Bus(db_path)
+          new_runner, _ = await serve_bus(new_bus, host="127.0.0.1", port=port)
+          return new_bus, new_runner
+
+        restarting = asyncio.create_task(restart())
+        await remote.node_heartbeat("node-a", 1)
+        bus, runner = await restarting
+        self.assertEqual(await remote.live_nodes(), {"node-a": 1})
+        # Boot grace window prevents immediate reaping of n1 before LEASE_MS elapses.
+        await remote.touch_leases("n2")
+        self.assertIsNone(await remote.acquire_run("tr-1", "n2"))
+        # Durable sessions, runs, checkpoints, and ownership survive control-server restart.
+        self.assertEqual((await remote.get_session("s1"))["metadata"], {"sdk": "0.39"})
+        self.assertEqual(await remote.checkpoint_version("tinker://tr-1/weights/v1"), "ver1")
+        self.assertEqual((await remote.get_run("tr-1"))["owner"], token)
+        # Lost sampling promises raise PromiseGoneError across HTTP RPC.
+        with self.assertRaises(PromiseGoneError):
+          await remote.wait_for_reply("samp-lost/1-1", 0)
+      finally:
+        await remote.aclose()
+        await runner.cleanup()
+        await bus.aclose()
 
 
 if __name__ == "__main__":

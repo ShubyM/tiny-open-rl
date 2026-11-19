@@ -1,15 +1,12 @@
 import asyncio
-import os
-import subprocess
 import tempfile
-import time
 import unittest
 import uuid
 
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from tinyrl.bus import Bus, connect, queue_checkpoint
+from tinyrl.bus import Bus, make_checkpoint
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -31,45 +28,18 @@ def new_id() -> str:
   return str(uuid.uuid4())
 
 
-def start_redis(socket_path: str) -> subprocess.Popen:
-  args = ["--port", "0", "--unixsocket", socket_path, "--save", "", "--appendonly", "no"]
-  proc = subprocess.Popen([os.getenv("REDIS_SERVER", "redis-server"), *args], stdout=subprocess.DEVNULL)
-  for _ in range(500):
-    if os.path.exists(socket_path):
-      break
-    time.sleep(0.01)
-  return proc
-
-
-class RedisTest(unittest.IsolatedAsyncioTestCase):
-  """Starts a throwaway redis-server for the test class, or uses REDIS_URL. Each test gets an empty database."""
-
-  proc: subprocess.Popen | None = None
+class BusTest(unittest.IsolatedAsyncioTestCase):
+  """Starts an isolated SQLite Bus per test."""
 
   async def seed_checkpoint(self, uri, size, *, ttl=None, owned=False, version=None):
-    pipeline = self.bus.s.pipeline()
-    queue_checkpoint(pipeline, uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned)
-    await pipeline.execute()
-
-  @classmethod
-  def setUpClass(cls):
-    if os.getenv("REDIS_URL"):
-      cls.url = os.environ["REDIS_URL"]
-      return
-    socket_path = f"{tempfile.mkdtemp()}/redis.sock"
-    cls.proc = start_redis(socket_path)
-    cls.url = f"unix://{socket_path}"
-
-  @classmethod
-  def tearDownClass(cls):
-    if cls.proc:
-      cls.proc.terminate()
-      cls.proc.wait()
+    with self.bus.db:
+      self.bus.checkpoints[uri] = make_checkpoint(uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned)
 
   async def asyncSetUp(self):
     self.renewal_tasks = []
-    self.bus = Bus(connect(self.url))
-    await self.bus.r.flushall()
+    self._db_dir = tempfile.TemporaryDirectory()
+    self.db_path = f"{self._db_dir.name}/tinyrl.db"
+    self.bus = Bus(self.db_path)
 
   async def worker(self, run: str) -> str:
     """The run's primary process, once every new run is assigned the way the scheduler assigns it."""
@@ -83,6 +53,7 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
       task.cancel()
     await asyncio.gather(*self.renewal_tasks, return_exceptions=True)
     await self.bus.aclose()
+    self._db_dir.cleanup()
 
 
 async def assign_new_runs(bus) -> dict:

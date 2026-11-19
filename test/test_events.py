@@ -1,11 +1,11 @@
 import asyncio
 
-from test.helpers import RedisTest
+from test.helpers import BusTest
 from tinyrl.bus import Run
 from tinyrl.control import scheduler
 
 
-class TestEvents(RedisTest):
+class TestEvents(BusTest):
   async def test_round_trip(self):
     first = await self.bus.append_event("node_up", node="n", gpus=2, memory=0)
     second = await self.bus.append_event("node_lost", node="n")

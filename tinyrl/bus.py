@@ -1,539 +1,603 @@
-"""Runs, sessions, command streams, ownership, checkpoints, and plans on Redis.
+"""In-memory control-plane Bus backed by SQLite WAL for durable metadata.
 
-Metadata lives as UTF-8 strings (`self.s`); command and reply streams carry raw protobuf bytes (`self.r`).
-Safety rests on two Redis facts (plus each node's local `on` table):
-  tinyrl:run:<r>       a training run's single-writer `(owner, epoch, pos, snap)`, fenced on claim/commit/detach
-  tinyrl:lease:<life>  each process incarnation's TTL; `acquire_run` replaces `owner` only after its lease expires
-Each run has one FIFO stream and one consumer group. Its pending list records claims across process restarts.
-Trainers claim under the current owner token; sampling replicas reclaim abandoned work and commit each entry once.
+Durable tables (`sessions`, `runs`, `checkpoints`, `meta`) are plain Python dicts (`Table`) that write through to a
+single SQLite WAL file. Command queues, replies, leases, nodes, and events live in RAM; lost sampling promises raise
+PromiseGoneError (HTTP 410) so the Tinker SDK resubmits them.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
+import sqlite3
 import time
 import uuid
-from dataclasses import asdict
-
-import redis.asyncio as redis
-from redis.asyncio.retry import Retry
-from redis.backoff import ExponentialBackoff
+import weakref
+from collections import OrderedDict, deque
+from dataclasses import asdict, dataclass
 
 from tinyrl.control.accounting import Charge
 from tinyrl.helpers import getenv
-from tinyrl.types import Cmd, Ev, Event, Op, Reply, Role, Run, parse_uri, unpack_snap  # noqa: F401
+from tinyrl.rpc import RemoteBus, serve_bus  # noqa: F401
+from tinyrl.types import Cmd, Ev, Event, Op, Reply, Role, Run, parse_uri, unpack_snap
 
-GROUP = "trainer"  # Persisted group name for both roles.
 LIVE_SECONDS, SESSION_GRACE = 30, getenv("SESSION_GRACE", 60)
 REPLY_TTL, READ_REPLY_TTL, SESSION_TTL = getenv("REPLY_TTL", 3600), 60, getenv("SESSION_TTL", 7 * 24 * 3600)
 LEASE_MS, NODE_MS = getenv("LEASE_MS", 10000), 30000
+SAMPLE_QUEUE_BYTES = getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20)
+SAMPLE_REPLY_BYTES = getenv("SAMPLE_REPLY_BYTES", 256 * 2**20)
 COUNTERS = ("steps", "failed", "cmds", "tokens", "busy_ms", "wait_ms")
-RUN_META = frozenset(("record", "owner", "epoch", "pos", "snap"))
 
 
-def key(*parts: str) -> str:
-  return ":".join(("tinyrl", *parts))
+class PromiseGoneError(LookupError):
+  """Raised when a stateless sampling promise no longer exists in RAM (maps to HTTP 410)."""
+
+
+class BackpressureError(RuntimeError):
+  """Raised when in-memory sampling queues hit SAMPLE_QUEUE_BYTES (maps to HTTP 429)."""
+
+
+@dataclass
+class Claim:
+  cmd: Cmd
+  consumer: str
+  claimed_at: float
+  deliveries: int = 1
 
 
 def life_of(token: str) -> str:
   return token.rsplit(":", 1)[0]
 
 
-def wake(p, stream: str = "wake") -> None:
-  p.xadd(key(stream), {"t": 1}, maxlen=1, approximate=False)
+def entry_sort_key(entry_id: str) -> tuple[int, int]:
+  ms, seq = entry_id.split("-", 1)
+  return int(ms), int(seq)
 
 
-def queue_event(p, kind: Ev, body: dict) -> None:
-  p.xadd(key("events"), {"kind": Ev(kind), "body": json.dumps(body)}, maxlen=1_000_000, approximate=True)
-
-
-def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
-  return Cmd(run, entry_id.decode(), Op(fields[b"op"].decode()), fields[b"body"], int(fields.get(b"cost", 1)))
-
-
-def parse_heads(got) -> list[Cmd]:
-  pre = key("q", "")
-  return [Cmd(s.decode().removeprefix(pre), e.decode(), Op(f[b"op"].decode()), b"") for s, rs in got for e, f in rs[:1]]
-
-
-def is_missing_stream(err: Exception) -> bool:
-  return "NOGROUP" in (msg := str(err)) or "no such key" in msg
-
-
-def finish_cmd(p, cmd: Cmd, reply: Reply, acct: str, charge: Charge | None) -> None:
-  q, fk = key("q", cmd.run), key("f", cmd.request_id)
-  p.xack(q, GROUP, cmd.entry_id)
-  p.xdel(q, cmd.entry_id)
-  p.xadd(fk, {"ok": int(reply.ok), "content_type": reply.content_type, "body": reply.body}, maxlen=1, approximate=False)
-  p.expire(fk, REPLY_TTL)
+def charge_counts(cmd: Cmd, reply: Reply, charge: Charge | None) -> dict[str, int]:
   counts = {"failed": 1} if not reply.ok else {"steps": 1} if cmd.op == Op.OPTIM_STEP else {}
   if charge:
-    counts.update(cmds=1, wait_ms=max(0, charge.started_ms - int(cmd.entry_id.split("-")[0])), busy_ms=charge.busy_ms)
+    wait_ms = max(0, charge.started_ms - int(cmd.entry_id.split("-")[0]))
+    counts.update(cmds=1, wait_ms=wait_ms, busy_ms=charge.busy_ms)
     if reply.ok:
       counts["tokens"] = cmd.cost
-    if acct and charge.gpu_ms:
-      p.hincrbyfloat(key("service"), acct, charge.gpu_ms)
-  for name, n in counts.items():
-    p.hincrby(key("run", cmd.run), name, n)
-  wake(p)
+  return counts
 
 
-def queue_delete(p, run_id: str) -> None:
-  p.srem(key("runs"), run_id)
-  p.delete(key("q", run_id))
-  p.hdel(key("run", run_id), "owner", "snap")
-  p.expire(key("run", run_id), SESSION_TTL)
-  p.expire(key("clients", run_id), SESSION_TTL)
-  p.hdel(key("writing"), run_id)
-  queue_event(p, Ev.RUN_DELETED, {"run": run_id})
-
-
-def checkpoint_field(uri: str) -> tuple[str, str]:
-  run, cid = parse_uri(uri)
-  return key("ckpt", run), cid
-
-
-def queue_expiry(p, uri: str, expires: float | None) -> None:
-  p.zadd(key("expiry"), {uri: expires}) if expires is not None else p.zrem(key("expiry"), uri)
-
-
-def queue_checkpoint(p, uri: str, size: int, *, version: str, ttl=None, owned=False) -> None:
-  """Publish the record, visible-page index, and expiry together with the fenced reply."""
-  ck, cid = checkpoint_field(uri)
+def make_checkpoint(uri: str, size: int, *, version: str, ttl=None, owned=False) -> dict:
+  _, cid = parse_uri(uri)
   raw_kind, now = cid.split("/", 1)[0], time.time()
   kind = {"weights": "training", "sampler_weights": "sampler"}.get(raw_kind, raw_kind)
-  expires = now + ttl if ttl else None
-  row = {"checkpoint_id": cid, "checkpoint_type": kind, "time": now, "tinker_path": uri, "size_bytes": size}
-  p.hset(ck, cid, json.dumps(row | {"expires_at": expires, "owned": owned, "version": version}))
-  if kind != "parked":
-    p.zadd(key("ckpts"), {uri: now})
-  queue_expiry(p, uri, expires)
+  return {
+    "checkpoint_id": cid,
+    "checkpoint_type": kind,
+    "time": now,
+    "tinker_path": uri,
+    "size_bytes": size,
+    "expires_at": now + ttl if ttl else None,
+    "owned": bool(owned),
+    "version": version,
+  }
 
 
-def queue_unregister(p, *uris: str) -> None:
-  for uri in uris:
-    p.hdel(*checkpoint_field(uri))
-    p.zrem(key("ckpts"), uri)
-    p.zrem(key("expiry"), uri)
+class Table(dict):
+  """In-memory dict backed by a namespace in SQLite (`kv(ns, k, v)`)."""
 
+  def __init__(self, db: sqlite3.Connection, ns: str):
+    self.db, self.ns = db, ns
+    super().__init__((k, json.loads(v)) for k, v in db.execute("SELECT k, v FROM kv WHERE ns = ?", (ns,)))
 
-def connect(url: str) -> redis.Redis:
-  retry = Retry(ExponentialBackoff(cap=2.0, base=0.1), 30)
-  return redis.from_url(url, socket_timeout=None, retry=retry, max_connections=10_000)
+  def __setitem__(self, key: str, value) -> None:
+    super().__setitem__(key, value)
+    self.db.execute("INSERT OR REPLACE INTO kv VALUES (?, ?, ?)", (self.ns, key, json.dumps(value)))
+
+  def __delitem__(self, key: str) -> None:
+    super().__delitem__(key)
+    self.db.execute("DELETE FROM kv WHERE ns = ? AND k = ?", (self.ns, key))
+
+  def pop(self, key: str, *default):
+    if key in self:
+      value = self[key]
+      del self[key]
+      return value
+    return default[0] if default else super().pop(key)
+
+  def save(self, key: str) -> None:
+    self[key] = self[key]
 
 
 class Bus:
-  def __init__(self, r: redis.Redis | None = None):
-    self.r = r if r is not None else connect(getenv("REDIS_URL", "redis://localhost:6379"))
-    pool = self.r.connection_pool
-    kw = pool.connection_kwargs | {"decode_responses": True, "max_connections": pool.max_connections}
-    self.s = redis.Redis(connection_pool=redis.ConnectionPool(connection_class=pool.connection_class, **kw))
+  """Single-control-plane bus: write-through SQLite Tables for durable metadata, RAM for queues & liveness."""
+
+  def __init__(self, path: str | None = None):
+    self.path = getenv("TINYRL_DB", "/tmp/tinyrl.db") if path is None else path
+    if self.path != ":memory:":
+      os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+    self.db = sqlite3.connect(self.path, isolation_level="IMMEDIATE")
+    for pragma in ("journal_mode=WAL", "synchronous=NORMAL", "busy_timeout=5000", "auto_vacuum=INCREMENTAL"):
+      self.db.execute(f"PRAGMA {pragma}")
+    self.db.execute("CREATE TABLE IF NOT EXISTS kv (ns TEXT, k TEXT, v TEXT, PRIMARY KEY (ns, k))")
+    self.db.commit()
+
+    self.sessions = Table(self.db, "sessions")
+    self.runs = Table(self.db, "runs")
+    self.checkpoints = Table(self.db, "checkpoints")
+    self.meta = Table(self.db, "meta")
+    self.service: dict[str, float] = {k: float(v) for k, v in self.meta.get("service", {}).items()}
+
+    self.queues: dict[str, dict[str, Cmd]] = {rid: {} for rid, r in self.runs.items() if r["live"]}
+    self.in_flight: dict[str, dict[str, Claim]] = {rid: {} for rid in self.queues}
+    self.replies: OrderedDict[str, tuple[Reply, float, int]] = OrderedDict()
+    self.seen: dict[tuple[str, int], tuple[str, float]] = {}
+    self.nodes: dict[str, dict] = {}
+    self.leases: dict[str, float] = {}
+    self.dropped: set[str] = set()
+    self.events: deque[Event] = deque(maxlen=100_000)
+    self.waiters: weakref.WeakValueDictionary[str, asyncio.Event] = weakref.WeakValueDictionary()
+    self.wake_seq = {"wake": 0, "plan_wake": 0}
+    self.seq = self.sample_bytes = self.reply_bytes = 0
+    self.dirty_runs: set[str] = set()
+    self.service_dirty = False
+
+    has_owner = any(r["live"] and r.get("owner") for r in self.runs.values())
+    self.reap_after = time.monotonic() + LEASE_MS / 1000 if has_owner else 0.0
+
+  def is_sampler(self, run_id: str) -> bool:
+    run = self.runs.get(run_id)
+    return bool(run and run["record"]["role"] == Role.SAMPLER)
+
+  def flush_dirty(self) -> None:
+    if self.service_dirty:
+      self.meta["service"] = self.service
+      self.service_dirty = False
+    for run_id in self.dirty_runs:
+      if run_id in self.runs:
+        self.runs.save(run_id)
+    self.dirty_runs.clear()
 
   async def aclose(self) -> None:
-    await self.s.aclose(close_connection_pool=True)
-    await self.r.aclose()
+    if self.db is not None:
+      with self.db:
+        self.flush_dirty()
+      self.db.close()
+      self.db = None
 
-  async def transact(self, fn, *keys: str, raw: bool = False):
-    client = self.r if raw else self.s
-    while True:
-      try:
-        async with client.pipeline(transaction=True) as p:
-          await p.watch(*keys)
-          return await fn(p)
-      except redis.WatchError:
-        continue
+  def notify(self, key: str) -> None:
+    if ev := self.waiters.pop(key, None):
+      ev.set()
+
+  def wake(self, stream: str = "wake") -> None:
+    self.wake_seq[stream] += 1
+    self.notify(f"wake:{stream}")
+
+  def record_event(self, kind: Ev, body: dict) -> Event:
+    self.seq += 1
+    now = time.time()
+    ev = Event(f"{int(now * 1000)}-{self.seq}", now, str(Ev(kind)), body)
+    self.events.append(ev)
+    return ev
+
+  async def peek(self, runs: list[str], heads_fn, block_ms: int) -> list[Cmd]:
+    if not runs:
+      if block_ms > 0:
+        await asyncio.sleep(block_ms / 1000)
+      return []
+    if (cmds := heads_fn(runs)) or block_ms <= 0:
+      return cmds
+    tasks = [asyncio.create_task(self.waiters.setdefault(f"run:{r}", asyncio.Event()).wait()) for r in runs]
+    try:
+      await asyncio.wait(tasks, timeout=block_ms / 1000, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+      for t in tasks:
+        t.cancel()
+      await asyncio.gather(*tasks, return_exceptions=True)
+    return heads_fn(runs)
 
   # ***** sessions *****
 
   async def heartbeat_session(self, session_id: str, metadata: dict | None = None) -> None:
-    k, now, p = key("sess", session_id), time.time(), self.s.pipeline()
-    p.hsetnx(k, "created", now)
+    now = time.time()
+    session = self.sessions.get(session_id) or {"created": now, "seen": now, "active": True, "metadata": {}}
+    session["seen"], session["active"] = now, True
     if metadata:
-      p.hset(k, "metadata", json.dumps(metadata))
-    p.hset(k, "seen", now)
-    p.zadd(key("seen"), {session_id: now})
-    p.expire(k, SESSION_TTL)
-    p.expire(key("sess", session_id, "runs"), SESSION_TTL)
-    await p.execute()
+      session["metadata"] = metadata
+    with self.db:
+      self.sessions[session_id] = session
 
   async def get_session(self, session_id: str) -> dict | None:
-    p = self.s.pipeline()
-    p.hgetall(key("sess", session_id))
-    p.smembers(key("sess", session_id, "runs"))
-    record, runs = await p.execute()
-    if not record:
+    if (session := self.sessions.get(session_id)) is None:
       return None
-    seen, meta = float(record["seen"]), json.loads(record.get("metadata") or "{}")
-    out = {"session_id": session_id, "created": float(record["created"]), "seen": seen}
-    return out | {"live": time.time() - seen < LIVE_SECONDS, "runs": sorted(runs), "metadata": meta}
+    runs = sorted(rid for rid, r in self.runs.items() if r["record"].get("session") == session_id)
+    return {
+      "session_id": session_id,
+      "created": session["created"],
+      "seen": session["seen"],
+      "live": time.time() - session["seen"] < LIVE_SECONDS,
+      "runs": runs,
+      "metadata": dict(session["metadata"]),
+    }
 
   async def expired_sessions(self) -> list[str]:
-    return await self.s.zrangebyscore(key("seen"), 0, time.time() - SESSION_GRACE)
+    cutoff = time.time() - SESSION_GRACE
+    return [sid for sid, s in self.sessions.items() if s["active"] and s["seen"] <= cutoff]
 
   async def finish_session(self, session_id: str) -> None:
-    p = self.s.pipeline()
-    p.zadd(key("seen"), {session_id: 0}, xx=True)
-    wake(p)
-    await p.execute()
+    if (session := self.sessions.get(session_id)) and session["active"]:
+      session["seen"] = 0.0
+      with self.db:
+        self.sessions.save(session_id)
+    self.wake()
 
   async def end_session(self, session_id: str) -> None:
-    left = False
-    for run_id in (await self.get_session(session_id) or {}).get("runs", []):
-      if not await self.s.sismember(key("runs"), run_id):
-        continue
-      if (await self.get_run(run_id) or {}).get("role") == Role.SAMPLER:
-        await self.delete_run(run_id)
+    live = sorted(rid for rid, r in self.runs.items() if r["live"] and r["record"].get("session") == session_id)
+    has_trainers = False
+    for rid in live:
+      if self.is_sampler(rid):
+        await self.delete_run(rid)
       else:
-        left = bool(await self.submit_command(run_id, Op.DELETE_MODEL, b"{}")) or left
-    await (self.s.zadd(key("seen"), {session_id: time.time()}) if left else self.s.zrem(key("seen"), session_id))
+        has_trainers = bool(await self.submit_command(rid, Op.DELETE_MODEL, b"{}")) or has_trainers
+    if session := self.sessions.get(session_id):
+      if has_trainers:
+        session["seen"] = time.time()
+      else:
+        session["active"] = False
+      with self.db:
+        self.sessions.save(session_id)
 
   # ***** runs and cluster state *****
 
   async def create_run(self, run: Run) -> None:
-    q, p = key("q", run.id), self.s.pipeline(transaction=True)
-    zero = dict.fromkeys(COUNTERS, 0)
-    p.xgroup_create(q, GROUP, id="0", mkstream=True)
-    p.execute_command("XCFGSET", q, "IDMP-DURATION", 86400, "IDMP-MAXSIZE", 10000)
-    p.sadd(key("runs"), run.id)
-    p.hset(key("run", run.id), mapping={"record": json.dumps({**asdict(run), "created": time.time()}), **zero})
-    if run.session:
-      p.sadd(key("sess", run.session, "runs"), run.id)
-      p.expire(key("sess", run.session, "runs"), SESSION_TTL)
-    fields = ("role", "base", "rank", "exclusive", "train_run", "gpus")
-    queue_event(p, Ev.RUN_CREATED, {"run": run.id, **{k: getattr(run, k) for k in fields}})
-    wake(p)
+    row = {
+      "live": True,
+      "record": {**asdict(run), "created": time.time()},
+      "owner": None,
+      "epoch": 0,
+      "pos": None,
+      "snap": None,
+      "writing": None,
+      "clients": 0,
+      "counters": dict.fromkeys(COUNTERS, 0),
+    }
+    self.queues[run.id] = {}
+    self.in_flight[run.id] = {}
+    with self.db:
+      self.runs[run.id] = row
     if run.role == Role.SAMPLER:
-      wake(p, "plan_wake")
-    await p.execute()
+      self.wake("plan_wake")
+    fields = ("role", "base", "rank", "exclusive", "train_run", "gpus")
+    self.record_event(Ev.RUN_CREATED, {"run": run.id, **{k: getattr(run, k) for k in fields}})
+    self.wake()
 
   async def read_state(self, *, backlogs: bool = True, counters: bool = False) -> dict:
-    """Cluster snapshot: live nodes, runs `(record, owner)`, plan, `gpu_ms` service, and optional stream backlogs."""
-    nodes, runs = await self.live_nodes(details=True), sorted(await self.s.smembers(key("runs")))
-    p = self.s.pipeline(transaction=False)
-    fields = ("record", "owner", *COUNTERS) if counters else ("record", "owner")
-    for r in runs:
-      p.hmget(key("run", r), fields)
-    if backlogs:
-      for r in runs:
-        p.xlen(key("q", r))
-    p.get(key("plan"))
-    p.hgetall(key("service"))
-    *rows, plan, service = await p.execute()
-    out_runs = {}
-    for r, (rec, owner, *values) in zip(runs, rows):
-      if rec:
-        out_runs[r] = {"record": json.loads(rec), "owner": owner}
-        if counters:
-          out_runs[r]["counters"] = {k: int(v) for k, v in zip(COUNTERS, values) if v is not None}
-    queues = dict(zip(runs, rows[len(runs) :]))
-    svc = {k: float(v) for k, v in service.items()}
-    return {"nodes": nodes, "runs": out_runs, "queues": queues, "plan": json.loads(plan or "{}"), "service": svc}
+    nodes = await self.live_nodes(details=True)
+    runs, queues = {}, {}
+    for rid in sorted(self.runs):
+      row = self.runs[rid]
+      if not row["live"]:
+        continue
+      info = {"record": dict(row["record"]), "owner": row["owner"]}
+      if counters:
+        info["counters"] = dict(row["counters"])
+      runs[rid] = info
+      if backlogs:
+        queues[rid] = len(self.queues.get(rid, ())) + len(self.in_flight.get(rid, ()))
+    return {
+      "nodes": nodes,
+      "runs": runs,
+      "queues": queues,
+      "plan": dict(self.meta.get("plan", {})),
+      "service": dict(self.service),
+    }
 
   async def write_plan(self, plan: dict, changes: list[tuple[Ev, dict]] = (), notify_nodes: bool = True) -> None:
-    p = self.s.pipeline(transaction=True)
-    p.set(key("plan"), json.dumps(plan))
+    with self.db:
+      self.meta["plan"] = plan
+      self.flush_dirty()
     for kind, body in changes:
-      queue_event(p, kind, body)
+      self.record_event(kind, body)
     if notify_nodes:
-      wake(p, "plan_wake")
-    await p.execute()
+      self.wake("plan_wake")
 
   async def get_run(self, run_id: str) -> dict | None:
-    if not (f := await self.s.hgetall(key("run", run_id))) or "record" not in f:
+    if (row := self.runs.get(run_id)) is None:
       return None
-    meta = {n: f[n] for n in ("owner", "pos", "snap") if f.get(n)}
-    return {**json.loads(f["record"]), **meta, **{k: int(v) for k, v in f.items() if k not in RUN_META}}
+    meta = {k: row[k] for k in ("owner", "pos", "snap") if row[k]}
+    return {**row["record"], **meta, **row["counters"]}
 
   async def join_sampling_session(self, run_id: str) -> int:
-    return int(await self.s.incr(key("clients", run_id)))
+    if (row := self.runs.get(run_id)) is None:
+      return 1
+    row["clients"] += 1
+    with self.db:
+      self.runs.save(run_id)
+    return row["clients"]
 
   async def delete_run(self, run_id: str) -> None:
-    p = self.s.pipeline(transaction=True)
-    queue_delete(p, run_id)
-    wake(p)
-    await p.execute()
+    is_sampler = self.is_sampler(run_id)
+    if row := self.runs.get(run_id):
+      row["live"] = False
+      row["owner"] = row["snap"] = row["writing"] = None
+      with self.db:
+        self.runs.save(run_id)
+        self.flush_dirty()
+    queued = list(self.queues.pop(run_id, {}).values())
+    claimed = [c.cmd for c in self.in_flight.pop(run_id, {}).values()]
+    for cmd in (*queued, *claimed):
+      if is_sampler:
+        self.sample_bytes -= len(cmd.body)
+      self.notify(f"reply:{cmd.request_id}")
+    if is_sampler:
+      for k in [k for k in self.seen if k[0] == run_id]:
+        del self.seen[k]
+    self.record_event(Ev.RUN_DELETED, {"run": run_id})
+    self.wake()
 
-  # ***** commands & replies *****
+  # ***** commands & replies (RAM) *****
 
   async def seen_request(self, run_id: str, seq_id: int | None) -> str | None:
-    return await self.s.get(key("seq", run_id, str(seq_id))) if seq_id is not None else None
+    entry = None if seq_id is None else self.seen.get((run_id, seq_id))
+    return entry[0] if entry and entry[1] > time.time() else None
 
   async def submit_command(
     self, run_id: str, op: Op, body: bytes, seq_id: int | None = None, cost: int = 1
   ) -> str | None:
-    if first := await self.seen_request(run_id, seq_id):
-      return first
-    seq = [] if seq_id is None else ["IDMP", run_id, seq_id]
-    args = ["NOMKSTREAM", *seq, "*", "op", op, "body", body, "cost", cost]
-    if (entry_id := await self.r.execute_command("XADD", key("q", run_id), *args)) is None:
+    if existing := await self.seen_request(run_id, seq_id):
+      return existing
+    if run_id not in self.queues:
       return None
-    request_id, p = f"{run_id}/{entry_id.decode()}", self.s.pipeline()
-    if seq:
-      p.set(key("seq", run_id, str(seq_id)), request_id, ex=SESSION_TTL)
-    wake(p)
-    await p.execute()
-    return request_id
+    if self.is_sampler(run_id):
+      if self.sample_bytes + len(body) > SAMPLE_QUEUE_BYTES:
+        raise BackpressureError("sampling queue memory limit reached")
+      self.sample_bytes += len(body)
+    self.seq += 1
+    cmd = Cmd(run_id, f"{time.time_ns() // 1_000_000}-{self.seq}", Op(op), body, cost)
+    self.queues[run_id][cmd.entry_id] = cmd
+    if seq_id is not None:
+      self.seen[(run_id, seq_id)] = (cmd.request_id, time.time() + SESSION_TTL)
+    self.notify(f"run:{run_id}")
+    self.wake()
+    return cmd.request_id
 
   async def wait_for_reply(self, request_id: str, timeout: float) -> Reply | None:
-    fk = key("f", request_id)
-    if not (got := await self.r.xread({fk: "0-0"}, count=1, block=int(timeout * 1000) or None)):
-      return None
-    f = got[0][1][0][1]
-    await self.s.expire(fk, min(REPLY_TTL, READ_REPLY_TTL), lt=True)
-    return Reply(f[b"ok"] == b"1", f[b"content_type"].decode(), f[b"body"])
+    run_id, _, entry_id = request_id.partition("/")
+    is_sampler = self.is_sampler(run_id) or request_id.startswith("samp-")
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+      now = time.time()
+      if (entry := self.replies.get(request_id)) is not None:
+        reply, expires_at, size = entry
+        if expires_at > now:
+          self.replies[request_id] = (reply, min(expires_at, now + min(REPLY_TTL, READ_REPLY_TTL)), size)
+          self.replies.move_to_end(request_id)
+          return reply
+        self.reply_bytes -= self.replies.pop(request_id)[2]
+      active = entry_id in self.queues.get(run_id, ()) or entry_id in self.in_flight.get(run_id, ())
+      if is_sampler and not active:
+        raise PromiseGoneError(f"sampling promise gone: {request_id}")
+      if (remaining := deadline - time.monotonic()) <= 0:
+        return None
+      with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(self.waiters.setdefault(f"reply:{request_id}", asyncio.Event()).wait(), remaining)
 
   async def queued_and_in_flight(self, run_id: str) -> dict:
-    q = key("q", run_id)
-    p = self.s.pipeline()
-    p.xinfo_groups(q)
-    p.xpending_range(q, GROUP, "-", "+", count=100)
-    groups, pending = await p.execute(raise_on_error=False)
-    if isinstance(groups, redis.ResponseError) and is_missing_stream(groups):
+    if run_id not in self.queues:
       return {"live": False}
-    for result in (groups, pending):
-      if isinstance(result, Exception):
-        raise result
+    now = time.monotonic()
     in_flight = [
       {
-        "request_id": f"{run_id}/{e['message_id']}",
-        "trainer": e["consumer"],
-        "deliveries": e["times_delivered"],
-        "seconds": e["time_since_delivered"] / 1000,
+        "request_id": c.cmd.request_id,
+        "trainer": c.consumer,
+        "deliveries": c.deliveries,
+        "seconds": max(0.0, now - c.claimed_at),
       }
-      for e in pending
+      for c in self.in_flight[run_id].values()
     ]
-    return {"live": True, "queued": groups[0]["lag"], "in_flight": in_flight}
+    return {"live": True, "queued": len(self.queues[run_id]), "in_flight": in_flight}
 
-  # ***** single-writer trainer ownership & leases *****
+  # ***** trainer ownership & leases *****
 
-  async def touch_leases(self, *lives: str, xx: bool = False) -> None:
-    if not lives:
-      return
-    p = self.s.pipeline(transaction=False)
+  async def touch_leases(self, *lives: str, xx: bool = False, ttl_ms: int | None = None) -> None:
+    now, ttl = time.monotonic(), (LEASE_MS if ttl_ms is None else ttl_ms) / 1000
     for life in lives:
-      p.set(key("lease", life), 1, px=LEASE_MS, xx=xx)
-    await p.execute()
+      if not xx or self.leases.get(life, 0.0) > now:
+        self.leases[life] = now + ttl
+        self.dropped.discard(life)
 
   async def drop_lease(self, life: str) -> None:
-    await self.s.delete(key("lease", life))
+    self.leases.pop(life, None)
+    self.dropped.add(life)
+    for rid in self.queues:
+      if self.is_sampler(rid):
+        self.notify(f"run:{rid}")
 
   async def acquire_run(self, run_id: str, life: str) -> tuple[str, str | None, str | None] | None:
-    """Claim an unowned (or expired-owner) training run under a fresh epoch token if `life`'s lease is live."""
-    k, lk = key("run", run_id), key("lease", life)
-
-    async def op(p):
-      rec, owner, epoch, pos, snap = await p.hmget(k, "record", "owner", "epoch", "pos", "snap")
-      if not rec or not await p.exists(lk):
+    now = time.monotonic()
+    if self.leases.get(life, 0.0) <= now:
+      return None
+    row = self.runs.get(run_id)
+    if not row or not row["live"]:
+      return None
+    if row["owner"]:
+      prev = life_of(row["owner"])
+      if self.leases.get(prev, 0.0) > now or (now < self.reap_after and prev not in self.dropped):
         return None
-      if owner:
-        await p.watch(old_lk := key("lease", life_of(owner)))
-        if await p.exists(old_lk):
-          return None
-      n = int(epoch or 0) + 1
-      p.multi()
-      p.hset(k, mapping={"owner": f"{life}:{n}", "epoch": n})
-      if owner:
-        p.hdel(key("writing"), run_id)
-      await p.execute()
-      return f"{life}:{n}", pos, snap
+    row["epoch"] += 1
+    row["owner"] = token = f"{life}:{row['epoch']}"
+    row["writing"] = None
+    with self.db:
+      self.runs.save(run_id)
+    return token, row["pos"], row["snap"]
 
-    return await self.transact(op, k, lk)
+  def trainer_heads(self, runs: list[str]) -> list[Cmd]:
+    heads = [
+      Cmd(r, (c := next(iter(q.values()))).entry_id, c.op, b"", c.cost) for r in runs if (q := self.queues.get(r))
+    ]
+    return sorted(heads, key=lambda c: (*entry_sort_key(c.entry_id), c.run))
 
   async def peek_trainer(self, runs: list[str], block_ms: int = 0) -> list[Cmd]:
-    """Peek one body-free head per trainer stream without claiming it."""
-    if not runs:
-      return await asyncio.sleep(block_ms / 1000) or []
-    got = await self.r.xread({key("q", r): "0-0" for r in runs}, count=1, block=block_ms or None)
-    return sorted(parse_heads(got), key=lambda c: (*map(int, c.entry_id.split("-")), c.run))
+    return await self.peek(runs, self.trainer_heads, block_ms)
 
   async def claim_trainer(self, run: str, token: str) -> Cmd | None:
-    """Mark the head of `run`'s FIFO stream in-flight under `token` (only the current epoch may claim)."""
-    k, q = key("run", run), key("q", run)
-
-    async def op(p):
-      if await p.hget(k, "owner") != token.encode():
-        raise RuntimeError(f"lost ownership of {run}")
-      p.multi()
-      p.xreadgroup(GROUP, life_of(token), {q: ">"}, count=1)
-      [rows] = await p.execute()
-      return parse_cmd(run, *rows[0][1][0]) if rows else None
-
-    return await self.transact(op, k, raw=True)
+    row = self.runs.get(run)
+    if not row or row["owner"] != token:
+      raise RuntimeError(f"lost ownership of {run}")
+    if not (queue := self.queues.get(run)):
+      return None
+    eid = next(iter(queue))
+    cmd = queue.pop(eid)
+    self.in_flight[run][eid] = Claim(cmd, life_of(token), time.monotonic(), 1)
+    return cmd
 
   async def begin_checkpoint(self, run: str, token: str) -> str:
-    """Protect this write from collection until this owner publishes it, fails it, or loses its lease."""
-    k, version = key("run", run), uuid.uuid4().hex
-
-    async def op(p):
-      if await p.hget(k, "owner") != token:
-        raise RuntimeError(f"lost ownership of {run}")
-      p.multi()
-      p.hset(key("writing"), run, version)
-      await p.execute()
-      return version
-
-    return await self.transact(op, k)
+    row = self.runs.get(run)
+    if not row or row["owner"] != token:
+      raise RuntimeError(f"lost ownership of {run}")
+    row["writing"] = version = uuid.uuid4().hex
+    with self.db:
+      self.runs.save(run)
+    return version
 
   async def detach_run(
     self, run_id: str, token: str, pos: str | None, snap: str | None, checkpoint: dict | None = None
   ) -> bool:
-    """Release `run_id` and record its exact snapshot `snap` iff `token` still owns it at `pos`."""
-    k = key("run", run_id)
-
-    async def op(p):
-      if await p.hmget(k, "owner", "pos") != [token, pos]:
-        return False
-      p.multi()
+    row = self.runs.get(run_id)
+    if not row or row["owner"] != token or row["pos"] != pos:
+      return False
+    row["owner"] = row["writing"] = None
+    row["snap"] = snap
+    with self.db:
       if checkpoint:
-        queue_checkpoint(p, **checkpoint)
-      p.hdel(k, "owner")
-      p.hdel(key("writing"), run_id)
-      p.hset(k, "snap", snap) if snap else p.hdel(k, "snap")
-      wake(p)
-      return bool(await p.execute())
-
-    return bool(await self.transact(op, k))
+        ckpt = make_checkpoint(**checkpoint)
+        self.checkpoints[ckpt["tinker_path"]] = ckpt
+      self.runs.save(run_id)
+    self.wake()
+    return True
 
   async def commit_reply(
     self, cmd: Cmd, reply: Reply, token: str, acct="", mutates=False, charge=None, checkpoint=None
   ) -> bool:
-    """Atomically publish a trainer reply, bill `gpu_ms`, and advance `pos` (clearing `snap`) iff `token` owns it."""
-    k, ck, deleting = key("run", cmd.run), key("ckpt", cmd.run), cmd.op == Op.DELETE_MODEL and reply.ok
-
-    async def op(p):
-      owner, old_snap = await p.hmget(k, "owner", "snap")
-      if owner != token.encode() or not await p.xrange(key("q", cmd.run), cmd.entry_id, cmd.entry_id):
-        return False
-      records = map(json.loads, await p.hvals(ck)) if deleting else ()
-      p.multi()
-      p.hdel(key("writing"), cmd.run)
+    row = self.runs.get(cmd.run)
+    if not row or row["owner"] != token:
+      return False
+    if (
+      self.in_flight.get(cmd.run, {}).pop(cmd.entry_id, None) is None
+      and self.queues.get(cmd.run, {}).pop(cmd.entry_id, None) is None
+    ):
+      return False
+    deleting = cmd.op == Op.DELETE_MODEL and reply.ok
+    row["writing"] = None
+    for name, delta in charge_counts(cmd, reply, charge).items():
+      row["counters"][name] += delta
+    gpu_ms = charge.gpu_ms if acct and charge and charge.gpu_ms else 0.0
+    if gpu_ms:
+      self.service[acct] = self.service.get(acct, 0.0) + gpu_ms
+    with self.db:
       if checkpoint and reply.ok:
-        queue_checkpoint(p, **checkpoint)
-      finish_cmd(p, cmd, reply, acct, charge)
+        ckpt = make_checkpoint(**checkpoint)
+        self.checkpoints[ckpt["tinker_path"]] = ckpt
       if mutates and not deleting:
-        p.hset(k, "pos", cmd.entry_id)
-        p.hdel(k, "snap")
-        if old_snap:
-          queue_unregister(p, unpack_snap(old_snap.decode())[0])
+        row["pos"] = cmd.entry_id
+        if row["snap"]:
+          self.checkpoints.pop(unpack_snap(row["snap"])[0], None)
+          row["snap"] = None
       elif deleting:
-        queue_unregister(p, *(r["tinker_path"] for r in records if r["owned"]))
-        queue_delete(p, cmd.run)
-      return bool(await p.execute())
-
-    return bool(await self.transact(op, k, key("f", cmd.request_id), *([ck] if deleting else []), raw=True))
+        row["live"] = False
+        row["owner"] = row["snap"] = None
+        for uri in [u for u, c in self.checkpoints.items() if parse_uri(u)[0] == cmd.run and c["owned"]]:
+          del self.checkpoints[uri]
+      self.runs.save(cmd.run)
+      if gpu_ms:
+        self.meta["service"] = self.service
+    self.replies[cmd.request_id] = (reply, time.time() + REPLY_TTL, 0)
+    if deleting:
+      self.queues.pop(cmd.run, None)
+      self.in_flight.pop(cmd.run, None)
+      self.record_event(Ev.RUN_DELETED, {"run": cmd.run})
+    self.notify(f"reply:{cmd.request_id}")
+    self.wake()
+    return True
 
   async def fail_stranded_commands(self, run_id: str, token: str) -> None:
-    """Fail the command left claimed by a dead trainer incarnation before serving new ones."""
-    start = "-"
-    while rows := await self.pending(run_id, start, count=1):
-      eid = rows[0]["message_id"]
-      start = f"({eid}"
-      if entry := await self.r.xrange(key("q", run_id), eid, eid):
-        cmd = parse_cmd(run_id, *entry[0])
-        err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {cmd.op}"))
-        if not await self.commit_reply(cmd, err, token):
-          return
+    for eid in sorted(self.in_flight.get(run_id, {}), key=entry_sort_key):
+      cmd = self.in_flight[run_id][eid].cmd
+      err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {cmd.op}"))
+      if not await self.commit_reply(cmd, err, token):
+        return
 
-  async def pending(self, run: str, start: str = "-", count: int = 1000) -> list[dict]:
-    try:
-      return await self.s.xpending_range(key("q", run), GROUP, start, "+", count=count)
-    except redis.ResponseError as e:
-      if is_missing_stream(e):
-        return []
-      raise
+  # ***** stateless sampler queues *****
 
-  # ***** stateless sampler consumer groups *****
+  def abandoned(self, run_id: str, now: float) -> list[str]:
+    claims = self.in_flight.get(run_id) or {}
+    return sorted((eid for eid, c in claims.items() if self.leases.get(c.consumer, 0.0) <= now), key=entry_sort_key)
 
-  async def abandoned(self, run: str) -> list[str]:
-    """Pending sample IDs whose consumer holds no lease, oldest first (live slow replicas are never touched)."""
-    rows = await self.pending(run)
-    if not rows:
-      return []
-    holders, p = sorted({row["consumer"] for row in rows}), self.s.pipeline(transaction=False)
-    for holder in holders:
-      p.exists(key("lease", holder))
-    dead = {holder for holder, live in zip(holders, await p.execute()) if not live}
-    return [row["message_id"] for row in rows if row["consumer"] in dead]
+  def sample_heads(self, runs: list[str]) -> list[Cmd]:
+    now, out = time.monotonic(), []
+    for r in runs:
+      if dead := self.abandoned(r, now):
+        out.append(Cmd(r, dead[0], Op.SAMPLE, b""))
+      elif q := self.queues.get(r):
+        c = next(iter(q.values()))
+        out.append(Cmd(r, c.entry_id, c.op, b"", c.cost))
+    return sorted(out, key=lambda c: (*entry_sort_key(c.entry_id), c.run))
 
   async def peek_sampler(self, runs: list[str], block_ms: int = 0) -> list[Cmd]:
-    """Peek one unclaimed or dead-replica-abandoned body-free head per sampler stream."""
-    p = self.s.pipeline(transaction=False)
-    for r in runs:
-      p.xinfo_groups(key("q", r))
-    cursors, pending = {}, []
-    for r, groups in zip(runs, await p.execute(raise_on_error=False)):
-      if isinstance(groups, Exception):
-        if not is_missing_stream(groups):
-          raise groups
-      elif g := next((g for g in groups if g["name"] == GROUP), None):
-        cursors[key("q", r)] = g["last-delivered-id"]
-        if g["pending"]:
-          pending.append(r)
-    if not cursors:
-      return await asyncio.sleep(block_ms / 1000) or []
-    cmds = [
-      Cmd(r, ids[0], Op.SAMPLE, b"")
-      for r, ids in zip(pending, await asyncio.gather(*(self.abandoned(r) for r in pending)))
-      if ids
-    ]
-    for cmd in cmds:
-      del cursors[key("q", cmd.run)]
-    if cursors:
-      cmds.extend(parse_heads(await self.r.xread(cursors, count=1, block=None if cmds else block_ms or None)))
-    return sorted(cmds, key=lambda c: (*map(int, c.entry_id.split("-")), c.run))
+    return await self.peek([r for r in runs if r in self.queues and self.is_sampler(r)], self.sample_heads, block_ms)
 
   async def take_commands(self, runs: list[str], consumer: str, count: int = 16) -> list[Cmd]:
-    """Claim up to `count` samples per session: dead-replica abandoned entries first, then fresh entries."""
-    cmds, rem = [], dict.fromkeys(runs, count)
+    now, taken = time.monotonic(), []
     for r in runs:
-      if ids := (await self.abandoned(r))[:count]:
-        # Idle for a second so two live replicas reclaiming at once don't take the same entries from each other.
-        try:
-          got = await self.r.xclaim(key("q", r), GROUP, consumer, 1000, ids)
-        except redis.ResponseError as e:
-          if is_missing_stream(e):
-            continue
-          raise
-        taken = [parse_cmd(r, eid, fields) for eid, fields in got if fields]
-        cmds.extend(taken)
-        rem[r] -= len(taken)
-    if not (fresh := [r for r in runs if rem[r] > 0]):
-      return cmds
-    p = self.r.pipeline(transaction=False)
-    for r in fresh:
-      p.xreadgroup(GROUP, consumer, {key("q", r): ">"}, count=rem[r])
-    for r, got in zip(fresh, await p.execute(raise_on_error=False)):
-      if isinstance(got, Exception):
-        if not is_missing_stream(got):
-          raise got
-      else:
-        cmds.extend(parse_cmd(r, eid, fields) for _, entries in got for eid, fields in entries)
-    return cmds
+      if r not in self.queues or not self.is_sampler(r):
+        continue
+      rem, claims, q = count, self.in_flight[r], self.queues[r]
+      for eid in self.abandoned(r, now)[:rem]:
+        c = claims[eid]
+        if now - c.claimed_at < 1.0:
+          continue
+        c.consumer, c.claimed_at, c.deliveries = consumer, now, c.deliveries + 1
+        taken.append(c.cmd)
+        rem -= 1
+      while rem > 0 and q:
+        eid = next(iter(q))
+        cmd = q.pop(eid)
+        claims[eid] = Claim(cmd, consumer, now, 1)
+        taken.append(cmd)
+        rem -= 1
+    return taken
 
   async def commit_sample(self, cmd: Cmd, reply: Reply, account="", charge: Charge | None = None) -> bool:
-    """The winning replica removes the queue entry. A late duplicate stays fenced after the reply expires."""
-    fk = key("f", cmd.request_id)
-
-    async def op(p):
-      if not await p.xrange(key("q", cmd.run), cmd.entry_id, cmd.entry_id):
-        return False
-      p.multi()
-      finish_cmd(p, cmd, reply, account, charge)
-      return bool(await p.execute())
-
-    return bool(await self.transact(op, fk, raw=True))
+    claims = self.in_flight.get(cmd.run)
+    if not claims or claims.pop(cmd.entry_id, None) is None:
+      return False
+    self.sample_bytes -= len(cmd.body)
+    size = len(reply.body)
+    self.replies[cmd.request_id] = (reply, time.time() + REPLY_TTL, size)
+    self.replies.move_to_end(cmd.request_id)
+    self.reply_bytes += size
+    while self.reply_bytes > SAMPLE_REPLY_BYTES and len(self.replies) > 1:
+      for req_id, (_, _, sz) in list(self.replies.items()):
+        if sz:
+          self.reply_bytes -= self.replies.pop(req_id)[2]
+          break
+      else:
+        break
+    if row := self.runs.get(cmd.run):
+      for name, delta in charge_counts(cmd, reply, charge).items():
+        row["counters"][name] += delta
+      self.dirty_runs.add(cmd.run)
+    if account and charge and charge.gpu_ms:
+      self.service[account] = self.service.get(account, 0.0) + charge.gpu_ms
+      self.service_dirty = True
+    self.notify(f"reply:{cmd.request_id}")
+    self.wake()
+    return True
 
   # ***** checkpoints *****
 
-  async def _checkpoint_rows(self, *uris: str) -> dict[str, dict]:
-    p = self.s.pipeline(transaction=False)
-    for uri in uris:
-      p.hget(*checkpoint_field(uri))
-    return {uri: json.loads(raw) for uri, raw in zip(uris, await p.execute()) if raw}
-
   async def get_checkpoint(self, uri: str) -> dict | None:
-    return (await self._checkpoint_rows(uri)).get(uri)
+    parse_uri(uri)
+    return dict(c) if (c := self.checkpoints.get(uri)) else None
 
   async def checkpoint_version(self, uri: str) -> str:
     if version := (await self.get_checkpoint(uri) or {}).get("version"):
@@ -541,85 +605,108 @@ class Bus:
     raise ValueError(f"no checkpoint at {uri}")
 
   async def checkpoint_versions(self, uris: list[str]) -> dict[str, str | Exception]:
-    rows = await self._checkpoint_rows(*uris)
-    return {u: rows.get(u, {}).get("version") or ValueError(f"no checkpoint at {u}") for u in uris}
+    result: dict[str, str | Exception] = {}
+    for uri in uris:
+      try:
+        parse_uri(uri)
+        ckpt = self.checkpoints.get(uri)
+        result[uri] = ckpt["version"] if ckpt else ValueError(f"no checkpoint at {uri}")
+      except ValueError as err:
+        result[uri] = err
+    return result
 
   async def checkpoints_of_run(self, run: str) -> list[dict]:
-    rows = map(json.loads, await self.s.hvals(key("ckpt", run)))
-    return sorted((c for c in rows if c["checkpoint_type"] != "parked"), key=lambda c: c["time"])
+    items = [
+      dict(c) for u, c in self.checkpoints.items() if parse_uri(u)[0] == run and c["checkpoint_type"] != "parked"
+    ]
+    return sorted(items, key=lambda c: c["time"])
 
   async def page_of_checkpoints(self, limit: int, offset: int) -> tuple[list[dict], int]:
-    ck = key("ckpts")
-    uris = await self.s.zrevrange(ck, offset, offset + limit - 1) if limit > 0 else []
-    return list((await self._checkpoint_rows(*uris)).values()), await self.s.zcard(ck)
+    visible = sorted(
+      (dict(c) for c in self.checkpoints.values() if c["checkpoint_type"] != "parked"),
+      key=lambda c: c["time"],
+      reverse=True,
+    )
+    return (visible[offset : offset + limit] if limit > 0 else []), len(visible)
 
   async def set_checkpoint_ttl(self, uri: str, ttl: int | None) -> bool:
-    ck, cid = checkpoint_field(uri)
-
-    async def update(p):
-      if not (raw := await p.hget(ck, cid)):
-        return False
-      expires = time.time() + ttl if ttl else None
-      p.multi()
-      p.hset(ck, cid, json.dumps(json.loads(raw) | {"expires_at": expires}))
-      queue_expiry(p, uri, expires)
-      return bool(await p.execute())
-
-    return await self.transact(update, ck)
+    parse_uri(uri)
+    if (ckpt := self.checkpoints.get(uri)) is None:
+      return False
+    ckpt["expires_at"] = time.time() + ttl if ttl else None
+    with self.db:
+      self.checkpoints.save(uri)
+    return True
 
   async def unregister_checkpoints(self, *uris: str) -> int:
-    p = self.s.pipeline()
-    queue_unregister(p, *uris)
-    return sum((await p.execute())[::3])
+    for uri in uris:
+      parse_uri(uri)
+    with self.db:
+      return sum(self.checkpoints.pop(uri, None) is not None for uri in uris)
 
   async def expire_checkpoints(self) -> int:
-    expiry, now = key("expiry"), time.time()
-    if not await self.s.zcount(expiry, "-inf", now):
-      return 0
+    now = time.time()
+    expired = [u for u, c in self.checkpoints.items() if c["expires_at"] is not None and c["expires_at"] <= now]
+    for k in [k for k, v in self.replies.items() if v[1] <= now]:
+      self.reply_bytes -= self.replies.pop(k)[2]
+    for k in [k for k, (_, exp) in self.seen.items() if exp <= now]:
+      del self.seen[k]
+    with self.db:
+      self.flush_dirty()
+      for u in expired:
+        del self.checkpoints[u]
+      for sid in [s for s, v in self.sessions.items() if not v["active"] and v["seen"] <= now - SESSION_TTL]:
+        del self.sessions[sid]
+    return len(expired)
 
-    async def expire(p):
-      due = await p.zrangebyscore(expiry, "-inf", now)
-      p.multi()
-      queue_unregister(p, *due)
-      return sum((await p.execute())[::3])
-
-    return await self.transact(expire, expiry)
+  async def live_versions(self) -> list[str]:
+    versions = {c["version"] for c in self.checkpoints.values() if c.get("version")}
+    versions.update(r["writing"] for r in self.runs.values() if r.get("writing"))
+    return sorted({v.partition("@")[0] for v in versions})
 
   async def sweep_checkpoints(self, store, grace: float) -> None:
-    """Read candidates, write intents, then published versions: an in-flight save spans the last two sets."""
     unused = await asyncio.to_thread(store.versions)
-    unused.difference_update(await self.s.hvals(key("writing")))
-    async for ck in self.s.scan_iter(match=key("ckpt", "*")):
-      for row in map(json.loads, await self.s.hvals(ck)):
-        unused.discard((row.get("version") or "").partition("@")[0])
+    unused.difference_update(await self.live_versions())
     await asyncio.to_thread(store.sweep, unused, grace)
 
-  # ***** nodes and events *****
+  # ***** nodes and events (RAM) *****
 
-  async def node_heartbeat(self, node: str, gpus: int, memory: int = 0, leases: tuple[str, ...] = (), **info) -> None:
-    body = json.dumps({"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, **info})
-    p = self.s.pipeline()
-    p.hset(key("nodes"), node, body)
+  async def node_heartbeat(
+    self, node: str, gpus: int, memory: int = 0, leases: tuple[str, ...] = (), ttl_ms: int | None = None, **info
+  ) -> list[str]:
+    self.nodes[node] = {"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, **info}
+    now, ttl, lost = time.monotonic(), (LEASE_MS if ttl_ms is None else ttl_ms) / 1000, []
     for life in leases:
-      p.set(key("lease", life), 1, px=LEASE_MS, xx=True)
-    await p.execute()
+      if self.leases.get(life, 0.0) > now:
+        self.leases[life] = now + ttl
+      else:
+        self.leases.pop(life, None)
+        lost.append(life)
+    return lost
 
   async def live_nodes(self, details: bool = False) -> dict:
-    nodes = {k: json.loads(v) for k, v in (await self.s.hgetall(key("nodes"))).items()}
-    if dead := [k for k, v in nodes.items() if v["until"] < time.time()]:
-      await self.s.hdel(key("nodes"), *dead)
-    return {k: v if details else v["gpus"] for k, v in nodes.items() if k not in dead}
+    now = time.time()
+    self.nodes = {k: v for k, v in self.nodes.items() if v["until"] >= now}
+    return {k: dict(v) if details else v["gpus"] for k, v in self.nodes.items()}
 
   async def append_event(self, _kind: Ev, **body) -> str:
-    p = self.s.pipeline()
-    queue_event(p, _kind, body)
-    wake(p)
-    return (await p.execute())[0]
+    ev = self.record_event(_kind, body)
+    self.wake()
+    return ev.id
 
   async def wait_wake(self, wake_id: str, block_ms: int, stream: str = "wake") -> str:
-    got = await self.s.xread({key(stream): wake_id}, count=1, block=block_ms or None)
-    return got[0][1][-1][0] if got else wake_id
+    if wake_id != "$" and self.wake_seq[stream] > int(wake_id):
+      return str(self.wake_seq[stream])
+    if block_ms > 0:
+      with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(self.waiters.setdefault(f"wake:{stream}", asyncio.Event()).wait(), block_ms / 1000)
+    return str(self.wake_seq[stream])
 
   async def read_events(self, after: str = "0-0", count: int = 10_000) -> list[Event]:
-    rows = got[0][1] if (got := await self.s.xread({key("events"): after}, count=count)) else ()
-    return [Event(eid, int(eid.split("-")[0]) / 1000, f["kind"], json.loads(f["body"])) for eid, f in rows]
+    cutoff = entry_sort_key(after)
+    return [ev for ev in self.events if entry_sort_key(ev.id) > cutoff][:count]
+
+
+def connect(target: str | None = None) -> Bus | RemoteBus:
+  url = target if target is not None else os.getenv("CONTROL_URL", "")
+  return RemoteBus(url) if url.startswith(("http://", "https://")) else Bus(target)

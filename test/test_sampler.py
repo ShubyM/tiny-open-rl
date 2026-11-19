@@ -7,10 +7,10 @@ from unittest import mock
 import httpx
 
 from test.execution import TestNode
-from test.helpers import FakeEngine, RedisTest, tiny
+from test.helpers import BusTest, FakeEngine, tiny
 from tinyrl.api import wire
 from tinyrl.api.gateway import app
-from tinyrl.bus import Op, Role, Run, key
+from tinyrl.bus import Op, Role, Run
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 from tinyrl.workers.sampler import Out, Seq, encode
@@ -31,7 +31,7 @@ JOB = {
 }
 
 
-class TestSampler(RedisTest):
+class TestSampler(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.nodes, self.tasks = [], []
@@ -50,19 +50,13 @@ class TestSampler(RedisTest):
     return node
 
   def pump(self, node, sched=False):
-    from tinyrl.bus import Bus, connect
-
     async def run():
-      wbus = Bus(connect(self.url))
-      wid = "0-0"
-      try:
-        while True:
-          if sched:
-            await scheduler.tick(self.bus)
-          await node.tick()
-          wid = await wbus.wait_wake(wid, 10)
-      finally:
-        await wbus.aclose()
+      wid = "0"
+      while True:
+        if sched:
+          await scheduler.tick(self.bus)
+        await node.tick()
+        wid = await self.bus.wait_wake(wid, 10)
 
     self.tasks.append(asyncio.create_task(run()))
 
@@ -202,7 +196,7 @@ class TestSampler(RedisTest):
       self.assertIsInstance(error, RuntimeError)
       self.assertIsNone(sampler.running)
       self.assertNotIn(lf.life, node.on)
-      self.assertFalse(await self.bus.r.exists(key("lease", lf.life)))
+      self.assertNotIn(lf.life, self.bus.leases)
       self.assertIsNone(await self.bus.wait_for_reply(future, 0))
       self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
     finally:
@@ -330,7 +324,20 @@ class TestSampler(RedisTest):
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
     self.assertGreater(queued[0], 0, "ready work waited for the whole invalid backlog")
     self.assertFalse((await self.bus.wait_for_reply(requests[-1], 5)).ok)
-    self.assertEqual(int(await self.bus.r.hget(key("run", "broken"), "failed")), len(requests))
+    self.assertEqual((await self.bus.get_run("broken"))["failed"], len(requests))
+
+  async def test_sampler_collect_polls_missing_runs_even_when_sibling_head_is_cached(self):
+    await self.bus.create_run(Run("high", "base", 4, role=Role.SAMPLER, account="alice"))
+    await self.bus.create_run(Run("low", "base", 4, role=Role.SAMPLER, account="bob"))
+    self.bus.service["bob"] = 1000.0
+    node = self.node(gpus=1)
+    lf = await node.bind("sampler", "high", "low")
+    # Seed a cached head for `low` and then enqueue work for `high` (which has higher priority).
+    req_low = await self.bus.submit_command("low", Op.SAMPLE, json.dumps(JOB).encode())
+    req_high = await self.bus.submit_command("high", Op.SAMPLE, json.dumps(JOB).encode())
+    self.assertTrue((await self.bus.wait_for_reply(req_high, 5)).ok)
+    self.assertTrue((await self.bus.wait_for_reply(req_low, 5)).ok)
+    self.assertEqual(lf.reader_args()[1], ["high", "low"])
 
 
 if __name__ == "__main__":

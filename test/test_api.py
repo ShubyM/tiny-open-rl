@@ -13,7 +13,7 @@ import safetensors.torch
 import torch
 
 from test.execution import TestNode
-from test.helpers import RedisTest, tiny
+from test.helpers import BusTest, tiny
 from test.test_wire import json_body
 from tinyrl import bus
 from tinyrl.api import gateway, wire
@@ -38,7 +38,7 @@ def proto_body(model_id: str, n: int = 12, loss_fn: str = "cross_entropy") -> by
   return req.SerializeToString()
 
 
-class TestAPI(RedisTest):
+class TestAPI(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.store = Store(root=tempfile.mkdtemp())
@@ -248,13 +248,17 @@ class TestAPI(RedisTest):
     self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 
-    stale = {session_id: time.time() - bus.SESSION_GRACE - 1}
-    await self.bus.r.zadd(bus.key("seen"), stale)
+    stale = time.time() - bus.SESSION_GRACE - 1
+    with self.bus.db:
+      self.bus.sessions[session_id]["seen"] = stale
+      self.bus.sessions.save(session_id)
     await self.post("session_heartbeat", json={"session_id": session_id})  # a heartbeat in time keeps it
     await asyncio.sleep(0.3)
     self.assertTrue((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
 
-    await self.bus.r.zadd(bus.key("seen"), stale)  # its last heartbeat, longer ago than the grace
+    with self.bus.db:
+      self.bus.sessions[session_id]["seen"] = stale  # longer ago than the grace
+      self.bus.sessions.save(session_id)
     await self.scheduling_until(lambda d: samp_id not in d["state"]["jobs"])
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
@@ -468,6 +472,28 @@ class TestAPI(RedisTest):
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)
     await self.scheduling_until(lambda d: sampler not in d["state"]["procs"])
+
+  async def test_lost_sampling_promise_returns_410_and_backpressure_returns_429(self):
+    from unittest.mock import patch
+
+    cfg = await self.post("client/config", json={})
+    self.assertEqual(cfg.json(), {"parallel_fwdbwd_chunks": False})
+    gone = await self.post("retrieve_future", json={"request_id": "samp-missing/1-1"})
+    self.assertEqual(gone.status_code, 410)
+
+    session = await self.post("create_sampling_session", json={"base_model": "tiny"})
+    sid = session.json()["sampling_session_id"]
+    with patch("tinyrl.bus.SAMPLE_QUEUE_BYTES", 8):
+      res = await self.post(
+        "asample",
+        json={
+          "sampling_session_id": sid,
+          "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+          "sampling_params": {"max_tokens": 2},
+          "num_samples": 1,
+        },
+      )
+    self.assertEqual(res.status_code, 429)
 
 
 if __name__ == "__main__":

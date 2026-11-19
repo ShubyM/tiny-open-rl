@@ -19,7 +19,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 
-from tinyrl.bus import LEASE_MS, Bus
+from tinyrl.bus import LEASE_MS, Bus, RemoteBus
 from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge, Wave
 from tinyrl.control.fairness import Demand, Worker, blocks, plan_gpus, select_runs
@@ -85,12 +85,15 @@ class NodeDaemon:
   async def push_heartbeat(self) -> None:
     on = {life.split("@", 1)[0]: list(gs) for life, gs in self.on.items()}
     pids = {p: m.proc.pid for p, lf in self.lives.items() if (m := lf.model) and m.proc and m.proc.pid is not None}
-    leases = tuple(lf.life for lf in self.lives.values() if not lf.closing)
+    leases = tuple(lf.life for lf in self.lives.values() if not lf.closing and not (lf.task and lf.task.cancelling()))
     before = time.monotonic()
-    await self.bus.node_heartbeat(
-      self.id, self.gpus, self.gpu_mib * 2**20, leases=leases, on=on, pids=pids, lag=self.lag
+    lost = await self.bus.node_heartbeat(
+      self.id, self.gpus, self.gpu_mib * 2**20, leases=leases, ttl_ms=LEASE_MS, on=on, pids=pids, lag=self.lag
     )
     self.heartbeat = before
+    for lf in list(self.lives.values()):
+      if lf.life in lost and not lf.closing and lf.task and not lf.task.cancelling():
+        lf.task.cancel()
 
   async def tick(self) -> None:
     if not self.draining and time.monotonic() - self.heartbeat >= LEASE_MS / 1000:
@@ -157,7 +160,9 @@ class NodeDaemon:
     while pending and time.monotonic() < deadline:
       _, pending = await asyncio.wait(pending, timeout=min(LEASE_MS / 4000, deadline - time.monotonic()))
       with contextlib.suppress(Exception):
-        await self.bus.touch_leases(*(lf.life for lf in self.lives.values() if not lf.closing), xx=True)
+        await self.bus.touch_leases(
+          *(lf.life for lf in self.lives.values() if not lf.closing), xx=True, ttl_ms=LEASE_MS
+        )
     await stop_tasks(*pending)
     self.dispatch()
     await asyncio.to_thread(self.store.close)
@@ -239,7 +244,7 @@ class Lifetime:
     try:
       if self.node.draining:
         return
-      opening = asyncio.create_task(self.bus.touch_leases(self.life))
+      opening = asyncio.create_task(self.bus.touch_leases(self.life, ttl_ms=LEASE_MS))
       try:
         await asyncio.shield(opening)
       except BaseException:
@@ -505,7 +510,9 @@ class SamplerLife(Lifetime):
     return self.node.open_sampler(self.proc, self.spec, env)
 
   def reader_args(self):
-    return self.bus.peek_sampler, sorted(self.streams()), IDLE_MS / 1000 if self.heads else 0
+    live = sorted(self.streams())
+    missing = [r for r in live if r not in self.heads]
+    return self.bus.peek_sampler, missing or live, IDLE_MS / 1000 if not missing and self.heads else 0
 
   def turn(self, ready: list[Cmd]) -> tuple[Demand, float | None]:
     return (Demand.READY if ready or self.model.warm_pending else Demand.IDLE), None
@@ -534,10 +541,11 @@ class SamplerLife(Lifetime):
     live, jobs = sorted(self.streams()), self.node.state.jobs
     live_set = set(live)
     self.heads = {r: c for r, c in self.heads.items() if r in live_set}
-    if (cmds := await self.poll_reader(self.bus.peek_sampler, live, not self.heads)) is None:
+    missing = [r for r in live if r not in self.heads]
+    if (cmds := await self.poll_reader(self.bus.peek_sampler, missing or live, bool(missing))) is None:
       return
-    self.heads = {c.run: c for c in cmds if c.run in live_set}
-    paths = {r: jobs[r].record.get("model_path") for r in self.heads}
+    self.heads = (self.heads if missing else {}) | {c.run: c for c in cmds if c.run in live_set}
+    paths = {r: jobs[r].record.get("model_path") or None for r in self.heads}
     versions = await self.bus.checkpoint_versions(sorted(set(paths.values()) - {None}))
     wanted = {v for v in versions.values() if isinstance(v, str)}
     self.staged = {v: t for v, t in self.staged.items() if v in wanted or not t.done()}
@@ -548,7 +556,9 @@ class SamplerLife(Lifetime):
     for r, path in paths.items():
       version = versions.get(path)
       self.inputs[r] = self.staged.get(version, version)
-    self.service = {r: self.service.get(r, self.service_floor) for r in self.heads}
+    self.service = {r: v for r, v in self.service.items() if r in live_set}
+    for r in self.heads:
+      self.service.setdefault(r, self.service_floor)
 
   async def dispatch(self, candidates: list[Cmd], failed: bool = False) -> bool:
     runs = self.choose_runs(candidates, SAMPLE_RUNS if self.spec.lora else 1)
@@ -599,7 +609,11 @@ if __name__ == "__main__":
 
   async def main():
     asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
-    with contextlib.suppress(asyncio.CancelledError):
-      await NodeDaemon(Bus()).serve()
+    bus = RemoteBus()
+    try:
+      with contextlib.suppress(asyncio.CancelledError):
+        await NodeDaemon(bus).serve()
+    finally:
+      await bus.aclose()
 
   asyncio.run(main())

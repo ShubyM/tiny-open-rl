@@ -27,11 +27,11 @@ from unittest import mock
 import torch
 
 from test.execution import InlineProcess, TestNode
-from test.helpers import FakeEngine, RedisTest, new_id, tiny
+from test.helpers import BusTest, FakeEngine, new_id, tiny
 from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
-from tinyrl.bus import Bus, Op, Role, Run, connect, key
+from tinyrl.bus import Op, RemoteBus, Role, Run, serve_bus
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import Model
@@ -48,14 +48,24 @@ if (
   torch.set_num_threads(int(os.getenv("THREADS", "1")))
 
 
-class Unreachable:
-  """A Redis that a node can no longer reach."""
+class CuttableBus:
+  """Wraps a Bus/RemoteBus so chaos can sever a node from the control plane immediately."""
+
+  def __init__(self, inner):
+    self.inner = inner
+    self.cut = False
 
   def __getattr__(self, name):
-    def call(*args, **kwargs):
-      raise ConnectionError(f"redis is unreachable ({name})")
+    if self.cut:
 
-    return call
+      async def fail(*args, **kwargs):
+        raise ConnectionError(f"control plane is unreachable ({name})")
+
+      return fail
+    return getattr(self.inner, name)
+
+  async def aclose(self) -> None:
+    await self.inner.aclose()
 
 
 class Occupancy:
@@ -146,9 +156,10 @@ class StressNode(TestNode):
     super().dispatch()
 
 
-class Stress(RedisTest):
+class Stress(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
+    self.runner, self.url = await serve_bus(self.bus, host="127.0.0.1", port=0)
     self.rng = random.Random(SEED)
     self.bucket = f"file://{tempfile.mkdtemp()}"
     self.nodes: dict[str, StressNode] = {}
@@ -167,6 +178,7 @@ class Stress(RedisTest):
       await node.bus.aclose()
     for node in self.cut:
       await asyncio.to_thread(node.store.close)
+    await self.runner.cleanup()
     await super().asyncTearDown()
 
   # ***** the cluster *****
@@ -176,7 +188,7 @@ class Stress(RedisTest):
     name = f"node-{self.made}"
     store = Store(self.bucket, cache=tempfile.mkdtemp())
     delay = lambda: self.rng.uniform(0.004, 0.02)  # noqa: E731
-    node = StressNode(Bus(connect(self.url)), store, gpus, name, self.violations, self.errors, delay)
+    node = StressNode(CuttableBus(RemoteBus(self.url)), store, gpus, name, self.violations, self.errors, delay)
     self.nodes[name] = node
     await node.announce_node()
 
@@ -194,28 +206,25 @@ class Stress(RedisTest):
     await node.close(graceful=graceful)
     if task := node.sweeping:
       task.cancel()
-    await self.bus.r.hdel(key("nodes"), name)
+    self.bus.nodes.pop(name, None)
     await node.bus.aclose()
 
   async def cut_node(self, name: str) -> None:
-    """The node loses Redis for good, mid-work: none of its replies, releases or lease drops arrive. Its leases and
-    heartbeat run out by themselves. Its store goes on uploading, so the saves it acknowledged are not lost."""
+    """The node loses the control plane for good, mid-work: none of its replies, releases or lease drops arrive. Its
+    leases and heartbeat run out by themselves. Its store goes on uploading, so the saves it acknowledged are not lost."""
     node = self.nodes.pop(name)
     self.loops.pop(name).cancel()
+    node.bus.cut = True
     await node.bus.aclose()
-    node.bus.r = node.bus.s = Unreachable()
     for task in node.tasks.values():
       task.cancel()
     await asyncio.gather(*node.tasks.values(), return_exceptions=True)
     self.cut.append(node)
 
   def start_scheduler(self) -> None:
-    bus = Bus(connect(self.url))
-    self.addAsyncCleanup(bus.aclose)
-
     async def loop():
       while True:
-        await scheduler.tick(bus)
+        await scheduler.tick(self.bus)
         await asyncio.sleep(0.01)
 
     self.loops["scheduler"] = asyncio.create_task(loop())
@@ -274,9 +283,7 @@ class Stress(RedisTest):
   async def dump(self, run: str, request: str) -> None:
     """Where a command that got no reply is stuck."""
     raw = await self.bus.read_state()
-    row = {
-      k.decode(): v.decode()[:80] for k, v in (await self.bus.r.hgetall(key("run", run))).items() if k != b"record"
-    }
+    row = {k: str(v)[:80] for k, v in (self.bus.runs.get(run) or {}).items() if k != "record"}
     plan, out = raw["plan"], [f"--- {request} at {time.monotonic() - self.started:.1f}s", f"row {row}"]
     out.append(f"queue {await self.bus.queued_and_in_flight(run)}")
     out.append(
@@ -449,7 +456,7 @@ class Stress(RedisTest):
 
     # Delete everything, then nothing may be left behind.
     for run in trainers:
-      if await self.bus.r.sismember(key("runs"), run):
+      if (self.bus.runs.get(run) or {}).get("live"):
         await self.call(run, Op.DELETE_MODEL, b"{}")
     for session in samplers:
       await self.bus.delete_run(session)
@@ -465,14 +472,16 @@ class Stress(RedisTest):
       self.problems.append(
         f"did not settle after deleting every run: procs {sorted(plan.get('procs', {}))} lives {lives}"
       )
-    # A node cut off from Redis cannot drop its leases. They must carry an expiry, and then they lapse by themselves.
-    cut, leases = {n.id for n in self.cut}, [k.decode() async for k in self.bus.r.scan_iter(match=key("lease", "*"))]
-    lapsing = [k for k in leases if k.split("@")[-1].rsplit("-", 1)[0] in cut and await self.bus.r.pttl(k) != -1]
+    # A node cut off from the control plane cannot drop its leases. They must carry an expiry and lapse by themselves.
+    now = time.monotonic()
+    cut = {n.id for n in self.cut}
+    leases = [k for k, exp in self.bus.leases.items() if exp > now]
+    lapsing = [k for k in leases if k.split("@")[-1].rsplit("-", 1)[0] in cut]
     left = {
       "leases": sorted(set(leases) - set(lapsing)),
-      "queues": [k.decode() async for k in self.bus.r.scan_iter(match=key("q", "*"))],
-      "writing": sorted(k.decode() for k in await self.bus.r.hkeys(key("writing"))),
-      "owners": [r for r in trainers if await self.bus.r.hget(key("run", r), "owner")],
+      "queues": sorted(self.bus.queues),
+      "writing": sorted(r for r, row in self.bus.runs.items() if row.get("writing")),
+      "owners": [r for r in trainers if (self.bus.runs.get(r) or {}).get("owner")],
       "on GPUs": {n.id: dict(n.occ.on) for n in self.nodes.values() if n.occ.on},
     }
     self.problems += [f"left behind {what}: {found}" for what, found in left.items() if found]

@@ -3,14 +3,12 @@ kind: Kustomization
 namespace: tinyrl
 resources:
 - namespace.yaml
-- redis.yaml
 - gateway.yaml
-- scheduler.yaml
 - node-daemon.yaml
 configMapGenerator:
 - name: tinyrl
   literals:
-  - REDIS_URL=redis://redis:6379
+  - CONTROL_URL=http://gateway:8001
   - CKPT=gs://open-rl-2-sandbox-102433-tinyrl/ckpt
   - CKPT_CACHE=/dev/shm/tinyrl-cache
 images:

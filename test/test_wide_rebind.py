@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 
 from test.execution import TestNode
-from test.helpers import RedisTest, new_id
+from test.helpers import BusTest, new_id
 from test.test_api import proto_body
 from tinyrl.bus import Op, Run
 from tinyrl.control.fairness import Demand, Worker, plan_gpus
@@ -21,7 +21,7 @@ class TestWideSelection(unittest.TestCase):
     self.assertEqual(plan_gpus(workers, 2, 1)[0], {"other": (0,)})
 
 
-class TestWideRebind(RedisTest):
+class TestWideRebind(BusTest):
   async def test_trainer_waits_on_its_original_block_when_no_other_block_fits(self):
     with tempfile.TemporaryDirectory() as folder:
       node = TestNode(self.bus, gpus=2, store=Store(root=folder))

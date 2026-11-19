@@ -8,12 +8,12 @@ from unittest.mock import patch
 
 import httpx
 
-from test.helpers import RedisTest
+from test.helpers import BusTest
 from tinyrl.api import gateway
 from tinyrl.control import estimator
 
 
-class TestGatewayDedupe(RedisTest):
+class TestGatewayDedupe(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app(self.bus)), base_url="http://tinyrl")
@@ -31,7 +31,7 @@ class TestGatewayDedupe(RedisTest):
     self.assertEqual(r2.status_code, 200)
     self.assertEqual(r1.json()["model_id"], r2.json()["model_id"])
 
-    runs = await self.bus.r.smembers("tinyrl:runs")
+    runs = (await self.bus.read_state())["runs"]
     self.assertEqual(len(runs), 1)
 
   async def test_b2_save_weights_for_sampler_dedupes(self):
@@ -47,8 +47,8 @@ class TestGatewayDedupe(RedisTest):
     self.assertEqual(s2.status_code, 200)
     self.assertEqual(s1.json()["request_id"], s2.json()["request_id"])
 
-    runs = await self.bus.r.smembers("tinyrl:runs")
-    samplers = [r for r in runs if r.decode().startswith("samp-")]
+    runs = (await self.bus.read_state())["runs"]
+    samplers = [r for r in runs if r.startswith("samp-")]
     self.assertEqual(len(samplers), 1)
 
   async def test_rejects_invalid_gpus(self):
@@ -73,7 +73,7 @@ class TestEstimator(unittest.TestCase):
     self.assertEqual(vllm_gpus, 1)
     self.assertGreater(vllm_bytes, 16_000_000_000)
 
-    check = "import sys, tinyrl.api.gateway, tinyrl.control.node_daemon; assert not ({'torch', 'transformers', 'peft', 'safetensors', 'huggingface_hub'} & sys.modules.keys())"
+    check = "import sys, tinyrl.api.gateway, tinyrl.control.node_daemon; assert not ({'torch', 'transformers', 'peft', 'safetensors', 'huggingface_hub', 'redis'} & sys.modules.keys())"
     res = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True)
     self.assertEqual(res.returncode, 0, res.stderr)
 

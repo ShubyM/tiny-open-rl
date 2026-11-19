@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import subprocess
 import sys
@@ -10,7 +9,7 @@ import uuid
 
 import torch
 
-from test.helpers import RedisTest, new_id
+from test.helpers import BusTest, new_id
 from tinyrl.bus import Op, Reply, Run
 from tinyrl.storage.store import SHARD_BYTES, Store
 
@@ -217,9 +216,9 @@ class TestStore(unittest.TestCase):
     self.assertTrue(os.path.isdir(f"{store.cache}/{pending}"))
 
 
-class TestRegistry(RedisTest):
+class TestRegistry(BusTest):
   async def test_preexisting_checkpoint_indexes_support_reads_and_expiry(self):
-    # Populate the persisted main schema directly, without using the writer under test.
+    # Populate the persisted checkpoint table directly, without using the writer under test.
     def record(cid, kind):
       return {
         "checkpoint_id": cid,
@@ -234,9 +233,9 @@ class TestRegistry(RedisTest):
 
     saved, parked = record("weights/saved", "training"), record("parked/host", "parked")
     uri = saved["tinker_path"]
-    for row in [saved, parked]:
-      await self.bus.s.hset("tinyrl:ckpt:r", row["checkpoint_id"], json.dumps(row))
-    await self.bus.s.zadd("tinyrl:ckpts", {uri: 1})
+    with self.bus.db:
+      for row in [saved, parked]:
+        self.bus.checkpoints[row["tinker_path"]] = row
     self.assertEqual(await self.bus.page_of_checkpoints(10, 0), ([saved], 1))
     self.assertEqual(await self.bus.checkpoints_of_run("r"), [saved])
     self.assertEqual(

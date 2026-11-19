@@ -11,12 +11,12 @@ from unittest import mock
 import torch
 
 from test.execution import InlineProcess, TestNode
-from test.helpers import FakeEngine, RedisTest, new_id, tiny
+from test.helpers import BusTest, FakeEngine, new_id, tiny
 from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
 from tinyrl.api import wire
-from tinyrl.bus import GROUP, LEASE_MS, Bus, Cmd, Ev, Op, Role, Run, connect, key
+from tinyrl.bus import Cmd, Ev, Op, Role, Run
 from tinyrl.control import scheduler
 from tinyrl.control.fairness import Demand, Worker, plan_gpus, select_runs, update_lag, waterfill
 from tinyrl.control.node_daemon import QUANTUM_MS, NodeDaemon
@@ -295,12 +295,22 @@ class TestCluster(unittest.TestCase):
 
   def test_a_backlogged_shared_sampler_gets_a_replica_per_batch_and_an_exclusive_one_does_not(self):
     c = Cluster()
-    for node in "abcd":
+    for node in "abcde":
       c.node(node, 1)
     c.run("t")
     c.run("x", role="sampler", train_run="t", exclusive=True, backlog=3 * SCALE_BATCH)
     c.run("s", role="sampler", backlog=3 * SCALE_BATCH)
     self.assertEqual((len(c.s.procs_of("x")), len(set(c.s.procs_of("s")))), (1, 3))
+
+  def test_unplaced_sampler_pool_does_not_scale_out_onto_busy_single_gpu_node(self):
+    spec = Spec(Role.SAMPLER, "tiny", lora=True, gpus=1)
+    state = State(
+      nodes={"n1": (1, 0)},
+      jobs={"s1": Job(spec, backlog=4 * SCALE_BATCH, account="alice")},
+    )
+    new, _ = step(state)
+    self.assertEqual(len(new.procs), 1)
+    self.assertEqual(next(iter(new.procs.values())).node, "n1")
 
   def test_scale_out_reuses_existing_placed_pool_before_spawning_more(self):
     c = Cluster()
@@ -834,7 +844,7 @@ class TestMultiNodeFairness(unittest.TestCase):
     self.assertTrue(4 <= moves <= 30, moves)
 
 
-class TestMultiNodeExecution(RedisTest):
+class TestMultiNodeExecution(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.bucket = f"file://{tempfile.mkdtemp()}"
@@ -847,12 +857,11 @@ class TestMultiNodeExecution(RedisTest):
     await asyncio.gather(*self.tasks, return_exceptions=True)
     for node in self.nodes:
       await node.aclose()
-      await node.bus.aclose()
     await super().asyncTearDown()
 
   async def add_node(self, name: str, gpus: int = 1, engine=FakeEngine) -> TestNode:
     store = Store(self.bucket, cache=tempfile.mkdtemp())
-    node = TestNode(Bus(connect(self.url)), store=store, gpus=gpus, node=name, engine=engine)
+    node = TestNode(self.bus, store=store, gpus=gpus, node=name, engine=engine)
     self.nodes.append(node)
     await node.announce_node()
 
@@ -865,12 +874,9 @@ class TestMultiNodeExecution(RedisTest):
     return node
 
   def start_scheduler(self) -> None:
-    bus = Bus(connect(self.url))
-    self.addAsyncCleanup(bus.aclose)
-
     async def loop():
       while True:
-        await scheduler.tick(bus)
+        await scheduler.tick(self.bus)
         await asyncio.sleep(0.01)
 
     self.tasks.append(asyncio.create_task(loop()))
@@ -914,11 +920,11 @@ class TestMultiNodeExecution(RedisTest):
     self.bus.write_plan = record
     await scheduler.tick(self.bus)  # the run gets a process, and the process a node
     await scheduler.tick(self.bus)  # nothing changed
-    await self.bus.r.hincrbyfloat(key("service"), "acct", 5.0)
+    self.bus.service["acct"] = self.bus.service.get("acct", 0.0) + 5.0
     await scheduler.tick(self.bus)  # only what the account has been served moved
     await self.bus.create_run(Run("r2", "tiny", 4, lora=LORA, account="acct"))
     await scheduler.tick(self.bus)  # a run joined the process: only `home` moved
-    await self.bus.r.hdel(key("nodes"), "n")
+    self.bus.nodes.pop("n", None)
     await self.bus.node_heartbeat("m", 1)
     await scheduler.tick(self.bus)  # the process changed node: only `procs` moved
     self.assertEqual(writes, [True, False, True, True])
@@ -1014,11 +1020,9 @@ class TestMultiNodeExecution(RedisTest):
       await self.bus.create_run(Run(run, "tiny", 4, lora=LORA, account=account))
       await self.run_cmd(run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode())
     with mock.patch.object(InlineProcess, "call", timed_call):
-      backlog = self.bus.r.pipeline()
       for run in accounts:
         for _ in range(100):
-          backlog.xadd(key("q", run), {"op": Op.OPTIM_STEP, "body": b'{"adam_params":{}}'})
-      await backlog.execute()
+          await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
       async with asyncio.timeout(30):
         while len(completed) < 80:
           await asyncio.sleep(0.005)
@@ -1106,7 +1110,7 @@ class TestMultiNodeExecution(RedisTest):
         self.assertEqual(len(wire.sample_json(reply.body)["sequences"]), 1)
 
     # Every command is counted and billed in `gpu_ms` once despite concurrent multi-node readers.
-    self.assertEqual(int(await self.bus.r.hget(key("run", sid), "tokens")), total_cmds * 50)
+    self.assertEqual((await self.bus.get_run(sid))["tokens"], total_cmds * 50)
     svc_before = (await self.bus.read_state())["service"]["team-s"]
     self.assertGreaterEqual(svc_before, total_cmds * 20.0)
 
@@ -1116,13 +1120,11 @@ class TestMultiNodeExecution(RedisTest):
     await self.until(scaled_in)
 
     # Deliver the final sample to a crashed replica before a live replica can see it.
-    queue = key("q", sid)
-    p = self.bus.r.pipeline()
-    p.xadd(queue, {"op": Op.SAMPLE, "body": payload, "cost": 50})
-    p.xreadgroup(GROUP, "dead", {queue: ">"}, count=1)
-    eid, _ = await p.execute()
-    await self.bus.r.xclaim(queue, GROUP, "dead", 0, [eid], idle=LEASE_MS)
-    self.assertTrue((await self.bus.wait_for_reply(f"{sid}/{eid.decode()}", 5)).ok)
+    req = await self.bus.submit_command(sid, Op.SAMPLE, payload, cost=50)
+    [taken] = await self.bus.take_commands([sid], "dead", 1)
+    self.bus.in_flight[sid][taken.entry_id].claimed_at = 0.0
+    self.bus.notify(f"run:{sid}")
+    self.assertTrue((await self.bus.wait_for_reply(req, 5)).ok)
     self.assertEqual((await self.bus.get_run(sid))["tokens"], (total_cmds + 1) * 50)
     self.assertGreater((await self.bus.read_state())["service"]["team-s"], svc_before)
 
@@ -1166,7 +1168,7 @@ class TestMultiNodeExecution(RedisTest):
 
     for req in futs:
       async with asyncio.timeout(10):
-        while (await self.bus.r.xlen(f"tinyrl:f:{req}")) == 0:
+        while req not in self.bus.replies:
           for node in (node_a, node_b):
             flat = [g for gs in node.on.values() for g in gs]
             self.assertEqual(len(flat), len(set(flat)))  # GpuExclusive

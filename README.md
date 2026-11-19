@@ -1,6 +1,6 @@
 # tiny-open-rl
 
-The [Tinker](https://thinkingmachines.ai/tinker/) training API, built on Redis Streams and PyTorch.
+The [Tinker](https://thinkingmachines.ai/tinker/) training API, built on an embedded SQLite control plane and PyTorch.
 
 The unmodified Tinker SDK trains and samples through it for both LoRA adapters and full fine-tunes:
 
@@ -21,13 +21,11 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path
 
 ```sh
 pip install -e .
-redis-server &                        # Redis 8.6+
-python -m tinyrl.api.gateway &        # Tinker HTTP API on :8000
-python -m tinyrl.control.scheduler &  # places trainers and sizes sampler pools
+python -m tinyrl.api.gateway &        # Tinker HTTP API (:8000), scheduler, and internal RPC (:8001)
 python -m tinyrl.control.node_daemon  # manages worker processes and GPUs
 ```
 
-Run one `node_daemon` per GPU machine (set `GPUS`, default `1`) and one `scheduler`.
+Run one `gateway` (single control-plane server with SQLite state in `TINYRL_DB`) and one `node_daemon` per GPU machine (set `CONTROL_URL`, `GPUS`).
 
 - **Checkpoints:** Stored under `CKPT/objects/<version>` (default `/tmp/tinyrl`). Point `CKPT` at a bucket (`gs://...`, `s3://...`; `pip install .[gcs]` for GCS) to persist and share checkpoints across nodes.
 - **Kubernetes:** Build [Dockerfile](Dockerfile), set `CKPT` in [k8s/kustomization.yaml](k8s/kustomization.yaml), and run `kubectl apply -k k8s/` on nodes labeled `tinyrl-gpu=true`. Verify cluster resilience with `python k8s/e2e.py`. See [docs/kubernetes.md](docs/kubernetes.md).
@@ -36,16 +34,14 @@ Run one `node_daemon` per GPU machine (set `GPUS`, default `1`) and one `schedul
 
 ```mermaid
 flowchart TD
-  G["Gateway"] -->|Commands| R[("Redis")]
-  S["Cluster scheduler"] -->|Node placements| R
-  R -->|Assignments & commands| N["Node daemon"]
+  G["Gateway + Scheduler + Bus"] <-->|SQLite WAL| D[("Metadata DB")]
+  G <-->|Internal HTTP RPC| N["Node daemon"]
   N -->|Unix IPC| T["Trainer ranks"]
   N -->|Engine calls| V["vLLM"]
   T -->|Checkpoints| C[("Store")]
-  N -->|Fenced replies| R
 ```
 
-Every training or sampling call is a command on its run's Redis stream, and its reply is a one-entry stream keyed by the request.
+Every training or sampling call is queued in memory on the control-plane `Bus` (durable sessions, runs, checkpoints, plans, and service accounting persist in SQLite WAL), and node daemons talk to it over internal HTTP RPC (`tinyrl/rpc.py`). Lost sampling promises return HTTP `410` so the Tinker SDK resubmits them transparently.
 
 - **Cluster placement.** Each training run has one trainer home. Compatible LoRA runs can share a trainer. Sampler sessions use any replica in a pool with the same model and worker configuration. The scheduler sizes each pool from its combined backlog and available GPUs.
 - **GPU turns.** Each node grants local GPUs to one worker at a time and releases them after the worker parks or exits. A sampling wave serves one account. Its requests share the GPU time spent loading their weights and executing samples. The cluster tracks each account’s share, and nodes use billed GPU time to choose subsequent turns.
@@ -56,11 +52,12 @@ Every training or sampling call is a command on its run's Redis stream, and its 
 
 ## Code layout
 
-`tinyrl/` is kept small (`python sz.py` counts token-bearing lines; CI caps it at 3,400). Start with [bus.py](tinyrl/bus.py).
+`tinyrl/` is kept small (`python sz.py` counts token-bearing lines; CI caps it at 3,700). Start with [bus.py](tinyrl/bus.py).
 
 | File | Responsibility |
 |---|---|
-| [tinyrl/bus.py](tinyrl/bus.py) | Sessions, command streams, fenced replies, leases, and the checkpoint registry |
+| [tinyrl/bus.py](tinyrl/bus.py) | In-memory queues/leases/replies + SQLite WAL durable tables (`sessions`, `runs`, `checkpoints`, `meta`) |
+| [tinyrl/rpc.py](tinyrl/rpc.py) | Internal HTTP JSON-RPC server and retrying client for remote node daemons |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints, and Prometheus `/metrics` |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy encoding |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | Cluster assignment: runs to workers, workers to nodes |
@@ -86,7 +83,7 @@ All settings are environment variables:
 
 | Area | Variables |
 |---|---|
-| **Core** | `REDIS_URL`, `PORT`, `GPUS` (`1`), `GPU_MEMORY_MIB`, `DRAIN_S` (`20`), `LEASE_MS`, `IDLE_MS`, `TICK`, `TICK_MS`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE` |
+| **Core** | `TINYRL_DB` (`/tmp/tinyrl.db`), `CONTROL_URL` (`http://127.0.0.1:8001`), `PORT` (`8000`), `INTERNAL_PORT` (`8001`), `GPUS` (`1`), `GPU_MEMORY_MIB`, `DRAIN_S` (`20`), `LEASE_MS`, `IDLE_MS`, `TICK`, `TICK_MS`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE` |
 | **Storage** | `CKPT` (`/tmp/tinyrl`), `CKPT_CACHE`, `CKPT_CACHE_BYTES`, `CKPT_TTL`, `SHARD_BYTES`, `SWEEP_S`, `MODEL_CACHE`, `MODEL_MIRROR` |
 | **Scheduling** | `QUANTUM_MS` (`2000`), `MAX_QUANTUM_MS` (`15000`), `SWITCH_BUDGET` (`0.1`), `CYCLE_GRACE_MS` (`100`), `SAMPLE_RUNS` (`3`), `SAMPLE_COMMANDS` (`128`), `SCALE_BATCH` (`4`), `REBALANCE_MS` (`20000`) |
 | **Execution** | `TOKEN_BUDGET`, `CHUNK`, `GRAD_CKPT`, `ENGINE`, `VLLM_ARGS`, `TINYRL_SNAPSHOTS`, `DEBUG=1` |
@@ -106,13 +103,13 @@ Stop the old scheduler and drain the old nodes before starting the new control p
 ## Test
 
 ```sh
-python -m unittest discover -s test -t .                            # starts its own redis-server, or set REDIS_URL
+python -m unittest discover -s test -t .                            # isolated SQLite Bus per test
 TINKER_PYTHON=$(which python) python -m unittest test.test_tinker  # end-to-end via examples/tinker_sdk.py
 python -m test.mutation                                             # control-plane mutation tests
 SEED=3 CHAOS=1 python -m test.stress_fleet                          # randomized chaos & fleet stress test
 ```
 
-Integration tests run against real Redis with tiny random Llama models and the unmodified SDK; CUDA parking tests run automatically when a GPU is present.
+Integration tests run against the real control plane with tiny random Llama models and the unmodified SDK; CUDA parking tests run automatically when a GPU is present.
 
 ## Not here yet
 

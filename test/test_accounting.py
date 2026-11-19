@@ -2,13 +2,13 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from test.helpers import RedisTest
+from test.helpers import BusTest
 from tinyrl.bus import Op, Reply, Role, Run
 from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import SamplerLife, TrainerLife
 
 
-class TestAccounting(RedisTest):
+class TestAccounting(BusTest):
   async def lifetime(self, role, **accounts):
     runs = list(accounts)
     for run, account in accounts.items():

@@ -12,7 +12,7 @@ import dataclasses
 import itertools
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus
+from tinyrl.bus import Bus, connect
 from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
 from tinyrl.types import Ev, Role
@@ -265,9 +265,13 @@ def size_samplers(s: State, out: list) -> None:
     for name in pool:
       if name not in keep and s.procs.pop(name).node:
         out.append((Ev.UNPLACED, {"proc": name, "rule": "place.scale_in"}))
-    while len(keep) < want and (spot := choose_node(s, keep[0], True)):
-      keep.append(q := s.add_proc(spec, spot))
-      out.append((Ev.PLACED, {"proc": q, "node": spot, "rule": "place.scale_out"}))
+    if want > 1 and s.procs[keep[0]].node is None and (spot := choose_node(s, keep[0])):
+      s.procs[keep[0]].node = spot
+      out.append((Ev.PLACED, {"proc": keep[0], "node": spot, "rule": "place.new"}))
+    if s.procs[keep[0]].node:
+      while len(keep) < want and (spot := choose_node(s, keep[0], True)):
+        keep.append(q := s.add_proc(spec, spot))
+        out.append((Ev.PLACED, {"proc": q, "node": spot, "rule": "place.scale_out"}))
 
 
 def collect_and_place(s: State, out: list) -> None:
@@ -324,4 +328,4 @@ async def run(bus: Bus) -> None:
 
 
 if __name__ == "__main__":
-  asyncio.run(run(Bus()))
+  asyncio.run(run(connect()))

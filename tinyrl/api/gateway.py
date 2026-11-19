@@ -6,6 +6,7 @@ Every training call becomes a command on its run's stream, and retrieve_future w
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import datetime
 import json
@@ -19,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from tinyrl.api import wire
-from tinyrl.bus import Bus
+from tinyrl.bus import BackpressureError, Bus, PromiseGoneError, serve_bus
 from tinyrl.control import estimator, scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.store import Store
@@ -114,16 +115,32 @@ def checkpoint_uri(run: str, kind: str, name: str) -> str:
   return f"tinker://{run}/{kind}/{name}"
 
 
-def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
+def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = False) -> FastAPI:
   bus = bus if bus is not None else Bus()
   store = store if store is not None else Store()
-  api = FastAPI(title="tiny-open-rl")
+
+  @contextlib.asynccontextmanager
+  async def lifespan(_: FastAPI):
+    runner, _ = await serve_bus(bus, port=getenv("INTERNAL_PORT", 8001))
+    sched = asyncio.create_task(scheduler.run(bus))
+    try:
+      yield
+    finally:
+      sched.cancel()
+      with contextlib.suppress(asyncio.CancelledError):
+        await sched
+      await runner.cleanup()
+      await bus.aclose()
+
+  api = FastAPI(title="tiny-open-rl", lifespan=lifespan if control else None)
 
   def bad_request(_: Request, e: Exception) -> JSONResponse:
     return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400)
 
   api.add_exception_handler(ValueError, bad_request)
   api.add_exception_handler(KeyError, bad_request)
+  api.add_exception_handler(PromiseGoneError, lambda _, e: JSONResponse({"error": str(e)}, status_code=410))
+  api.add_exception_handler(BackpressureError, lambda _, e: JSONResponse({"error": str(e)}, status_code=429))
 
   async def require_run(run_id: str, kind: str = "model") -> dict:
     if (record := await bus.get_run(run_id)) is None:
@@ -189,8 +206,11 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     return {"status": "accepted"}
 
   @api.post("/api/v1/client/config")
-  @api.post("/api/v1/client/dynamic_config")
   async def client_config():
+    return {"parallel_fwdbwd_chunks": False}
+
+  @api.post("/api/v1/client/dynamic_config")
+  async def client_dynamic_config():
     return {}  # the SDK's defaults
 
   @api.get("/api/v1/get_server_capabilities")
@@ -449,4 +469,4 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
 
 if __name__ == "__main__":
-  uvicorn.run(app(), host="0.0.0.0", port=getenv("PORT", 8000))
+  uvicorn.run(app(control=True), host="0.0.0.0", port=getenv("PORT", 8000))
