@@ -19,10 +19,11 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from tinyrl.api import wire
-from tinyrl.bus import Bus, Op, Role, Run, key
+from tinyrl.bus import Bus
 from tinyrl.control import estimator, scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.store import Store
+from tinyrl.types import Op, Role, Run, parse_uri
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
 CKPT_TTL = getenv("CKPT_TTL", 0)  # the TTL of a checkpoint saved without one, at least 3600. 0 keeps it until deleted
@@ -106,7 +107,8 @@ def public(c: dict) -> dict:
 def checkpoint_uri(run: str, kind: str, name: str) -> str:
   """The logical tinker://<run>/<kind>/<name> URI for a checkpoint."""
   if name.startswith("tinker://"):  # a checkpoint by URI, maybe another run's to resume from
-    run, kind, name = name.removeprefix("tinker://").split("/", 2)
+    run, cid = parse_uri(name)
+    kind, _, name = cid.partition("/")
   if not name or name.startswith("/") or ".." in f"{run}/{kind}/{name}".split("/"):
     raise ValueError(f"bad checkpoint name {name}")
   return f"tinker://{run}/{kind}/{name}"
@@ -139,10 +141,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   async def open_sampler(base_model: str | None, model_path: str | None, session_id: str = "") -> str:
     train = {}
     if model_path:
-      if not model_path.startswith("tinker://"):
-        raise ValueError(f"bad model_path {model_path}")
-      uri = checkpoint_uri("x", "sampler_weights", model_path)
-      train_run = uri.removeprefix("tinker://").split("/", 1)[0]
+      train_run, _ = parse_uri(model_path)
+      uri = model_path
       train = await bus.get_run(train_run) or {}
       if train.get("base"):
         base, lora = train["base"], train["rank"] > 0
@@ -225,7 +225,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     run = f"{req.session_id}-{seq}" if req.session_id and seq is not None else str(uuid.uuid4())
 
     base, account = req.base_model, str(metadata.get("openrl.account") or "")
-    gpus = int(metadata.get("openrl.gpus") or (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")))
+    raw_gpus = metadata.get("openrl.gpus")
+    gpus = (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")) if raw_gpus is None else int(raw_gpus)
+    if gpus < 1:
+      raise ValueError(f"openrl.gpus must be at least 1, got {gpus}")
     if not await bus.get_run(run):
       await bus.create_run(Run(run, base, rank, req.session_id, None, lora, exclusive, gpus=gpus, account=account))
     return await submit(run, Op.CREATE_MODEL, {"base_model": base, "rank": rank, "lora": lora}, seq)
@@ -247,8 +250,10 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   # ***** training *****
 
   async def submit_fb(data: dict, forward_only: bool = False) -> dict[str, str]:
-    body = wire.from_json(data, forward_only=forward_only)
-    return await submit(data["model_id"], Op.FORWARD_BACKWARD, body, data.get("seq_id"), wire.cost(wire.parse(body)))
+    req = wire.from_json(data, forward_only=forward_only)
+    return await submit(
+      data["model_id"], Op.FORWARD_BACKWARD, req.SerializeToString(), data.get("seq_id"), wire.cost(req)
+    )
 
   @api.post("/api/v1/forward_backward")
   async def forward_backward(request: Request):
@@ -272,9 +277,8 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveRequest):
-    if req.seq_id is not None:
-      if request_id := await bus.r.get(key("seq", req.model_id, str(req.seq_id))):
-        return {"request_id": request_id.decode(), "model_id": req.model_id}
+    if request_id := await bus.seen_request(req.model_id, req.seq_id):
+      return {"request_id": request_id, "model_id": req.model_id}
 
     train = await require_run(req.model_id)
     # a sampling session's weights, which its run owns

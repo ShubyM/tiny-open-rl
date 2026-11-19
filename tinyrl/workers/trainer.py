@@ -14,9 +14,9 @@ import torch
 import torch.distributed as dist
 
 from tinyrl.api import wire
-from tinyrl.bus import Cmd, Op, Reply
 from tinyrl.storage.store import Store, nbytes
 from tinyrl.trace import span
+from tinyrl.types import Cmd, Op, Reply
 from tinyrl.workers.model import GradientRecoveryError, Model
 
 RECOVERABLE_ERRORS = (ValueError, KeyError, GradientRecoveryError)

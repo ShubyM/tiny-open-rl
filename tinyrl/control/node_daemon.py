@@ -197,7 +197,7 @@ class NodeDaemon:
     await asyncio.to_thread(self.store.close)
 
   async def read_state(self) -> scheduler.State:
-    return scheduler.from_state(await self.bus.read_state())
+    return scheduler.from_state(await self.bus.read_state(backlogs=False))
 
   def notify(self) -> None:
     changed, self.changed = self.changed, asyncio.Event()
@@ -401,7 +401,7 @@ class TrainerLife(Lifetime):
 
   async def fail_promote(self, err: Reply) -> None:
     for r, (token, _, _) in list(self.owned.items()):
-      if cmd := await self.bus.take_trainer_command(r, token):
+      if cmd := await self.bus.claim_trainer(r, token):
         await self.bus.commit_reply(cmd, err, token)
 
   async def sync_runs(self) -> None:
@@ -442,7 +442,7 @@ class TrainerLife(Lifetime):
     self.heads.pop(run, None)
     token, _, snap = self.owned[run]
     with span("node.claim"):
-      cmd = await self.bus.take_trainer_command(run, token)
+      cmd = await self.bus.claim_trainer(run, token)
     if cmd is None:
       return None
     charge, acct, effects, version = Charge(), self.node.state.account(run), {}, None
@@ -463,7 +463,7 @@ class TrainerLife(Lifetime):
         self.loaded.add(run) if effects.get("loaded") else self.loaded.discard(run)
     with span("node.publish"):
       mutates = bool(effects.get("mutated"))
-      billed, old = await self.bus.commit_reply(cmd, reply, token, acct, mutates, charge, effects.get("saved"))
+      billed = await self.bus.commit_reply(cmd, reply, token, acct, mutates, charge, effects.get("saved"))
       if not billed:
         self.owned.pop(run, None)
         self.loaded.discard(run)
@@ -472,8 +472,6 @@ class TrainerLife(Lifetime):
         self.owned.pop(run, None)
       elif mutates:
         self.owned[run] = (token, cmd.entry_id, None)
-        if old:
-          await self.bus.unregister_checkpoints(unpack_snap(old)[0])
       self.open_grads.discard(run)
       if cmd.op == Op.FORWARD_BACKWARD and reply.ok:
         self.open_grads.add(run)

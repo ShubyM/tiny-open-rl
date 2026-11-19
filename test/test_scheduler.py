@@ -865,7 +865,7 @@ class TestMultiNodeExecution(RedisTest):
     await asyncio.gather(*self.tasks, return_exceptions=True)
     for node in self.nodes:
       await node.aclose()
-      await node.bus.r.aclose()
+      await node.bus.aclose()
     await super().asyncTearDown()
 
   async def add_node(self, name: str, gpus: int = 1, engine=FakeEngine) -> TestNode:
@@ -884,7 +884,7 @@ class TestMultiNodeExecution(RedisTest):
 
   def start_scheduler(self) -> None:
     bus = Bus(connect(self.url))
-    self.addAsyncCleanup(bus.r.aclose)
+    self.addAsyncCleanup(bus.aclose)
 
     async def loop():
       while True:

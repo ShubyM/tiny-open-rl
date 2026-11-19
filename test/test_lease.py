@@ -10,7 +10,7 @@ import unittest
 
 from test.helpers import RedisTest, new_id, tiny
 from test.test_process import require_unix
-from tinyrl.bus import GROUP, Op, Reply, Run, key, unpack_snap
+from tinyrl.bus import Op, Reply, Run, key, unpack_snap
 from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 
@@ -89,7 +89,6 @@ class TestLease(RedisTest):
     await self.until(both_up)
     await asyncio.sleep(1.5 * LEASE_MS / 1000)
     self.assertEqual((await self.bus.get_run(run))["owner"], old_owner)
-    self.assertEqual(len(await self.bus.r.xinfo_consumers(key("q", run), GROUP)), 1)
 
     async def reported():
       node = (await self.bus.live_nodes(details=True)).get(first_node, {})

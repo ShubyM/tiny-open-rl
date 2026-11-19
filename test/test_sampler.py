@@ -62,7 +62,7 @@ class TestSampler(RedisTest):
           await node.tick()
           wid = await wbus.wait_wake(wid, 10)
       finally:
-        await wbus.r.aclose()
+        await wbus.aclose()
 
     self.tasks.append(asyncio.create_task(run()))
 

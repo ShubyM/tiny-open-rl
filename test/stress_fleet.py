@@ -164,7 +164,7 @@ class Stress(RedisTest):
     await asyncio.gather(*self.loops.values(), return_exceptions=True)
     for node in self.nodes.values():
       await node.aclose()
-      await node.bus.r.aclose()
+      await node.bus.aclose()
     for node in self.cut:
       await asyncio.to_thread(node.store.close)
     await super().asyncTearDown()
@@ -195,15 +195,15 @@ class Stress(RedisTest):
     if task := node.sweeping:
       task.cancel()
     await self.bus.r.hdel(key("nodes"), name)
-    await node.bus.r.aclose()
+    await node.bus.aclose()
 
   async def cut_node(self, name: str) -> None:
     """The node loses Redis for good, mid-work: none of its replies, releases or lease drops arrive. Its leases and
     heartbeat run out by themselves. Its store goes on uploading, so the saves it acknowledged are not lost."""
     node = self.nodes.pop(name)
     self.loops.pop(name).cancel()
-    await node.bus.r.aclose()
-    node.bus.r = Unreachable()
+    await node.bus.aclose()
+    node.bus.r = node.bus.s = Unreachable()
     for task in node.tasks.values():
       task.cancel()
     await asyncio.gather(*node.tasks.values(), return_exceptions=True)
@@ -211,7 +211,7 @@ class Stress(RedisTest):
 
   def start_scheduler(self) -> None:
     bus = Bus(connect(self.url))
-    self.addAsyncCleanup(bus.r.aclose)
+    self.addAsyncCleanup(bus.aclose)
 
     async def loop():
       while True:

@@ -51,6 +51,11 @@ class TestGatewayDedupe(RedisTest):
     samplers = [r for r in runs if r.decode().startswith("samp-")]
     self.assertEqual(len(samplers), 1)
 
+  async def test_rejects_invalid_gpus(self):
+    body = {"base_model": "tiny", "user_metadata": {"openrl.gpus": 0}}
+    res = await self.http.post("/api/v1/create_model", json=body)
+    self.assertEqual(res.status_code, 400)
+
 
 class TestEstimator(unittest.TestCase):
   def test_estimates_full_and_vllm_without_importing_ml_frameworks(self):

@@ -15,6 +15,7 @@ assert sys.byteorder == "little", "the wire format is little endian"
 
 PROTO = "application/x-protobuf"
 JSON = "application/json"
+MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
 
 NUMPY_DTYPES = {
   pb.DTYPE_FLOAT32: np.float32,
@@ -81,7 +82,7 @@ def loss_config(req: pb.ForwardBackwardRequest) -> dict[str, float | str]:
   return dict(req.loss_fn_config)
 
 
-def from_json(body: dict, forward_only: bool = False) -> bytes:
+def from_json(body: dict, forward_only: bool = False) -> pb.ForwardBackwardRequest:
   """Turn the JSON forward_backward that SDKs before 0.25 send into the same protobuf, so the trainer reads one format."""
   fb = body.get("forward_backward_input") or body.get("forward_input") or {}
   req = pb.ForwardBackwardRequest(
@@ -107,7 +108,7 @@ def from_json(body: dict, forward_only: bool = False) -> bytes:
       tensor = pb.Tensor(dense=array.tobytes(), dtype=pb.DTYPE_INT64 if is_int else pb.DTYPE_FLOAT32, shape=array.shape)
       datum.loss_fn_inputs[name].CopyFrom(tensor)
 
-  return req.SerializeToString()
+  return req
 
 
 # ***** outputs *****
@@ -189,8 +190,8 @@ def _format_topk(tk_pb):
   lps = np.frombuffer(tk_pb.logprobs, np.float32).reshape(tk_pb.length, tk_pb.k)
   return [
     None
-    if ids[i, 0] == 0 and lps[i, 0] == -99999.0
-    else [[int(tid), float(lp)] for tid, lp in zip(ids[i], lps[i]) if not (tid == 0 and lp == -99999.0)]
+    if ids[i, 0] == 0 and lps[i, 0] == MASK_LOGPROB
+    else [[int(tid), float(lp)] for tid, lp in zip(ids[i], lps[i]) if not (tid == 0 and lp == MASK_LOGPROB)]
     for i in range(tk_pb.length)
   ]
 

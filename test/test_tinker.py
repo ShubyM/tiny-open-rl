@@ -69,7 +69,7 @@ class TestTinkerSDK(unittest.TestCase):
       async def published() -> dict:
         db = connect(env["REDIS_URL"])
         try:
-          return json.loads(await db.hget(f"tinyrl:ckpt:{model_id}", "sampler_weights/final"))
+          return json.loads(await db.hget("tinyrl:ckpts", f"tinker://{model_id}/sampler_weights/final"))
         finally:
           await db.aclose()
 

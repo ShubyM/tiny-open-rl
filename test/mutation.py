@@ -29,7 +29,7 @@ CASES = [
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
   (BUS, "finish_cmd", "if acct and charge.gpu_ms:", "if reply.ok and acct and charge.gpu_ms:", BILLING),
-  (BUS, "take_trainer_command", 'await p.hget(k, "owner") != token.encode()', "False", CLAIM),
+  (BUS, "claim_trainer", 'await p.hget(k, "owner") != token.encode()', "False", CLAIM),
   (
     BUS,
     "commit_sample",
