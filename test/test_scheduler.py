@@ -68,7 +68,7 @@ class Cluster:
     self.runs[name] = {"record": {"role": "trainer", "base": "a", "rank": 0} | body, "owner": owner}
     self.queues[name] = backlog
     self.settle()
-    return self.s.home[name][0]
+    return self.s.procs_of(name)[0]
 
   def queue(self, run: str, n: int) -> None:
     self.queues[run] = n
@@ -125,12 +125,10 @@ def check_plan_invariants(test: unittest.TestCase, s: State) -> None:
     test.assertLessEqual(s.excl_used(node), total)
   for p in s.procs.values():
     test.assertTrue(p.node is None or (p.node in s.nodes and p.spec.gpus <= s.nodes[p.node][0]))
-  for r, ps in s.home.items():
+  for r, proc in s.home.items():
     test.assertIn(r, s.jobs)
-    if s.jobs[r].spec.role == Role.TRAINER:
-      test.assertLessEqual(len(ps), 1)
-    for proc in ps:
-      test.assertIn(proc, s.procs)
+    test.assertEqual(s.jobs[r].spec.role, Role.TRAINER)
+    test.assertIn(proc, s.procs)
 
 
 def check_gpu_invariants(test: unittest.TestCase, keep: dict, lives: dict, total: int) -> None:
@@ -251,7 +249,7 @@ class TestCluster(unittest.TestCase):
     p1 = c.run("r1", rank=8, backlog=1)
     self.assertEqual(c.run("r2", rank=8, backlog=1), p1)
     c.node("b", 1)
-    p2 = c.s.home["r2"][0]
+    p2 = c.s.home["r2"]
     self.assertNotEqual(p1, p2)
     self.assertEqual({c.s.procs[p1].node, c.s.procs[p2].node}, {"a", "b"})
     c.run("excl", exclusive=True, backlog=1)
@@ -272,7 +270,7 @@ class TestCluster(unittest.TestCase):
     c.queue("r2", 0)
     c.queue("s1", 12)
     c.settle()
-    self.assertEqual((c.s.home["s1"], c.s.made), ([s1], 3))
+    self.assertEqual((c.s.procs_of("s1"), c.s.made), ([s1], 3))
     check_plan_invariants(self, c.s)
 
   def test_sampling_sessions_share_only_their_kind_and_exclusive_training_run(self):
@@ -299,9 +297,7 @@ class TestCluster(unittest.TestCase):
 
   def test_a_proc_is_owed_what_its_ready_runs_are_owed(self):
     jobs = {"a": Job(Spec(lora=True), account="A", backlog=1), "b": Job(Spec(lora=True), account="B")}
-    s = State(
-      procs={"p": Proc(Spec(lora=True), "n")}, home={"a": ["p"], "b": ["p"]}, jobs=jobs, lag={"A": 5.0, "B": 9.0}
-    )
+    s = State(procs={"p": Proc(Spec(lora=True), "n")}, home={"a": "p", "b": "p"}, jobs=jobs, lag={"A": 5.0, "B": 9.0})
     self.assertEqual(s.lag_of("p"), 5.0)
 
   def test_demand_is_what_each_account_could_run_now(self):
@@ -323,23 +319,24 @@ class TestCluster(unittest.TestCase):
     c.run("t")
     c.run("x", role="sampler", train_run="t", exclusive=True, backlog=3 * SCALE_BATCH)
     c.run("s", role="sampler", backlog=3 * SCALE_BATCH)
-    self.assertEqual((len(c.s.home["x"]), len(set(c.s.home["s"]))), (1, 3))
+    self.assertEqual((len(c.s.procs_of("x")), len(set(c.s.procs_of("s")))), (1, 3))
 
-  def test_scale_out_reuses_an_idle_sampler_but_not_a_busy_one(self):
+  def test_scale_out_reuses_existing_placed_pool_before_spawning_more(self):
     c = Cluster()
     c.node("a", 1)
     c.node("b", 2)
     first = c.run("s", role="sampler")
     c.s.procs["p9"] = Proc(c.s.procs[first].spec, "b")
-    c.runs["o"], c.queues["o"], c.s.home["o"] = dict(c.runs["s"]), 0, ["p9"]
+    c.runs["o"], c.queues["o"] = dict(c.runs["s"]), 0
     c.queue("s", 2 * SCALE_BATCH)
     c.settle()
-    self.assertEqual(c.s.home["s"], [first, "p9"])  # the idle one on b, not a third process
+    self.assertEqual(c.s.procs_of("s"), [first, "p9"])  # the existing replica on b, not a third process
     c.queue("s", 3 * SCALE_BATCH)
     c.queue("o", 1)
     c.settle()
-    self.assertEqual(len(c.s.home["s"]), 3)  # p9 is busy with `o` now: a new process on b's other GPU
-    self.assertEqual(c.s.procs[c.s.home["s"][2]].node, "b")
+    self.assertEqual(len(c.s.procs_of("s")), 3)  # a third replica spawns on b's other GPU
+    new_proc = next(p for p in c.s.procs_of("s") if p not in (first, "p9"))
+    self.assertEqual(c.s.procs[new_proc].node, "b")
 
   def test_two_busy_sessions_do_not_split_their_sampler(self):
     c = Cluster()
@@ -349,7 +346,8 @@ class TestCluster(unittest.TestCase):
     c.queue("s1", 1)
     c.queue("s2", 1)
     c.settle()
-    self.assertEqual(c.s.home["s1"], c.s.home["s2"])
+    self.assertEqual(c.s.procs_of("s1"), c.s.procs_of("s2"))
+    self.assertEqual(len(c.s.procs_of("s1")), 1)
 
   def test_idle_lora_trainers_stay_split_while_their_node_has_room(self):
     c = Cluster()
@@ -369,7 +367,7 @@ class TestCluster(unittest.TestCase):
     c.settle()
     self.assertEqual((c.s.procs[p1].node, c.s.procs[p2].node), ("a", "a"))
     c.node("c", 1)
-    self.assertEqual((c.s.home["r1"], c.s.home["r2"]), ([p1], [p2]))
+    self.assertEqual((c.s.home["r1"], c.s.home["r2"]), (p1, p2))
     self.assertEqual({c.s.procs[p1].node, c.s.procs[p2].node}, {"a", "c"})
 
   def test_an_idle_proc_stays_on_a_crowded_node(self):
@@ -391,7 +389,7 @@ class TestCluster(unittest.TestCase):
 
   def test_an_exclusive_proc_holds_its_gpus_whether_or_not_it_is_busy(self):
     jobs = {"r": Job(Spec(exclusive=True), backlog=1)}
-    s = State(nodes={"n": (2, 0)}, procs={"x": Proc(Spec(exclusive=True), "n")}, home={"r": ["x"]}, jobs=jobs)
+    s = State(nodes={"n": (2, 0)}, procs={"x": Proc(Spec(exclusive=True), "n")}, home={"r": "x"}, jobs=jobs)
     self.assertEqual(s.spare("n"), 1)
 
   def test_crowding_moves_a_shared_proc_and_never_an_exclusive_one(self):
@@ -408,10 +406,10 @@ class TestCluster(unittest.TestCase):
     c.node("a", 1)
     first = c.run("s", role="sampler")
     c.s.procs["p9"] = Proc(c.s.procs[first].spec, None)
-    c.runs["o"], c.queues["o"], c.s.home["o"] = dict(c.runs["s"]), 0, ["p9"]
+    c.runs["o"], c.queues["o"] = dict(c.runs["s"]), 0
     c.queue("s", 2 * SCALE_BATCH)
     c.settle()
-    self.assertEqual(c.s.home["s"], [first])
+    self.assertEqual(c.s.procs_of("s"), [first])
 
   def test_rotation_weighs_a_mover_against_the_busy_shared_procs_on_the_other_node(self):
     def target(c_lag: float, n2: int = 1, **extra) -> str | None:
@@ -419,7 +417,7 @@ class TestCluster(unittest.TestCase):
       specs |= {"c": (Spec(lora=True, base="c"), "n2", 1)} | extra
       s = State(nodes={"n1": (1, 0), "n2": (n2, 0)}, lag={"me": 30000.0, "b": 25000.0, "c": c_lag, "x": -50000.0})
       for name, (spec, node, backlog) in specs.items():
-        s.procs[name], s.home[name], s.jobs[name] = Proc(spec, node), [name], Job(spec, account=name, backlog=backlog)
+        s.procs[name], s.home[name], s.jobs[name] = Proc(spec, node), name, Job(spec, account=name, backlog=backlog)
       return scheduler.rebalance_target(s, "me")
 
     self.assertEqual(target(5000.0), "n2")  # owed REBALANCE_MS more than `c`, who is owed less than `b`
@@ -432,17 +430,17 @@ class TestCluster(unittest.TestCase):
     c.node("a", 2)
     first = c.run("r1", rank=4)
     c.s.procs["p9"] = Proc(c.s.procs[first].spec, "a")
-    c.runs["r2"], c.queues["r2"], c.s.home["r2"] = dict(c.runs["r1"]), 0, [first]
-    c.runs["r3"], c.queues["r3"], c.s.home["r3"] = dict(c.runs["r1"]), 0, ["p9"]
+    c.runs["r2"], c.queues["r2"], c.s.home["r2"] = dict(c.runs["r1"]), 0, first
+    c.runs["r3"], c.queues["r3"], c.s.home["r3"] = dict(c.runs["r1"]), 0, "p9"
     self.assertEqual(c.run("r4", rank=4), "p9")
 
   def test_only_a_trainer_is_owed_room_for_a_sampler(self):
     c = Cluster()
     c.node("a", 2)
-    c.run("q", role="sampler")
+    q = c.run("q", role="sampler")
     c.node("b", 2)
     c.run("r1", rank=4, base="m1")
-    self.assertEqual([c.s.procs[p].node for p in (c.s.home["q"][0], c.s.home["r1"][0])], ["a", "b"])
+    self.assertEqual([c.s.procs[p].node for p in (q, c.s.home["r1"])], ["a", "b"])
     new = c.run("r2", rank=4, base="m2")
     self.assertEqual(c.s.procs[new].node, "a")
 
@@ -964,7 +962,7 @@ class TestMultiNodeExecution(RedisTest):
       self.assertTrue((await self.bus.wait_for_reply(b, 10)).ok)
 
     state = from_state(await self.bus.read_state())
-    self.assertEqual({state.procs[state.home[r][0]].node for r in (r1, r2)}, {"node-a", "node-b"})
+    self.assertEqual({state.procs[state.home[r]].node for r in (r1, r2)}, {"node-a", "node-b"})
 
     ref = Model(tiny)
     ref.create_run(ctrl, "tiny", 0, {})
@@ -1069,7 +1067,7 @@ class TestMultiNodeExecution(RedisTest):
     await scheduler.tick(self.bus)
     s1 = from_state(await self.bus.read_state())
     self.assertNotEqual(s1.home[r1], s1.home[r2])
-    self.assertEqual({s1.procs[s1.home[r][0]].node for r in (r1, r2)}, {"node-a", "node-b"})
+    self.assertEqual({s1.procs[s1.home[r]].node for r in (r1, r2)}, {"node-a", "node-b"})
     for a, b in futs:
       self.assertTrue((await self.bus.wait_for_reply(a, 10)).ok)
       self.assertTrue((await self.bus.wait_for_reply(b, 10)).ok)
@@ -1117,7 +1115,7 @@ class TestMultiNodeExecution(RedisTest):
 
       async def scaled_out() -> bool:
         st = from_state(await self.bus.read_state())
-        return len(st.home.get(sid, ())) >= 2 and len(set(served_by)) >= 2
+        return len(st.procs_of(sid)) >= 2 and len(set(served_by)) >= 2
 
       await self.until(scaled_out)
       for req in reqs:
@@ -1131,7 +1129,7 @@ class TestMultiNodeExecution(RedisTest):
     self.assertGreaterEqual(svc_before, total_cmds * 20.0)
 
     async def scaled_in() -> bool:
-      return len(from_state(await self.bus.read_state()).home.get(sid, ())) == 1
+      return len(from_state(await self.bus.read_state()).procs_of(sid)) == 1
 
     await self.until(scaled_in)
 
@@ -1154,9 +1152,9 @@ class TestMultiNodeExecution(RedisTest):
     await self.create(r2)
     await self.create(gang, gpus=2)
 
-    # Malformed split-brain plan: `r1` assigned to BOTH nodes, `r2` co-placed on 1-GPU `node-a`, `gang` on undersized `node-a`.
+    # Split-brain plans: `node-a` and `node-b` each believe they own `r1`, `r2` is co-placed on `node-a`, and `gang` is oversized.
     spec1 = {"role": "trainer", "base": "tiny", "lora": False, "exclusive": False, "train_run": None, "gpus": 1}
-    bad_plan = {
+    base_plan = {
       "made": 4,
       "procs": {
         "p1": {"spec": spec1, "node": "node-a"},
@@ -1164,11 +1162,19 @@ class TestMultiNodeExecution(RedisTest):
         "pg": {"spec": spec1 | {"gpus": 2}, "node": "node-a"},
         "p3": {"spec": spec1, "node": "node-b"},
       },
-      "home": {r1: ["p1", "p3"], r2: ["p2"], gang: ["pg"]},
+      "home": {r1: "p1", r2: "p2", gang: "pg"},
       "lag": {},
       "seen": {},
     }
-    await self.bus.write_plan(bad_plan)
+    await self.bus.write_plan(base_plan)
+    orig_b = node_b.read_state
+
+    async def split_b():
+      st = await orig_b()
+      st.home[r1] = "p3"
+      return st
+
+    node_b.read_state = split_b
 
     fb, opt = proto_body(r1, 10), json.dumps({"adam_params": {"learning_rate": 1e-2}}).encode()
     futs = []
@@ -1201,7 +1207,7 @@ class TestMultiNodeExecution(RedisTest):
     a, b = new_id(), new_id()
     await self.create(a, account="alice")
     await self.run_cmd(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
-    pa = from_state(await self.bus.read_state()).home[a][0]
+    pa = from_state(await self.bus.read_state()).home[a]
     lf_a = node.lives[pa]
     # Push `a` past its minimum quantum (into xOS OVERTIME) without touching `b` yet.
     first_grant = lf_a.granted_at

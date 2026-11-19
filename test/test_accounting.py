@@ -14,7 +14,8 @@ class TestAccounting(RedisTest):
       await self.bus.create_run(Run(run, "base", 4, role=role, account=f"{run}-account", gpus=2))
     state = scheduler.from_state(await self.bus.read_state())
     state.procs["worker"] = scheduler.Proc(state.jobs[runs[0]].spec)
-    state.home = dict.fromkeys(runs, ["worker"])
+    if role == Role.TRAINER:
+      state.home = dict.fromkeys(runs, "worker")
     node = SimpleNamespace(id="node", bus=self.bus, store=None, state=state, notify=Mock())
     life = Lifetime(node, "worker")
     await self.bus.touch_leases(life.life)

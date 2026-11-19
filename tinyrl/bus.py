@@ -256,6 +256,8 @@ class Bus:
       key("events"), {"kind": Ev.RUN_CREATED, "body": json.dumps(ev | {"train_run": run.train_run, "gpus": run.gpus})}
     )
     wake(p)
+    if run.role == Role.SAMPLER:
+      wake(p, "plan_wake")
     await p.execute()
 
   async def read_state(self) -> dict:
@@ -296,19 +298,16 @@ class Bus:
   async def join_sampling_session(self, run_id: str) -> int:
     return int(await self.r.incr(key("clients", run_id)))
 
-  async def run_counters(self) -> dict[tuple[str, str], dict]:
+  async def run_counters(self) -> dict[str, dict]:
     runs = sorted(r.decode() for r in await self.r.smembers(key("runs")))
     p = self.r.pipeline()
     for r in runs:
       p.hgetall(key("run", r))
-    p.get(key("plan"))
-    *rows, plan_raw = await p.execute()
-    home = (json.loads(plan_raw) if plan_raw else {}).get("home", {})
-    out = {}
-    for r, f in zip(runs, rows):
-      if b"record" in f and (ps := home.get(r)):
-        out[(ps[0], r)] = {k.decode(): int(v) for k, v in f.items() if k not in RUN_META}
-    return out
+    return {
+      r: {k.decode(): int(v) for k, v in f.items() if k not in RUN_META}
+      for r, f in zip(runs, await p.execute())
+      if b"record" in f
+    }
 
   async def delete_run(self, run_id: str) -> None:
     p = self.r.pipeline(transaction=True)

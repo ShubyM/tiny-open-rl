@@ -29,5 +29,5 @@ class TestEvents(RedisTest):
       await asyncio.sleep(0.02)
     self.assertEqual(home["a"], home["b"])
     self.assertNotEqual(home["a"], home["f"])
-    self.assertEqual(state.runs(home["a"][0]), ["a", "b"])
-    self.assertEqual(state.runs(home["f"][0]), ["f"])
+    self.assertEqual(state.runs(home["a"]), ["a", "b"])
+    self.assertEqual(state.runs(home["f"]), ["f"])

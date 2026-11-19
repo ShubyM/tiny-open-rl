@@ -121,13 +121,13 @@ class TestNodeDaemon(RedisTest):
       try:
         ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(ready, node)
-        resident = node.lives[node.state.home["slow"][0]]
+        resident = node.lives[node.state.procs_of("slow")[0]]
         await self.until(started.is_set, node)
         # Another base-model sampler yields the GPU from `resident` while `slow` is still downloading off-GPU.
         await self.bus.create_run(Run("other", "other-base", 4, role=Role.SAMPLER))
         request = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(request, node)
-        contender = node.lives[node.state.home["other"][0]]
+        contender = node.lives[node.state.procs_of("other")[0]]
         self.assertNotIn(resident.life, node.on)
         self.assertIn(contender.life, node.on)
         self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
@@ -239,7 +239,7 @@ class TestNodeDaemon(RedisTest):
       a, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
     )
     await self.reply(req_a, node)
-    pa = node.state.home[a][0]
+    pa = node.state.home[a]
     holder = node.lives[pa]
     pid = holder.model.proc.pid
     os.killpg(pid, signal.SIGSTOP)
@@ -248,8 +248,8 @@ class TestNodeDaemon(RedisTest):
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
       )
       # The holder keeps its turn for CYCLE_GRACE_MS after its command, then the newcomer is planned onto its GPU.
-      await self.until(lambda: (pb := node.state.home.get(b, [""])[0]) in node.lives and node.select_gpus(pb), node)
-      pb = node.state.home[b][0]
+      await self.until(lambda: (pb := node.state.home.get(b, "")) in node.lives and node.select_gpus(pb), node)
+      pb = node.state.home[b]
       self.assertTrue(node.lives[pb].active)
       self.assertEqual(node.select_gpus(pb), (0,))
       self.assertEqual(node.on.get(holder.life), (0,))
@@ -274,7 +274,7 @@ class TestNodeDaemon(RedisTest):
     await node.announce_node()
     await scheduler.tick(self.bus)
     await self.create(run, base, node)
-    proc = node.state.home[run][0]
+    proc = node.state.home[run]
     first = node.lives[proc].model.proc.pid
     # When GPU 0 is occupied, the parked 1-GPU trainer hops to GPU 1 without restarting its subprocess.
     life = node.lives[proc]

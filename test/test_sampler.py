@@ -243,7 +243,8 @@ class TestSampler(RedisTest):
 
   async def test_a_new_preparation_error_replies_while_its_process_is_waiting_for_gpu(self):
     store = Store(tempfile.mkdtemp())
-    for run, path in (("busy", None), ("ready", None), ("broken", "tinker://r/sampler_weights/missing")):
+    await self.bus.create_run(Run("busy", "busy-base", 4, role=Role.SAMPLER))
+    for run, path in (("ready", None), ("broken", "tinker://r/sampler_weights/missing")):
       await self.bus.create_run(Run(run, "base", 4, role=Role.SAMPLER, model_path=path))
     sampling, finish = asyncio.Event(), asyncio.Event()
 
@@ -300,7 +301,7 @@ class TestSampler(RedisTest):
       self.pump(node, sched=True)
       await asyncio.wait_for(sampling.wait(), 5)
       ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode(), cost=10)
-      await self.until(lambda: "ready" in node.state.home and node.state.home["ready"][0] in node.lives)
+      await self.until(lambda: (ps := node.state.procs_of("ready")) and ps[0] in node.lives)
       tail = [
         await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [p]}).encode(), cost=10)
         for p in (33, 44, 55)

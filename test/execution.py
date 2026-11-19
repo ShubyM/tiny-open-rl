@@ -3,6 +3,7 @@
 import asyncio
 
 from test.helpers import FakeEngine, assign_new_runs, tiny
+from tinyrl.bus import Role
 from tinyrl.control import scheduler
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.workers.model import Model
@@ -70,7 +71,8 @@ class TestNode(NodeDaemon):
     state = scheduler.from_state(await self.bus.read_state())
     for r in runs:
       state.procs.setdefault(proc, scheduler.Proc(state.jobs[r].spec))
-      state.home[r] = [proc]
+      if state.jobs[r].spec.role == Role.TRAINER:
+        state.home[r] = proc
     await self.bus.write_plan(scheduler.to_plan(state))
     return await self.add(proc)
 
@@ -102,7 +104,7 @@ class TestNode(NodeDaemon):
   async def worker_for(self, run: str) -> str | None:
     await assign_new_runs(self.bus)
     await self.sync()
-    ps = self.state.home.get(run)
+    ps = self.state.procs_of(run)
     return ps[0] if ps else None
 
   async def drain(self, run: str):

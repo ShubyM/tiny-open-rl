@@ -73,8 +73,10 @@ class RedisTest(unittest.IsolatedAsyncioTestCase):
 
   async def worker(self, run: str) -> str:
     """The run's primary process, once every new run is assigned the way the scheduler assigns it."""
-    plan = await assign_new_runs(self.bus)
-    return plan["home"][run][0]
+    from tinyrl.control import scheduler
+
+    await assign_new_runs(self.bus)
+    return scheduler.from_state(await self.bus.read_state()).procs_of(run)[0]
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
@@ -95,8 +97,8 @@ async def assign_new_runs(bus) -> dict:
     **{n: v for n, v in scheduler.to_plan(new)["procs"].items() if n not in plan.get("procs", {})},
   }
   home = {
-    **{r: ps for r, ps in plan.get("home", {}).items() if r in new.jobs},
-    **{b["run"]: [b["proc"]] for k, b in changes if k == "assigned"},
+    **{r: p for r, p in plan.get("home", {}).items() if r in new.jobs},
+    **{b["run"]: b["proc"] for k, b in changes if k == "assigned"},
   }
   merged = {**plan, "made": max(plan.get("made", 0), new.made), "procs": procs, "home": home}
   if merged != plan:

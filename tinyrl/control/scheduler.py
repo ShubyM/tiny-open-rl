@@ -58,7 +58,7 @@ class State:
   made: int = 0
   nodes: dict[str, tuple[int, int]] = field(default_factory=dict)
   procs: dict[str, Proc] = field(default_factory=dict)
-  home: dict[str, list[str]] = field(default_factory=dict)
+  home: dict[str, str] = field(default_factory=dict)  # training run -> single trainer proc
   jobs: dict[str, Job] = field(default_factory=dict)
   lag: dict[str, float] = field(default_factory=dict)
   seen: dict[str, float] = field(default_factory=dict)
@@ -66,7 +66,18 @@ class State:
   weights: dict[str, float] = field(default_factory=dict)
 
   def runs(self, proc: str) -> list[str]:
-    return [r for r, ps in sorted(self.home.items()) if proc in ps]
+    if (p := self.procs.get(proc)) is None:
+      return []
+    if p.spec.role == Role.SAMPLER:
+      return [r for r, j in sorted(self.jobs.items()) if j.spec == p.spec]
+    return [r for r, owner in sorted(self.home.items()) if owner == proc]
+
+  def procs_of(self, run: str) -> list[str]:
+    if (j := self.jobs.get(run)) is None:
+      return []
+    if j.spec.role == Role.SAMPLER:
+      return [n for n, p in sorted(self.procs.items()) if p.spec == j.spec]
+    return [p] if (p := self.home.get(run)) in self.procs else []
 
   def ready(self, run: str) -> bool:
     return self.jobs[run].backlog > 0
@@ -125,7 +136,7 @@ def from_state(raw: dict) -> State:
   jobs = {r: j for r, j in jobs.items() if not j.spec.train_run or j.spec.train_run in jobs}
   for n, p in plan.get("procs", {}).items():
     procs[n] = Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
-  home = {r: list(ps) for r, ps in plan.get("home", {}).items() if r in jobs}
+  home = {r: p for r, p in plan.get("home", {}).items() if r in jobs and jobs[r].spec.role == Role.TRAINER}
   fv = [{a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights")]
   return State(int(plan.get("made", 0)), nodes, procs, home, jobs, fv[0], fv[1], dict(raw.get("service", {})), fv[2])
 
@@ -192,7 +203,7 @@ def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width
 def choose_node(s: State, proc: str, only_spare: bool = False) -> str | None:
   """A node that can host `proc`: one with room for it and its sampler, then its trainer's node, then the least used."""
   spec = s.procs[proc].spec
-  near = {s.procs[p].node for r in s.runs(proc) for p in s.home.get(s.jobs[r].train_run, ())}
+  near = {s.procs[p].node for r in s.runs(proc) if (p := s.home.get(s.jobs[r].train_run or ""))}
   sampled = {j.train_run for j in s.jobs.values()}
 
   def placement_rank(node: str) -> tuple:
@@ -236,30 +247,20 @@ def demand(s: State, cap: float) -> dict[str, float]:
   return want
 
 
-def spawn(s: State, out: list, run: str, spec: Spec, node: str, rule: str, append: bool = False) -> None:
-  q = s.add_proc(spec)
-  s.procs[q].node = node
-  s.home[run] = [*s.home[run], q] if append else [q]
-  out.append((Ev.ASSIGNED, {"run": run, "proc": q}))
-  out.append((Ev.PLACED, {"proc": q, "node": node, "rule": rule}))
-
-
 def drop_lost(s: State, out: list) -> None:
-  """Unplace processes whose node vanished or no longer has room for them, and drop sampler replicas past the backlog."""
+  """Unplace processes whose node vanished or no longer has room for them."""
   for name, p in sorted(s.procs.items()):
     if p.node and (p.node not in s.nodes or not s.can_host(p.node, p.spec, name)):
       p.node = None
       out.append((Ev.UNPLACED, {"proc": name, "rule": "place.node_lost"}))
-  for r, ps in list(s.home.items()):
-    s.home[r] = list(dict.fromkeys(ps))[: max(1, s.jobs[r].backlog // max(1, SCALE_BATCH))]
 
 
 def assign(s: State, out: list) -> None:
-  """Give every homeless run a process: the matching one with the fewest runs, or a new one."""
+  """Give every homeless training run a process: the matching shareable one with the fewest runs, or a new one."""
   for r, j in sorted(s.jobs.items()):
-    if not s.home.get(r):
+    if j.spec.role == Role.TRAINER and r not in s.home:
       match = [n for n, p in sorted(s.procs.items()) if j.spec.shareable and p.spec == j.spec]
-      s.home[r] = [target := min(match, key=lambda n: len(s.runs(n))) if match else s.add_proc(j.spec)]
+      s.home[r] = target = min(match, key=lambda n: len(s.runs(n))) if match else s.add_proc(j.spec)
       out.append((Ev.ASSIGNED, {"run": r, "proc": target}))
 
 
@@ -273,27 +274,36 @@ def merge_and_split(s: State, out: list) -> None:
     twins = [q for q, pr in sorted(s.procs.items()) if q != name and pr.spec == p.spec]
     if (idle_dup or busy_dup) and twins:
       for r in s.runs(name):
-        s.home[r] = [twins[0]]
+        s.home[r] = twins[0]
         out.append((Ev.ASSIGNED, {"run": r, "proc": twins[0]}))
       continue
     while len(busy := [r for r in s.runs(name) if s.ready(r)]) >= 2 and (spot := choose_node(s, name, True)):
-      spawn(s, out, busy[-1], p.spec, spot, "place.split")
+      q = s.add_proc(p.spec)
+      s.procs[q].node = spot
+      s.home[busy[-1]] = q
+      out.append((Ev.ASSIGNED, {"run": busy[-1], "proc": q}))
+      out.append((Ev.PLACED, {"proc": q, "node": spot, "rule": "place.split"}))
 
 
-def scale_out(s: State, out: list) -> None:
-  """Give a backlogged sampler more replicas: idle matching processes first, then new ones on spare GPUs."""
-  for r, j in sorted(s.jobs.items()):
-    elastic = j.spec.role == Role.SAMPLER and not j.spec.exclusive
-    want = j.backlog // max(1, SCALE_BATCH) if elastic else 1
-    while len(s.home[r]) < want:
-      pool = [q for q, p in sorted(s.procs.items()) if p.spec == j.spec and p.node]
-      if idle := [q for q in pool if not s.busy(q)]:
-        s.home[r].append(idle[0])
-        out.append((Ev.ASSIGNED, {"run": r, "proc": idle[0]}))
-      elif spot := choose_node(s, s.home[r][0], True):
-        spawn(s, out, r, j.spec, spot, "place.scale_out", append=True)
-      else:
-        break
+def size_samplers(s: State, out: list) -> None:
+  """Maintain one stateless sampler pool per active Spec: scale out on spare GPUs, scale in past backlog."""
+  by_spec: dict[Spec, list[Job]] = {}
+  for _, j in sorted(s.jobs.items()):
+    if j.spec.role == Role.SAMPLER:
+      by_spec.setdefault(j.spec, []).append(j)
+  for spec, js in by_spec.items():
+    pool = [n for n, p in sorted(s.procs.items()) if p.spec == spec]
+    placed = [n for n in pool if s.procs[n].node]
+    want = 1 if spec.exclusive else max(1, sum(j.backlog for j in js) // max(1, SCALE_BATCH))
+    keep = placed[:want] if placed else (pool[:1] or [s.add_proc(spec)])
+    for name in pool:
+      if name not in keep and s.procs.pop(name).node:
+        out.append((Ev.UNPLACED, {"proc": name, "rule": "place.scale_in"}))
+    while len(keep) < want and (spot := choose_node(s, keep[0], True)):
+      q = s.add_proc(spec)
+      s.procs[q].node = spot
+      keep.append(q)
+      out.append((Ev.PLACED, {"proc": q, "node": spot, "rule": "place.scale_out"}))
 
 
 def collect_and_place(s: State, out: list) -> None:
@@ -321,7 +331,7 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
   s, out = copy.deepcopy(state), []
   cap = float(sum(g for g, _ in s.nodes.values()))
   s.lag, s.seen = update_lag(s.lag, s.seen, s.service, cap, demand(s, cap), s.weights)
-  for phase in (drop_lost, assign, merge_and_split, scale_out, collect_and_place, rebalance):
+  for phase in (drop_lost, assign, merge_and_split, size_samplers, collect_and_place, rebalance):
     phase(s, out)
   return s, out
 

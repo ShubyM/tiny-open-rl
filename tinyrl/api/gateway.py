@@ -421,8 +421,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
     run = await require_run(run_id)
-    plan = json.loads(raw) if (raw := await bus.r.get(key("plan"))) else {}
-    procs = plan.get("home", {}).get(run_id, [])
+    procs = scheduler.from_state(await bus.read_state()).procs_of(run_id)
     extra = {"procs": procs, **({"worker": procs[0]} if procs else {})}
     return {**run, **extra, **await bus.queued_and_in_flight(run_id)}
 
@@ -436,14 +435,17 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.get("/metrics")
   async def metrics():
     """Every run's counters, account service and node loop lag for Prometheus."""
+    raw = await bus.read_state()
+    state = scheduler.from_state(raw)
     lines = []
-    for (proc, run), counters in (await bus.run_counters()).items():
-      for name, n in counters.items():
-        name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
-        lines.append(f'tinyrl_{name}_total{{worker="{proc}",run="{run}"}} {n}')
-    for account, total in sorted((await bus.r.hgetall(key("service"))).items()):
-      lines.append(f'tinyrl_account_service_total{{account="{account.decode()}"}} {float(total)}')
-    for node, beat in (await bus.live_nodes(details=True)).items():
+    for run, counters in (await bus.run_counters()).items():
+      if ps := state.procs_of(run):
+        for name, n in counters.items():
+          name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
+          lines.append(f'tinyrl_{name}_total{{worker="{ps[0]}",run="{run}"}} {n}')
+    for account, total in sorted(raw["service"].items()):
+      lines.append(f'tinyrl_account_service_total{{account="{account}"}} {float(total)}')
+    for node, beat in raw["nodes"].items():
       lines.append(f'tinyrl_node_loop_lag_seconds{{node="{node}"}} {beat.get("lag", 0.0)}')
     return PlainTextResponse("\n".join(lines) + "\n")
 
