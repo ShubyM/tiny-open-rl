@@ -40,8 +40,8 @@ flowchart TD
   N -->|Fenced replies| R
 ```
 
-- **Redis as single state store ([bus.py](tinyrl/bus.py)):** each run is a Redis stream with single-writer `(owner, epoch, pos, snap)` fencing, process leases, and checkpoint metadata in the same transactions.
-- **Cluster scheduler ([scheduler.py](tinyrl/control/scheduler.py)):** places stateful trainers and per-spec stateless sampler pools across nodes, splits/merges LoRA trainers, scales samplers on backlog, and tracks per-account EEVDF `gpu_ms` lag.
+- **Redis as single state store ([bus.py](tinyrl/bus.py)):** each run is a Redis stream (groupless FIFO for trainers, shared `sampler` group for samplers) with single-writer `(owner, epoch, pos, snap, claimed)` fencing, node-renewed leases, and a single `tinyrl:ckpts` hash.
+- **Cluster scheduler ([scheduler.py](tinyrl/control/scheduler.py)) & fairness ([fairness.py](tinyrl/control/fairness.py)):** places stateful trainers and per-spec stateless sampler pools across nodes, splits/merges LoRA trainers, scales samplers on backlog, and enforces per-account EEVDF `gpu_ms` fairness with single-account sampler waves.
 - **Node daemon ([node_daemon.py](tinyrl/control/node_daemon.py)):** time-slices local GPUs on adaptive wall-clock quanta, parks trainers to pinned host memory, drives vLLM (or custom `ENGINE=module:Class`) with optional CRIU snapshots, and stages checkpoints off-GPU.
 - **Immutable checkpoints ([store.py](tinyrl/storage/store.py)):** pure safetensors directories at `CKPT/objects/<version>` with peer-to-peer node caching and background bucket uploads.
 
@@ -51,10 +51,12 @@ Key environment variables: `REDIS_URL`, `PORT`, `GPUS`, `CKPT`, `CKPT_CACHE`, `M
 
 | Path | Responsibility |
 |---|---|
-| [tinyrl/bus.py](tinyrl/bus.py) | Runs, sessions, streams, fenced ownership, leases, and checkpoint registry |
+| [tinyrl/types.py](tinyrl/types.py) | Shared stdlib-only domain types (`Op`, `Ev`, `Role`, `Run`, `Cmd`, `Reply`, `Event`, `parse_uri`) |
+| [tinyrl/bus.py](tinyrl/bus.py) | Runs, sessions, streams, fenced ownership, leases, and `tinyrl:ckpts` hash |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes and Prometheus `/metrics` |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobuf and JSON wire codecs |
-| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | Cluster placement, elastic scaling, rebalancing, and EEVDF lag |
+| [tinyrl/control/fairness.py](tinyrl/control/fairness.py) | Pure GPU fairness (`waterfill`, `update_lag`, `select_runs`, `plan_gpus`) |
+| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | Cluster placement, elastic sampler pools, and rebalancing |
 | [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | Local GPU quanta, `TrainerLife`, and `SamplerLife` |
 | [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | Concurrent wave GPU-time accounting |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | Private Unix-socket IPC and parent-owned process groups |
