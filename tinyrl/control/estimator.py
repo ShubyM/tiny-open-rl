@@ -9,8 +9,6 @@ import json
 import os
 import re
 
-from huggingface_hub import get_safetensors_metadata, hf_hub_download
-
 OVERHEAD = int(0.75 * 1024**3)  # measured: 529 MiB CUDA context + ~210 MiB cuBLAS, H100
 
 
@@ -21,6 +19,8 @@ def estimate(
   revision: str = "main",
   max_model_len: int = 4096,
 ) -> tuple[int, int | None]:
+  from huggingface_hub import get_safetensors_metadata, hf_hub_download
+
   meta = get_safetensors_metadata(repo, revision=revision).parameter_count
   if mode == "full":
     tot = sum(meta.values()) * 16 + OVERHEAD

@@ -73,10 +73,6 @@ def nbytes(t: torch.Tensor) -> int:
   return t.numel() * t.element_size()
 
 
-def aligned(n: int) -> int:
-  return (n + 7) & ~7  # so a view of the pinned buffer can start any dtype
-
-
 def as_bytes(t: torch.Tensor) -> torch.Tensor:
   import torch
 

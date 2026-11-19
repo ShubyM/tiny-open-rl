@@ -59,8 +59,8 @@ class TestEstimator(unittest.TestCase):
       json.dump({"text_config": {"num_hidden_layers": 32, "hidden_size": 4096, "num_attention_heads": 32}}, f)
       f.flush()
       with (
-        patch.object(estimator, "get_safetensors_metadata", return_value=meta),
-        patch.object(estimator, "hf_hub_download", return_value=f.name),
+        patch("huggingface_hub.get_safetensors_metadata", return_value=meta),
+        patch("huggingface_hub.hf_hub_download", return_value=f.name),
       ):
         full_bytes, full_gpus = estimator.estimate("org/model", "full")
         vllm_bytes, vllm_gpus = estimator.estimate("org/model", "vllm")
@@ -68,7 +68,7 @@ class TestEstimator(unittest.TestCase):
     self.assertEqual(vllm_gpus, 1)
     self.assertGreater(vllm_bytes, 16_000_000_000)
 
-    check = "import sys, tinyrl.api.gateway, tinyrl.control.node_daemon; assert not ({'torch', 'transformers', 'peft'} & sys.modules.keys())"
+    check = "import sys, tinyrl.api.gateway, tinyrl.control.node_daemon; assert not ({'torch', 'transformers', 'peft', 'safetensors', 'huggingface_hub'} & sys.modules.keys())"
     res = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True)
     self.assertEqual(res.returncode, 0, res.stderr)
 
