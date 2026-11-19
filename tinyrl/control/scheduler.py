@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from tinyrl.bus import Bus, Ev, Role
 from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
-from tinyrl.storage.registry import Registry
 
 REBALANCE_MS = getenv("REBALANCE_MS", 20_000)
 SCALE_BATCH, TICK_MS = getenv("SCALE_BATCH", 4), getenv("TICK_MS", 100)
@@ -285,11 +284,10 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
 # ***** loop *****
 
 
-async def tick(bus: Bus, registry: Registry | None = None) -> list[tuple[Ev, dict]]:
+async def tick(bus: Bus) -> list[tuple[Ev, dict]]:
   for session in await bus.expired_sessions():
     await bus.end_session(session)
-  if registry:
-    await registry.unregister_checkpoints(*await registry.expired_checkpoints())
+  await bus.unregister_checkpoints(*await bus.expired_checkpoints())
   raw = await bus.read_state()
   old, (new, changes) = raw["plan"], step(from_state(raw))
   plan = to_plan(new)
@@ -300,9 +298,9 @@ async def tick(bus: Bus, registry: Registry | None = None) -> list[tuple[Ev, dic
 
 
 async def run(bus: Bus) -> None:
-  registry, wake_id = Registry(bus), "$"
+  wake_id = "$"
   while True:
-    await tick(bus, registry)
+    await tick(bus)
     wake_id = await bus.wait_wake(wake_id, TICK_MS)
 
 

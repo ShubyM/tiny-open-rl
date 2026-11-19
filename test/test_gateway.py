@@ -44,6 +44,13 @@ class TestGatewayDedupe(RedisTest):
     samplers = [r for r in runs if r.decode().startswith("samp-")]
     self.assertEqual(len(samplers), 1)
 
+  async def test_zero_or_negative_gpus_is_rejected(self):
+    for bad in (0, "0", -1):
+      res = await self.http.post(
+        "/api/v1/create_model", json={"base_model": "tiny", "user_metadata": {"openrl.gpus": bad}}
+      )
+      self.assertEqual(res.status_code, 400)
+
 
 if __name__ == "__main__":
   unittest.main()

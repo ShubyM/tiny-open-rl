@@ -38,7 +38,7 @@ CASES = [
     "await p.exists(fk)",
     DEDUP,
   ),
-  (BUS, "commit_reply", "if mutates and not deleting:", "if reply.ok and mutates and not deleting:", RECOVERY),
+  (BUS, "commit_reply", "if mutates:", "if reply.ok and mutates:", RECOVERY),
 ]
 
 

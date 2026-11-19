@@ -357,7 +357,7 @@ class TestTrainer(RedisTest):
       info = await self.bus.get_run(run)
       self.assertIsNone(info.get("owner"))
       parked = info["snap"].partition("\n")[0]
-      self.assertIsNotNone(await self.registry.get_checkpoint(parked))
+      self.assertIsNotNone(await self.bus.get_checkpoint(parked))
       # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
       await self.node.drain(run)
@@ -369,7 +369,7 @@ class TestTrainer(RedisTest):
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
       self.assertIsNone((await self.bus.get_run(run)).get("snap"))
-      self.assertIsNone(await self.registry.get_checkpoint(parked))  # recovery cannot replay old state after a crash
+      self.assertIsNone(await self.bus.get_checkpoint(parked))  # recovery cannot replay old state after a crash
 
   async def test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure(self):
     run = new_id()
@@ -395,7 +395,7 @@ class TestTrainer(RedisTest):
       info = await self.bus.get_run(run)
       self.assertEqual(info["pos"], request.rsplit("/", 1)[1])
       self.assertIsNone(info.get("snap"))
-      self.assertIsNone(await self.registry.get_checkpoint(parked))
+      self.assertIsNone(await self.bus.get_checkpoint(parked))
 
     self.node.drop_local("p")
     await self.finish_worker("p")
