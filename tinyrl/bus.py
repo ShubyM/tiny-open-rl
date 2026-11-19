@@ -52,11 +52,8 @@ def parse_cmd(run: str, entry_id: bytes, fields: dict[bytes, bytes]) -> Cmd:
 
 
 def parse_heads(got) -> list[Cmd]:
-  return [
-    Cmd(s.decode().removeprefix(key("q", "")), eid.decode(), Op(f[b"op"].decode()), b"")
-    for s, entries in got
-    for eid, f in entries[:1]
-  ]
+  pre = key("q", "")
+  return [Cmd(s.decode().removeprefix(pre), e.decode(), Op(f[b"op"].decode()), b"") for s, rs in got for e, f in rs[:1]]
 
 
 def is_missing_stream(err: Exception) -> bool:
@@ -72,8 +69,7 @@ def finish_cmd(p, cmd: Cmd, reply: Reply, acct: str, charge: Charge | None, *, g
   p.expire(fk, REPLY_TTL)
   counts = {"failed": 1} if not reply.ok else {"steps": 1} if cmd.op == Op.OPTIM_STEP else {}
   if charge:
-    wait_ms = max(0, charge.started_ms - int(cmd.entry_id.split("-")[0]))
-    counts.update(cmds=1, wait_ms=wait_ms, busy_ms=charge.busy_ms)
+    counts.update(cmds=1, wait_ms=max(0, charge.started_ms - int(cmd.entry_id.split("-")[0])), busy_ms=charge.busy_ms)
     if reply.ok:
       counts["tokens"] = cmd.cost
     if acct and charge.gpu_ms:
@@ -98,11 +94,9 @@ def queue_checkpoint(p, uri: str, size: int, *, version: str, ttl=None, owned=Fa
   _, cid = parse_uri(uri)
   raw_kind, now = cid.split("/", 1)[0], time.time()
   kind = {"weights": "training", "sampler_weights": "sampler"}.get(raw_kind, raw_kind)
-  info = {"checkpoint_id": cid, "checkpoint_type": kind, "time": now, "tinker_path": uri, "size_bytes": size}
+  row = {"checkpoint_id": cid, "checkpoint_type": kind, "time": now, "tinker_path": uri, "size_bytes": size}
   p.hset(
-    key("ckpts"),
-    uri,
-    json.dumps({**info, "expires_at": now + ttl if ttl else None, "owned": owned, "version": version}),
+    key("ckpts"), uri, json.dumps(row | {"expires_at": now + ttl if ttl else None, "owned": owned, "version": version})
   )
 
 
@@ -536,23 +530,18 @@ class Bus:
     raise ValueError(f"no checkpoint at {uri}")
 
   async def checkpoint_versions(self, uris: list[str]) -> dict[str, str | Exception]:
-    if not uris:
-      return {}
-    rows = await self.s.hmget(key("ckpts"), *uris)
+    rows = await self.s.hmget(key("ckpts"), *uris) if uris else []
     return {
-      uri: v if (v := (json.loads(raw) if raw else {}).get("version")) else ValueError(f"no checkpoint at {uri}")
-      for uri, raw in zip(uris, rows)
+      u: v if (v := (json.loads(r) if r else {}).get("version")) else ValueError(f"no checkpoint at {u}")
+      for u, r in zip(uris, rows)
     }
 
   async def _all_checkpoints(self) -> list[dict]:
     return [json.loads(v) for v in await self.s.hvals(key("ckpts"))]
 
   async def _visible_checkpoints(self, prefix: str = "") -> list[dict]:
-    return [
-      c
-      for c in await self._all_checkpoints()
-      if c["tinker_path"].startswith(prefix) and c["checkpoint_type"] != "parked"
-    ]
+    items = await self._all_checkpoints()
+    return [c for c in items if c["tinker_path"].startswith(prefix) and c["checkpoint_type"] != "parked"]
 
   async def checkpoints_of_run(self, run: str) -> list[dict]:
     return sorted(await self._visible_checkpoints(f"tinker://{run}/"), key=lambda c: c["time"])
@@ -592,10 +581,9 @@ class Bus:
   # ***** nodes and events *****
 
   async def node_heartbeat(self, node: str, gpus: int, memory: int = 0, leases: tuple[str, ...] = (), **info) -> None:
+    body = json.dumps({"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, **info})
     p = self.s.pipeline()
-    p.hset(
-      key("nodes"), node, json.dumps({"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, **info})
-    )
+    p.hset(key("nodes"), node, body)
     for life in leases:
       p.set(key("lease", life), 1, px=LEASE_MS, xx=True)
     await p.execute()

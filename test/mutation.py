@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = "tinyrl/control/scheduler.py"
 BUS = "tinyrl/bus.py"
+FAIRNESS = "tinyrl/control/fairness.py"
 ACCOUNTING = "tinyrl/control/accounting.py"
 ORDER = "test.test_scheduler.TestLocalQuantum"
 BILLING = "test.test_accounting.TestAccounting"
@@ -22,9 +23,9 @@ RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery
 
 # (source, function, original expression, faulty replacement, tests that should detect it)
 CASES = [
-  (SCHEDULER, "select_runs", "-state.ready_lag(cmd.run)", "state.ready_lag(cmd.run)", ORDER),
-  (SCHEDULER, "select_runs", "[:width]", "[:1]", ORDER),
-  (SCHEDULER, "select_runs", 'tuple(map(int, cmd.entry_id.split("-")))', "cmd.entry_id", ORDER),
+  (FAIRNESS, "select_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
+  (FAIRNESS, "select_runs", "[:width]", "[:1]", ORDER),
+  (FAIRNESS, "select_runs", 'tuple(map(int, cmd.entry_id.split("-")))', "cmd.entry_id", ORDER),
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),

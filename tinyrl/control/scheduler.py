@@ -12,8 +12,10 @@ import dataclasses
 import itertools
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus, Cmd, Ev, Role
+from tinyrl.bus import Bus
+from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
+from tinyrl.types import Ev, Role
 
 REBALANCE_MS = getenv("REBALANCE_MS", 20_000)
 SCALE_BATCH, TICK_MS = getenv("SCALE_BATCH", 4), getenv("TICK_MS", 100)
@@ -27,6 +29,14 @@ class Spec:
   exclusive: bool = False
   train_run: str | None = None
   gpus: int = 1
+
+  @property
+  def shareable(self) -> bool:
+    return self.role == Role.SAMPLER or (self.lora and not self.exclusive)
+
+  @property
+  def elastic(self) -> bool:
+    return self.role == Role.SAMPLER and not self.exclusive
 
 
 @dataclass
@@ -95,15 +105,17 @@ class State:
     account = self.account(run)
     return self.lag.get(account, 0.0) - max(0.0, self.service.get(account, 0.0) - self.seen.get(account, 0.0))
 
+  def procs_on(self, node: str, skip: str = "") -> list[tuple[str, Proc]]:
+    return [(n, p) for n, p in self.procs.items() if p.node == node and n != skip]
+
   def used(self, node: str) -> int:
-    return sum(p.spec.gpus for p in self.procs.values() if p.node == node)
+    return sum(p.spec.gpus for _, p in self.procs_on(node))
 
   def excl_used(self, node: str, skip: str = "") -> int:
-    return sum(p.spec.gpus for n, p in self.procs.items() if n != skip and p.node == node and p.spec.exclusive)
+    return sum(p.spec.gpus for _, p in self.procs_on(node, skip) if p.spec.exclusive)
 
   def busy_gpus(self, node: str, skip: str = "") -> int:
-    shared = (n for n, p in self.procs.items() if p.node == node and not p.spec.exclusive and n != skip)
-    return sum(self.procs[n].spec.gpus for n in shared if self.busy(n))
+    return sum(p.spec.gpus for n, p in self.procs_on(node, skip) if not p.spec.exclusive and self.busy(n))
 
   def spare(self, node: str) -> int:
     return self.nodes[node][0] - self.excl_used(node) - self.busy_gpus(node)
@@ -148,52 +160,6 @@ def settings(gpus: int, gpu_bytes: int) -> dict[str, str]:
   return env | ({"TINYRL_KV_BYTES": str(24 * 2**30)} if gpu_bytes >= 64 * 2**30 else {})
 
 
-# ***** fairness (progressive water-filling + EEVDF lag in gpu_ms) *****
-
-
-def waterfill(capacity: float, demand: dict[str, float], weights: dict[str, float] | None = None) -> dict[str, float]:
-  """Weighted progressive max-min fair rates `r*[a] <= demand[a]` summing to `min(capacity, sum(demand))`."""
-  rates, rem, left = {}, float(capacity), {a: float(d) for a, d in demand.items() if d > 0}
-  w = {a: max(1e-9, float((weights or {}).get(a, 1.0))) for a in left}
-  while left:
-    tw, level = sum(w[a] for a in left), min(left[a] / w[a] for a in left)
-    if level * tw >= rem - 1e-9:
-      return rates | {a: rem * w[a] / tw for a in left}
-    for a in [a for a in left if left[a] / w[a] <= level + 1e-9]:
-      rates[a] = left.pop(a)
-      rem -= rates[a]
-  return rates
-
-
-def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, weights: dict | None = None):
-  """Advance EEVDF lag from monotone `service - seen` deltas (`Lag.tla`: race-free, no idle hoard, no flicker gain)."""
-  lag, seen, w = dict(lag), dict(seen), weights or {}
-  accts = set(lag) | set(service) | set(demand)
-  deltas = {a: max(0.0, service.get(a, 0.0) - seen.get(a, 0.0)) for a in accts}
-  seen |= {a: max(seen.get(a, 0.0), v) for a, v in service.items()}
-  rates = waterfill(max(cap, 1.0), {a: max(demand.get(a, 0.0), float(deltas[a] > 0)) for a in accts}, w)
-  if (work := sum(deltas[a] for a in rates)) > 0 and (total_r := sum(rates.values())) > 0:
-    for a, r in rates.items():
-      lag[a] = lag.get(a, 0.0) + work * (r / total_r) - deltas[a]
-    live_w = sum(max(1e-9, float(w.get(a, 1.0))) for a in rates)
-    for a in set(lag) - set(rates):
-      wa = max(1e-9, float(w.get(a, 1.0)))
-      lag[a] = min(0.0, lag[a] + work * wa / (live_w + wa))
-  active = {a for a in accts if demand.get(a, 0.0) > 0 or deltas[a] > 0}
-  return {a: v for a, v in lag.items() if a in active or v < -1e-9}, seen
-
-
-def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width: int) -> list[str]:
-  """Choose up to `width` ready runs: accounts owed the most GPU time first, then their least-served runs."""
-  ready = {cmd.run: cmd for cmd in reversed(heads)}
-  floor = min((service[run] for run in ready if run in service), default=0.0)
-
-  def rank(cmd: Cmd) -> tuple:
-    return -state.ready_lag(cmd.run), service.get(cmd.run, floor), tuple(map(int, cmd.entry_id.split("-")))
-
-  return [cmd.run for cmd in sorted(ready.values(), key=rank)[:width]]
-
-
 # ***** placement, elastic scaling, and cross-node rebalance *****
 
 
@@ -204,7 +170,7 @@ def choose_node(s: State, proc: str, only_spare: bool = False) -> str | None:
   sampled = {j.train_run for j in s.jobs.values()}
 
   def placement_rank(node: str) -> tuple:
-    unpaired = [n for n, p in s.procs.items() if p.node == node and p.spec.role == Role.TRAINER and not p.spec.lora]
+    unpaired = [n for n, p in s.procs_on(node) if p.spec.role == Role.TRAINER and not p.spec.lora]
     owed = sum(s.procs[n].spec.gpus for n in unpaired if not (sampled & set(s.runs(n))))
     used, capacity = s.used(node), s.nodes[node][0]
     paired = spec.gpus * (2 if spec.role == Role.TRAINER and not spec.lora else 1)
@@ -224,7 +190,7 @@ def rebalance_target(s: State, name: str) -> str | None:
     return min(spare, key=lambda n: s.used(n) / s.nodes[n][0])
 
   def floor(node: str) -> float:
-    on = (s.lag_of(h) for h, q in s.procs.items() if q.node == node and not q.spec.exclusive and s.busy(h))
+    on = (s.lag_of(h) for h, q in s.procs_on(node) if not q.spec.exclusive and s.busy(h))
     return min(on, default=float("inf"))
 
   here = (round(s.load(p.node, name), 6), round(floor(p.node), 3))
@@ -237,8 +203,7 @@ def demand(s: State, cap: float) -> dict[str, float]:
   biggest, want = max((g for g, _ in s.nodes.values()), default=0), {}
   for r, j in s.jobs.items():
     if s.ready(r) and j.spec.gpus <= biggest:
-      elastic = j.spec.role == Role.SAMPLER and not j.spec.exclusive
-      reps = min(int(cap) // j.spec.gpus, max(1, j.backlog // max(1, SCALE_BATCH))) if elastic else 1
+      reps = min(int(cap) // j.spec.gpus, max(1, j.backlog // max(1, SCALE_BATCH))) if j.spec.elastic else 1
       a = s.account(r)
       want[a] = want.get(a, 0.0) + reps * j.spec.gpus
   return want
@@ -256,7 +221,7 @@ def assign(s: State, out: list) -> None:
   """Give every homeless training run a process: the matching shareable one with the fewest runs, or a new one."""
   for r, j in sorted(s.jobs.items()):
     if j.spec.role == Role.TRAINER and r not in s.home:
-      match = [n for n, p in sorted(s.procs.items()) if j.spec.lora and not j.spec.exclusive and p.spec == j.spec]
+      match = [n for n, p in sorted(s.procs.items()) if j.spec.shareable and p.spec == j.spec]
       s.home[r] = target = min(match, key=lambda n: len(s.runs(n))) if match else s.add_proc(j.spec)
       out.append((Ev.ASSIGNED, {"run": r, "proc": target}))
 
@@ -264,7 +229,7 @@ def assign(s: State, out: list) -> None:
 def merge_and_split(s: State, out: list) -> None:
   """Coalesce crowded LoRA trainers, and split busy ones onto spare GPUs."""
   for name, p in sorted(list(s.procs.items())):
-    if p.spec.role != Role.TRAINER or not p.spec.lora or p.spec.exclusive or not p.node:
+    if p.spec.role != Role.TRAINER or not p.spec.shareable or not p.node:
       continue
     idle_dup = not s.busy(name) and s.used(p.node) > s.nodes[p.node][0]
     busy_dup = s.spare(p.node) < 0 and not any(s.spare(n) >= p.spec.gpus for n in s.nodes)

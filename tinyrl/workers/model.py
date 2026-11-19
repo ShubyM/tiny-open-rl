@@ -470,10 +470,8 @@ class Model:
     if device == "cpu":
       cuda = [t for t in tensors if t.is_cuda]
       if need := [t for t in cuda if (b := self.pinned.get(id(t))) is None or (b.shape, b.dtype) != (t.shape, t.dtype)]:
-        slab, at = (
-          pinned_bytes(sum((nbytes(t) + 7) & ~7 for t in need)),
-          0,
-        )  # 8-byte aligned so any dtype view starts clean
+        # 8-byte aligned so any dtype view starts clean
+        slab, at = pinned_bytes(sum((nbytes(t) + 7) & ~7 for t in need)), 0
         for t in need:
           self.pinned[id(t)] = slab[at : at + nbytes(t)].view(t.dtype).view(t.shape)
           at += (nbytes(t) + 7) & ~7

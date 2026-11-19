@@ -299,9 +299,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
     """What the SDK asks before it resumes from a checkpoint: how to create a run like the one that saved it. The checkpoint
     says so itself, as its run is deleted soon after its client stops."""
     try:
-      meta = await asyncio.to_thread(
-        store.read_meta, await bus.checkpoint_version(checkpoint_uri("", "", req.tinker_path))
-      )
+      meta = await asyncio.to_thread(store.read_meta, await bus.checkpoint_version(req.tinker_path))
     except (OSError, IndexError, ValueError):
       meta = {}
     if "base" not in meta:
@@ -424,7 +422,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
     run = await require_run(run_id)
-    procs = scheduler.from_state(await bus.read_state()).procs_of(run_id)
+    procs = scheduler.from_state(await bus.read_state(backlogs=False)).procs_of(run_id)
     extra = {"procs": procs, **({"worker": procs[0]} if procs else {})}
     return {**run, **extra, **await bus.queued_and_in_flight(run_id)}
 
@@ -438,7 +436,7 @@ def app(bus: Bus | None = None, store: Store | None = None) -> FastAPI:
   @api.get("/metrics")
   async def metrics():
     """Every run's counters, account service and node loop lag for Prometheus."""
-    raw = await bus.read_state()
+    raw = await bus.read_state(backlogs=False)
     state = scheduler.from_state(raw)
     lines = []
     for run, counters in (await bus.run_counters()).items():

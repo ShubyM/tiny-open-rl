@@ -291,9 +291,9 @@ class Stress(RedisTest):
         heads = [(c.run[:4], c.op.value) for c in lf.heads.values()]
         owned = [r[:4] for r in getattr(lf, "owned", ())]
         out.append(
-          f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} active={lf.active} wanted={lf.wanted()} "
+          f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} demand={lf.demand.value} wanted={lf.wanted()} "
           f"owned={owned} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
-          f"task={'done' if node.tasks[proc].done() else 'running'} q={lf.quantum:.2f} granted={time.monotonic() - lf.granted_at:.1f}s ago"
+          f"task={'done' if node.tasks[proc].done() else 'running'} hold={lf.hold_until - time.monotonic():.1f}s"
         )
     print("\n".join(out), file=sys.stderr)
 
