@@ -11,7 +11,7 @@ from test.helpers import RedisTest, new_id
 from test.test_api import proto_body
 from test.test_scheduler import FakeLife
 from tinyrl.bus import Op, Run
-from tinyrl.control.node_daemon import plan_gpus
+from tinyrl.control.fairness import Demand, plan_gpus
 from tinyrl.control.scheduler import Spec, State
 from tinyrl.storage.store import Store
 
@@ -19,8 +19,8 @@ from tinyrl.storage.store import Store
 class TestWideSelection(unittest.TestCase):
   def test_exclusive_prefers_to_leave_a_parked_gangs_block_available(self):
     state, on = State(), {}
-    gang = FakeLife("gang", Spec(gpus=2), state, on, bound=(0, 1))
-    other = FakeLife("other", Spec(exclusive=True), state, on)
+    gang = FakeLife("gang", Spec(gpus=2), state, bound=(0, 1))
+    other = FakeLife("other", Spec(exclusive=True), state)
     lives = {"gang": gang, "other": other}
     self.assertEqual(plan_gpus(lives, on, 4, 1)[0], {"other": (2,), "gang": (0, 1)})
     self.assertEqual(plan_gpus(lives, on, 2, 1)[0], {"other": (0,)})
@@ -41,7 +41,7 @@ class TestWideRebind(RedisTest):
         self.assertNotIn(gang.life, node.on)
         request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
         async with asyncio.timeout(5):
-          while not gang.active:
+          while gang.demand == Demand.IDLE:
             await node.changed.wait()
         self.assertTrue(gang.wanted())
         self.assertEqual(node.select_gpus(run), ())

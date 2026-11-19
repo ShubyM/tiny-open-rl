@@ -17,6 +17,7 @@ from test.test_process import require_unix
 from test.test_sampler import JOB
 from tinyrl.bus import GROUP, LEASE_MS, Op, Role, Run, key
 from tinyrl.control import scheduler
+from tinyrl.control.fairness import Demand
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.storage.store import Store
 
@@ -250,7 +251,7 @@ class TestNodeDaemon(RedisTest):
       # The holder keeps its turn for CYCLE_GRACE_MS after its command, then the newcomer is planned onto its GPU.
       await self.until(lambda: (pb := node.state.home.get(b, [""])[0]) in node.lives and node.select_gpus(pb), node)
       pb = node.state.home[b][0]
-      self.assertTrue(node.lives[pb].active)
+      self.assertNotEqual(node.lives[pb].demand, Demand.IDLE)
       self.assertEqual(node.select_gpus(pb), (0,))
       self.assertEqual(node.on.get(holder.life), (0,))
       self.assertNotIn(node.lives[pb].life, node.on)  # Rule R1: never enters GPU 0 until holder finishes parking

@@ -12,7 +12,8 @@ import dataclasses
 import itertools
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus, Cmd, Ev, Role
+from tinyrl.bus import Bus, Ev, Role
+from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
 from tinyrl.storage.registry import Registry
 
@@ -139,52 +140,6 @@ def to_plan(s: State) -> dict:
 def settings(gpus: int, gpu_bytes: int) -> dict[str, str]:
   env = {"TINYRL_WARM_SAMPLER": "1"} if gpus >= 2 else {}
   return env | ({"TINYRL_KV_BYTES": str(24 * 2**30)} if gpu_bytes >= 64 * 2**30 else {})
-
-
-# ***** fairness (progressive water-filling + EEVDF lag in gpu_ms) *****
-
-
-def waterfill(capacity: float, demand: dict[str, float], weights: dict[str, float] | None = None) -> dict[str, float]:
-  """Weighted progressive max-min fair rates `r*[a] <= demand[a]` summing to `min(capacity, sum(demand))`."""
-  rates, rem, left = {}, float(capacity), {a: float(d) for a, d in demand.items() if d > 0}
-  w = {a: max(1e-9, float((weights or {}).get(a, 1.0))) for a in left}
-  while left:
-    tw, level = sum(w[a] for a in left), min(left[a] / w[a] for a in left)
-    if level * tw >= rem - 1e-9:
-      return rates | {a: rem * w[a] / tw for a in left}
-    for a in [a for a in left if left[a] / w[a] <= level + 1e-9]:
-      rates[a] = left.pop(a)
-      rem -= rates[a]
-  return rates
-
-
-def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, weights: dict | None = None):
-  """Advance EEVDF lag from monotone `service - seen` deltas (`Lag.tla`: race-free, no idle hoard, no flicker gain)."""
-  lag, seen, w = dict(lag), dict(seen), weights or {}
-  accts = set(lag) | set(service) | set(demand)
-  deltas = {a: max(0.0, service.get(a, 0.0) - seen.get(a, 0.0)) for a in accts}
-  seen |= {a: max(seen.get(a, 0.0), v) for a, v in service.items()}
-  rates = waterfill(max(cap, 1.0), {a: max(demand.get(a, 0.0), float(deltas[a] > 0)) for a in accts}, w)
-  if (work := sum(deltas[a] for a in rates)) > 0 and (total_r := sum(rates.values())) > 0:
-    for a, r in rates.items():
-      lag[a] = lag.get(a, 0.0) + work * (r / total_r) - deltas[a]
-    live_w = sum(max(1e-9, float(w.get(a, 1.0))) for a in rates)
-    for a in set(lag) - set(rates):
-      wa = max(1e-9, float(w.get(a, 1.0)))
-      lag[a] = min(0.0, lag[a] + work * wa / (live_w + wa))
-  active = {a for a in accts if demand.get(a, 0.0) > 0 or deltas[a] > 0}
-  return {a: v for a, v in lag.items() if a in active or v < -1e-9}, seen
-
-
-def select_runs(state: State, heads: list[Cmd], service: dict[str, float], width: int) -> list[str]:
-  """Choose up to `width` ready runs: accounts owed the most GPU time first, then their least-served runs."""
-  ready = {cmd.run: cmd for cmd in reversed(heads)}
-  floor = min((service[run] for run in ready if run in service), default=0.0)
-
-  def rank(cmd: Cmd) -> tuple:
-    return -state.ready_lag(cmd.run), service.get(cmd.run, floor), tuple(map(int, cmd.entry_id.split("-")))
-
-  return [cmd.run for cmd in sorted(ready.values(), key=rank)[:width]]
 
 
 # ***** placement, elastic scaling, and cross-node rebalance *****

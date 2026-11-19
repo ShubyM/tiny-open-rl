@@ -295,10 +295,10 @@ class Stress(RedisTest):
           (c.run[:4], c.op.value, c.request_id in lf.prepared and lf.prepared[c.request_id][1].done()) for c in lf.heads
         ]
         out.append(
-          f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} active={lf.active} wanted={lf.wanted()} "
+          f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} demand={lf.demand.value} wanted={lf.wanted()} "
           f"owned={[r[:4] for r in lf.owned]} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
           f"reader={'none' if lf.reader is None else 'done' if lf.reader.done() else 'reading'} "
-          f"task={'done' if node.tasks[proc].done() else 'running'} q={lf.quantum:.2f} granted={time.monotonic() - lf.granted_at:.1f}s ago"
+          f"task={'done' if node.tasks[proc].done() else 'running'} quantum_left={lf.hold_until - time.monotonic():.2f}s"
         )
     print("\n".join(out), file=sys.stderr)
 

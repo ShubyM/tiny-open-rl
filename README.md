@@ -48,12 +48,16 @@ the event loop and overlaps startup and execution. A slow download does not bloc
 otherwise idle worker from yielding its GPU. Executable commands are claimed only after GPU admission, one bounded batch
 at a time. A preparation error claims and answers its failed head without waiting for a GPU.
 
-Under contention, the planner divides available GPU time among backlogged accounts according to their weights and
-demand. Both the node and its shared trainers select the ready account owed the most service. Starting more LoRA
-runs on the same base does not buy an account more turns. Among equally owed accounts, workers choose the ready runs
-that received the fewest GPU-ms, breaking ties by queue arrival. A stream of sampler saves follows the same rule.
-Sampling can batch multiple ready runs at the same priority. Each interval of a wave is split among the requests still
-executing: for two requests finishing at 100 and 900 ms on one GPU, the charges are 50 and 850 GPU-ms.
+Fairness is measured in GPU-ms. At each planner tick, an account's balance increases by its weighted share of
+the GPU time used and decreases by the service it received. Positive balance means the fleet owes it time.
+Between ticks the node deducts newly billed service before choosing a worker. A busy resident can finish its
+minimum quantum or an open training step. Among eligible contenders the node prefers the worker whose ready
+account is owed the most time, with exclusive reservations taking precedence.
+
+Inside the chosen worker, the highest-ranked ready run chooses the account for this batch. Among equally owed
+accounts, the least-served run wins, with queue arrival breaking ties. A sampler can fill the wave with more
+runs from that same account, then choose again while keeping the GPU. Each interval is divided among the
+requests still executing. Two requests finishing at 100 and 900 ms on one GPU receive 50 and 850 GPU-ms.
 Token estimates are still reported as run counters, but do not determine service.
 
 The node keeps actual process placements, waiting order and GPU reservations to itself. The cluster plan in Redis holds
@@ -182,7 +186,7 @@ whole design. Redis does the bookkeeping that would otherwise take a database, a
 Start with the docstring at the top of [bus.py](tinyrl/bus.py), which explains the streams. Then read [gateway.py](tinyrl/api/gateway.py)
 to see how each Tinker call becomes a command, [scheduler.py](tinyrl/control/scheduler.py) for how the cluster places workers on nodes,
 [accounting.py](tinyrl/control/accounting.py) for how concurrent model calls share GPU time,
-and [node_daemon.py](tinyrl/control/node_daemon.py) for local GPU selection, worker lifetimes and handoff,
+and [node_daemon.py](tinyrl/control/node_daemon.py) for worker lifetimes and GPU handoff,
 [store.py](tinyrl/storage/store.py) to see how checkpoints are stored, and [trainer.py](tinyrl/workers/trainer.py) and
 [model.py](tinyrl/workers/model.py) to see how a command runs on the model.
 
@@ -191,6 +195,7 @@ and [node_daemon.py](tinyrl/control/node_daemon.py) for local GPU selection, wor
 | [tinyrl/bus.py](tinyrl/bus.py) | runs, sessions, command streams, fenced replies and leases |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints and Prometheus metrics |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy arrays |
+| [tinyrl/control/fairness.py](tinyrl/control/fairness.py) | account service balances, GPU turns and run selection within a turn |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | the cluster's assignment: runs to workers, workers to nodes |
 | [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | monotonic GPU-time measurement across overlapping calls |
 | [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | worker lifetimes, leases, ready work, GPU reservations and recovery |
