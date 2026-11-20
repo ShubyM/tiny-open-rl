@@ -9,7 +9,7 @@ import uuid
 
 import torch
 
-from test.helpers import BusTest, new_id
+from test.helpers import BusTest, finished, new_id
 from tinyrl.bus import Op, Reply, Run
 from tinyrl.storage.store import SHARD_BYTES, Store
 
@@ -247,7 +247,7 @@ class TestRegistry(BusTest):
     self.assertEqual(await self.bus.get_checkpoint(parked["tinker_path"]), parked)
 
   async def test_deletion_wins_over_concurrent_ttl_updates(self):
-    from tinyrl.types import NodeReport, TurnResult
+    from tinyrl.types import NodeReport
 
     run = new_id()
     await self.bus.create_run(Run(id=run, base="base", rank=8))
@@ -255,9 +255,7 @@ class TestRegistry(BusTest):
     await self.seed_checkpoint(uri, 1, ttl=60, owned=True)
     await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
     [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
-    done = NodeReport(
-      "n1", "b1", 1, finished=[TurnResult(turn.id, "train", turn.worker, reply=Reply(True, "application/json", b"{}"))]
-    )
+    done = NodeReport("n1", "b1", 1, finished=[finished(turn, Reply(True, "application/json", b"{}"))])
     await asyncio.gather(
       *(self.bus.set_checkpoint_ttl(uri, 600) for _ in range(20)),
       self.bus.exchange(done),
@@ -267,7 +265,7 @@ class TestRegistry(BusTest):
     self.assertEqual(await self.bus.checkpoints_of_run(run), [])
 
   async def test_stale_writer_cannot_replace_published_bytes_on_disk_or_in_bucket(self):
-    from tinyrl.types import NodeReport, TurnResult
+    from tinyrl.types import NodeReport
 
     def sweep(store: Store, grace: float) -> None:
       unused = store.versions()
@@ -293,16 +291,12 @@ class TestRegistry(BusTest):
         sweep(new, grace=0)  # protected even before the reply publishes it
         good = {"uri": uri, "size": 8, "version": winner}
         reply = Reply(True, "application/json", b"{}")
-        await self.bus.exchange(
-          NodeReport("n2", b2, 1, finished=[TurnResult(t2.id, "train", t2.worker, reply=reply, saved=good)])
-        )
+        await self.bus.exchange(NodeReport("n2", b2, 1, finished=[finished(t2, reply, saved=good)]))
         new.upload_pending_saves()
         late = old.put({"w": torch.zeros(2)}, version=abandoned)
         old.upload_pending_saves()
         stale_reply = await self.bus.exchange(
-          NodeReport(
-            "n1", b1, 1, finished=[TurnResult(t1.id, "train", t1.worker, reply=reply, saved=good | {"version": late})]
-          )
+          NodeReport("n1", b1, 1, finished=[finished(t1, reply, saved=good | {"version": late})])
         )
         self.assertTrue(stale_reply.reset)
         reader = Store(root, cache=tempfile.mkdtemp())

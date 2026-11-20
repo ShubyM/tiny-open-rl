@@ -122,23 +122,18 @@ class Turn:
   worker: str
   spec: WorkerSpec = WorkerSpec()
   gpus: tuple[int, ...] = ()
-  cmd: Cmd | None = None
-  cmds: list[Cmd] = field(default_factory=list)
+  cmds: list[Cmd] = field(default_factory=list)  # a train turn carries exactly one
   args: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class TurnResult:
   turn_id: str
-  kind: str
-  worker: str
   ok: bool = True
-  reply: Reply | None = None
-  charge: Charge | None = None
+  results: list[tuple[str, Reply, Charge | None]] = field(default_factory=list)  # (request id, reply, charge)
   mutated: bool = False
   loaded: bool = False
   saved: dict | None = None
-  samples: list[tuple[str, Reply, Charge | None]] = field(default_factory=list)
   resume_s: float = 0.0
   park_s: float = 0.0
 

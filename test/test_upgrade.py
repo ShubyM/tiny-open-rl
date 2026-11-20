@@ -1,7 +1,7 @@
-from test.helpers import BusTest
+from test.helpers import BusTest, finished
 from tinyrl.bus import Bus
 from tinyrl.control import scheduler
-from tinyrl.types import NodeReport, Op, Reply, Role, Run, TurnResult
+from tinyrl.types import NodeReport, Op, Reply, Role, Run
 
 OK = Reply(True, "application/json", b"{}")
 
@@ -36,7 +36,7 @@ class TestPopulatedUpgrade(BusTest):
     second = await self.bus.submit_command("t", Op.OPTIM_STEP, b"\xff")
     reply1 = await self.bus.exchange(NodeReport("n1", "b1", 1))
     [t1] = reply1.turns
-    self.assertEqual(t1.cmd.request_id, first)
+    self.assertEqual(t1.cmds[0].request_id, first)
 
     # n1 disappears; n2 takes over after n1 is reaped, first command fails and tail runs on n2.
     self.bus.nodes["n1"].until = 0.0
@@ -44,10 +44,8 @@ class TestPopulatedUpgrade(BusTest):
     self.assertFalse((await self.bus.wait_for_reply(first, 0)).ok)
     self.assertEqual((await self.bus.get_run("t"))["failed"], 1)
     [t2] = reply2.turns
-    self.assertEqual((t2.cmd.request_id, t2.cmd.body), (second, b"\xff"))
-    await self.bus.exchange(
-      NodeReport("n2", "b2", 1, finished=[TurnResult(t2.id, "train", t2.worker, reply=OK, mutated=True)])
-    )
+    self.assertEqual((t2.cmds[0].request_id, t2.cmds[0].body), (second, b"\xff"))
+    await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(t2, OK, mutated=True)]))
     self.assertEqual(await self.bus.wait_for_reply(second, 0), OK)
 
   async def test_sampler_recovers_abandoned_claim_alongside_fresh_entries(self):
@@ -62,10 +60,7 @@ class TestPopulatedUpgrade(BusTest):
     reply2 = await self.bus.exchange(NodeReport("n2", "b2", 1))
     [t2] = reply2.turns
     self.assertEqual([c.request_id for c in t2.cmds], [first, second])
-    samples = [(c.request_id, OK, None) for c in t2.cmds]
-    await self.bus.exchange(
-      NodeReport("n2", "b2", 1, finished=[TurnResult(t2.id, "sample", t2.worker, samples=samples)])
-    )
+    await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(t2, OK)]))
     self.assertEqual(await self.bus.wait_for_reply(first, 0), OK)
     self.assertEqual(await self.bus.wait_for_reply(second, 0), OK)
     self.assertEqual(await self.bus.queued_and_in_flight("s"), {"live": True, "queued": 0, "in_flight": []})
@@ -77,9 +72,7 @@ class TestPopulatedUpgrade(BusTest):
     req = await self.bus.submit_command("t", Op.OPTIM_STEP, b"{}", seq_id=7)
     reply = await self.bus.exchange(NodeReport("n1", "b1", 1))
     [turn] = reply.turns
-    await self.bus.exchange(
-      NodeReport("n1", "b1", 1, finished=[TurnResult(turn.id, "train", turn.worker, reply=OK, mutated=True)])
-    )
+    await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(turn, OK, mutated=True)]))
     await self.bus.aclose()
 
     self.bus = Bus(self.db_path)

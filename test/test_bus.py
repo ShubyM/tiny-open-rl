@@ -5,10 +5,10 @@ import time
 import unittest
 from unittest import mock
 
-from test.helpers import BusTest, new_id, serve_control
+from test.helpers import BusTest, finished, new_id, serve_control
 from tinyrl.bus import BackpressureError, Bus, ControlClient, PromiseGoneError
 from tinyrl.control.accounting import Charge
-from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run, TurnResult, WorkerStatus, unpack_snap
+from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run, WorkerStatus, unpack_snap
 
 
 def ok(**body) -> Reply:
@@ -27,16 +27,14 @@ class TestBus(BusTest):
 
     reply = await self.bus.exchange(NodeReport("n1", "b1", 1))
     [turn] = reply.turns
-    cmd = turn.cmd
+    [cmd] = turn.cmds
     self.assertEqual(
       (cmd.run, cmd.op, cmd.body, cmd.request_id, cmd.cost), (run_id, Op.OPTIM_STEP, b'{"lr": 1}', request_id, 42)
     )
     self.assertIsNone(await self.bus.wait_for_reply(request_id, 0))
 
     charge = Charge(started_ms=int(cmd.entry_id.split("-")[0]) + 12, busy_ms=50, gpu_ms=100.5)
-    res = TurnResult(
-      turn.id, "train", turn.worker, reply=ok(type="optim_step"), charge=charge, mutated=True, loaded=True
-    )
+    res = finished(turn, ok(type="optim_step"), charge, mutated=True, loaded=True)
     done = await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[res]))
     self.assertEqual(done.acknowledged, [turn.id])
     self.assertEqual(done.turns, [])
@@ -61,9 +59,7 @@ class TestBus(BusTest):
     waiters = [asyncio.create_task(self.bus.wait_for_reply(request_id, 5)) for _ in range(3)]
     await asyncio.sleep(0.05)
     start = time.perf_counter()
-    await self.bus.exchange(
-      NodeReport("n1", "b1", 1, finished=[TurnResult(turn.id, "train", turn.worker, reply=ok(n=1))])
-    )
+    await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(turn, ok(n=1))]))
 
     self.assertEqual(await asyncio.gather(*waiters), [ok(n=1)] * 3)
     self.assertLess(time.perf_counter() - start, 0.5)
@@ -80,9 +76,7 @@ class TestBus(BusTest):
 
     async def answer_late():
       await asyncio.sleep(1.0)
-      await self.bus.exchange(
-        NodeReport("n1", "b1", 1, finished=[TurnResult(turn.id, "train", turn.worker, reply=ok(n=1))])
-      )
+      await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(turn, ok(n=1))]))
 
     answering = asyncio.create_task(answer_late())
     self.assertEqual(await self.bus.wait_for_reply(request_id, 10), ok(n=1))
@@ -118,7 +112,7 @@ class TestBus(BusTest):
       await self.seed_checkpoint(uri, 1, ttl=60, owned=uri == owned)
     request = await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
     [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
-    await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[TurnResult(turn.id, "train", turn.worker, reply=ok())]))
+    await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(turn, ok())]))
     self.assertEqual(await self.bus.wait_for_reply(request, 5), ok())
     self.assertNotIn(run, self.bus.pending)
     self.assertIsNone((await self.bus.get_run(run)).get("snap"))
@@ -140,11 +134,9 @@ class TestBus(BusTest):
     self.assertEqual(queue["queued"], 2)
     self.assertEqual([c["request_id"] for c in queue["in_flight"]], [request_ids[0]])
 
-    reply2 = await self.bus.exchange(
-      NodeReport("n1", "b1", 1, finished=[TurnResult(t1.id, "train", t1.worker, reply=ok(), loaded=True)])
-    )
+    reply2 = await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(t1, ok(), loaded=True)]))
     self.assertEqual(reply2.acknowledged, [t1.id])
-    self.assertEqual(reply2.turns[0].cmd.request_id, request_ids[1])
+    self.assertEqual(reply2.turns[0].cmds[0].request_id, request_ids[1])
 
   async def test_a_turn_the_node_already_holds_is_not_sent_again(self):
     run_id = await self.new_run()
@@ -191,18 +183,14 @@ class TestBus(BusTest):
 
     second = await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
     [t2] = (await self.bus.exchange(NodeReport("n2", "b2", 1))).turns
-    self.assertEqual(t2.cmd.request_id, second)
+    self.assertEqual(t2.cmds[0].request_id, second)
     uri = f"tinker://{run}/weights/step"
     saved = {"uri": uri, "size": 20, "version": "new"}
-    await self.bus.exchange(
-      NodeReport("n2", "b2", 1, finished=[TurnResult(t2.id, "train", t2.worker, reply=ok(), saved=saved)])
-    )
+    await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(t2, ok(), saved=saved)]))
 
     # Stale n1/b1 returns with a late result; it gets reset=True and cannot overwrite reply or checkpoint.
     stale = {"uri": uri, "size": 10, "ttl": 60, "version": "old"}
-    stale_reply = await self.bus.exchange(
-      NodeReport("n1", "b1", 1, finished=[TurnResult(t1.id, "train", t1.worker, reply=ok(), saved=stale)])
-    )
+    stale_reply = await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(t1, ok(), saved=stale)]))
     self.assertTrue(stale_reply.reset)
     self.assertEqual(await self.bus.wait_for_reply(first, 0), failed)
     self.assertEqual(await self.bus.checkpoint_version(uri), "new")
@@ -212,9 +200,7 @@ class TestBus(BusTest):
     run_id = await self.new_run()
     req1 = await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
     [t1] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
-    await self.bus.exchange(
-      NodeReport("n1", "b1", 1, finished=[TurnResult(t1.id, "train", t1.worker, reply=ok(), mutated=True, loaded=True)])
-    )
+    await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(t1, ok(), mutated=True, loaded=True)]))
     self.assertIsNotNone(req1)
 
     # Draining n1 issues an off-GPU snapshot turn.
@@ -226,11 +212,7 @@ class TestBus(BusTest):
     snap_ver = snap_turn.args["version"]
     parked_uri = f"tinker://{run_id}/parked/{snap_ver}"
     saved = {"uri": parked_uri, "size": 1, "owned": True, "version": snap_ver}
-    await self.bus.exchange(
-      NodeReport(
-        "n1", "b1", 1, draining=True, finished=[TurnResult(snap_turn.id, "snapshot", snap_turn.worker, saved=saved)]
-      )
-    )
+    await self.bus.exchange(NodeReport("n1", "b1", 1, draining=True, finished=[finished(snap_turn, saved=saved)]))
     info = await self.bus.get_run(run_id)
     self.assertIsNone(info.get("owner"))
     self.assertEqual(unpack_snap(info["snap"]), (parked_uri, snap_ver))
@@ -239,22 +221,14 @@ class TestBus(BusTest):
     await self.bus.submit_command(run_id, Op.SAVE_WEIGHTS, b"{}")
     [ro] = (await self.bus.exchange(NodeReport("n2", "b2", 1))).turns
     self.assertEqual(ro.args["saved"], snap_ver)
-    await self.bus.exchange(
-      NodeReport(
-        "n2", "b2", 1, finished=[TurnResult(ro.id, "train", ro.worker, reply=ok(), mutated=False, loaded=True)]
-      )
-    )
+    await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(ro, ok(), mutated=False, loaded=True)]))
     self.assertIsNotNone(await self.bus.get_checkpoint(parked_uri))
 
     await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
     [mut] = (
       await self.bus.exchange(NodeReport("n2", "b2", 1, workers=[WorkerStatus(ro.worker, (0,), loaded=(run_id,))]))
     ).turns
-    await self.bus.exchange(
-      NodeReport(
-        "n2", "b2", 1, finished=[TurnResult(mut.id, "train", mut.worker, reply=ok(), mutated=True, loaded=True)]
-      )
-    )
+    await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(mut, ok(), mutated=True, loaded=True)]))
     self.assertIsNone((await self.bus.get_run(run_id)).get("snap"))
     self.assertIsNone(await self.bus.get_checkpoint(parked_uri))
 
@@ -365,9 +339,9 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
         req = await bus.submit_command("tr-1", Op.SAVE_WEIGHTS, b"\x00\xff", cost=5)
         reply = await client.exchange(NodeReport("node-a", "boot-a", 1))
         [turn] = reply.turns
-        self.assertEqual(turn.cmd.body, b"\x00\xff")
+        self.assertEqual(turn.cmds[0].body, b"\x00\xff")
         ckpt = {"uri": "tinker://tr-1/weights/v1", "size": 99, "version": "ver1"}
-        done = TurnResult(turn.id, "train", turn.worker, reply=ok(done=1), mutated=True, loaded=True, saved=ckpt)
+        done = finished(turn, ok(done=1), mutated=True, loaded=True, saved=ckpt)
 
         # Restart control server BEFORE node delivers TurnResult!
         await runner.cleanup()

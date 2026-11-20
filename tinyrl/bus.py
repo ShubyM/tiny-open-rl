@@ -205,7 +205,7 @@ class Bus:
       self.disk.queued_bytes += len(cmd.body)
       if tid := c.get("turn"):
         wid = (self.runs[rid].get("owner") or "").split("@", 1)[0]
-        self.active_turns[tid] = (c.get("node", ""), c.get("boot", ""), Turn(tid, "train", wid, cmd=cmd))
+        self.active_turns[tid] = (c.get("node", ""), c.get("boot", ""), Turn(tid, "train", wid, cmds=[cmd]))
     owned = bool(self.active_turns) or any(r["live"] and r.get("owner") for r in self.runs.values())
     self.reap_after = now + LEASE_MS / 1000 if owned else 0.0
 
@@ -502,13 +502,12 @@ class Bus:
       if (tn, tb) != (node_id, boot_id):
         continue
       del self.active_turns[tid]
-      if turn.kind == "train" and turn.cmd:
-        err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {turn.cmd.op}"))
-        self.commit(turn.cmd, err, tid, clear_owner=True)
-      elif turn.kind == "sample":
-        for cmd in turn.cmds:
-          if (p := self.pending.get(cmd.run, {}).get(cmd.entry_id)) and p.turn == tid:
-            p.turn = None  # queued again, in its old place
+      for cmd in turn.cmds:
+        if turn.kind == "train":  # its weights went with the node
+          err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {cmd.op}"))
+          self.commit(cmd, err, tid, clear_owner=True)
+        elif (p := self.pending.get(cmd.run, {}).get(cmd.entry_id)) and p.turn == tid:
+          p.turn = None  # queued again, in its old place
     self.clear_owners(lambda _, o: o.endswith(f"@{node_id}:{boot_id}"))
     self.wake_all()
 
@@ -560,27 +559,21 @@ class Bus:
       sw = (res.park_s + res.resume_s) / max(0.01, SWITCH_BUDGET) if res.park_s else 0.0
       w.hold_until = now + min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, sw))
 
-    def bill(rid: str, ch: Charge | None) -> None:
-      if w and ch and ch.gpu_ms:
+    unanswered = {c.request_id: c for c in turn.cmds}
+    for req_id, rep, ch in res.results:
+      if (cmd := unanswered.pop(req_id, None)) is None:
+        continue
+      effects = {"mutated": res.mutated, "saved": res.saved, "clear_owner": not res.ok}
+      if self.commit(cmd, rep, turn.id, charge=ch, **effects) and w and res.ok and ch and ch.gpu_ms:
         w.gpu_ms += ch.gpu_ms
-        w.run_service[rid] = w.run_service.get(rid, w.service_floor) + ch.gpu_ms
-
-    if turn.kind == "train" and turn.cmd:
-      cmd, rep = turn.cmd, res.reply or Reply.error(RuntimeError("trainer failed"))
-      if w and res.ok:
+        w.run_service[cmd.run] = w.run_service.get(cmd.run, w.service_floor) + ch.gpu_ms
+      if w and res.ok and turn.kind == "train":
         w.idle_since = now
         (w.loaded.add if res.loaded else w.loaded.discard)(cmd.run)
         (w.open_grad.add if cmd.op == Op.FORWARD_BACKWARD and rep.ok else w.open_grad.discard)(cmd.run)
-        bill(cmd.run, res.charge)
-      self.commit(cmd, rep, turn.id, charge=res.charge, mutated=res.mutated, saved=res.saved, clear_owner=not res.ok)
-    elif turn.kind == "sample":
-      by_req, fb = {c.request_id: c for c in turn.cmds}, res.reply or Reply.error(RuntimeError("sampler failed"))
-      for req_id, rep, ch in res.samples:
-        if (cmd := by_req.pop(req_id, None)) and self.commit(cmd, rep, turn.id, charge=ch):
-          bill(cmd.run, ch)
-      for cmd in by_req.values():
-        self.commit(cmd, fb, turn.id)
-    elif turn.kind == "snapshot":
+    for cmd in unanswered.values():
+      self.commit(cmd, Reply.error(RuntimeError(f"its {turn.kind} turn failed")), turn.id, clear_owner=True)
+    if turn.kind == "snapshot":
       rid, row = turn.args["run"], self.runs.get(turn.args["run"])
       if row and row.get("owner") == owner_token(node_id, boot_id, turn.worker):
         row["owner"] = row["writing"] = None
@@ -627,9 +620,10 @@ class Bus:
       for o in node.workers.values():
         if o.id != w.id and o.resident and not set(o.resident).isdisjoint(turn.gpus):
           o.resident = ()
-    if turn.kind == "train" and turn.cmd:
-      cmd, row = turn.cmd, self.runs[turn.cmd.run]
+    for cmd in turn.cmds:
       self.pending[cmd.run][cmd.entry_id] = Pending(cmd, turn.id, now)
+    if turn.kind == "train":
+      [cmd], row = turn.cmds, self.runs[turn.cmds[0].run]
       row["owner"] = owner_token(node.node, node.boot_id, turn.worker)
       if cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
         row["writing"] = turn.args.get("version")
@@ -638,9 +632,6 @@ class Bus:
           c.update(turn=turn.id, node=node.node, boot=node.boot_id)
           self.disk.cmds.save(cmd.request_id)
         self.runs.save(cmd.run)
-    elif turn.kind == "sample":
-      for cmd in turn.cmds:
-        self.pending[cmd.run][cmd.entry_id] = Pending(cmd, turn.id, now)
     elif turn.kind == "snapshot" and (ver := turn.args.get("version")):
       rid = turn.args["run"]
       self.runs[rid]["writing"] = ver
@@ -771,7 +762,7 @@ class Bus:
         self.issue(
           node,
           Turn(
-            tid, "train", wid, spec, gpus, cmd, args={"record": dict(row["record"]), "saved": saved, "version": ver}
+            tid, "train", wid, spec, gpus, [cmd], args={"record": dict(row["record"]), "saved": saved, "version": ver}
           ),
         )
       else:

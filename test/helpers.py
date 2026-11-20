@@ -8,6 +8,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from tinyrl.bus import Bus, make_checkpoint
 from tinyrl.control import scheduler
+from tinyrl.types import TurnResult
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -22,6 +23,11 @@ def tiny(name: str = "") -> LlamaForCausalLM:
     num_key_value_heads=2,
   )
   return LlamaForCausalLM(config)
+
+
+def finished(turn, reply=None, charge=None, **effects) -> TurnResult:
+  """What a node reports when `turn` ends with `reply` for each command it carried."""
+  return TurnResult(turn.id, results=[(c.request_id, reply, charge) for c in turn.cmds], **effects)
 
 
 def new_id() -> str:

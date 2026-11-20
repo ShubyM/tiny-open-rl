@@ -41,6 +41,11 @@ def gpu_memory_mib() -> int:
     return 0
 
 
+def failed(turn: Turn, exc: Exception, charge: Charge | None = None, **times) -> TurnResult:
+  """The result of a turn that broke: every command it carried gets the error."""
+  return TurnResult(turn.id, False, [(c.request_id, Reply.error(exc), charge) for c in turn.cmds], **times)
+
+
 class WorkerHandle:
   def __init__(self, wid: str, spec: WorkerSpec, model, resident=(), bound=()):
     self.id, self.spec, self.model, self.resident, self.bound = wid, spec, model, resident, bound
@@ -88,13 +93,8 @@ class NodeDaemon:
     return WorkerHandle(wid, spec, self.open_trainer(wid, spec.gpus, env), bound=() if spec.gpus == 1 else gpus)
 
   def build_report(self) -> NodeReport:
-    finished = [
-      TurnResult(tid, t.kind, t.worker, False, Reply.error(RuntimeError("cancelled")))
-      if tk.cancelled()
-      else tk.result()
-      for tid, (t, tk) in list(self.active.items())
-      if tk.done()
-    ]
+    done = [(t, tk) for t, tk in list(self.active.values()) if tk.done()]
+    finished = [failed(t, RuntimeError("cancelled")) if tk.cancelled() else tk.result() for t, tk in done]
     for ver, tk in list(self.staging.items()):
       if tk.done() and not (self.staging.pop(ver) and tk.cancelled()):
         if isinstance(res := tk.result(), Exception):
@@ -265,7 +265,7 @@ class NodeDaemon:
         return await self.run_gpu_turn(turn)
       if turn.kind == "snapshot":
         if not (h := self.workers.get(turn.worker)) or h.exited():
-          return TurnResult(turn.id, "snapshot", turn.worker)
+          return TurnResult(turn.id)
         rid, ver = turn.args["run"], turn.args.get("version")
         saved = await h.model.call("save_run", rid, ver) if ver and rid in h.loaded else None
         if turn.args.get("drop") and rid in h.loaded:
@@ -273,42 +273,39 @@ class NodeDaemon:
         h.loaded.discard(rid)
         if turn.args.get("close"):
           await self.drop_handle(h)
-        return TurnResult(turn.id, "snapshot", turn.worker, saved=saved)
+        return TurnResult(turn.id, saved=saved)
       if turn.kind == "close":
         async with self.gpu_cond:
           while (h := self.workers.get(turn.worker)) and (h.busy or h.parking):
             await self.gpu_cond.wait()
           if h is None:
-            return TurnResult(turn.id, "close", turn.worker)
+            return TurnResult(turn.id)
           h.busy = True
         await self.drop_handle(h)
-        return TurnResult(turn.id, "close", turn.worker)
+        return TurnResult(turn.id)
       raise ValueError(f"unknown turn kind {turn.kind}")
     except asyncio.CancelledError:
       raise
     except Exception as exc:
-      return TurnResult(turn.id, turn.kind, turn.worker, False, Reply.error(exc))
+      return failed(turn, exc)
 
   async def run_gpu_turn(self, turn: Turn) -> TurnResult:
     h, resume_s, park_s = await self.prepare(turn.worker, turn.spec, turn.gpus)
     charge = Charge()
     try:
       if turn.kind == "train":
+        [cmd] = turn.cmds
         with span("node.execute"):
-          call = h.model.call(
-            "execute", turn.cmd, turn.args.get("record") or None, turn.args.get("saved"), turn.args.get("version")
-          )
-          rep, eff = await Wave(turn.spec.gpus).run(call, charge)
+          args = (turn.args.get("record") or None, turn.args.get("saved"), turn.args.get("version"))
+          rep, eff = await Wave(turn.spec.gpus).run(h.model.call("execute", cmd, *args), charge)
         loaded = bool(eff.get("loaded"))
-        (h.loaded.add if loaded else h.loaded.discard)(turn.cmd.run)
+        (h.loaded.add if loaded else h.loaded.discard)(cmd.run)
         if DEBUG:
-          print(f"{turn.worker} {turn.cmd.request_id} {turn.cmd.op:24s} {charge.busy_ms:9d} ms")
+          print(f"{turn.worker} {cmd.request_id} {cmd.op:24s} {charge.busy_ms:9d} ms")
         mut, saved = bool(eff.get("mutated")), eff.get("saved")
-        return TurnResult(
-          turn.id, "train", turn.worker, True, rep, charge, mut, loaded, saved, resume_s=resume_s, park_s=park_s
-        )
+        return TurnResult(turn.id, True, [(cmd.request_id, rep, charge)], mut, loaded, saved, resume_s, park_s)
       if not turn.cmds:
-        return TurnResult(turn.id, "sample", turn.worker, resume_s=resume_s, park_s=park_s)
+        return TurnResult(turn.id, resume_s=resume_s, park_s=park_s)
       inputs, errors = {}, {}
       for rid, ver in turn.args.get("versions", {}).items():
         if ver is None:
@@ -339,14 +336,13 @@ class NodeDaemon:
       async with asyncio.TaskGroup() as group:
         for cmd in turn.cmds:
           group.create_task(answer(cmd))
-      return TurnResult(turn.id, "sample", turn.worker, samples=results, resume_s=resume_s, park_s=park_s)
+      return TurnResult(turn.id, results=results, resume_s=resume_s, park_s=park_s)
     except asyncio.CancelledError:
       await asyncio.shield(self.drop_handle(h))
       raise
     except Exception as exc:
       await self.drop_handle(h)
-      c = charge if turn.kind == "train" else None
-      return TurnResult(turn.id, turn.kind, turn.worker, False, Reply.error(exc), c, resume_s=resume_s, park_s=park_s)
+      return failed(turn, exc, charge if turn.kind == "train" else None, resume_s=resume_s, park_s=park_s)
     finally:
       await self.release(h)
 
