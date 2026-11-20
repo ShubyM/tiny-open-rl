@@ -29,6 +29,33 @@ def new_id() -> str:
   return str(uuid.uuid4())
 
 
+async def serve_control(bus: Bus, host: str = "127.0.0.1", port: int = 0):
+  """Run the FastAPI gateway (including `/internal/exchange`) on a TCP port for tests."""
+  import socket
+
+  import uvicorn
+
+  from tinyrl.api import gateway
+
+  sock = socket.socket()
+  sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  sock.bind((host, port))
+  sock.listen(128)
+  actual = sock.getsockname()[1]
+  server = uvicorn.Server(uvicorn.Config(gateway.app(bus), host=host, port=actual, log_level="error"))
+  task = asyncio.create_task(server.serve(sockets=[sock]))
+  while not server.started:
+    await asyncio.sleep(0.005)
+
+  class Handle:
+    async def cleanup(self):
+      server.should_exit = True
+      await task
+      sock.close()
+
+  return Handle(), f"http://{host}:{actual}"
+
+
 class BusTest(unittest.IsolatedAsyncioTestCase):
   """Starts an isolated SQLite Bus per test."""
 

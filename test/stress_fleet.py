@@ -27,11 +27,11 @@ from unittest import mock
 import torch
 
 from test.execution import InlineProcess, TestNode
-from test.helpers import BusTest, FakeEngine, new_id, tiny
+from test.helpers import BusTest, FakeEngine, new_id, serve_control, tiny
 from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
-from tinyrl.bus import ControlClient, Op, Role, Run, serve_control
+from tinyrl.bus import ControlClient, Op, Role, Run
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import Model
 from tinyrl.workers.trainer import Trainer

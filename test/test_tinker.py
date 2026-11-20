@@ -39,13 +39,12 @@ class TestTinkerSDK(unittest.TestCase):
     base = f"{tmp}/tiny"
     tiny().save_pretrained(base)  # a base model on disk, loaded the way any other is
 
-    port, internal_port = free_port(), free_port()
+    port = free_port()
     env = {
       **os.environ,
       "TINYRL_DB": f"{tmp}/tinyrl.db",
       "PORT": str(port),
-      "INTERNAL_PORT": str(internal_port),
-      "CONTROL_URL": f"http://127.0.0.1:{internal_port}",
+      "CONTROL_URL": f"http://127.0.0.1:{port}",
       "CKPT": f"file://{tmp}/ckpt",  # a URL, so checkpoints go through upload and download as they do on GCS
       "CKPT_CACHE": f"{tmp}/cache",
       "ENGINE": "test.helpers:FakeEngine",  # the sampler's engine, since CI has no GPU for vLLM

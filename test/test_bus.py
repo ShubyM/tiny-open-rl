@@ -5,10 +5,9 @@ import time
 import unittest
 from unittest import mock
 
-from test.helpers import BusTest, new_id
-from tinyrl.bus import BackpressureError, Bus, PromiseGoneError, serve_control
+from test.helpers import BusTest, new_id, serve_control
+from tinyrl.bus import BackpressureError, Bus, ControlClient, PromiseGoneError
 from tinyrl.control.accounting import Charge
-from tinyrl.rpc import ControlClient
 from tinyrl.types import NodeReport, Op, Reply, Role, Run, TurnResult, WorkerStatus, unpack_snap
 
 

@@ -21,7 +21,7 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path
 
 ```sh
 pip install -e .
-python -m tinyrl.api.gateway &        # Tinker HTTP API (:8000) and controller exchange RPC (:8001)
+python -m tinyrl.api.gateway &        # Tinker HTTP API and controller exchange RPC (:8000)
 python -m tinyrl.control.node_daemon  # executes assigned turns and manages local GPUs
 ```
 
@@ -56,9 +56,8 @@ The control plane runs in one process (`tinyrl/bus.py`) and talks to every node 
 
 | File | Responsibility |
 |---|---|
-| [tinyrl/bus.py](tinyrl/bus.py) | Single-process controller: transactional KV trainer state, RAM sampling, and `exchange` turn scheduler |
-| [tinyrl/rpc.py](tinyrl/rpc.py) | Single-RPC HTTP server and client for `POST /internal/exchange` |
-| [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, checkpoints, and Prometheus `/metrics` |
+| [tinyrl/bus.py](tinyrl/bus.py) | Single-process controller: transactional KV trainer state, RAM sampling, `exchange` scheduler, and msgpack client |
+| [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, `/internal/exchange` RPC, checkpoints, and Prometheus `/metrics` |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy encoding |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | Pure cluster placement: runs to workers, workers to nodes |
 | [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | Monotonic GPU-time accounting across overlapping calls |
@@ -83,7 +82,7 @@ All settings are environment variables:
 
 | Area | Variables |
 |---|---|
-| **Core** | `TINYRL_DB` (`/tmp/tinyrl.db`), `CONTROL_URL` (`http://127.0.0.1:8001`), `PORT` (`8000`), `INTERNAL_PORT` (`8001`), `GPUS` (`1`), `GPU_MEMORY_MIB`, `DRAIN_S` (`20`), `LEASE_MS`, `TICK`, `TICK_MS`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE` |
+| **Core** | `TINYRL_DB` (`/tmp/tinyrl.db`), `CONTROL_URL` (`http://127.0.0.1:8000`), `PORT` (`8000`), `GPUS` (`1`), `GPU_MEMORY_MIB`, `DRAIN_S` (`20`), `LEASE_MS`, `TICK`, `TICK_MS`, `WAIT`, `REPLY_TTL`, `SESSION_TTL`, `SESSION_GRACE` |
 | **Storage** | `CKPT` (`/tmp/tinyrl`), `CKPT_CACHE`, `CKPT_CACHE_BYTES`, `CKPT_TTL`, `SHARD_BYTES`, `SWEEP_S`, `MODEL_CACHE`, `MODEL_MIRROR` |
 | **Scheduling** | `QUANTUM_MS` (`2000`), `MAX_QUANTUM_MS` (`15000`), `SWITCH_BUDGET` (`0.1`), `CYCLE_GRACE_MS` (`100`), `SAMPLE_RUNS` (`3`), `SAMPLE_COMMANDS` (`128`), `SCALE_BATCH` (`4`), `REBALANCE_MS` (`20000`) |
 | **Execution** | `TOKEN_BUDGET`, `CHUNK`, `GRAD_CKPT`, `ENGINE`, `VLLM_ARGS`, `TINYRL_SNAPSHOTS`, `DEBUG=1` |

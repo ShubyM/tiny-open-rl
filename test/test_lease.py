@@ -8,9 +8,9 @@ import sys
 import tempfile
 import unittest
 
-from test.helpers import BusTest, new_id, tiny
+from test.helpers import BusTest, new_id, serve_control, tiny
 from test.test_process import require_unix
-from tinyrl.bus import Op, Reply, Run, serve_control, unpack_snap
+from tinyrl.bus import Op, Reply, Run, unpack_snap
 from tinyrl.storage.store import Store
 
 LEASE_MS = 2000

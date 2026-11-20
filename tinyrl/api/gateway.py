@@ -14,17 +14,18 @@ import time
 import uuid
 from typing import Any
 
+import msgspec
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from tinyrl.api import wire
-from tinyrl.bus import BackpressureError, Bus, PromiseGoneError, serve_control
+from tinyrl.bus import BackpressureError, Bus, PromiseGoneError
 from tinyrl.control import estimator, scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.store import Store
-from tinyrl.types import Op, Role, Run, parse_uri
+from tinyrl.types import NodeReport, Op, Role, Run, parse_uri
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
 CKPT_TTL = getenv("CKPT_TTL", 0)  # the TTL of a checkpoint saved without one, at least 3600. 0 keeps it until deleted
@@ -121,8 +122,6 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
 
   @contextlib.asynccontextmanager
   async def lifespan(_: FastAPI):
-    runner, _ = await serve_control(bus, port=getenv("INTERNAL_PORT", 8001))
-
     async def maintain_loop():
       while True:
         await bus.maintain()
@@ -135,10 +134,14 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
       maint.cancel()
       with contextlib.suppress(asyncio.CancelledError):
         await maint
-      await runner.cleanup()
       await bus.aclose()
 
   api = FastAPI(title="tiny-open-rl", lifespan=lifespan if control else None)
+
+  @api.post("/internal/exchange")
+  async def exchange(request: Request, wait_ms: int = 0) -> Response:
+    report = msgspec.msgpack.decode(await request.body(), type=NodeReport)
+    return Response(msgspec.msgpack.encode(await bus.exchange(report, wait_ms)), media_type="application/msgpack")
 
   def bad_request(_: Request, e: Exception) -> JSONResponse:
     return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400)

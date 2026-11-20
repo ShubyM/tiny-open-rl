@@ -19,10 +19,8 @@ spec:
         - configMapRef: {name: tinyrl}
         env:
         - {name: TINYRL_DB, value: /data/tinyrl.db}
-        - {name: INTERNAL_PORT, value: "8001"}
         ports:
         - {name: http, containerPort: 8000}
-        - {name: rpc, containerPort: 8001}
         readinessProbe:
           httpGet: {path: /api/v1/healthz, port: 8000}
         resources:
@@ -44,4 +42,3 @@ spec:
   selector: {app: gateway}
   ports:
   - {name: http, port: 8000}
-  - {name: rpc, port: 8001}

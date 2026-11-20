@@ -138,7 +138,7 @@ class TurnResult:
   mutated: bool = False
   loaded: bool = False
   saved: dict | None = None
-  samples: list[tuple[str, Reply, Charge]] = field(default_factory=list)
+  samples: list[tuple[str, Reply, Charge | None]] = field(default_factory=list)
   resume_s: float = 0.0
   park_s: float = 0.0
 
