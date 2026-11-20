@@ -10,7 +10,7 @@ from test.execution import TestNode
 from test.helpers import BusTest, new_id
 from test.test_api import proto_body
 from tinyrl.bus import Op, Run
-from tinyrl.control.fairness import Demand, Worker, plan_gpus
+from tinyrl.control.fairness import Worker, plan_gpus
 from tinyrl.storage.store import Store
 
 
@@ -31,18 +31,16 @@ class TestWideRebind(BusTest):
           await self.bus.create_run(Run(name, "tiny", 0, gpus=width, exclusive=name == exclusive))
           await node.bind(name, name)
           request = await self.bus.submit_command(name, Op.CREATE_MODEL, b'{"base_model":"tiny","rank":0,"lora":{}}')
+          await node.drain(name)
           self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
-        gang = node.lives[run]
-        self.assertNotIn(gang.life, node.on)
+        self.assertEqual(node.workers[exclusive].resident, (0,))
         request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
-        async with asyncio.timeout(5):
-          while gang.demand == Demand.IDLE:
-            await node.changed.wait()
-        self.assertTrue(gang.wanted())
-        self.assertEqual(node.select_gpus(run), ())
-        node.drop_local(exclusive)
+        await node.tick()
+        self.assertIsNone(await self.bus.wait_for_reply(request, 0))
+        await self.bus.delete_run(exclusive)
+        await node.drain(run)
         self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
-        self.assertEqual(node.on, {gang.life: (0, 1)})
+        self.assertEqual({k: h.resident for k, h in node.workers.items() if h.resident}, {run: (0, 1)})
       finally:
         await node.aclose()
 
@@ -65,30 +63,30 @@ class TestWideRebind(BusTest):
           self.assertTrue(reply.ok, reply.body)
 
         create = {"base_model": "tiny", "rank": 0, "lora": {}}
-        gang = await node.bind("wide", run)
+        await node.bind("wide", run)
         await command(run, Op.CREATE_MODEL, create)
         await command(run, Op.FORWARD_BACKWARD, proto_body(run))
         await command(run, Op.OPTIM_STEP, {"adam_params": {}})
         await command(run, Op.FORWARD_BACKWARD, proto_body(run))
-        self.assertEqual(node.on[gang.life], (0, 1))
-        child = gang.model
+        self.assertEqual(node.workers["wide"].resident, (0, 1))
+        child = node.workers["wide"].model
         expected, _ = child.trainer.model.training_state(run)
 
-        sibling = await node.bind("neighbor", neighbor)
+        await node.bind("neighbor", neighbor)
         await command(neighbor, Op.CREATE_MODEL, create)
-        self.assertEqual(node.on[sibling.life], (2, 3))
-        pin = await node.bind("exclusive", exclusive)
+        self.assertEqual(node.workers["neighbor"].resident, (2, 3))
+        await node.bind("exclusive", exclusive)
         await command(exclusive, Op.CREATE_MODEL, create)
-        self.assertEqual(node.on[pin.life], (0,))
-        self.assertNotIn(gang.life, node.on)
+        self.assertEqual(node.workers["exclusive"].resident, (0,))
+        self.assertEqual(node.workers["wide"].resident, ())
 
-        # A parked gang detaches straight from host RAM without disturbing the exclusive resident.
+        # A parked gang snapshots straight from host RAM without disturbing the exclusive resident.
         old_call, queued = child.call, []
 
         async def check_admission(method, *args):
           if method == "save_run":
-            self.assertNotIn(gang.life, node.on)
-            self.assertEqual(node.on.get(pin.life), (0,))
+            self.assertEqual(node.workers["wide"].resident, ())
+            self.assertEqual(node.workers["exclusive"].resident, (0,))
             queued.append(await self.bus.submit_command(exclusive, Op.OPTIM_STEP, b'{"adam_params":{}}'))
             body = json.dumps({"uri": f"tinker://{run}/weights/queued"}).encode()
             queued.append(await self.bus.submit_command(run, Op.SAVE_WEIGHTS, body))
@@ -99,13 +97,16 @@ class TestWideRebind(BusTest):
 
         self.assertEqual(len(queued), 2)
         for request in queued:
-          reply = await self.bus.wait_for_reply(request, 10)
-          self.assertIsNotNone(reply)
+          async with asyncio.timeout(10):
+            while (reply := await self.bus.wait_for_reply(request, 0)) is None:
+              await node.tick()
+              await asyncio.sleep(0.005)
           self.assertTrue(reply.ok, reply.body)
         self.assertTrue(child.closed)
-        replacement = node.lives["wide"]
-        self.assertEqual(node.on, {replacement.life: (2, 3), pin.life: (0,)})
-        actual, _ = replacement.model.trainer.model.training_state(run)
+        self.assertEqual(
+          {k: h.resident for k, h in node.workers.items() if h.resident}, {"wide": (2, 3), "exclusive": (0,)}
+        )
+        actual, _ = node.workers["wide"].model.trainer.model.training_state(run)
         self.assertEqual(actual.keys(), expected.keys())
         for key in expected:
           torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)

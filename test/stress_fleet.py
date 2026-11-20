@@ -31,8 +31,7 @@ from test.helpers import BusTest, FakeEngine, new_id, tiny
 from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
-from tinyrl.bus import Op, RemoteBus, Role, Run, serve_bus
-from tinyrl.control import scheduler
+from tinyrl.bus import ControlClient, Op, Role, Run, serve_control
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import Model
 from tinyrl.workers.trainer import Trainer
@@ -137,29 +136,23 @@ def tracked_engine(occ: Occupancy, delay):
 
 
 class StressNode(TestNode):
-  def __init__(self, bus, store, gpus, node, violations, errors, delay):
-    super().__init__(bus, store=store, gpus=gpus, node=node)
+  def __init__(self, control, store, gpus, node, violations, errors, delay):
+    super().__init__(control, store=store, gpus=gpus, node=node)
     self.occ, self.errors, self.delay = Occupancy(node, violations), errors, delay
     self.engine_type = tracked_engine(self.occ, delay)
 
-  def open_trainer(self, proc, width, env):
+  def open_trainer(self, worker_id, width, env):
     gpus = tuple(map(int, env["CUDA_VISIBLE_DEVICES"].split(",")))
-    name = f"{proc}#{next(serial)}"
+    name = f"{worker_id}#{next(serial)}"
     process = TrackedProcess(Trainer(Model(self.default_model), self.store), self.occ, name, gpus, self.delay)
-    self.processes[proc] = process
+    self.processes[worker_id] = process
     return process
-
-  def dispatch(self):
-    for proc, task in self.tasks.items():
-      if task.done() and not task.cancelled() and (err := task.exception()):
-        self.errors.append(f"{self.id}/{proc}: {err!r}")
-    super().dispatch()
 
 
 class Stress(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
-    self.runner, self.url = await serve_bus(self.bus, host="127.0.0.1", port=0)
+    self.runner, self.url = await serve_control(self.bus, host="127.0.0.1", port=0)
     self.rng = random.Random(SEED)
     self.bucket = f"file://{tempfile.mkdtemp()}"
     self.nodes: dict[str, StressNode] = {}
@@ -175,7 +168,7 @@ class Stress(BusTest):
     await asyncio.gather(*self.loops.values(), return_exceptions=True)
     for node in self.nodes.values():
       await node.aclose()
-      await node.bus.aclose()
+      await node.control.aclose()
     for node in self.cut:
       await asyncio.to_thread(node.store.close)
     await self.runner.cleanup()
@@ -188,9 +181,9 @@ class Stress(BusTest):
     name = f"node-{self.made}"
     store = Store(self.bucket, cache=tempfile.mkdtemp())
     delay = lambda: self.rng.uniform(0.004, 0.02)  # noqa: E731
-    node = StressNode(CuttableBus(RemoteBus(self.url)), store, gpus, name, self.violations, self.errors, delay)
+    node = StressNode(CuttableBus(ControlClient(self.url)), store, gpus, name, self.violations, self.errors, delay)
     self.nodes[name] = node
-    await node.announce_node()
+    await node.tick()
 
     async def loop():
       while True:
@@ -202,29 +195,32 @@ class Stress(BusTest):
 
   async def remove_node(self, name: str, graceful: bool) -> None:
     node = self.nodes.pop(name)
+    if graceful:
+      node.begin_drain()
+      deadline = time.monotonic() + 10.0
+      while (node.active or node.workers) and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
     self.loops.pop(name).cancel()
-    await node.close(graceful=graceful)
-    if task := node.sweeping:
-      task.cancel()
-    self.bus.nodes.pop(name, None)
-    await node.bus.aclose()
+    await node.close()
+    if n := self.bus.nodes.get(name):
+      self.bus.reap_node(name, n.boot_id)
+    await node.control.aclose()
 
   async def cut_node(self, name: str) -> None:
-    """The node loses the control plane for good, mid-work: none of its replies, releases or lease drops arrive. Its
-    leases and heartbeat run out by themselves. Its store goes on uploading, so the saves it acknowledged are not lost."""
+    """The node loses the control plane for good, mid-work: none of its replies arrive. Its heartbeat runs out."""
     node = self.nodes.pop(name)
     self.loops.pop(name).cancel()
-    node.bus.cut = True
-    await node.bus.aclose()
-    for task in node.tasks.values():
+    node.control.cut = True
+    await node.control.aclose()
+    for _, task in node.active.values():
       task.cancel()
-    await asyncio.gather(*node.tasks.values(), return_exceptions=True)
+    await asyncio.gather(*(t for _, t in node.active.values()), return_exceptions=True)
     self.cut.append(node)
 
   def start_scheduler(self) -> None:
     async def loop():
       while True:
-        await scheduler.tick(self.bus)
+        await self.bus.maintain()
         await asyncio.sleep(0.01)
 
     self.loops["scheduler"] = asyncio.create_task(loop())
@@ -236,14 +232,18 @@ class Stress(BusTest):
       action = self.rng.choice(["cancel", "crash", "crash", "lose", "drain", "cut", "add"])
       if action in ("cancel", "crash"):
         node = self.nodes[self.rng.choice(nodes)]
-        if not (live := sorted(p for p, t in node.tasks.items() if not t.done())):
-          continue
-        proc = self.rng.choice(live)
-        self.injected.append(f"{action} {node.id}/{proc}")
         if action == "cancel":
-          node.tasks[proc].cancel()
-        elif proc in node.processes:
-          node.processes[proc].closed = True  # the model process died
+          if not (live := sorted(t for t, (_, task) in node.active.items() if not task.done())):
+            continue
+          tid = self.rng.choice(live)
+          self.injected.append(f"cancel {node.id}/{tid}")
+          node.active[tid][1].cancel()
+        else:
+          if not (live := sorted(w for w in node.workers if w in node.processes)):
+            continue
+          proc = self.rng.choice(live)
+          self.injected.append(f"crash {node.id}/{proc}")
+          node.processes[proc].closed = True
       elif action in ("lose", "drain") and len(nodes) > 1:
         name = self.rng.choice(nodes)
         self.injected.append(f"{action} {name}")
@@ -293,15 +293,12 @@ class Stress(BusTest):
       f"lag { {a: round(v) for a, v in plan.get('lag', {}).items()} } service { {a: round(v) for a, v in raw['service'].items()} }"
     )
     for node in self.nodes.values():
-      out.append(f"{node.id}: gpus={node.gpus} on={node.on} physical={node.occ.on} draining={node.draining}")
-      for proc, lf in node.lives.items():
-        heads = [(c.run[:4], c.op.value) for c in lf.heads.values()]
-        owned = [r[:4] for r in getattr(lf, "owned", ())]
-        out.append(
-          f"  {proc} {lf.life[-6:]} role={lf.spec.role.value} gpus={lf.spec.gpus} demand={lf.demand.value} wanted={lf.wanted()} "
-          f"owned={owned} runs={[r[:4] for r in node.state.runs(proc)]} heads={heads} "
-          f"task={'done' if node.tasks[proc].done() else 'running'} hold={lf.hold_until - time.monotonic():.1f}s"
-        )
+      on = {k: h.resident for k, h in node.workers.items() if h.resident}
+      out.append(
+        f"{node.id}: gpus={node.gpus} on={on} physical={node.occ.on} draining={node.draining} active={list(node.active)}"
+      )
+      for proc, h in node.workers.items():
+        out.append(f"  {proc} role={h.spec.role.value} gpus={h.spec.gpus} loaded={sorted(h.loaded)} busy={h.busy}")
     print("\n".join(out), file=sys.stderr)
 
   async def train(self, run: str, account: str, rank: int, rng: random.Random) -> None:
@@ -421,12 +418,11 @@ class Stress(BusTest):
     self.started = started
     self.abandoned, self.finished = [], []
     patches = [
-      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 100),
+      mock.patch("tinyrl.bus.QUANTUM_MS", 100),
       mock.patch("tinyrl.control.scheduler.REBALANCE_MS", 1000),
     ]
-    if CHAOS:  # so that a node cut off from Redis is given up on in seconds
+    if CHAOS:  # so that a node cut off from the controller is given up on in seconds
       patches += [mock.patch(f"tinyrl.{m}.LEASE_MS", 3000) for m in ("bus", "control.node_daemon")]
-      patches.append(mock.patch("tinyrl.bus.NODE_MS", 4000))
     for p in patches:
       p.start()
       self.addCleanup(p.stop)
@@ -463,22 +459,16 @@ class Stress(BusTest):
     try:
       async with asyncio.timeout(30):
         while (await self.bus.read_state())["plan"].get("procs") or any(
-          n.lives or n.tasks for n in self.nodes.values()
+          n.workers or n.active for n in self.nodes.values()
         ):
           await asyncio.sleep(0.05)
     except TimeoutError:
       plan = (await self.bus.read_state())["plan"]
-      lives = {n.id: sorted(n.lives) for n in self.nodes.values()}
+      workers = {n.id: sorted(n.workers) for n in self.nodes.values()}
       self.problems.append(
-        f"did not settle after deleting every run: procs {sorted(plan.get('procs', {}))} lives {lives}"
+        f"did not settle after deleting every run: procs {sorted(plan.get('procs', {}))} workers {workers}"
       )
-    # A node cut off from the control plane cannot drop its leases. They must carry an expiry and lapse by themselves.
-    now = time.monotonic()
-    cut = {n.id for n in self.cut}
-    leases = [k for k, exp in self.bus.leases.items() if exp > now]
-    lapsing = [k for k in leases if k.split("@")[-1].rsplit("-", 1)[0] in cut]
     left = {
-      "leases": sorted(set(leases) - set(lapsing)),
       "queues": sorted(self.bus.queues),
       "writing": sorted(r for r, row in self.bus.runs.items() if row.get("writing")),
       "owners": [r for r in trainers if (self.bus.runs.get(r) or {}).get("owner")],

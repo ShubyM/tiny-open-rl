@@ -10,8 +10,7 @@ import unittest
 
 from test.helpers import BusTest, new_id, tiny
 from test.test_process import require_unix
-from tinyrl.bus import Op, Reply, Run, serve_bus, unpack_snap
-from tinyrl.control import scheduler
+from tinyrl.bus import Op, Reply, Run, serve_control, unpack_snap
 from tinyrl.storage.store import Store
 
 LEASE_MS = 2000
@@ -21,7 +20,7 @@ LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 class TestLease(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
-    self.runner, self.url = await serve_bus(self.bus, host="127.0.0.1", port=0)
+    self.runner, self.url = await serve_control(self.bus, host="127.0.0.1", port=0)
     self.tasks, self.processes = [], []
     self.folder = tempfile.TemporaryDirectory()
     self.addCleanup(self.folder.cleanup)
@@ -78,7 +77,7 @@ class TestLease(BusTest):
     run = new_id()
     await self.bus.create_run(Run(run, base, 4, lora=LORA))
     first = self.daemon()
-    self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    self.start_maintenance()
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
     old_owner = (await self.bus.get_run(run))["owner"]
     proc_name = old_owner.split("@", 1)[0]
@@ -108,12 +107,11 @@ class TestLease(BusTest):
       await self.until(pending)
       first.send_signal(signal.SIGSTOP)
       os.killpg(model_pid, signal.SIGCONT)  # the child may run while its parent cannot publish a result
-      self.bus.nodes.pop(first_node, None)  # its heartbeat ran out
+      self.bus.nodes[first_node].until = 0.0  # its heartbeat ran out
       expected = await self.bus.wait_for_reply(request, 30)
       self.assertFalse(expected.ok)
       self.assertIn("lost ownership", json.loads(expected.body)["error"])
-      new_owner = (await self.bus.get_run(run))["owner"]
-      self.assertNotEqual(new_owner, old_owner)
+      self.assertNotEqual((await self.bus.get_run(run)).get("owner"), old_owner)
     finally:
       first.send_signal(signal.SIGCONT)
       with contextlib.suppress(ProcessLookupError):
@@ -138,7 +136,7 @@ class TestLease(BusTest):
     run = new_id()
     await self.bus.create_run(Run(run, base, 4, lora=LORA))
     proc = self.daemon()
-    self.tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    self.start_maintenance()
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
     proc.terminate()
     self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)

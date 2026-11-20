@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from tinyrl.api import wire
-from tinyrl.bus import BackpressureError, Bus, PromiseGoneError, serve_bus
+from tinyrl.bus import BackpressureError, Bus, PromiseGoneError, serve_control
 from tinyrl.control import estimator, scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.store import Store
@@ -121,14 +121,20 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
 
   @contextlib.asynccontextmanager
   async def lifespan(_: FastAPI):
-    runner, _ = await serve_bus(bus, port=getenv("INTERNAL_PORT", 8001))
-    sched = asyncio.create_task(scheduler.run(bus))
+    runner, _ = await serve_control(bus, port=getenv("INTERNAL_PORT", 8001))
+
+    async def maintain_loop():
+      while True:
+        await bus.maintain()
+        await asyncio.sleep(scheduler.TICK_MS / 1000)
+
+    maint = asyncio.create_task(maintain_loop())
     try:
       yield
     finally:
-      sched.cancel()
+      maint.cancel()
       with contextlib.suppress(asyncio.CancelledError):
-        await sched
+        await maint
       await runner.cleanup()
       await bus.aclose()
 

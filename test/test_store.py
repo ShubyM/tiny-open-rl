@@ -238,9 +238,8 @@ class TestRegistry(BusTest):
         self.bus.checkpoints[row["tinker_path"]] = row
     self.assertEqual(await self.bus.page_of_checkpoints(10, 0), ([saved], 1))
     self.assertEqual(await self.bus.checkpoints_of_run("r"), [saved])
-    self.assertEqual(
-      await self.bus.checkpoint_versions([uri, parked["tinker_path"]]), {uri: "saved", parked["tinker_path"]: "host"}
-    )
+    self.assertEqual(await self.bus.checkpoint_version(uri), "saved")
+    self.assertEqual(await self.bus.checkpoint_version(parked["tinker_path"]), "host")
     self.assertTrue(await self.bus.set_checkpoint_ttl(uri, -1))
     self.assertEqual(await self.bus.expire_checkpoints(), 1)
     self.assertEqual(await self.bus.page_of_checkpoints(10, 0), ([], 0))
@@ -248,68 +247,84 @@ class TestRegistry(BusTest):
     self.assertEqual(await self.bus.get_checkpoint(parked["tinker_path"]), parked)
 
   async def test_deletion_wins_over_concurrent_ttl_updates(self):
+    from tinyrl.types import NodeReport, TurnResult
+
     run = new_id()
     await self.bus.create_run(Run(id=run, base="base", rank=8))
-    await self.bus.touch_leases("owner")
-    token, _, _ = await self.bus.acquire_run(run, "owner")
     uri = f"tinker://{run}/sampler_weights/session"
     await self.seed_checkpoint(uri, 1, ttl=60, owned=True)
     await self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
-    cmd = await self.bus.claim_trainer(run, token)
+    [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
+    done = NodeReport(
+      "n1", "b1", 1, finished=[TurnResult(turn.id, "train", turn.worker, reply=Reply(True, "application/json", b"{}"))]
+    )
     await asyncio.gather(
       *(self.bus.set_checkpoint_ttl(uri, 600) for _ in range(20)),
-      self.bus.commit_reply(cmd, Reply(True, "application/json", b"{}"), token),
+      self.bus.exchange(done),
     )
     self.assertFalse(await self.bus.set_checkpoint_ttl(uri, 600))
     self.assertIsNone(await self.bus.get_checkpoint(uri))
     self.assertEqual(await self.bus.checkpoints_of_run(run), [])
 
   async def test_stale_writer_cannot_replace_published_bytes_on_disk_or_in_bucket(self):
+    from tinyrl.types import NodeReport, TurnResult
+
+    def sweep(store: Store, grace: float) -> None:
+      unused = store.versions()
+      unused.difference_update(self.bus.live_versions_sync())
+      store.sweep(unused, grace)
+
     for root in (tempfile.mkdtemp(), f"file://{tempfile.mkdtemp()}"):
       with self.subTest(root=root):
         old, new = (Store(root, cache=tempfile.mkdtemp()) for _ in range(2))
-        run = new_id()
+        run, b1, b2 = new_id(), uuid.uuid4().hex[:8], uuid.uuid4().hex[:8]
         uri = f"tinker://{run}/weights/final"
         await self.bus.create_run(Run(run, "base", 4))
-        await self.bus.touch_leases("previous")
-        stale, _, _ = await self.bus.acquire_run(run, "previous")
         await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        first = await self.bus.claim_trainer(run, stale)
-        abandoned = await self.bus.begin_checkpoint(run, stale)
-        await self.bus.drop_lease("previous")
-        await self.bus.touch_leases("current")
-        owner, _, _ = await self.bus.acquire_run(run, "current")
-        await self.bus.fail_stranded_commands(run, owner)
+        [t1] = (await self.bus.exchange(NodeReport("n1", b1, 1))).turns
+        abandoned = t1.args["version"]
+        self.bus.nodes["n1"].until = 0.0
+        await self.bus.maintain()
+
         await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        cmd = await self.bus.claim_trainer(run, owner)
-        version = await self.bus.begin_checkpoint(run, owner)
+        [t2] = (await self.bus.exchange(NodeReport("n2", b2, 1))).turns
+        version = t2.args["version"]
         winner = new.put({"w": torch.ones(2)}, version=version)
-        await self.bus.sweep_checkpoints(new, grace=0)  # protected even before the reply publishes it
+        sweep(new, grace=0)  # protected even before the reply publishes it
         good = {"uri": uri, "size": 8, "version": winner}
         reply = Reply(True, "application/json", b"{}")
-        self.assertTrue(await self.bus.commit_reply(cmd, reply, owner, checkpoint=good))
+        await self.bus.exchange(
+          NodeReport("n2", b2, 1, finished=[TurnResult(t2.id, "train", t2.worker, reply=reply, saved=good)])
+        )
         new.upload_pending_saves()
         late = old.put({"w": torch.zeros(2)}, version=abandoned)
         old.upload_pending_saves()
-        self.assertFalse(await self.bus.commit_reply(first, reply, stale, checkpoint=good | {"version": late}))
+        stale_reply = await self.bus.exchange(
+          NodeReport(
+            "n1", b1, 1, finished=[TurnResult(t1.id, "train", t1.worker, reply=reply, saved=good | {"version": late})]
+          )
+        )
+        self.assertTrue(stale_reply.reset)
         reader = Store(root, cache=tempfile.mkdtemp())
         published = await self.bus.checkpoint_version(uri)
         self.assertEqual(published, winner)
         torch.testing.assert_close(reader.get(published)[0]["w"], torch.ones(2))
-        await self.bus.sweep_checkpoints(reader, grace=600)
+        sweep(reader, grace=600)
         self.assertEqual(reader.versions(), {abandoned, version})
-        await self.bus.sweep_checkpoints(reader, grace=0)
+        sweep(reader, grace=0)
         self.assertEqual(reader.versions(), {version})
         await self.bus.unregister_checkpoints(uri)
-        await self.bus.sweep_checkpoints(reader, grace=0)
+        sweep(reader, grace=0)
         self.assertEqual(reader.versions(), set())
-        await self.bus.drop_lease("current")
+        self.bus.reap_node("n2", b2)
 
   async def test_sweep_removes_only_unregistered_staged_uploads(self):
     store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())
     kept, dropped = (store.put({"w": torch.ones(1)}) for _ in range(2))
     await self.seed_checkpoint("tinker://r/weights/kept", 1, version=kept)
-    await self.bus.sweep_checkpoints(store, 0)
+    unused = store.versions()
+    unused.difference_update(self.bus.live_versions_sync())
+    store.sweep(unused, 0)
     self.assertTrue(os.path.isdir(f"{store.cache}/{kept}"))
     self.assertTrue(os.path.exists(f"{store.cache}/{kept}.upload"))
     self.assertFalse(os.path.exists(f"{store.cache}/{dropped}"))

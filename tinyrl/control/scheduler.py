@@ -1,42 +1,22 @@
-"""Cluster planner: places, scales, and rebalances processes across nodes (`run -> procs -> node`).
+"""Pure cluster placement and EEVDF lag update (`run -> procs -> node`).
 
-Nodes time-slice their own GPUs locally on wall-clock quanta and enforce all safety via `on`, `run.owner`, and `lease`.
-`tinyrl:plan` stores only process placement, run assignment, and per-account EEVDF `lag` (in `gpu_ms`).
+Called synchronously inside the controller's `exchange` and `maintain` paths — zero I/O, zero locks.
 """
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import dataclasses
 import itertools
 from dataclasses import dataclass, field
 
-from tinyrl.bus import Bus, connect
 from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
 from tinyrl.types import Ev, Role
+from tinyrl.types import WorkerSpec as Spec
 
 REBALANCE_MS = getenv("REBALANCE_MS", 20_000)
 SCALE_BATCH, TICK_MS = getenv("SCALE_BATCH", 4), getenv("TICK_MS", 100)
-
-
-@dataclass(frozen=True)
-class Spec:
-  role: Role = Role.TRAINER
-  base: str = ""
-  lora: bool = False
-  exclusive: bool = False
-  train_run: str | None = None
-  gpus: int = 1
-
-  @property
-  def shareable(self) -> bool:
-    return self.role == Role.SAMPLER or (self.lora and not self.exclusive)
-
-  @property
-  def elastic(self) -> bool:
-    return self.role == Role.SAMPLER and not self.exclusive
 
 
 @dataclass
@@ -57,7 +37,7 @@ class Job:
 
 def owner_of(token: str | None) -> tuple[str, str]:
   proc, _, rest = (token or "").rsplit(":", 1)[0].partition("@")
-  return proc, rest.rsplit("-", 1)[0]
+  return proc, rest
 
 
 @dataclass
@@ -101,7 +81,7 @@ class State:
     return max((self.ready_lag(r) for r in self.runs(proc) if self.ready(r)), default=0.0)
 
   def ready_lag(self, run: str) -> float:
-    """The account's lag, less service completed since the planner's last update."""
+    """The account's lag, less service completed since the last update."""
     account = self.account(run)
     return self.lag.get(account, 0.0) - max(0.0, self.service.get(account, 0.0) - self.seen.get(account, 0.0))
 
@@ -134,7 +114,7 @@ class State:
 
 def from_state(raw: dict) -> State:
   plan, queues, rnodes = raw["plan"], raw.get("queues", {}), raw.get("nodes", {})
-  nodes = {n: (int(v["gpus"]), int(v.get("memory", 0))) for n, v in rnodes.items()}
+  nodes = {n: (int(v["gpus"]), int(v.get("memory", 0))) for n, v in rnodes.items() if not v.get("draining")}
   jobs, procs = {}, {}
   for r, info in raw.get("runs", {}).items():
     rec = info["record"]
@@ -145,7 +125,6 @@ def from_state(raw: dict) -> State:
   jobs = {r: j for r, j in jobs.items() if not j.spec.train_run or j.spec.train_run in jobs}
   for n, p in plan.get("procs", {}).items():
     procs[n] = Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
-  # Earlier plans stored a trainer's single home as a one-element list.
   home = {
     r: p[0] if isinstance(p, list) else p
     for r, p in plan.get("home", {}).items()
@@ -275,7 +254,7 @@ def size_samplers(s: State, out: list) -> None:
 
 
 def collect_and_place(s: State, out: list) -> None:
-  """Remove empty processes, then place the unplaced ones, exclusives first."""
+  """Remove empty processes, then place the unplaced ones."""
   held = {owner_of(j.owner)[0] for j in s.jobs.values() if owner_of(j.owner)[1] in s.nodes}
   for name in [n for n in sorted(s.procs) if not s.runs(n) and n not in held]:
     if s.procs.pop(name).node:
@@ -302,30 +281,3 @@ def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
   for phase in (drop_lost, assign, merge_and_split, size_samplers, collect_and_place, rebalance):
     phase(s, out)
   return s, out
-
-
-# ***** loop *****
-
-
-async def tick(bus: Bus) -> list[tuple[Ev, dict]]:
-  for session in await bus.expired_sessions():
-    await bus.end_session(session)
-  await bus.expire_checkpoints()
-  raw = await bus.read_state()
-  old, (new, changes) = raw["plan"], step(from_state(raw))
-  plan = to_plan(new)
-  if plan != old:
-    wake = plan["procs"] != old.get("procs") or plan["home"] != old.get("home")
-    await bus.write_plan(plan, changes, notify_nodes=wake)
-  return changes
-
-
-async def run(bus: Bus) -> None:
-  wake_id = "$"
-  while True:
-    await tick(bus)
-    wake_id = await bus.wait_wake(wake_id, TICK_MS)
-
-
-if __name__ == "__main__":
-  asyncio.run(run(connect()))

@@ -324,19 +324,25 @@ class TestTrainer(BusTest):
   async def until(self, predicate):
     async with asyncio.timeout(10):
       while not predicate():
-        self.node.dispatch()
+        await self.node.tick()
         await asyncio.sleep(0.01)
 
   async def finish_worker(self, proc):
-    await self.until(lambda: proc not in self.node.lives)
+    await self.until(lambda: proc not in self.node.workers and not self.node.active)
+
+  async def drain_and_evict(self, proc):
+    self.node.draining = True
+    await self.finish_worker(proc)
+    self.node.draining = False
+    await self.node.tick()
 
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
     await self.bus.create_run(Run(run, "tiny", 0))
     await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
     await self.node.bind(run, run)
+    await self.until(lambda: run in self.node.processes and run not in self.node.workers and not self.node.active)
     child = self.node.processes[run]
-    await self.finish_worker(run)
     self.assertTrue(child.closed)
     self.assertIsNone((await self.bus.get_run(run)).get("owner"))
 
@@ -353,8 +359,7 @@ class TestTrainer(BusTest):
           )
         await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
         await self.node.drain(r)
-      self.node.drop_local(f"p-{rank}")  # detaches dirty run to store before releasing owner
-      await self.finish_worker(f"p-{rank}")
+      await self.drain_and_evict(f"p-{rank}")  # detaches dirty run to store before releasing owner
       info = await self.bus.get_run(run)
       self.assertIsNone(info.get("owner"))
       parked = info["snap"].partition("\n")[0]
@@ -384,8 +389,7 @@ class TestTrainer(BusTest):
     expected = {k: p.detach().clone() for k, p in self.model("p").params[run].items()}
     step = (Op.OPTIM_STEP, {"adam_params": {}})
     for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
-      self.node.drop_local("p")
-      await self.finish_worker("p")
+      await self.drain_and_evict("p")
       parked = (await self.bus.get_run(run))["snap"].partition("\n")[0]
       [request] = await self.submit(run, command)
       await self.node.drain(run)
@@ -398,8 +402,7 @@ class TestTrainer(BusTest):
       self.assertIsNone(info.get("snap"))
       self.assertIsNone(await self.bus.get_checkpoint(parked))
 
-    self.node.drop_local("p")
-    await self.finish_worker("p")
+    await self.drain_and_evict("p")
     [request] = await self.submit(run, step)
     await self.node.drain(run)
     self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
@@ -413,8 +416,8 @@ class TestTrainer(BusTest):
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
     )
     await self.node.drain(run)
-    self.node.tasks["p"].cancel()  # a lost process has no detached snapshot
-    await self.finish_worker("p")
+    await self.node.drop_handle(self.node.workers["p"])  # a lost process has no detached snapshot
+    await self.node.tick()
     ids = await self.submit(
       run,
       (Op.OPTIM_STEP, {"adam_params": {}}),

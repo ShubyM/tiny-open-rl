@@ -1,9 +1,4 @@
-"""In-memory control-plane Bus backed by SQLite WAL for durable metadata.
-
-Durable tables (`sessions`, `runs`, `checkpoints`, `meta`) are plain Python dicts (`Table`) that write through to a
-single SQLite WAL file. Command queues, replies, leases, nodes, and events live in RAM; lost sampling promises raise
-PromiseGoneError (HTTP 410) so the Tinker SDK resubmits them.
-"""
+"""Single-process control plane: transactional KV trainer state, RAM sampling, and one `exchange` RPC."""
 
 from __future__ import annotations
 
@@ -16,16 +11,22 @@ import time
 import uuid
 import weakref
 from collections import OrderedDict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 
+from tinyrl import types
+from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge
+from tinyrl.control.fairness import Demand, Worker, blocks, plan_gpus, select_runs
 from tinyrl.helpers import getenv
-from tinyrl.rpc import RemoteBus, serve_bus  # noqa: F401
-from tinyrl.types import Cmd, Ev, Event, Op, Reply, Role, Run, parse_uri, unpack_snap
+from tinyrl.rpc import ControlClient, serve_control  # noqa: F401
+from tinyrl.types import Cmd, Ev, NodeReply, NodeReport, Op, Reply, Role, Run, Turn, TurnResult, parse_uri, unpack_snap
 
 LIVE_SECONDS, SESSION_GRACE = 30, getenv("SESSION_GRACE", 60)
 REPLY_TTL, READ_REPLY_TTL, SESSION_TTL = getenv("REPLY_TTL", 3600), 60, getenv("SESSION_TTL", 7 * 24 * 3600)
-LEASE_MS, NODE_MS = getenv("LEASE_MS", 10000), 30000
+LEASE_MS, QUANTUM_MS = getenv("LEASE_MS", 10000), getenv("QUANTUM_MS", 2000)
+MAX_QUANTUM_MS, CYCLE_GRACE_MS = getenv("MAX_QUANTUM_MS", 15000), getenv("CYCLE_GRACE_MS", 100)
+SWITCH_BUDGET = float(getenv("SWITCH_BUDGET", 0.1))
+SAMPLE_RUNS, SAMPLE_COMMANDS = getenv("SAMPLE_RUNS", 3), getenv("SAMPLE_COMMANDS", 128)
 SAMPLE_QUEUE_BYTES = getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20)
 SAMPLE_REPLY_BYTES = getenv("SAMPLE_REPLY_BYTES", 256 * 2**20)
 COUNTERS = ("steps", "failed", "cmds", "tokens", "busy_ms", "wait_ms")
@@ -39,16 +40,78 @@ class BackpressureError(RuntimeError):
   """Raised when in-memory sampling queues hit SAMPLE_QUEUE_BYTES (maps to HTTP 429)."""
 
 
-@dataclass
-class Claim:
-  cmd: Cmd
-  consumer: str
-  claimed_at: float
-  deliveries: int = 1
+class WorkerRuntime:
+  def __init__(self, wid: str, spec: types.WorkerSpec, resident=(), bound=(), pid=None, loaded=(), park_s=0.0):
+    self.id, self.spec, self.resident, self.bound, self.pid = wid, spec, resident, bound, pid
+    self.loaded, self.open_grad, self.run_service = set(loaded), set(), {}
+    self.hold_until = self.idle_since = self.gpu_ms = self.service_floor = 0.0
+    self.park_s, self.active_turn = park_s, None
 
 
-def life_of(token: str) -> str:
-  return token.rsplit(":", 1)[0]
+class NodeRuntime:
+  def __init__(self, node: str, boot_id: str, gpus: int, memory: int = 0):
+    self.node, self.boot_id, self.gpus, self.memory = node, boot_id, gpus, memory
+    self.draining, self.lag, self.until, self.next_wake = False, 0.0, 0.0, None
+    self.workers, self.staged, self.stage_errors = {}, set(), {}
+
+
+class KV:
+  """Transactional SQLite key-value store backing `Table` dicts and on-disk binary blobs."""
+
+  def __init__(self, path: str):
+    if path != ":memory:":
+      os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    self.conn = sqlite3.connect(path, isolation_level="IMMEDIATE")
+    for p in ("journal_mode=WAL", "synchronous=NORMAL", "busy_timeout=5000", "auto_vacuum=INCREMENTAL"):
+      self.conn.execute(f"PRAGMA {p}")
+    self.conn.execute("CREATE TABLE IF NOT EXISTS kv (ns TEXT, k TEXT, v BLOB, PRIMARY KEY (ns, k))")
+    self.conn.commit()
+    self.close = self.conn.close
+
+  def __enter__(self):
+    return self.conn.__enter__()
+
+  def __exit__(self, *exc):
+    return self.conn.__exit__(*exc)
+
+  def get(self, ns: str, key: str) -> bytes | None:
+    row = self.conn.execute("SELECT v FROM kv WHERE ns=? AND k=?", (ns, key)).fetchone()
+    return bytes(row[0]) if row else None
+
+  def put(self, ns: str, key: str, value: str | bytes) -> None:
+    self.conn.execute("INSERT OR REPLACE INTO kv VALUES (?, ?, ?)", (ns, key, value))
+
+  def delete(self, ns: str, key: str) -> None:
+    self.conn.execute("DELETE FROM kv WHERE ns=? AND k=?", (ns, key))
+
+  def load(self, ns: str) -> list[tuple[str, str]]:
+    return self.conn.execute("SELECT k, v FROM kv WHERE ns=?", (ns,)).fetchall()
+
+
+class Table(dict):
+  """In-memory dict persisted to a namespace in `KV`."""
+
+  def __init__(self, kv: KV, ns: str):
+    self.kv, self.ns = kv, ns
+    super().__init__((k, json.loads(v)) for k, v in kv.load(ns))
+
+  def __setitem__(self, key: str, value) -> None:
+    super().__setitem__(key, value)
+    self.kv.put(self.ns, key, json.dumps(value))
+
+  def __delitem__(self, key: str) -> None:
+    super().__delitem__(key)
+    self.kv.delete(self.ns, key)
+
+  def pop(self, key: str, *default):
+    if key not in self:
+      return default[0] if default else super().pop(key)
+    val = self[key]
+    del self[key]
+    return val
+
+  def save(self, key: str) -> None:
+    self[key] = self[key]
 
 
 def entry_sort_key(entry_id: str) -> tuple[int, int]:
@@ -56,105 +119,56 @@ def entry_sort_key(entry_id: str) -> tuple[int, int]:
   return int(ms), int(seq)
 
 
-def charge_counts(cmd: Cmd, reply: Reply, charge: Charge | None) -> dict[str, int]:
-  counts = {"failed": 1} if not reply.ok else {"steps": 1} if cmd.op == Op.OPTIM_STEP else {}
-  if charge:
-    wait_ms = max(0, charge.started_ms - int(cmd.entry_id.split("-")[0]))
-    counts.update(cmds=1, wait_ms=wait_ms, busy_ms=charge.busy_ms)
-    if reply.ok:
-      counts["tokens"] = cmd.cost
-  return counts
+def owner_token(node: str, boot_id: str, worker: str) -> str:
+  return f"{worker}@{node}:{boot_id}"
 
 
 def make_checkpoint(uri: str, size: int, *, version: str, ttl=None, owned=False) -> dict:
   _, cid = parse_uri(uri)
-  raw_kind, now = cid.split("/", 1)[0], time.time()
-  kind = {"weights": "training", "sampler_weights": "sampler"}.get(raw_kind, raw_kind)
-  return {
-    "checkpoint_id": cid,
-    "checkpoint_type": kind,
-    "time": now,
-    "tinker_path": uri,
-    "size_bytes": size,
-    "expires_at": now + ttl if ttl else None,
-    "owned": bool(owned),
-    "version": version,
-  }
-
-
-class Table(dict):
-  """In-memory dict backed by a namespace in SQLite (`kv(ns, k, v)`)."""
-
-  def __init__(self, db: sqlite3.Connection, ns: str):
-    self.db, self.ns = db, ns
-    super().__init__((k, json.loads(v)) for k, v in db.execute("SELECT k, v FROM kv WHERE ns = ?", (ns,)))
-
-  def __setitem__(self, key: str, value) -> None:
-    super().__setitem__(key, value)
-    self.db.execute("INSERT OR REPLACE INTO kv VALUES (?, ?, ?)", (self.ns, key, json.dumps(value)))
-
-  def __delitem__(self, key: str) -> None:
-    super().__delitem__(key)
-    self.db.execute("DELETE FROM kv WHERE ns = ? AND k = ?", (self.ns, key))
-
-  def pop(self, key: str, *default):
-    if key in self:
-      value = self[key]
-      del self[key]
-      return value
-    return default[0] if default else super().pop(key)
-
-  def save(self, key: str) -> None:
-    self[key] = self[key]
+  raw, now = cid.split("/", 1)[0], time.time()
+  kind = {"weights": "training", "sampler_weights": "sampler"}.get(raw, raw)
+  meta = {"checkpoint_id": cid, "checkpoint_type": kind, "time": now, "tinker_path": uri, "size_bytes": size}
+  return meta | {"expires_at": now + ttl if ttl else None, "owned": bool(owned), "version": version}
 
 
 class Bus:
-  """Single-control-plane bus: write-through SQLite Tables for durable metadata, RAM for queues & liveness."""
+  """Central control plane: transactional KV state + single-call `exchange` scheduler."""
 
   def __init__(self, path: str | None = None):
     self.path = getenv("TINYRL_DB", "/tmp/tinyrl.db") if path is None else path
-    if self.path != ":memory:":
-      os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-    self.db = sqlite3.connect(self.path, isolation_level="IMMEDIATE")
-    for pragma in ("journal_mode=WAL", "synchronous=NORMAL", "busy_timeout=5000", "auto_vacuum=INCREMENTAL"):
-      self.db.execute(f"PRAGMA {pragma}")
-    self.db.execute("CREATE TABLE IF NOT EXISTS kv (ns TEXT, k TEXT, v TEXT, PRIMARY KEY (ns, k))")
-    self.db.commit()
-
-    self.sessions = Table(self.db, "sessions")
-    self.runs = Table(self.db, "runs")
-    self.checkpoints = Table(self.db, "checkpoints")
-    self.meta = Table(self.db, "meta")
-    self.service: dict[str, float] = {k: float(v) for k, v in self.meta.get("service", {}).items()}
-
-    self.queues: dict[str, dict[str, Cmd]] = {rid: {} for rid, r in self.runs.items() if r["live"]}
-    self.in_flight: dict[str, dict[str, Claim]] = {rid: {} for rid in self.queues}
-    self.replies: OrderedDict[str, tuple[Reply, float, int]] = OrderedDict()
-    self.seen: dict[tuple[str, int], tuple[str, float]] = {}
-    self.nodes: dict[str, dict] = {}
-    self.leases: dict[str, float] = {}
-    self.dropped: set[str] = set()
-    self.events: deque[Event] = deque(maxlen=100_000)
-    self.waiters: weakref.WeakValueDictionary[str, asyncio.Event] = weakref.WeakValueDictionary()
-    self.wake_seq = {"wake": 0, "plan_wake": 0}
-    self.seq = self.sample_bytes = self.reply_bytes = 0
-    self.dirty_runs: set[str] = set()
-    self.service_dirty = False
-
-    has_owner = any(r["live"] and r.get("owner") for r in self.runs.values())
-    self.reap_after = time.monotonic() + LEASE_MS / 1000 if has_owner else 0.0
+    self.db = KV(self.path)
+    tables = [Table(self.db, n) for n in ("sessions", "runs", "checkpoints", "meta", "cmds", "replies", "seen")]
+    self.sessions, self.runs, self.checkpoints, self.meta, self.cmds, self.replies, self.seen = tables
+    self.service = {k: float(v) for k, v in self.meta.get("service", {}).items()}
+    self.queues = {rid: {} for rid, r in self.runs.items() if r["live"]}
+    self.in_flight, self.sample_replies, self.sample_seen = {rid: {} for rid in self.queues}, OrderedDict(), {}
+    self.nodes, self.reaped_boots, self.active_turns = {}, set(), {}
+    self.events, self.waiters = deque(maxlen=100_000), weakref.WeakValueDictionary()
+    self.work_event, self.seq = asyncio.Event(), max((c["seq"] for c in self.cmds.values()), default=0)
+    self.sample_bytes, self.reply_bytes, self.dirty_runs, self.service_dirty = 0, 0, set(), False
+    self.plan_state, now = scheduler.from_state(self.snapshot_state()), time.monotonic()
+    for req_id, c in sorted(self.cmds.items(), key=lambda kv: kv[1]["seq"]):
+      if (rid := c["run"]) not in self.queues:
+        continue
+      cmd = Cmd(rid, c["eid"], Op(c["op"]), self.db.get("blobs", f"c:{req_id}") or b"", c["cost"])
+      if tid := c.get("turn"):
+        self.in_flight[rid][c["eid"]] = (cmd, tid, now)
+        wid = (self.runs[rid].get("owner") or "").split("@", 1)[0]
+        self.active_turns[tid] = (c.get("node", ""), c.get("boot", ""), Turn(tid, "train", wid, cmd=cmd))
+      else:
+        self.queues[rid][c["eid"]] = cmd
+    pending = bool(self.active_turns) or any(r["live"] and r.get("owner") for r in self.runs.values())
+    self.reap_after = now + LEASE_MS / 1000 if pending else 0.0
 
   def is_sampler(self, run_id: str) -> bool:
-    run = self.runs.get(run_id)
-    return bool(run and run["record"]["role"] == Role.SAMPLER)
+    return bool((run := self.runs.get(run_id)) and run["record"]["role"] == Role.SAMPLER)
 
   def flush_dirty(self) -> None:
     if self.service_dirty:
-      self.meta["service"] = self.service
-      self.service_dirty = False
-    for run_id in self.dirty_runs:
-      if run_id in self.runs:
-        self.runs.save(run_id)
+      self.meta["service"], self.service_dirty = self.service, False
+    for rid in self.dirty_runs:
+      if rid in self.runs:
+        self.runs.save(rid)
     self.dirty_runs.clear()
 
   async def aclose(self) -> None:
@@ -168,143 +182,122 @@ class Bus:
     if ev := self.waiters.pop(key, None):
       ev.set()
 
-  def wake(self, stream: str = "wake") -> None:
-    self.wake_seq[stream] += 1
-    self.notify(f"wake:{stream}")
+  def wake_all(self) -> None:
+    ev, self.work_event = self.work_event, asyncio.Event()
+    ev.set()
 
-  def record_event(self, kind: Ev, body: dict) -> Event:
+  def record_event(self, kind: Ev, body: dict) -> types.Event:
     self.seq += 1
     now = time.time()
-    ev = Event(f"{int(now * 1000)}-{self.seq}", now, str(Ev(kind)), body)
+    ev = types.Event(f"{int(now * 1000)}-{self.seq}", now, str(Ev(kind)), body)
     self.events.append(ev)
     return ev
 
-  async def peek(self, runs: list[str], heads_fn, block_ms: int) -> list[Cmd]:
-    if not runs:
-      if block_ms > 0:
-        await asyncio.sleep(block_ms / 1000)
-      return []
-    if (cmds := heads_fn(runs)) or block_ms <= 0:
-      return cmds
-    tasks = [asyncio.create_task(self.waiters.setdefault(f"run:{r}", asyncio.Event()).wait()) for r in runs]
-    try:
-      await asyncio.wait(tasks, timeout=block_ms / 1000, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-      for t in tasks:
-        t.cancel()
-      await asyncio.gather(*tasks, return_exceptions=True)
-    return heads_fn(runs)
+  def clear_owners(self, pred) -> None:
+    with self.db:
+      for rid, row in self.runs.items():
+        if (owner := row.get("owner")) and pred(rid, owner):
+          row["owner"] = row["writing"] = None
+          self.runs.save(rid)
 
-  # ***** sessions *****
+  def drop_run_cmds(self, run_id: str) -> None:
+    for req_id in [k for k, c in self.cmds.items() if c["run"] == run_id]:
+      del self.cmds[req_id]
+      self.db.delete("blobs", f"c:{req_id}")
+
+  def save_checkpoint(self, saved: dict) -> dict:
+    ckpt = make_checkpoint(**saved)
+    self.checkpoints[ckpt["tinker_path"]] = ckpt
+    return ckpt
+
+  def record_usage(self, cmd: Cmd, reply: Reply, charge: Charge | None) -> None:
+    if not (row := self.runs.get(cmd.run)):
+      return
+    c = row["counters"]
+    if not reply.ok:
+      c["failed"] += 1
+    elif cmd.op == Op.OPTIM_STEP:
+      c["steps"] += 1
+    if charge:
+      c["cmds"], c["busy_ms"] = c["cmds"] + 1, c["busy_ms"] + charge.busy_ms
+      c["wait_ms"] += max(0, charge.started_ms - int(cmd.entry_id.split("-")[0]))
+      c["tokens"] += cmd.cost if reply.ok else 0
+
+  # ***** sessions & runs *****
 
   async def heartbeat_session(self, session_id: str, metadata: dict | None = None) -> None:
     now = time.time()
-    session = self.sessions.get(session_id) or {"created": now, "seen": now, "active": True, "metadata": {}}
-    session["seen"], session["active"] = now, True
-    if metadata:
-      session["metadata"] = metadata
+    s = self.sessions.get(session_id) or {"created": now, "seen": now, "active": True, "metadata": {}}
+    s.update(seen=now, active=True, **({"metadata": metadata} if metadata else {}))
     with self.db:
-      self.sessions[session_id] = session
+      self.sessions[session_id] = s
 
   async def get_session(self, session_id: str) -> dict | None:
-    if (session := self.sessions.get(session_id)) is None:
+    if (s := self.sessions.get(session_id)) is None:
       return None
     runs = sorted(rid for rid, r in self.runs.items() if r["record"].get("session") == session_id)
-    return {
-      "session_id": session_id,
-      "created": session["created"],
-      "seen": session["seen"],
-      "live": time.time() - session["seen"] < LIVE_SECONDS,
-      "runs": runs,
-      "metadata": dict(session["metadata"]),
-    }
-
-  async def expired_sessions(self) -> list[str]:
-    cutoff = time.time() - SESSION_GRACE
-    return [sid for sid, s in self.sessions.items() if s["active"] and s["seen"] <= cutoff]
+    live = time.time() - s["seen"] < LIVE_SECONDS
+    out = {"session_id": session_id, "created": s["created"], "seen": s["seen"], "live": live}
+    return out | {"runs": runs, "metadata": dict(s["metadata"])}
 
   async def finish_session(self, session_id: str) -> None:
-    if (session := self.sessions.get(session_id)) and session["active"]:
-      session["seen"] = 0.0
+    if (s := self.sessions.get(session_id)) and s["active"]:
+      s["seen"] = 0.0
       with self.db:
         self.sessions.save(session_id)
-    self.wake()
+    self.wake_all()
 
   async def end_session(self, session_id: str) -> None:
     live = sorted(rid for rid, r in self.runs.items() if r["live"] and r["record"].get("session") == session_id)
-    has_trainers = False
+    has_tr = False
     for rid in live:
       if self.is_sampler(rid):
         await self.delete_run(rid)
       else:
-        has_trainers = bool(await self.submit_command(rid, Op.DELETE_MODEL, b"{}")) or has_trainers
-    if session := self.sessions.get(session_id):
-      if has_trainers:
-        session["seen"] = time.time()
-      else:
-        session["active"] = False
+        has_tr = bool(await self.submit_command(rid, Op.DELETE_MODEL, b"{}")) or has_tr
+    if s := self.sessions.get(session_id):
+      s["seen" if has_tr else "active"] = time.time() if has_tr else False
       with self.db:
         self.sessions.save(session_id)
 
-  # ***** runs and cluster state *****
-
   async def create_run(self, run: Run) -> None:
-    row = {
-      "live": True,
-      "record": {**asdict(run), "created": time.time()},
-      "owner": None,
-      "epoch": 0,
-      "pos": None,
-      "snap": None,
-      "writing": None,
-      "clients": 0,
-      "counters": dict.fromkeys(COUNTERS, 0),
-    }
-    self.queues[run.id] = {}
-    self.in_flight[run.id] = {}
+    row = {"live": True, "record": {**asdict(run), "created": time.time()}, "clients": 0}
+    row |= {"owner": None, "pos": None, "snap": None, "writing": None, "counters": dict.fromkeys(COUNTERS, 0)}
+    self.queues[run.id], self.in_flight[run.id] = {}, {}
     with self.db:
       self.runs[run.id] = row
-    if run.role == Role.SAMPLER:
-      self.wake("plan_wake")
-    fields = ("role", "base", "rank", "exclusive", "train_run", "gpus")
-    self.record_event(Ev.RUN_CREATED, {"run": run.id, **{k: getattr(run, k) for k in fields}})
-    self.wake()
+    ev = {"run": run.id, **{k: getattr(run, k) for k in ("role", "base", "rank", "exclusive", "train_run", "gpus")}}
+    self.record_event(Ev.RUN_CREATED, ev)
+    self.wake_all()
+
+  def snapshot_state(self, *, backlogs: bool = True, counters: bool = False) -> dict:
+    nodes, runs, queues = {}, {}, {}
+    for nid, n in self.nodes.items():
+      on = {wid: list(w.resident) for wid, w in n.workers.items() if w.resident}
+      pids = {wid: w.pid for wid, w in n.workers.items() if w.pid is not None}
+      nodes[nid] = {"gpus": n.gpus, "memory": n.memory, "draining": n.draining, "lag": n.lag, "on": on, "pids": pids}
+    for rid in sorted(self.runs):
+      if (row := self.runs[rid])["live"]:
+        extra = {"counters": dict(row["counters"])} if counters else {}
+        runs[rid] = {"record": dict(row["record"]), "owner": row["owner"], **extra}
+        if backlogs:
+          queues[rid] = len(self.queues.get(rid, ())) + len(self.in_flight.get(rid, ()))
+    plan = dict(self.meta.get("plan", {}))
+    return {"nodes": nodes, "runs": runs, "queues": queues, "plan": plan, "service": dict(self.service)}
 
   async def read_state(self, *, backlogs: bool = True, counters: bool = False) -> dict:
-    nodes = await self.live_nodes(details=True)
-    runs, queues = {}, {}
-    for rid in sorted(self.runs):
-      row = self.runs[rid]
-      if not row["live"]:
-        continue
-      info = {"record": dict(row["record"]), "owner": row["owner"]}
-      if counters:
-        info["counters"] = dict(row["counters"])
-      runs[rid] = info
-      if backlogs:
-        queues[rid] = len(self.queues.get(rid, ())) + len(self.in_flight.get(rid, ()))
-    return {
-      "nodes": nodes,
-      "runs": runs,
-      "queues": queues,
-      "plan": dict(self.meta.get("plan", {})),
-      "service": dict(self.service),
-    }
+    self.reap_dead_nodes()
+    return self.snapshot_state(backlogs=backlogs, counters=counters)
 
-  async def write_plan(self, plan: dict, changes: list[tuple[Ev, dict]] = (), notify_nodes: bool = True) -> None:
-    with self.db:
-      self.meta["plan"] = plan
-      self.flush_dirty()
-    for kind, body in changes:
-      self.record_event(kind, body)
-    if notify_nodes:
-      self.wake("plan_wake")
+  async def live_nodes(self, details: bool = False) -> dict:
+    self.reap_dead_nodes()
+    snap = self.snapshot_state(backlogs=False)["nodes"]
+    return snap if details else {nid: info["gpus"] for nid, info in snap.items()}
 
   async def get_run(self, run_id: str) -> dict | None:
     if (row := self.runs.get(run_id)) is None:
       return None
-    meta = {k: row[k] for k in ("owner", "pos", "snap") if row[k]}
-    return {**row["record"], **meta, **row["counters"]}
+    return {**row["record"], **{k: row[k] for k in ("owner", "pos", "snap") if row[k]}, **row["counters"]}
 
   async def join_sampling_session(self, run_id: str) -> int:
     if (row := self.runs.get(run_id)) is None:
@@ -315,30 +308,30 @@ class Bus:
     return row["clients"]
 
   async def delete_run(self, run_id: str) -> None:
-    is_sampler = self.is_sampler(run_id)
+    is_samp = self.is_sampler(run_id)
     if row := self.runs.get(run_id):
-      row["live"] = False
-      row["owner"] = row["snap"] = row["writing"] = None
+      row.update(live=False, owner=None, snap=None, writing=None)
       with self.db:
         self.runs.save(run_id)
+        if not is_samp:
+          self.drop_run_cmds(run_id)
         self.flush_dirty()
-    queued = list(self.queues.pop(run_id, {}).values())
-    claimed = [c.cmd for c in self.in_flight.pop(run_id, {}).values()]
-    for cmd in (*queued, *claimed):
-      if is_sampler:
-        self.sample_bytes -= len(cmd.body)
+    for cmd in (*self.queues.pop(run_id, {}).values(), *(c for c, _, _ in self.in_flight.pop(run_id, {}).values())):
+      self.sample_bytes -= len(cmd.body) if is_samp else 0
       self.notify(f"reply:{cmd.request_id}")
-    if is_sampler:
-      for k in [k for k in self.seen if k[0] == run_id]:
-        del self.seen[k]
+    if is_samp:
+      for k in [k for k in self.sample_seen if k.startswith(f"{run_id}:")]:
+        del self.sample_seen[k]
     self.record_event(Ev.RUN_DELETED, {"run": run_id})
-    self.wake()
+    self.wake_all()
 
-  # ***** commands & replies (RAM) *****
+  # ***** commands & replies (durable KV for trainers, RAM for samplers) *****
 
   async def seen_request(self, run_id: str, seq_id: int | None) -> str | None:
-    entry = None if seq_id is None else self.seen.get((run_id, seq_id))
-    return entry[0] if entry and entry[1] > time.time() else None
+    if seq_id is None:
+      return None
+    store = self.sample_seen if self.is_sampler(run_id) else self.seen
+    return e[0] if (e := store.get(f"{run_id}:{seq_id}")) and e[1] > time.time() else None
 
   async def submit_command(
     self, run_id: str, op: Op, body: bytes, seq_id: int | None = None, cost: int = 1
@@ -347,273 +340,463 @@ class Bus:
       return existing
     if run_id not in self.queues:
       return None
-    if self.is_sampler(run_id):
-      if self.sample_bytes + len(body) > SAMPLE_QUEUE_BYTES:
-        raise BackpressureError("sampling queue memory limit reached")
-      self.sample_bytes += len(body)
+    is_samp = self.is_sampler(run_id)
+    if is_samp and self.sample_bytes + len(body) > SAMPLE_QUEUE_BYTES:
+      raise BackpressureError("sampling queue memory limit reached")
     self.seq += 1
-    cmd = Cmd(run_id, f"{time.time_ns() // 1_000_000}-{self.seq}", Op(op), body, cost)
+    cmd, exp = Cmd(run_id, f"{time.time_ns() // 1_000_000}-{self.seq}", Op(op), body, cost), time.time() + SESSION_TTL
+    if is_samp:
+      self.sample_bytes += len(body)
+      if seq_id is not None:
+        self.sample_seen[f"{run_id}:{seq_id}"] = [cmd.request_id, exp]
+    else:
+      meta = {"run": run_id, "eid": cmd.entry_id, "op": str(cmd.op), "cost": cost, "seq": self.seq}
+      with self.db:
+        self.db.put("blobs", f"c:{cmd.request_id}", body)
+        self.cmds[cmd.request_id] = meta
+        if seq_id is not None:
+          self.seen[f"{run_id}:{seq_id}"] = [cmd.request_id, exp]
     self.queues[run_id][cmd.entry_id] = cmd
-    if seq_id is not None:
-      self.seen[(run_id, seq_id)] = (cmd.request_id, time.time() + SESSION_TTL)
-    self.notify(f"run:{run_id}")
-    self.wake()
+    self.wake_all()
     return cmd.request_id
 
   async def wait_for_reply(self, request_id: str, timeout: float) -> Reply | None:
     run_id, _, entry_id = request_id.partition("/")
-    is_sampler = self.is_sampler(run_id) or request_id.startswith("samp-")
+    is_samp = self.is_sampler(run_id) or request_id.startswith("samp-")
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
-      now = time.time()
-      if (entry := self.replies.get(request_id)) is not None:
-        reply, expires_at, size = entry
-        if expires_at > now:
-          self.replies[request_id] = (reply, min(expires_at, now + min(REPLY_TTL, READ_REPLY_TTL)), size)
-          self.replies.move_to_end(request_id)
-          return reply
-        self.reply_bytes -= self.replies.pop(request_id)[2]
-      active = entry_id in self.queues.get(run_id, ()) or entry_id in self.in_flight.get(run_id, ())
-      if is_sampler and not active:
-        raise PromiseGoneError(f"sampling promise gone: {request_id}")
-      if (remaining := deadline - time.monotonic()) <= 0:
+      now, read_ttl = time.time(), min(REPLY_TTL, READ_REPLY_TTL)
+      if is_samp:
+        if (entry := self.sample_replies.get(request_id)) is not None:
+          reply, exp, size = entry
+          if exp > now:
+            self.sample_replies[request_id] = (reply, min(exp, now + read_ttl), size)
+            self.sample_replies.move_to_end(request_id)
+            return reply
+          self.reply_bytes -= self.sample_replies.pop(request_id)[2]
+        if entry_id not in self.queues.get(run_id, ()) and entry_id not in self.in_flight.get(run_id, ()):
+          raise PromiseGoneError(f"sampling promise gone: {request_id}")
+      elif (m := self.replies.get(request_id)) and m[2] > now:
+        if (body := self.db.get("blobs", f"r:{request_id}")) is not None:
+          m[2] = min(m[2], now + read_ttl)
+          with self.db:
+            self.replies.save(request_id)
+          return Reply(bool(m[0]), m[1], body)
+      if (rem := deadline - time.monotonic()) <= 0:
         return None
       with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(self.waiters.setdefault(f"reply:{request_id}", asyncio.Event()).wait(), remaining)
+        await asyncio.wait_for(self.waiters.setdefault(f"reply:{request_id}", asyncio.Event()).wait(), rem)
 
   async def queued_and_in_flight(self, run_id: str) -> dict:
     if run_id not in self.queues:
       return {"live": False}
-    now = time.monotonic()
-    in_flight = [
-      {
-        "request_id": c.cmd.request_id,
-        "trainer": c.consumer,
-        "deliveries": c.deliveries,
-        "seconds": max(0.0, now - c.claimed_at),
-      }
-      for c in self.in_flight[run_id].values()
-    ]
-    return {"live": True, "queued": len(self.queues[run_id]), "in_flight": in_flight}
+    now, items = time.monotonic(), []
+    for cmd, tid, t0 in self.in_flight[run_id].values():
+      tr = self.active_turns[tid][2].worker if tid in self.active_turns else ""
+      items.append({"request_id": cmd.request_id, "trainer": tr, "deliveries": 1, "seconds": max(0.0, now - t0)})
+    return {"live": True, "queued": len(self.queues[run_id]), "in_flight": items}
 
-  # ***** trainer ownership & leases *****
+  # ***** single-RPC exchange protocol & central scheduling *****
 
-  async def touch_leases(self, *lives: str, xx: bool = False, ttl_ms: int | None = None) -> None:
-    now, ttl = time.monotonic(), (LEASE_MS if ttl_ms is None else ttl_ms) / 1000
-    for life in lives:
-      if not xx or self.leases.get(life, 0.0) > now:
-        self.leases[life] = now + ttl
-        self.dropped.discard(life)
-
-  async def drop_lease(self, life: str) -> None:
-    self.leases.pop(life, None)
-    self.dropped.add(life)
-    for rid in self.queues:
-      if self.is_sampler(rid):
-        self.notify(f"run:{rid}")
-
-  async def acquire_run(self, run_id: str, life: str) -> tuple[str, str | None, str | None] | None:
-    now = time.monotonic()
-    if self.leases.get(life, 0.0) <= now:
-      return None
-    row = self.runs.get(run_id)
-    if not row or not row["live"]:
-      return None
-    if row["owner"]:
-      prev = life_of(row["owner"])
-      if self.leases.get(prev, 0.0) > now or (now < self.reap_after and prev not in self.dropped):
-        return None
-    row["epoch"] += 1
-    row["owner"] = token = f"{life}:{row['epoch']}"
-    row["writing"] = None
-    with self.db:
-      self.runs.save(run_id)
-    return token, row["pos"], row["snap"]
-
-  def trainer_heads(self, runs: list[str]) -> list[Cmd]:
-    heads = [
-      Cmd(r, (c := next(iter(q.values()))).entry_id, c.op, b"", c.cost) for r in runs if (q := self.queues.get(r))
-    ]
-    return sorted(heads, key=lambda c: (*entry_sort_key(c.entry_id), c.run))
-
-  async def peek_trainer(self, runs: list[str], block_ms: int = 0) -> list[Cmd]:
-    return await self.peek(runs, self.trainer_heads, block_ms)
-
-  async def claim_trainer(self, run: str, token: str) -> Cmd | None:
-    row = self.runs.get(run)
-    if not row or row["owner"] != token:
-      raise RuntimeError(f"lost ownership of {run}")
-    if not (queue := self.queues.get(run)):
-      return None
-    eid = next(iter(queue))
-    cmd = queue.pop(eid)
-    self.in_flight[run][eid] = Claim(cmd, life_of(token), time.monotonic(), 1)
-    return cmd
-
-  async def begin_checkpoint(self, run: str, token: str) -> str:
-    row = self.runs.get(run)
-    if not row or row["owner"] != token:
-      raise RuntimeError(f"lost ownership of {run}")
-    row["writing"] = version = uuid.uuid4().hex
-    with self.db:
-      self.runs.save(run)
-    return version
-
-  async def detach_run(
-    self, run_id: str, token: str, pos: str | None, snap: str | None, checkpoint: dict | None = None
-  ) -> bool:
-    row = self.runs.get(run_id)
-    if not row or row["owner"] != token or row["pos"] != pos:
-      return False
-    row["owner"] = row["writing"] = None
-    row["snap"] = snap
-    with self.db:
-      if checkpoint:
-        ckpt = make_checkpoint(**checkpoint)
-        self.checkpoints[ckpt["tinker_path"]] = ckpt
-      self.runs.save(run_id)
-    self.wake()
-    return True
-
-  async def commit_reply(
-    self, cmd: Cmd, reply: Reply, token: str, acct="", mutates=False, charge=None, checkpoint=None
-  ) -> bool:
-    row = self.runs.get(cmd.run)
-    if not row or row["owner"] != token:
-      return False
-    if (
-      self.in_flight.get(cmd.run, {}).pop(cmd.entry_id, None) is None
-      and self.queues.get(cmd.run, {}).pop(cmd.entry_id, None) is None
-    ):
-      return False
-    deleting = cmd.op == Op.DELETE_MODEL and reply.ok
-    row["writing"] = None
-    for name, delta in charge_counts(cmd, reply, charge).items():
-      row["counters"][name] += delta
+  def commit_trainer_cmd(
+    self, cmd: Cmd, reply: Reply, *, charge: Charge | None = None, mutated=False, saved=None, clear_owner=False
+  ) -> None:
+    self.in_flight.get(cmd.run, {}).pop(cmd.entry_id, None)
+    self.queues.get(cmd.run, {}).pop(cmd.entry_id, None)
+    row, deleting = self.runs.get(cmd.run), cmd.op == Op.DELETE_MODEL and reply.ok
+    acct = self.plan_state.account(cmd.run)
     gpu_ms = charge.gpu_ms if acct and charge and charge.gpu_ms else 0.0
     if gpu_ms:
       self.service[acct] = self.service.get(acct, 0.0) + gpu_ms
     with self.db:
-      if checkpoint and reply.ok:
-        ckpt = make_checkpoint(**checkpoint)
-        self.checkpoints[ckpt["tinker_path"]] = ckpt
-      if mutates and not deleting:
-        row["pos"] = cmd.entry_id
-        if row["snap"]:
-          self.checkpoints.pop(unpack_snap(row["snap"])[0], None)
-          row["snap"] = None
-      elif deleting:
-        row["live"] = False
-        row["owner"] = row["snap"] = None
-        for uri in [u for u, c in self.checkpoints.items() if parse_uri(u)[0] == cmd.run and c["owned"]]:
-          del self.checkpoints[uri]
-      self.runs.save(cmd.run)
+      self.cmds.pop(cmd.request_id, None)
+      self.db.delete("blobs", f"c:{cmd.request_id}")
+      self.db.put("blobs", f"r:{cmd.request_id}", reply.body)
+      self.replies[cmd.request_id] = [reply.ok, reply.content_type, time.time() + REPLY_TTL]
+      if row:
+        row["writing"] = None
+        self.record_usage(cmd, reply, charge)
+        if saved and reply.ok:
+          self.save_checkpoint(saved)
+        if mutated and not deleting:
+          row["pos"] = cmd.entry_id
+          if row["snap"]:
+            self.checkpoints.pop(unpack_snap(row["snap"])[0], None)
+            row["snap"] = None
+        elif deleting:
+          row.update(live=False, owner=None, snap=None)
+          self.drop_run_cmds(cmd.run)
+          for uri in [u for u, c in self.checkpoints.items() if parse_uri(u)[0] == cmd.run and c["owned"]]:
+            del self.checkpoints[uri]
+        if clear_owner and not deleting:
+          row["owner"] = None
+        self.runs.save(cmd.run)
       if gpu_ms:
         self.meta["service"] = self.service
-    self.replies[cmd.request_id] = (reply, time.time() + REPLY_TTL, 0)
     if deleting:
       self.queues.pop(cmd.run, None)
       self.in_flight.pop(cmd.run, None)
       self.record_event(Ev.RUN_DELETED, {"run": cmd.run})
     self.notify(f"reply:{cmd.request_id}")
-    self.wake()
-    return True
 
-  async def fail_stranded_commands(self, run_id: str, token: str) -> None:
-    for eid in sorted(self.in_flight.get(run_id, {}), key=entry_sort_key):
-      cmd = self.in_flight[run_id][eid].cmd
-      err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {cmd.op}"))
-      if not await self.commit_reply(cmd, err, token):
-        return
-
-  # ***** stateless sampler queues *****
-
-  def abandoned(self, run_id: str, now: float) -> list[str]:
-    claims = self.in_flight.get(run_id) or {}
-    return sorted((eid for eid, c in claims.items() if self.leases.get(c.consumer, 0.0) <= now), key=entry_sort_key)
-
-  def sample_heads(self, runs: list[str]) -> list[Cmd]:
-    now, out = time.monotonic(), []
-    for r in runs:
-      if dead := self.abandoned(r, now):
-        out.append(Cmd(r, dead[0], Op.SAMPLE, b""))
-      elif q := self.queues.get(r):
-        c = next(iter(q.values()))
-        out.append(Cmd(r, c.entry_id, c.op, b"", c.cost))
-    return sorted(out, key=lambda c: (*entry_sort_key(c.entry_id), c.run))
-
-  async def peek_sampler(self, runs: list[str], block_ms: int = 0) -> list[Cmd]:
-    return await self.peek([r for r in runs if r in self.queues and self.is_sampler(r)], self.sample_heads, block_ms)
-
-  async def take_commands(self, runs: list[str], consumer: str, count: int = 16) -> list[Cmd]:
-    now, taken = time.monotonic(), []
-    for r in runs:
-      if r not in self.queues or not self.is_sampler(r):
-        continue
-      rem, claims, q = count, self.in_flight[r], self.queues[r]
-      for eid in self.abandoned(r, now)[:rem]:
-        c = claims[eid]
-        if now - c.claimed_at < 1.0:
-          continue
-        c.consumer, c.claimed_at, c.deliveries = consumer, now, c.deliveries + 1
-        taken.append(c.cmd)
-        rem -= 1
-      while rem > 0 and q:
-        eid = next(iter(q))
-        cmd = q.pop(eid)
-        claims[eid] = Claim(cmd, consumer, now, 1)
-        taken.append(cmd)
-        rem -= 1
-    return taken
-
-  async def commit_sample(self, cmd: Cmd, reply: Reply, account="", charge: Charge | None = None) -> bool:
+  def commit_sample_cmd(self, cmd: Cmd, reply: Reply, turn_id: str | None = None, charge: Charge | None = None) -> bool:
     claims = self.in_flight.get(cmd.run)
-    if not claims or claims.pop(cmd.entry_id, None) is None:
+    if turn_id is not None:
+      if not claims or (entry := claims.get(cmd.entry_id)) is None or entry[1] != turn_id:
+        return False
+      claims.pop(cmd.entry_id, None)
+    elif self.queues.get(cmd.run, {}).pop(cmd.entry_id, None) is None:
       return False
-    self.sample_bytes -= len(cmd.body)
     size = len(reply.body)
-    self.replies[cmd.request_id] = (reply, time.time() + REPLY_TTL, size)
-    self.replies.move_to_end(cmd.request_id)
-    self.reply_bytes += size
-    while self.reply_bytes > SAMPLE_REPLY_BYTES and len(self.replies) > 1:
-      for req_id, (_, _, sz) in list(self.replies.items()):
-        if sz:
-          self.reply_bytes -= self.replies.pop(req_id)[2]
-          break
-      else:
+    self.sample_bytes, self.reply_bytes = self.sample_bytes - len(cmd.body), self.reply_bytes + size
+    self.sample_replies[cmd.request_id] = (reply, time.time() + REPLY_TTL, size)
+    self.sample_replies.move_to_end(cmd.request_id)
+    while self.reply_bytes > SAMPLE_REPLY_BYTES and len(self.sample_replies) > 1:
+      if (victim := next((k for k, (_, _, sz) in self.sample_replies.items() if sz), None)) is None:
         break
-    if row := self.runs.get(cmd.run):
-      for name, delta in charge_counts(cmd, reply, charge).items():
-        row["counters"][name] += delta
+      self.reply_bytes -= self.sample_replies.pop(victim)[2]
+    self.record_usage(cmd, reply, charge)
+    if cmd.run in self.runs:
       self.dirty_runs.add(cmd.run)
-    if account and charge and charge.gpu_ms:
-      self.service[account] = self.service.get(account, 0.0) + charge.gpu_ms
-      self.service_dirty = True
+    if (acct := self.plan_state.account(cmd.run)) and charge and charge.gpu_ms:
+      self.service[acct], self.service_dirty = self.service.get(acct, 0.0) + charge.gpu_ms, True
     self.notify(f"reply:{cmd.request_id}")
-    self.wake()
     return True
 
-  # ***** checkpoints *****
+  def reap_node(self, node_id: str, boot_id: str) -> None:
+    if (cur := self.nodes.get(node_id)) and cur.boot_id == boot_id:
+      del self.nodes[node_id]
+    self.reaped_boots.add(boot_id)
+    self.record_event(Ev.NODE_LOST, {"node": node_id})
+    for tid, (tn, tb, turn) in list(self.active_turns.items()):
+      if (tn, tb) != (node_id, boot_id):
+        continue
+      del self.active_turns[tid]
+      if turn.kind == "train" and turn.cmd:
+        err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {turn.cmd.op}"))
+        self.commit_trainer_cmd(turn.cmd, err, clear_owner=True)
+      elif turn.kind == "sample":
+        for cmd in reversed(turn.cmds):
+          if (claims := self.in_flight.get(cmd.run)) and (e := claims.get(cmd.entry_id)) and e[1] == tid:
+            claims.pop(cmd.entry_id)
+            if (q := self.queues.get(cmd.run)) is not None:
+              self.queues[cmd.run] = {cmd.entry_id: cmd, **q}
+    self.clear_owners(lambda _, o: o.endswith(f"@{node_id}:{boot_id}"))
+    self.wake_all()
+
+  def reap_dead_nodes(self) -> None:
+    now = time.monotonic()
+    for n in [n for n in self.nodes.values() if n.until <= now]:
+      self.reap_node(n.node, n.boot_id)
+    if self.reap_after and now >= self.reap_after:
+      self.reap_after, live = 0.0, {(n.node, n.boot_id) for n in self.nodes.values()}
+      for _, (tn, tb, _) in list(self.active_turns.items()):
+        if (tn, tb) not in live:
+          self.reap_node(tn, tb)
+      self.clear_owners(lambda _, o: "@" in o and ":" in o and tuple(o.split("@", 1)[1].rsplit(":", 1)) not in live)
+
+  def observe_node(self, report: NodeReport) -> NodeRuntime:
+    now, node = time.monotonic(), self.nodes.get(report.node)
+    if node and node.boot_id != report.boot_id:
+      self.reap_node(node.node, node.boot_id)
+      node = None
+    if node is None:
+      self.nodes[report.node] = node = NodeRuntime(report.node, report.boot_id, report.gpus, report.memory)
+      self.record_event(Ev.NODE_UP, {"node": report.node, "gpus": report.gpus, "memory": report.memory})
+    node.gpus, node.memory, node.draining, node.lag = report.gpus, report.memory, report.draining, report.lag
+    node.until, node.staged = now + LEASE_MS / 1000, set(report.staged)
+    node.stage_errors.update(report.stage_errors)
+    reported = {ws.worker: ws for ws in report.workers}
+    for wid, ws in reported.items():
+      if w := node.workers.get(wid):
+        w.pid, w.park_s, w.bound = ws.pid, ws.park_s, ws.bound or w.bound
+        if w.active_turn is None:
+          w.resident, w.loaded = ws.gpus, set(ws.loaded)
+      elif proc := self.plan_state.procs.get(wid):
+        node.workers[wid] = WorkerRuntime(wid, proc.spec, ws.gpus, ws.bound, ws.pid, ws.loaded, ws.park_s)
+    for wid in [k for k, w in node.workers.items() if w.active_turn is None and k not in reported]:
+      del node.workers[wid]
+      self.clear_owners(lambda _, o, t=owner_token(node.node, node.boot_id, wid): o == t)
+    return node
+
+  def finish_once(self, node_id: str, boot_id: str, res: TurnResult) -> None:
+    if (entry := self.active_turns.get(res.turn_id)) is None or entry[:2] != (node_id, boot_id):
+      return
+    _, _, turn = self.active_turns.pop(res.turn_id)
+    node, now = self.nodes.get(node_id), time.monotonic()
+    w = node.workers.get(turn.worker) if node else None
+    if w and w.active_turn == res.turn_id:
+      w.active_turn = None
+    if w and res.ok and res.resume_s > 0:
+      sw = (res.park_s + res.resume_s) / max(0.01, SWITCH_BUDGET) if res.park_s else 0.0
+      w.hold_until = now + min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, sw))
+
+    def bill(rid: str, ch: Charge | None) -> None:
+      if w and ch and ch.gpu_ms:
+        w.gpu_ms += ch.gpu_ms
+        w.run_service[rid] = w.run_service.get(rid, w.service_floor) + ch.gpu_ms
+
+    if turn.kind == "train" and turn.cmd:
+      cmd, rep = turn.cmd, res.reply or Reply.error(RuntimeError("trainer failed"))
+      if w and res.ok:
+        w.idle_since = now
+        (w.loaded.add if res.loaded else w.loaded.discard)(cmd.run)
+        (w.open_grad.add if cmd.op == Op.FORWARD_BACKWARD and rep.ok else w.open_grad.discard)(cmd.run)
+        bill(cmd.run, res.charge)
+      self.commit_trainer_cmd(cmd, rep, charge=res.charge, mutated=res.mutated, saved=res.saved, clear_owner=not res.ok)
+    elif turn.kind == "sample":
+      by_req, fb = {c.request_id: c for c in turn.cmds}, res.reply or Reply.error(RuntimeError("sampler failed"))
+      for req_id, rep, ch in res.samples:
+        if (cmd := by_req.pop(req_id, None)) and self.commit_sample_cmd(cmd, rep, turn.id, ch):
+          bill(cmd.run, ch)
+      for cmd in by_req.values():
+        self.commit_sample_cmd(cmd, fb, turn.id)
+    elif turn.kind == "snapshot":
+      rid, row = turn.args["run"], self.runs.get(turn.args["run"])
+      if row and row.get("owner") == owner_token(node_id, boot_id, turn.worker):
+        row["owner"] = row["writing"] = None
+        with self.db:
+          if res.ok and res.saved:
+            ckpt = self.save_checkpoint(res.saved)
+            row["snap"] = f"{ckpt['tinker_path']}\n{ckpt['version']}"
+          self.runs.save(rid)
+      if w:
+        w.loaded.discard(rid)
+        w.open_grad.discard(rid)
+    elif turn.kind == "close":
+      self.clear_owners(lambda _, o, t=owner_token(node_id, boot_id, turn.worker): o == t)
+    if w and res.ok and w.run_service:
+      w.service_floor = max(w.service_floor, min(w.run_service.values()))
+    drop_w = turn.kind == "close" or turn.args.get("close") or (not res.ok and turn.kind in ("train", "sample"))
+    if drop_w and node:
+      node.workers.pop(turn.worker, None)
+    self.wake_all()
+
+  def reconcile(self) -> list[tuple[Ev, dict]]:
+    old = self.meta.get("plan", {})
+    self.plan_state, changes = scheduler.step(scheduler.from_state(self.snapshot_state()))
+    if (plan := scheduler.to_plan(self.plan_state)) != old:
+      with self.db:
+        self.meta["plan"] = plan
+        self.flush_dirty()
+      for kind, body in changes:
+        self.record_event(kind, body)
+      self.wake_all()
+    return changes
+
+  def issue(self, node: NodeRuntime, turn: Turn) -> None:
+    self.active_turns[turn.id] = (node.node, node.boot_id, turn)
+    w = node.workers.setdefault(turn.worker, WorkerRuntime(turn.worker, turn.spec))
+    w.active_turn, now = turn.id, time.monotonic()
+    if turn.gpus:
+      w.hold_until = now + QUANTUM_MS / 1000 if w.resident != turn.gpus else w.hold_until
+      w.resident = turn.gpus
+      if not w.bound and (turn.spec.role == Role.SAMPLER or turn.spec.gpus > 1):
+        w.bound = turn.gpus
+      for o in node.workers.values():
+        if o.id != w.id and o.resident and not set(o.resident).isdisjoint(turn.gpus):
+          o.resident = ()
+    if turn.kind == "train" and turn.cmd:
+      cmd, row = turn.cmd, self.runs[turn.cmd.run]
+      self.queues[cmd.run].pop(cmd.entry_id, None)
+      self.in_flight[cmd.run][cmd.entry_id] = (cmd, turn.id, now)
+      row["owner"] = owner_token(node.node, node.boot_id, turn.worker)
+      if cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
+        row["writing"] = turn.args.get("version")
+      with self.db:
+        if c := self.cmds.get(cmd.request_id):
+          c.update(turn=turn.id, node=node.node, boot=node.boot_id)
+          self.cmds.save(cmd.request_id)
+        self.runs.save(cmd.run)
+    elif turn.kind == "sample":
+      for cmd in turn.cmds:
+        self.queues[cmd.run].pop(cmd.entry_id, None)
+        self.in_flight[cmd.run][cmd.entry_id] = (cmd, turn.id, now)
+    elif turn.kind == "snapshot" and (ver := turn.args.get("version")):
+      rid = turn.args["run"]
+      self.runs[rid]["writing"] = ver
+      with self.db:
+        self.runs.save(rid)
+
+  def ready_trainer_cmds(self, node: NodeRuntime, wid: str) -> list[Cmd]:
+    tok, out = owner_token(node.node, node.boot_id, wid), []
+    for r in self.plan_state.runs(wid):
+      row, q = self.runs.get(r), self.queues.get(r)
+      if row and row["live"] and row.get("owner") in (None, tok) and not self.in_flight.get(r) and q:
+        out.append(next(iter(q.values())))
+    return out
+
+  def ready_sampler_cmds(self, node: NodeRuntime, spec: types.WorkerSpec, prefetch: set[str]) -> list[Cmd]:
+    out = []
+    for rid, job in sorted(self.plan_state.jobs.items()):
+      if job.spec != spec or not (q := self.queues.get(rid)):
+        continue
+      head, mp = next(iter(q.values())), job.record.get("model_path")
+      if not mp:
+        out.append(head)
+        continue
+      try:
+        ver = self.checkpoint_version_sync(mp)
+      except ValueError as err:
+        self.commit_sample_cmd(head, Reply.error(err))
+        continue
+      if err_msg := node.stage_errors.pop(ver, None):
+        self.commit_sample_cmd(head, Reply.error(RuntimeError(err_msg)))
+      elif ver in node.staged:
+        out.append(head)
+      else:
+        prefetch.add(ver)
+    return out
+
+  def schedule_node(self, node: NodeRuntime) -> list[str]:
+    now, evicting = time.monotonic(), set()
+    placed = {} if node.draining else {p: pr for p, pr in self.plan_state.procs.items() if pr.node == node.node}
+    excl = {g for w in node.workers.values() if w.spec.exclusive for g in w.resident}
+
+    # Phase 1: Drain, evict moved/blocked workers, and detach runs reassigned off a worker (off-GPU).
+    for wid, w in list(node.workers.items()):
+      if w.active_turn is not None:
+        continue
+      tok = owner_token(node.node, node.boot_id, wid)
+      owned = [rid for rid, r in self.runs.items() if r["live"] and r.get("owner") == tok]
+      blocked = not w.resident and bool(w.bound) and bool(excl & set(w.bound))
+      free_blk = blocked and w.spec.gpus > 1 and any(excl.isdisjoint(b) for b in blocks(node.gpus, w.spec.gpus))
+      rebind = free_blk and w.spec.role == Role.TRAINER and bool(self.ready_trainer_cmds(node, wid))
+      if wid not in placed or (blocked and w.spec.role == Role.SAMPLER) or rebind:
+        evicting.add(wid)
+        dirty = [r for r in owned if self.runs[r]["pos"] is not None and self.runs[r]["snap"] is None and r in w.loaded]
+        self.clear_owners(lambda r, o, t=tok, d=set(dirty): o == t and r not in d)
+        args = {"run": dirty[0], "version": uuid.uuid4().hex, "close": len(dirty) == 1} if dirty else {}
+        self.issue(node, Turn(uuid.uuid4().hex[:12], "snapshot" if dirty else "close", wid, w.spec, args=args))
+      elif w.spec.role == Role.TRAINER:
+        want = set(self.plan_state.runs(wid))
+        for r in [r for r in owned if r not in want]:
+          dirty = self.runs[r]["pos"] is not None and self.runs[r]["snap"] is None and r in w.loaded
+          if dirty or r in w.loaded:
+            args = {"run": r, "version": uuid.uuid4().hex if dirty else None, "drop": True}
+            self.issue(node, Turn(uuid.uuid4().hex[:12], "snapshot", wid, w.spec, args=args))
+            break
+          self.clear_owners(lambda rid, _, target=r: rid == target)
+
+    if node.draining:
+      node.next_wake = None
+      return []
+
+    # Phase 2: Gather ready commands + off-GPU checkpoint prefetch, then assign GPUs via plan_gpus.
+    prefetch, ready_by, workers_plan, occupied, linger_at = set(), {}, {}, set(), []
+    for wid, proc in sorted(placed.items()):
+      if wid in evicting:
+        continue
+      spec, is_new = proc.spec, wid not in node.workers
+      w = node.workers.get(wid) or WorkerRuntime(wid, spec)
+      active = w.active_turn is not None
+      if active and w.resident:
+        occupied.update(w.resident)
+      if spec.role == Role.SAMPLER:
+        ready = [] if active else self.ready_sampler_cmds(node, spec, prefetch)
+        demand = Demand.READY if (ready or active or (is_new and node.gpus >= 2)) else Demand.IDLE
+      else:
+        ready = [] if active else self.ready_trainer_cmds(node, wid)
+        grace = (w.idle_since + CYCLE_GRACE_MS / 1000) if w.resident else 0.0
+        linger = bool(w.resident and grace > now)
+        if linger:
+          linger_at.append(grace)
+        closing = any(c.op == Op.OPTIM_STEP and c.run in w.open_grad for c in ready)
+        hold_grad = active or closing or (linger and not ready and bool(w.open_grad))
+        demand = Demand.FINISH_STEP if hold_grad else (Demand.READY if (ready or linger) else Demand.IDLE)
+      ready_by[wid] = ready
+      runs = [c.run for c in ready] or [r for r in self.plan_state.runs(wid) if r in self.plan_state.jobs]
+      lag = max(map(self.plan_state.ready_lag, runs), default=-w.gpu_ms)
+      gang, hold = spec.role == Role.TRAINER and spec.gpus > 1, float("inf") if active else w.hold_until
+      workers_plan[wid] = Worker(spec.gpus, spec.exclusive, demand, w.resident, w.bound, gang, hold, lag, w.gpu_ms)
+
+    keep, wake_at = plan_gpus(workers_plan, node.gpus, now, occupied)
+    node.next_wake = min((d for d in (wake_at, *linger_at) if d is not None and d > now), default=None)
+
+    # Phase 3: Issue concrete turns for granted GPU blocks.
+    for wid, gpus in keep.items():
+      w, spec, ready = node.workers.get(wid), placed[wid].spec, ready_by.get(wid, [])
+      if (w and w.active_turn is not None) or (occupied & set(gpus)):
+        continue
+      tid = uuid.uuid4().hex[:12]
+      if not ready:
+        if spec.role == Role.SAMPLER and w is None and node.gpus >= 2:
+          self.issue(node, Turn(tid, "sample", wid, spec, gpus))
+        continue
+      svc, floor = (w.run_service, w.service_floor) if w else ({}, 0.0)
+      for c in ready:
+        svc[c.run] = max(svc.get(c.run, floor), floor)
+      if spec.role == Role.TRAINER:
+        [rid] = select_runs(ready, self.plan_state.account, self.plan_state.ready_lag, svc, 1)
+        cmd, row, ver = next(iter(self.queues[rid].values())), self.runs[rid], None
+        if cmd.op == Op.LOAD_WEIGHTS:
+          try:
+            ver = self.checkpoint_version_sync(json.loads(cmd.body)["uri"])
+          except (KeyError, ValueError) as err:
+            self.commit_trainer_cmd(cmd, Reply.error(err))
+            continue
+        elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
+          ver = uuid.uuid4().hex
+        need_snap = row["snap"] and not (w and rid in w.loaded) and cmd.op != Op.LOAD_WEIGHTS
+        saved = unpack_snap(row["snap"])[1] if need_snap else None
+        self.issue(
+          node,
+          Turn(
+            tid, "train", wid, spec, gpus, cmd, args={"record": dict(row["record"]), "saved": saved, "version": ver}
+          ),
+        )
+      else:
+        rids = select_runs(
+          ready, self.plan_state.account, self.plan_state.ready_lag, svc, SAMPLE_RUNS if spec.lora else 1
+        )
+        cmds = [cmd for r in rids for cmd in list(self.queues[r].values())[:SAMPLE_COMMANDS]]
+        vers = {
+          r: (self.checkpoints.get(self.runs[r]["record"].get("model_path") or "") or {}).get("version") for r in rids
+        }
+        if cmds:
+          self.issue(node, Turn(tid, "sample", wid, spec, gpus, cmds=cmds, args={"versions": vers}))
+    return sorted(prefetch)
+
+  def exchange_sync(self, report: NodeReport) -> NodeReply:
+    self.reap_dead_nodes()
+    if report.boot_id in self.reaped_boots:
+      return NodeReply(reset=True)
+    node, ack = self.observe_node(report), []
+    for result in report.finished:
+      self.finish_once(report.node, report.boot_id, result)
+      ack.append(result.turn_id)
+    self.reconcile()
+    prefetch, live = self.schedule_node(node), self.live_versions_sync() if report.want_sweep else None
+    turns = [t for tn, tb, t in self.active_turns.values() if tn == report.node and tb == report.boot_id]
+    return NodeReply(ack, turns, prefetch, live)
+
+  async def exchange(self, report: NodeReport, wait_ms: int = 0) -> NodeReply:
+    r = self.exchange_sync(report)
+    busy = report.draining or r.reset or r.acknowledged or r.turns or r.prefetch or r.live_versions is not None
+    if wait_ms <= 0 or busy:
+      return r
+    node, timeout = self.nodes.get(report.node), wait_ms / 1000
+    if node and node.next_wake is not None:
+      timeout = min(timeout, max(0.0, node.next_wake - time.monotonic()))
+    if timeout > 0:
+      with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(self.work_event.wait(), timeout)
+    return self.exchange_sync(report)
+
+  # ***** checkpoints, maintenance, and events *****
+
+  def checkpoint_version_sync(self, uri: str) -> str:
+    parse_uri(uri)
+    if version := (self.checkpoints.get(uri) or {}).get("version"):
+      return version
+    raise ValueError(f"no checkpoint at {uri}")
 
   async def get_checkpoint(self, uri: str) -> dict | None:
     parse_uri(uri)
     return dict(c) if (c := self.checkpoints.get(uri)) else None
 
   async def checkpoint_version(self, uri: str) -> str:
-    if version := (await self.get_checkpoint(uri) or {}).get("version"):
-      return version
-    raise ValueError(f"no checkpoint at {uri}")
-
-  async def checkpoint_versions(self, uris: list[str]) -> dict[str, str | Exception]:
-    result: dict[str, str | Exception] = {}
-    for uri in uris:
-      try:
-        parse_uri(uri)
-        ckpt = self.checkpoints.get(uri)
-        result[uri] = ckpt["version"] if ckpt else ValueError(f"no checkpoint at {uri}")
-      except ValueError as err:
-        result[uri] = err
-    return result
+    return self.checkpoint_version_sync(uri)
 
   async def checkpoints_of_run(self, run: str) -> list[dict]:
     items = [
@@ -622,12 +805,10 @@ class Bus:
     return sorted(items, key=lambda c: c["time"])
 
   async def page_of_checkpoints(self, limit: int, offset: int) -> tuple[list[dict], int]:
-    visible = sorted(
-      (dict(c) for c in self.checkpoints.values() if c["checkpoint_type"] != "parked"),
-      key=lambda c: c["time"],
-      reverse=True,
+    vis = sorted(
+      (dict(c) for c in self.checkpoints.values() if c["checkpoint_type"] != "parked"), key=lambda c: -c["time"]
     )
-    return (visible[offset : offset + limit] if limit > 0 else []), len(visible)
+    return (vis[offset : offset + limit] if limit > 0 else []), len(vis)
 
   async def set_checkpoint_ttl(self, uri: str, ttl: int | None) -> bool:
     parse_uri(uri)
@@ -644,69 +825,44 @@ class Bus:
     with self.db:
       return sum(self.checkpoints.pop(uri, None) is not None for uri in uris)
 
+  def live_versions_sync(self) -> list[str]:
+    v = {c["version"] for c in self.checkpoints.values() if c.get("version")}
+    v.update(r["writing"] for r in self.runs.values() if r.get("writing"))
+    return sorted({x.partition("@")[0] for x in v})
+
   async def expire_checkpoints(self) -> int:
     now = time.time()
     expired = [u for u, c in self.checkpoints.items() if c["expires_at"] is not None and c["expires_at"] <= now]
-    for k in [k for k, v in self.replies.items() if v[1] <= now]:
-      self.reply_bytes -= self.replies.pop(k)[2]
-    for k in [k for k, (_, exp) in self.seen.items() if exp <= now]:
-      del self.seen[k]
+    for k in [k for k, v in self.sample_replies.items() if v[1] <= now]:
+      self.reply_bytes -= self.sample_replies.pop(k)[2]
+    for k in [k for k, (_, exp) in self.sample_seen.items() if exp <= now]:
+      del self.sample_seen[k]
     with self.db:
       self.flush_dirty()
       for u in expired:
         del self.checkpoints[u]
+      for k in [k for k, v in self.replies.items() if v[2] <= now]:
+        del self.replies[k]
+        self.db.delete("blobs", f"r:{k}")
+      for k in [k for k, (_, exp) in self.seen.items() if exp <= now]:
+        del self.seen[k]
       for sid in [s for s, v in self.sessions.items() if not v["active"] and v["seen"] <= now - SESSION_TTL]:
         del self.sessions[sid]
     return len(expired)
 
-  async def live_versions(self) -> list[str]:
-    versions = {c["version"] for c in self.checkpoints.values() if c.get("version")}
-    versions.update(r["writing"] for r in self.runs.values() if r.get("writing"))
-    return sorted({v.partition("@")[0] for v in versions})
+  async def maintain(self) -> list[tuple[Ev, dict]]:
+    self.reap_dead_nodes()
+    cutoff = time.time() - SESSION_GRACE
+    for sid in [s for s, v in list(self.sessions.items()) if v["active"] and v["seen"] <= cutoff]:
+      await self.end_session(sid)
+    await self.expire_checkpoints()
+    return self.reconcile()
 
-  async def sweep_checkpoints(self, store, grace: float) -> None:
-    unused = await asyncio.to_thread(store.versions)
-    unused.difference_update(await self.live_versions())
-    await asyncio.to_thread(store.sweep, unused, grace)
-
-  # ***** nodes and events (RAM) *****
-
-  async def node_heartbeat(
-    self, node: str, gpus: int, memory: int = 0, leases: tuple[str, ...] = (), ttl_ms: int | None = None, **info
-  ) -> list[str]:
-    self.nodes[node] = {"gpus": gpus, "memory": memory, "until": time.time() + NODE_MS / 1000, **info}
-    now, ttl, lost = time.monotonic(), (LEASE_MS if ttl_ms is None else ttl_ms) / 1000, []
-    for life in leases:
-      if self.leases.get(life, 0.0) > now:
-        self.leases[life] = now + ttl
-      else:
-        self.leases.pop(life, None)
-        lost.append(life)
-    return lost
-
-  async def live_nodes(self, details: bool = False) -> dict:
-    now = time.time()
-    self.nodes = {k: v for k, v in self.nodes.items() if v["until"] >= now}
-    return {k: dict(v) if details else v["gpus"] for k, v in self.nodes.items()}
-
-  async def append_event(self, _kind: Ev, **body) -> str:
-    ev = self.record_event(_kind, body)
-    self.wake()
-    return ev.id
-
-  async def wait_wake(self, wake_id: str, block_ms: int, stream: str = "wake") -> str:
-    if wake_id != "$" and self.wake_seq[stream] > int(wake_id):
-      return str(self.wake_seq[stream])
-    if block_ms > 0:
-      with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(self.waiters.setdefault(f"wake:{stream}", asyncio.Event()).wait(), block_ms / 1000)
-    return str(self.wake_seq[stream])
-
-  async def read_events(self, after: str = "0-0", count: int = 10_000) -> list[Event]:
+  async def read_events(self, after: str = "0-0", count: int = 10_000) -> list[types.Event]:
     cutoff = entry_sort_key(after)
     return [ev for ev in self.events if entry_sort_key(ev.id) > cutoff][:count]
 
 
-def connect(target: str | None = None) -> Bus | RemoteBus:
+def connect(target: str | None = None) -> Bus | ControlClient:
   url = target if target is not None else os.getenv("CONTROL_URL", "")
-  return RemoteBus(url) if url.startswith(("http://", "https://")) else Bus(target)
+  return ControlClient(url) if url.startswith(("http://", "https://")) else Bus(target)

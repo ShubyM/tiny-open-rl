@@ -10,7 +10,7 @@ import unittest
 import urllib.request
 
 from test.helpers import tiny
-from tinyrl.bus import connect
+from tinyrl.bus import Bus
 
 EXAMPLE = pathlib.Path(__file__).parent.parent / "examples" / "tinker_sdk.py"
 
@@ -66,7 +66,7 @@ class TestTinkerSDK(unittest.TestCase):
       model_id = out.stdout.split("model ")[1].split()[0]
 
       async def published() -> dict:
-        db = connect(env["CONTROL_URL"])
+        db = Bus(env["TINYRL_DB"])
         try:
           return await db.get_checkpoint(f"tinker://{model_id}/sampler_weights/final")
         finally:

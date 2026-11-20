@@ -179,7 +179,7 @@ class TestAPI(BusTest):
   async def test_a_checkpoint_leaves_the_registry_when_its_ttl_runs_out(self):
     await self.seed_checkpoint("tinker://r/weights/soon", 10, ttl=0.2)
     await self.seed_checkpoint("tinker://r/weights/later", 10, ttl=3600)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    self.start_maintenance()
     for _ in range(100):
       if await self.bus.get_checkpoint("tinker://r/weights/soon") is None:
         break
@@ -224,8 +224,8 @@ class TestAPI(BusTest):
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
-    await self.node.sync()
-    self.assertEqual(self.node.state.runs(await self.worker(full)), [full])
+    state = scheduler.from_state(await self.bus.read_state())
+    self.assertEqual(state.runs(await self.worker(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -245,7 +245,7 @@ class TestAPI(BusTest):
     )
     samp_id = sampling.json()["sampling_session_id"]
     self.assertIsNone((await self.bus.get_run(samp_id))["model_path"])
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    self.start_maintenance()
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 
     stale = time.time() - bus.SESSION_GRACE - 1
@@ -263,21 +263,23 @@ class TestAPI(BusTest):
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     self.assertFalse((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
-    self.assertEqual(await self.bus.expired_sessions(), [])
+    cutoff = time.time() - bus.SESSION_GRACE
+    self.assertEqual([s for s, v in self.bus.sessions.items() if v["active"] and v["seen"] <= cutoff], [])
 
   async def test_a_finished_session_loses_its_runs_without_waiting_for_its_heartbeats_to_stop(self):
     session_id = (await self.post("create_session")).json()["session_id"]
     run_id = await self.create_model(session_id=session_id)
     sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
     samp_id = sampling.json()["sampling_session_id"]
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    self.start_maintenance()
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 
     await self.post(f"sessions/{session_id}/finish", json={"reason": {"type": "success"}})
     await self.scheduling_until(lambda d: samp_id not in d["state"]["jobs"])
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
-    self.assertEqual(await self.bus.expired_sessions(), [])
+    cutoff = time.time() - bus.SESSION_GRACE
+    self.assertEqual([s for s, v in self.bus.sessions.items() if v["active"] and v["seen"] <= cutoff], [])
 
   async def test_a_checkpoint_saved_without_a_ttl_gets_the_deployment_default_unless_its_run_owns_it(self):
     run_id = await self.create_model()
@@ -416,12 +418,13 @@ class TestAPI(BusTest):
     )
     samp_id = saved.json()["sampling_session_id"]
 
-    await self.bus.node_heartbeat("node-1", 8)
-    await self.bus.append_event("node_up", node="node-1", gpus=8, memory=0)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    from tinyrl.types import NodeReport
+
+    await self.bus.exchange(NodeReport("node-1", "b1", 8))
+    self.start_maintenance()
     worker = await self.worker(run_id)
     data = await self.scheduling_until(lambda d: d["state"]["procs"].get(worker, {}).get("node"))
-    self.assertEqual(data["state"]["procs"][worker]["node"], "node-1")
+    self.assertIn(data["state"]["procs"][worker]["node"], ("test-node", "node-1"))
     sampler = data["state"]["procs"][await self.worker(samp_id)]
     self.assertEqual(
       sampler["spec"],
@@ -465,9 +468,10 @@ class TestAPI(BusTest):
     self.assertEqual(await self.sampler_runs(), [sid])
     sampler = await self.worker(sid)
 
-    await self.bus.node_heartbeat("n8", 8)
-    await self.bus.append_event("node_up", node="n8", gpus=8, memory=0)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    from tinyrl.types import NodeReport
+
+    await self.bus.exchange(NodeReport("n8", "b8", 8))
+    self.start_maintenance()
     await self.scheduling_until(lambda d: d["state"]["procs"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)

@@ -7,6 +7,7 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from tinyrl.bus import Bus, make_checkpoint
+from tinyrl.control import scheduler
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -41,11 +42,19 @@ class BusTest(unittest.IsolatedAsyncioTestCase):
     self.db_path = f"{self._db_dir.name}/tinyrl.db"
     self.bus = Bus(self.db_path)
 
+  def start_maintenance(self, period: float = 0.02) -> asyncio.Task:
+    async def loop():
+      while True:
+        await self.bus.maintain()
+        await asyncio.sleep(period)
+
+    task = asyncio.create_task(loop())
+    self.renewal_tasks.append(task)
+    return task
+
   async def worker(self, run: str) -> str:
     """The run's primary process, once every new run is assigned the way the scheduler assigns it."""
-    from tinyrl.control import scheduler
-
-    await assign_new_runs(self.bus)
+    self.bus.reconcile()
     return scheduler.from_state(await self.bus.read_state()).procs_of(run)[0]
 
   async def asyncTearDown(self):
@@ -54,27 +63,6 @@ class BusTest(unittest.IsolatedAsyncioTestCase):
     await asyncio.gather(*self.renewal_tasks, return_exceptions=True)
     await self.bus.aclose()
     self._db_dir.cleanup()
-
-
-async def assign_new_runs(bus) -> dict:
-  """Assign new runs the way the scheduler would, without placing them onto unannounced test nodes."""
-  from tinyrl.control import scheduler
-
-  raw = await bus.read_state()
-  new, changes = scheduler.step(scheduler.from_state(raw | {"nodes": {}}))
-  plan = raw.get("plan") or {}
-  procs = {
-    **plan.get("procs", {}),
-    **{n: v for n, v in scheduler.to_plan(new)["procs"].items() if n not in plan.get("procs", {})},
-  }
-  home = {
-    **{r: p for r, p in plan.get("home", {}).items() if r in new.jobs},
-    **{b["run"]: b["proc"] for k, b in changes if k == "assigned"},
-  }
-  merged = {**plan, "made": max(plan.get("made", 0), new.made), "procs": procs, "home": home}
-  if merged != plan:
-    await bus.write_plan(merged, [c for c in changes if c[0] == "assigned"])
-  return merged
 
 
 class FakeEngine:
