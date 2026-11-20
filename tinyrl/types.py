@@ -156,6 +156,7 @@ class NodeReport:
   staged: list[str] = field(default_factory=list)
   stage_errors: dict[str, str] = field(default_factory=dict)
   want_sweep: bool = False
+  active: list[str] = field(default_factory=list)  # turns this node already holds
 
 
 @dataclass(frozen=True)

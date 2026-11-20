@@ -8,7 +8,7 @@ from unittest import mock
 from test.helpers import BusTest, new_id, serve_control
 from tinyrl.bus import BackpressureError, Bus, ControlClient, PromiseGoneError
 from tinyrl.control.accounting import Charge
-from tinyrl.types import NodeReport, Op, Reply, Role, Run, TurnResult, WorkerStatus, unpack_snap
+from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run, TurnResult, WorkerStatus, unpack_snap
 
 
 def ok(**body) -> Reply:
@@ -145,6 +145,36 @@ class TestBus(BusTest):
     )
     self.assertEqual(reply2.acknowledged, [t1.id])
     self.assertEqual(reply2.turns[0].cmd.request_id, request_ids[1])
+
+  async def test_a_turn_the_node_already_holds_is_not_sent_again(self):
+    run_id = await self.new_run()
+    await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"")
+    [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
+    self.assertEqual((await self.bus.exchange(NodeReport("n1", "b1", 1, active=[turn.id]))).turns, [])
+
+  async def test_the_planner_runs_on_an_exchange_only_when_its_inputs_changed(self):
+    with (
+      mock.patch("tinyrl.control.scheduler.TICK_MS", 10**9),
+      mock.patch.object(self.bus, "reconcile", wraps=self.bus.reconcile) as plan,
+    ):
+      run_id = await self.new_run()
+      await self.bus.exchange(NodeReport("n1", "b1", 1))
+      await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"")
+      [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
+      self.assertEqual(plan.call_count, 1)
+      await self.new_run()
+      await self.bus.exchange(NodeReport("n1", "b1", 1, active=[turn.id]))
+      self.assertEqual(plan.call_count, 2)
+
+  async def test_expired_dedupe_keys_are_swept_less_often_than_the_tick(self):
+    await self.bus.maintain()
+    with self.bus.db:
+      self.bus.seen["run:1"] = ["run/1-1", 0.0]
+    await self.bus.maintain()
+    self.assertIn("run:1", self.bus.seen)
+    self.bus.gc_due = 0.0
+    await self.bus.maintain()
+    self.assertNotIn("run:1", self.bus.seen)
 
   async def test_reaped_boot_id_is_fenced_and_gets_reset_without_overwriting_checkpoint(self):
     run = await self.new_run()
@@ -308,6 +338,20 @@ class TestBus(BusTest):
 
 
 class TestControlRestart(unittest.IsolatedAsyncioTestCase):
+  async def test_a_node_that_never_returns_after_a_restart_is_lost_once(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      bus = Bus(f"{tmp}/tinyrl.db")
+      for name in ("a", "b"):
+        await bus.create_run(Run(name, f"base-{name}", 0))
+        await bus.submit_command(name, Op.OPTIM_STEP, b"")
+      self.assertEqual(len((await bus.exchange(NodeReport("n1", "b1", 2))).turns), 2)
+      await bus.aclose()
+      with mock.patch("tinyrl.bus.LEASE_MS", 0):
+        bus = Bus(f"{tmp}/tinyrl.db")
+      await bus.maintain()
+      self.assertEqual([e.kind for e in await bus.read_events()].count(Ev.NODE_LOST), 1)
+      await bus.aclose()
+
   async def test_exchange_client_survives_control_server_restart_and_preserves_durable_state(self):
     with tempfile.TemporaryDirectory() as tmp:
       db_path = f"{tmp}/tinyrl.db"

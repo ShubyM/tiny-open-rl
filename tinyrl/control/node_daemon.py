@@ -111,7 +111,7 @@ class NodeDaemon:
       statuses.append(WorkerStatus(h.id, h.resident, h.bound, h.pid(), tuple(sorted(h.loaded)), h.park_s))
     sweep = not self.draining and time.time() - self.swept > SWEEP_S and (not self.sweeping or self.sweeping.done())
     args = (self.id, self.boot_id, self.gpus, self.gpu_mib * 2**20, self.draining, self.lag)
-    return NodeReport(*args, statuses, finished, staged, stage_errors, sweep)
+    return NodeReport(*args, statuses, finished, staged, stage_errors, sweep, list(self.active))
 
   def start_prefetch(self, version: str) -> None:
     if version in self.staged_paths or version in self.staging:

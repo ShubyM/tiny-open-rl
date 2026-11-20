@@ -72,7 +72,7 @@ class TestNode(NodeDaemon):
         state.home[r] = proc
     with self.control.db:
       self.control.meta["plan"] = scheduler.to_plan(state)
-    self.control.plan_state = state
+    self.control.plan_state, self.control.plan_due = state, 0.0
     await self.tick()
     return self.workers.get(proc)
 
@@ -85,6 +85,7 @@ class TestNode(NodeDaemon):
       plan["procs"] = procs
       with self.control.db:
         self.control.meta["plan"] = plan
+      self.control.plan_due = 0.0
     self.notify()
 
   async def worker_for(self, run: str) -> str | None:

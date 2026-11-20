@@ -31,6 +31,7 @@ SAMPLE_RUNS, SAMPLE_COMMANDS = getenv("SAMPLE_RUNS", 3), getenv("SAMPLE_COMMANDS
 SAMPLE_QUEUE_BYTES = getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20)
 SAMPLE_REPLY_BYTES = getenv("SAMPLE_REPLY_BYTES", 256 * 2**20)
 COUNTERS = ("steps", "failed", "cmds", "tokens", "busy_ms", "wait_ms")
+GC_S = 10  # how often expired replies, dedupe keys and sessions are swept: their TTLs are a minute or more
 
 
 class PromiseGoneError(LookupError):
@@ -147,7 +148,9 @@ class Bus:
     self.events, self.waiters = deque(maxlen=100_000), weakref.WeakValueDictionary()
     self.work_event, self.seq = asyncio.Event(), max((c["seq"] for c in self.cmds.values()), default=0)
     self.sample_bytes, self.reply_bytes, self.dirty_runs, self.service_dirty = 0, 0, set(), False
+    self.plan_due = self.gc_due = 0.0  # monotonic deadlines: 0 runs the planner, or the sweep, at the next chance
     self.plan_state, now = scheduler.from_state(self.snapshot_state()), time.monotonic()
+    self.plan_state.service = self.service
     for req_id, c in sorted(self.cmds.items(), key=lambda kv: kv[1]["seq"]):
       if (rid := c["run"]) not in self.queues:
         continue
@@ -192,6 +195,8 @@ class Bus:
     now = time.time()
     ev = types.Event(f"{int(now * 1000)}-{self.seq}", now, str(Ev(kind)), body)
     self.events.append(ev)
+    if kind in (Ev.RUN_CREATED, Ev.RUN_DELETED, Ev.NODE_UP, Ev.NODE_LOST):
+      self.plan_due = 0.0  # the planner's inputs changed
     return ev
 
   def clear_owners(self, pred) -> None:
@@ -491,9 +496,8 @@ class Bus:
       self.reap_node(n.node, n.boot_id)
     if self.reap_after and now >= self.reap_after:
       self.reap_after, live = 0.0, {(n.node, n.boot_id) for n in self.nodes.values()}
-      for _, (tn, tb, _) in list(self.active_turns.items()):
-        if (tn, tb) not in live:
-          self.reap_node(tn, tb)
+      for tn, tb in {t[:2] for t in self.active_turns.values()} - live:
+        self.reap_node(tn, tb)
       self.clear_owners(lambda _, o: "@" in o and ":" in o and tuple(o.split("@", 1)[1].rsplit(":", 1)) not in live)
 
   def observe_node(self, report: NodeReport) -> NodeRuntime:
@@ -504,6 +508,8 @@ class Bus:
     if node is None:
       self.nodes[report.node] = node = NodeRuntime(report.node, report.boot_id, report.gpus, report.memory)
       self.record_event(Ev.NODE_UP, {"node": report.node, "gpus": report.gpus, "memory": report.memory})
+    if (node.gpus, node.memory, node.draining) != (report.gpus, report.memory, report.draining):
+      self.plan_due = 0.0
     node.gpus, node.memory, node.draining, node.lag = report.gpus, report.memory, report.draining, report.lag
     node.until, node.staged = now + LEASE_MS / 1000, set(report.staged)
     node.stage_errors.update(report.stage_errors)
@@ -574,15 +580,17 @@ class Bus:
     self.wake_all()
 
   def reconcile(self) -> list[tuple[Ev, dict]]:
-    old = self.meta.get("plan", {})
+    old, self.plan_due = self.meta.get("plan", {}), time.monotonic() + scheduler.TICK_MS / 1000
     self.plan_state, changes = scheduler.step(scheduler.from_state(self.snapshot_state()))
+    self.plan_state.service = self.service  # ready_lag reads service billed since this step
     if (plan := scheduler.to_plan(self.plan_state)) != old:
       with self.db:
         self.meta["plan"] = plan
         self.flush_dirty()
       for kind, body in changes:
         self.record_event(kind, body)
-      self.wake_all()
+      if any(plan[k] != old.get(k) for k in ("procs", "home")):  # lag alone moves no work
+        self.wake_all()
     return changes
 
   def issue(self, node: NodeRuntime, turn: Turn) -> None:
@@ -766,10 +774,11 @@ class Bus:
     for result in report.finished:
       self.finish_once(report.node, report.boot_id, result)
       ack.append(result.turn_id)
-    self.reconcile()
+    if time.monotonic() >= self.plan_due:
+      self.reconcile()
     prefetch, live = self.schedule_node(node), self.live_versions_sync() if report.want_sweep else None
-    turns = [t for tn, tb, t in self.active_turns.values() if tn == report.node and tb == report.boot_id]
-    return NodeReply(ack, turns, prefetch, live)
+    mine = [t for tn, tb, t in self.active_turns.values() if (tn, tb) == (report.node, report.boot_id)]
+    return NodeReply(ack, [t for t in mine if t.id not in report.active], prefetch, live)
 
   async def exchange(self, report: NodeReport, wait_ms: int = 0) -> NodeReply:
     r = self.exchange_sync(report)
@@ -834,21 +843,23 @@ class Bus:
   async def expire_checkpoints(self) -> int:
     now = time.time()
     expired = [u for u, c in self.checkpoints.items() if c["expires_at"] is not None and c["expires_at"] <= now]
-    for k in [k for k, v in self.sample_replies.items() if v[1] <= now]:
-      self.reply_bytes -= self.sample_replies.pop(k)[2]
-    for k in [k for k, (_, exp) in self.sample_seen.items() if exp <= now]:
-      del self.sample_seen[k]
     with self.db:
-      self.flush_dirty()
       for u in expired:
         del self.checkpoints[u]
-      for k in [k for k, v in self.replies.items() if v[2] <= now]:
-        del self.replies[k]
-        self.db.delete("blobs", f"r:{k}")
-      for k in [k for k, (_, exp) in self.seen.items() if exp <= now]:
-        del self.seen[k]
-      for sid in [s for s, v in self.sessions.items() if not v["active"] and v["seen"] <= now - SESSION_TTL]:
-        del self.sessions[sid]
+      if time.monotonic() >= self.gc_due:  # these tables grow with every command, so scan them rarely
+        self.gc_due = time.monotonic() + GC_S
+        self.flush_dirty()
+        for k in [k for k, v in self.sample_replies.items() if v[1] <= now]:
+          self.reply_bytes -= self.sample_replies.pop(k)[2]
+        for k in [k for k, (_, exp) in self.sample_seen.items() if exp <= now]:
+          del self.sample_seen[k]
+        for k in [k for k, v in self.replies.items() if v[2] <= now]:
+          del self.replies[k]
+          self.db.delete("blobs", f"r:{k}")
+        for k in [k for k, (_, exp) in self.seen.items() if exp <= now]:
+          del self.seen[k]
+        for sid in [s for s, v in self.sessions.items() if not v["active"] and v["seen"] <= now - SESSION_TTL]:
+          del self.sessions[sid]
     return len(expired)
 
   async def maintain(self) -> list[tuple[Ev, dict]]:
