@@ -10,7 +10,7 @@ import unittest
 
 from test.helpers import BusTest, new_id, serve_control, tiny
 from test.test_process import require_unix
-from tinyrl.bus import Op, Reply, Run, unpack_snap
+from tinyrl.bus import Op, Reply, Run
 from tinyrl.storage.store import Store
 
 LEASE_MS = 2000
@@ -80,7 +80,7 @@ class TestLease(BusTest):
     self.start_maintenance()
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
     old_owner = (await self.bus.get_run(run))["owner"]
-    proc_name = old_owner.split("@", 1)[0]
+    proc_name = old_owner[0]
     [first_node] = await self.bus.live_nodes()
     second = self.daemon()
 
@@ -142,7 +142,7 @@ class TestLease(BusTest):
     self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
     info = await self.bus.get_run(run)
     self.assertIsNone(info.get("owner"))
-    uri, version = unpack_snap(info["snap"])
+    uri, version = info["snap"]
     tensors, meta = self.store.get(version)
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])

@@ -8,7 +8,7 @@ from unittest import mock
 from test.helpers import BusTest, finished, new_id, serve_control
 from tinyrl.bus import BackpressureError, Bus, ControlClient, PromiseGoneError
 from tinyrl.control.accounting import Charge
-from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run, WorkerStatus, unpack_snap
+from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run, WorkerStatus
 
 
 def ok(**body) -> Reply:
@@ -49,7 +49,7 @@ class TestBus(BusTest):
       (run["base"], run["rank"], run["steps"], run["tokens"], run["pos"]), ("base", 8, 1, 42, cmd.entry_id)
     )
     self.assertEqual((run["wait_ms"], run["busy_ms"]), (12, 50))
-    self.assertEqual((await self.bus.read_state())["service"]["alice"], 100.5)
+    self.assertEqual(self.bus.service["alice"], 100.5)
 
   async def test_a_reply_wakes_every_waiter_and_reading_it_never_consumes_it(self):
     run_id = await self.new_run()
@@ -117,7 +117,7 @@ class TestBus(BusTest):
     self.assertNotIn(run, self.bus.pending)
     self.assertIsNone((await self.bus.get_run(run)).get("snap"))
     self.assertIsNone((await self.bus.get_run(run)).get("owner"))
-    self.assertNotIn(run, (await self.bus.read_state())["runs"])
+    self.assertNotIn(run, self.bus.state().jobs)
     self.assertIsNone(await self.bus.get_checkpoint(owned))
     self.assertIsNotNone(await self.bus.get_checkpoint(saved))
     self.assertEqual([c["tinker_path"] for c in (await self.bus.page_of_checkpoints(10, 0))[0]], [saved])
@@ -215,7 +215,7 @@ class TestBus(BusTest):
     await self.bus.exchange(NodeReport("n1", "b1", 1, draining=True, finished=[finished(snap_turn, saved=saved)]))
     info = await self.bus.get_run(run_id)
     self.assertIsNone(info.get("owner"))
-    self.assertEqual(unpack_snap(info["snap"]), (parked_uri, snap_ver))
+    self.assertEqual(info["snap"], [parked_uri, snap_ver])
 
     # Read-only SAVE_WEIGHTS on n2 keeps the parked snap; mutating OPTIM_STEP clears it.
     await self.bus.submit_command(run_id, Op.SAVE_WEIGHTS, b"{}")
@@ -245,7 +245,7 @@ class TestBus(BusTest):
     self.assertEqual(await self.bus.wait_for_reply(req, 0), ok(replica=winner))
     run = await self.bus.get_run(sid)
     self.assertEqual((run["cmds"], run["tokens"]), (1, 100))
-    service = (await self.bus.read_state())["service"]["bob"]
+    service = self.bus.service["bob"]
     self.assertEqual(service, 40.5 + winner)
 
     self.bus.ram.drop_reply(req)
@@ -253,7 +253,7 @@ class TestBus(BusTest):
     with self.assertRaises(PromiseGoneError):
       await self.bus.wait_for_reply(req, 0)
     self.assertEqual(await self.bus.get_run(sid), run)
-    self.assertEqual((await self.bus.read_state())["service"]["bob"], service)
+    self.assertEqual(self.bus.service["bob"], service)
 
   async def test_sampling_backpressure_and_unknown_promise_raise_typed_errors(self):
     sid = await self.new_run(role=Role.SAMPLER)

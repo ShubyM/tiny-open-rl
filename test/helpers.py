@@ -7,7 +7,6 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from tinyrl.bus import Bus, make_checkpoint
-from tinyrl.control import scheduler
 from tinyrl.types import TurnResult
 
 
@@ -88,7 +87,7 @@ class BusTest(unittest.IsolatedAsyncioTestCase):
   async def worker(self, run: str) -> str:
     """The run's primary process, once every new run is assigned the way the scheduler assigns it."""
     self.bus.reconcile()
-    return scheduler.from_state(await self.bus.read_state()).procs_of(run)[0]
+    return self.bus.state().procs_of(run)[0]
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:

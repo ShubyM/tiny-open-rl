@@ -18,7 +18,6 @@ from test.test_wire import json_body
 from tinyrl import bus
 from tinyrl.api import gateway, wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
-from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 
 PROTO = {"content-type": wire.PROTO}
@@ -224,7 +223,7 @@ class TestAPI(BusTest):
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
-    state = scheduler.from_state(await self.bus.read_state())
+    state = self.bus.state()
     self.assertEqual(state.runs(await self.worker(full)), [full])
 
   async def test_delete(self):

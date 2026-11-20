@@ -27,7 +27,7 @@ from tinyrl.control.scheduler import (
   Proc,
   Spec,
   State,
-  from_state,
+  from_plan,
   step,
   to_plan,
 )
@@ -38,22 +38,15 @@ GIB = 2**30
 
 
 class Cluster:
-  """In-memory mirror of `bus.read_state()` for stepping the pure L2 cluster planner."""
+  """Nodes, runs and queues that step the pure L2 cluster planner the way `Bus.reconcile` does."""
 
   def __init__(self):
     self.nodes, self.runs, self.queues, self.service, self.s = {}, {}, {}, {}, State()
 
-  def raw(self) -> dict:
-    return {
-      "nodes": self.nodes,
-      "runs": self.runs,
-      "queues": {r: q for r, q in self.queues.items() if q > 0},
-      "service": dict(self.service),
-      "plan": to_plan(self.s),
-    }
-
   def settle(self) -> list[tuple[Ev, dict]]:
-    self.s, changes = step(from_state(self.raw()))
+    self.s.nodes = {n: (v["gpus"], v["memory"]) for n, v in self.nodes.items()}
+    self.s.jobs, self.s.service = scheduler.jobs(self.runs, self.queues), dict(self.service)
+    self.s, changes = step(self.s)
     return changes
 
   def node(self, name: str, gpus: int, memory: int = 80 * GIB) -> None:
@@ -63,7 +56,7 @@ class Cluster:
   def lose(self, node: str) -> None:
     self.nodes.pop(node, None)
 
-  def run(self, name: str, *, backlog: int = 0, owner: str | None = None, **body) -> str:
+  def run(self, name: str, *, backlog: int = 0, owner: list[str] | None = None, **body) -> str:
     self.runs[name] = {"record": {"role": "trainer", "base": "a", "rank": 0} | body, "owner": owner}
     self.queues[name] = backlog
     self.settle()
@@ -132,7 +125,7 @@ class TestCluster(unittest.TestCase):
     c.delete("a")
     self.assertEqual(c.settle(), [])
     c.run("c")
-    c.runs["c"]["owner"] = f"{a}@n:boot1"
+    c.runs["c"]["owner"] = [a, "n", "boot1"]
     c.delete("b")
     self.assertEqual(c.settle(), [])
     self.assertIn(a, c.s.procs)
@@ -440,7 +433,7 @@ class TestCluster(unittest.TestCase):
     c.node("n", 1)
     c.run("r")
     c.s.procs["p9"] = Proc(Spec(), None)
-    c.runs["r"]["owner"] = "p9@gone-1:1"
+    c.runs["r"]["owner"] = ["p9", "gone-1", "1"]
     c.settle()
     self.assertNotIn("p9", c.s.procs)
 
@@ -501,7 +494,9 @@ class TestCluster(unittest.TestCase):
           c.delete(name)
         c.settle()
         check_plan_invariants(self, c.s)
-        self.assertEqual(from_state(c.raw()), c.s)
+        saved = from_plan(to_plan(c.s))  # the plan comes back from the database as it went in
+        saved.nodes, saved.jobs, saved.service = c.s.nodes, c.s.jobs, c.s.service
+        self.assertEqual(saved, c.s)
         c.settle()
         check_plan_invariants(self, c.s)
         again, changes = step(c.s)
@@ -965,7 +960,7 @@ class TestMultiNodeExecution(BusTest):
       self.assertTrue((await self.bus.wait_for_reply(a, 10)).ok)
       self.assertTrue((await self.bus.wait_for_reply(b, 10)).ok)
 
-    state = from_state(await self.bus.read_state())
+    state = self.bus.state()
     self.assertEqual({state.procs[state.home[r]].node for r in (r1, r2)}, {"node-a", "node-b"})
 
     ref = Model(tiny)
@@ -1055,7 +1050,7 @@ class TestMultiNodeExecution(BusTest):
       await self.create(r, rank=4, lora=LORA)
       await self.run_cmd(r, Op.FORWARD_BACKWARD, proto_body(r, 10))
       await self.run_cmd(r, Op.OPTIM_STEP, opt)
-    s0 = from_state(await self.bus.read_state())
+    s0 = self.bus.state()
     self.assertEqual(s0.home[r1], s0.home[r2])
 
     await self.add_node("node-b", gpus=1)
@@ -1064,7 +1059,7 @@ class TestMultiNodeExecution(BusTest):
       for r in (r1, r2)
     ]
     await self.bus.maintain()
-    s1 = from_state(await self.bus.read_state())
+    s1 = self.bus.state()
     self.assertNotEqual(s1.home[r1], s1.home[r2])
     self.assertEqual({s1.procs[s1.home[r]].node for r in (r1, r2)}, {"node-a", "node-b"})
     for a, b in futs:
@@ -1076,7 +1071,7 @@ class TestMultiNodeExecution(BusTest):
     await self.run_cmd(excl, Op.FORWARD_BACKWARD, proto_body(excl, 6))
 
     async def merged() -> bool:
-      st = from_state(await self.bus.read_state())
+      st = self.bus.state()
       return st.home.get(r1) == st.home.get(r2)
 
     await self.until(merged)
@@ -1113,7 +1108,7 @@ class TestMultiNodeExecution(BusTest):
       reqs = [await self.submit(sid, Op.SAMPLE, payload, cost=50) for _ in range(total_cmds)]
 
       async def scaled_out() -> bool:
-        st = from_state(await self.bus.read_state())
+        st = self.bus.state()
         return len(st.procs_of(sid)) >= 2 and len(set(served_by)) >= 2
 
       await self.until(scaled_out)
@@ -1123,22 +1118,22 @@ class TestMultiNodeExecution(BusTest):
         self.assertEqual(len(wire.sample_json(reply.body)["sequences"]), 1)
 
     self.assertEqual((await self.bus.get_run(sid))["tokens"], total_cmds * 50)
-    svc_before = (await self.bus.read_state())["service"]["team-s"]
+    svc_before = self.bus.service["team-s"]
     self.assertGreaterEqual(svc_before, total_cmds * 20.0)
 
     async def scaled_in() -> bool:
-      return len(from_state(await self.bus.read_state()).procs_of(sid)) == 1
+      return len(self.bus.state().procs_of(sid)) == 1
 
     await self.until(scaled_in)
 
     # Simulate the active sampler's node dying mid-sample -> surviving node reclaims and answers.
-    st = from_state(await self.bus.read_state())
+    st = self.bus.state()
     active_node = st.procs[st.procs_of(sid)[0]].node
     req = await self.bus.submit_command(sid, Op.SAMPLE, payload, cost=50)
     self.bus.nodes[active_node].until = 0.0
     self.assertTrue((await self.bus.wait_for_reply(req, 5)).ok)
     self.assertEqual((await self.bus.get_run(sid))["tokens"], (total_cmds + 1) * 50)
-    self.assertGreater((await self.bus.read_state())["service"]["team-s"], svc_before)
+    self.assertGreater(self.bus.service["team-s"], svc_before)
 
   async def test_controller_enforces_gpu_exclusivity_oversized_rejection_and_single_writer(self):
     node_a = await self.add_node("node-a", gpus=1)
@@ -1181,7 +1176,7 @@ class TestMultiNodeExecution(BusTest):
     before = time.monotonic()
     await self.create(a, account="alice")
     await self.run_cmd(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
-    pa = from_state(await self.bus.read_state()).home[a]
+    pa = self.bus.state().home[a]
     w_a = self.bus.nodes["node-a"].workers[pa]
     # Push `a` past its minimum quantum (into OVERTIME) without touching `b` yet.
     self.assertGreaterEqual(w_a.hold_until, before + QUANTUM_MS / 1000)
@@ -1198,7 +1193,7 @@ class TestMultiNodeExecution(BusTest):
     self.assertLess(time.monotonic() - t0, 1.5)
     for req in fa:
       self.assertTrue((await self.bus.wait_for_reply(req, 5)).ok)
-    svc = (await self.bus.read_state())["service"]
+    svc = self.bus.service
     self.assertGreater(svc["alice"], 0.0)
     self.assertGreater(svc["bob"], 0.0)
 

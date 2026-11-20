@@ -1,35 +1,11 @@
 from test.helpers import BusTest, finished
 from tinyrl.bus import Bus
-from tinyrl.control import scheduler
 from tinyrl.types import NodeReport, Op, Reply, Role, Run
 
 OK = Reply(True, "application/json", b"{}")
 
 
 class TestPopulatedUpgrade(BusTest):
-  async def test_scheduler_keeps_trainer_home_and_derives_existing_sampler_pool(self):
-    await self.bus.create_run(Run("t", "base", 8, role=Role.TRAINER))
-    await self.bus.create_run(Run("s", "base", 8, role=Role.SAMPLER))
-    await self.bus.exchange(NodeReport("n", "b1", 2))
-    old_plan = {
-      "made": 2,
-      "procs": {
-        p: {"node": "n", "spec": {"role": role, "base": "base", "lora": True}}
-        for p, role in [("p1", "trainer"), ("p2", "sampler")]
-      },
-      "home": {"t": ["p1"], "s": ["p2"]},
-    }
-    with self.bus.db:
-      self.bus.meta["plan"] = old_plan
-    for _ in range(2):
-      await self.bus.maintain()
-      raw = await self.bus.read_state()
-      self.assertEqual(raw["plan"]["home"], {"t": "p1"})
-      state = scheduler.from_state(raw)
-      self.assertEqual(state.procs_of("t"), ["p1"])
-      self.assertEqual(state.procs_of("s"), ["p2"])
-      self.assertEqual(state.procs["p1"].node, "n")
-
   async def test_new_owner_fails_old_pending_command_and_keeps_the_queued_tail(self):
     await self.bus.create_run(Run("t", "base", 8, role=Role.TRAINER))
     first = await self.bus.submit_command("t", Op.OPTIM_STEP, b"\xff")

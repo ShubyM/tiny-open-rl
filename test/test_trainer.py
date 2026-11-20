@@ -362,13 +362,13 @@ class TestTrainer(BusTest):
       await self.drain_and_evict(f"p-{rank}")  # detaches dirty run to store before releasing owner
       info = await self.bus.get_run(run)
       self.assertIsNone(info.get("owner"))
-      parked = info["snap"].partition("\n")[0]
+      parked = info["snap"][0]
       self.assertIsNotNone(await self.bus.get_checkpoint(parked))
       # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
       await self.node.drain(run)
       self.assertFalse((await self.bus.wait_for_reply(invalid, 1)).ok)
-      self.assertEqual((await self.bus.get_run(run))["snap"].partition("\n")[0], parked)
+      self.assertEqual((await self.bus.get_run(run))["snap"][0], parked)
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
@@ -390,7 +390,7 @@ class TestTrainer(BusTest):
     step = (Op.OPTIM_STEP, {"adam_params": {}})
     for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
       await self.drain_and_evict("p")
-      parked = (await self.bus.get_run(run))["snap"].partition("\n")[0]
+      parked = (await self.bus.get_run(run))["snap"][0]
       [request] = await self.submit(run, command)
       await self.node.drain(run)
       reply = await self.bus.wait_for_reply(request, 1)

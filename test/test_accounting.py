@@ -55,7 +55,7 @@ class TestAccounting(BusTest):
     w = self.bus.nodes["node"].workers["worker"]
     self.assertEqual(w.run_service, {"short": 10, "long": 50})
     self.assertEqual(w.gpu_ms, 60)
-    self.assertEqual((await self.bus.read_state())["service"], {"alice": 60})
+    self.assertEqual(self.bus.service, {"alice": 60})
     short, long = await self.bus.get_run("short"), await self.bus.get_run("long")
     self.assertEqual((short["busy_ms"], short["failed"], short["tokens"]), (10, 1, 0))
     self.assertEqual((long["busy_ms"], long["failed"], long["tokens"]), (30, 0, 999))
@@ -103,7 +103,7 @@ class TestAccounting(BusTest):
     w = self.bus.nodes["node"].workers["worker"]
     self.assertAlmostEqual(w.run_service["a1"], 80 / 3)
     self.assertAlmostEqual(w.run_service["a2"], 40 / 3)
-    self.assertAlmostEqual((await self.bus.read_state())["service"]["alice"], 40)
+    self.assertAlmostEqual(self.bus.service["alice"], 40)
     self.assertEqual((await self.bus.get_run("a1"))["failed"], 2)
 
   async def test_three_sampler_sessions_get_the_same_gpu_time_as_one(self):
@@ -131,7 +131,7 @@ class TestAccounting(BusTest):
         end = now + 12_000_000
         await self.step_turn(node)
 
-    self.assertEqual((await self.bus.read_state())["service"], {"alice": 72, "bob": 72})
+    self.assertEqual(self.bus.service, {"alice": 72, "bob": 72})
     w = self.bus.nodes["node"].workers["worker"]
     self.assertEqual(w.run_service, {"a1": 24, "a2": 24, "a3": 24, "b": 72})
 
@@ -170,12 +170,12 @@ class TestAccounting(BusTest):
     model.call.assert_not_awaited()
     w = self.bus.nodes["node"].workers["worker"]
     self.assertEqual(w.gpu_ms, 0)
-    self.assertEqual((await self.bus.read_state())["service"], {})
+    self.assertEqual(self.bus.service, {})
     await self.bus.submit_command("run", Op.OPTIM_STEP, b"{}")
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=[0, 250_000]):
       await self.step_turn(node)
     self.assertEqual(w.run_service, {"run": 0.5})
     self.assertEqual(w.gpu_ms, 0.5)
-    self.assertEqual((await self.bus.read_state())["service"], {"run-account": 0.5})
+    self.assertEqual(self.bus.service, {"run-account": 0.5})
     run = await self.bus.get_run("run")
     self.assertEqual((run["cmds"], run["failed"], run["steps"], run["tokens"]), (1, 2, 0, 0))

@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from tinyrl.api import wire
-from tinyrl.bus import BackpressureError, Bus, PromiseGoneError
+from tinyrl.bus import COUNTERS, BackpressureError, Bus, PromiseGoneError
 from tinyrl.control import estimator, scheduler
 from tinyrl.helpers import getenv
 from tinyrl.storage.store import Store
@@ -192,14 +192,14 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
   @api.get("/api/v1/scheduling")
   async def scheduling():
     """The cluster's plan, account lags, and each process's actual GPUs and PID from its node's last heartbeat."""
-    raw = await bus.read_state()
-    state = dataclasses.asdict(scheduler.from_state(raw))
+    nodes = await bus.live_nodes(details=True)
+    state = dataclasses.asdict(bus.state())
     for proc, placed in state["procs"].items():
-      heartbeat = raw["nodes"].get(placed["node"], {})
+      heartbeat = nodes.get(placed["node"], {})
       for src, field in (("pids", "pid"), ("on", "gpus")):
         if proc in heartbeat.get(src, {}):
           placed[field] = heartbeat[src][proc]
-    return {"nodes": {n: v["gpus"] for n, v in raw["nodes"].items()}, "state": state}
+    return {"nodes": {n: v["gpus"] for n, v in nodes.items()}, "state": state}
 
   @api.get("/api/v1/healthz")
   async def healthz():
@@ -446,7 +446,7 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
     run = await require_run(run_id)
-    procs = scheduler.from_state(await bus.read_state(backlogs=False)).procs_of(run_id)
+    procs = bus.state().procs_of(run_id)
     extra = {"procs": procs, **({"worker": procs[0]} if procs else {})}
     return {**run, **extra, **await bus.queued_and_in_flight(run_id)}
 
@@ -460,17 +460,16 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
   @api.get("/metrics")
   async def metrics():
     """Every run's counters, account service and node loop lag for Prometheus."""
-    raw = await bus.read_state(backlogs=False, counters=True)
-    state = scheduler.from_state(raw)
-    lines = []
-    for run, info in raw["runs"].items():
+    nodes, state, lines = await bus.live_nodes(details=True), bus.state(), []
+    for run in state.jobs:
       if ps := state.procs_of(run):
-        for name, n in info["counters"].items():
-          name, n = (f"{name[:-3]}_seconds", n / 1000) if name.endswith("_ms") else (name, n)
+        info = await bus.get_run(run)
+        for name in COUNTERS:
+          name, n = (f"{name[:-3]}_seconds", info[name] / 1000) if name.endswith("_ms") else (name, info[name])
           lines.append(f'tinyrl_{name}_total{{worker="{ps[0]}",run="{run}"}} {n}')
-    for account, total in sorted(raw["service"].items()):
+    for account, total in sorted(bus.service.items()):
       lines.append(f'tinyrl_account_service_total{{account="{account}"}} {float(total)}')
-    for node, beat in raw["nodes"].items():
+    for node, beat in nodes.items():
       lines.append(f'tinyrl_node_loop_lag_seconds{{node="{node}"}} {beat.get("lag", 0.0)}')
     return PlainTextResponse("\n".join(lines) + "\n")
 

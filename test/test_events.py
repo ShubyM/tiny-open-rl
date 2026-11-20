@@ -1,6 +1,5 @@
 from test.helpers import BusTest
 from tinyrl.bus import Run
-from tinyrl.control import scheduler
 from tinyrl.types import Ev
 
 
@@ -19,7 +18,7 @@ class TestEvents(BusTest):
       await self.bus.create_run(Run(run, "tiny", 4))
     await self.bus.create_run(Run("f", "tiny", 0))
     await self.bus.maintain()
-    state = scheduler.from_state(await self.bus.read_state())
+    state = self.bus.state()
     home = state.home
     self.assertEqual(home["a"], home["b"])
     self.assertNotEqual(home["a"], home["f"])

@@ -30,14 +30,9 @@ class Job:
   spec: Spec
   train_run: str | None = None
   account: str = ""
-  owner: str | None = None
+  owner: list[str] | None = None  # [proc, node, boot id] of the worker holding its weights
   backlog: int = 0
   record: dict = field(default_factory=dict)
-
-
-def owner_of(token: str | None) -> tuple[str, str]:
-  proc, _, rest = (token or "").rsplit(":", 1)[0].partition("@")
-  return proc, rest
 
 
 @dataclass
@@ -112,26 +107,28 @@ class State:
     return name
 
 
-def from_state(raw: dict) -> State:
-  plan, queues, rnodes = raw["plan"], raw.get("queues", {}), raw.get("nodes", {})
-  nodes = {n: (int(v["gpus"]), int(v.get("memory", 0))) for n, v in rnodes.items() if not v.get("draining")}
-  jobs, procs = {}, {}
-  for r, info in raw.get("runs", {}).items():
-    rec = info["record"]
+def jobs(runs: dict[str, dict], backlog: dict[str, int]) -> dict[str, Job]:
+  """Every live run as the planner sees it: its worker spec, account, owner and queue length."""
+  out = {}
+  for r, row in runs.items():
+    rec = row["record"]
     excl, tr, role = bool(rec.get("exclusive")), rec.get("train_run"), Role(rec.get("role", "trainer"))
     spec = Spec(role, rec.get("base", ""), rec.get("rank", 0) > 0, excl, tr if excl else None, int(rec.get("gpus", 1)))
     acct = rec.get("account") or ("" if tr else rec.get("session", ""))
-    jobs[r] = Job(spec, tr, acct, info.get("owner"), queues.get(r, 0), rec)
-  jobs = {r: j for r, j in jobs.items() if not j.spec.train_run or j.spec.train_run in jobs}
-  for n, p in plan.get("procs", {}).items():
-    procs[n] = Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
-  home = {
-    r: p[0] if isinstance(p, list) else p
-    for r, p in plan.get("home", {}).items()
-    if p and r in jobs and jobs[r].spec.role == Role.TRAINER
+    out[r] = Job(spec, tr, acct, row.get("owner"), backlog.get(r, 0), rec)
+  return {r: j for r, j in out.items() if not j.spec.train_run or j.spec.train_run in out}
+
+
+def from_plan(plan: dict) -> State:
+  """What `to_plan` saved. The Bus fills in the nodes, jobs and service of the moment before each step."""
+  procs = {
+    n: Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
+    for n, p in plan.get("procs", {}).items()
   }
   fv = [{a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights")]
-  return State(int(plan.get("made", 0)), nodes, procs, home, jobs, fv[0], fv[1], dict(raw.get("service", {})), fv[2])
+  return State(
+    int(plan.get("made", 0)), procs=procs, home=dict(plan.get("home", {})), lag=fv[0], seen=fv[1], weights=fv[2]
+  )
 
 
 def to_plan(s: State) -> dict:
@@ -194,7 +191,8 @@ def demand(s: State, cap: float) -> dict[str, float]:
 
 
 def drop_lost(s: State, out: list) -> None:
-  """Unplace processes whose node vanished or no longer has room for them."""
+  """Forget the homes of runs that are gone, and unplace processes whose node vanished or has no room for them."""
+  s.home = {r: p for r, p in s.home.items() if r in s.jobs}
   for name, p in sorted(s.procs.items()):
     if p.node and (p.node not in s.nodes or not s.can_host(p.node, p.spec, name)):
       p.node = None
@@ -255,7 +253,7 @@ def size_samplers(s: State, out: list) -> None:
 
 def collect_and_place(s: State, out: list) -> None:
   """Remove empty processes, then place the unplaced ones."""
-  held = {owner_of(j.owner)[0] for j in s.jobs.values() if owner_of(j.owner)[1] in s.nodes}
+  held = {j.owner[0] for j in s.jobs.values() if j.owner and j.owner[1] in s.nodes}
   for name in [n for n in sorted(s.procs) if not s.runs(n) and n not in held]:
     if s.procs.pop(name).node:
       out.append((Ev.UNPLACED, {"proc": name, "rule": "place.emptied"}))

@@ -163,9 +163,10 @@ class NodeReply:
   reset: bool = False
 
 
-def unpack_snap(snap: str) -> tuple[str, str]:
-  uri, version = snap.split("\n", 1)
-  return uri, version
+def entry_sort_key(entry_id: str) -> tuple[int, int]:
+  """An entry id `<ms>-<seq>` as numbers, which sort in the order the ids were made."""
+  ms, seq = entry_id.split("-", 1)
+  return int(ms), int(seq)
 
 
 def parse_uri(uri: str) -> tuple[str, str]:

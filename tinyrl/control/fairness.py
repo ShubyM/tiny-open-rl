@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from tinyrl.types import Cmd
+from tinyrl.types import Cmd, entry_sort_key
 
 
 class Demand(StrEnum):
@@ -74,7 +74,7 @@ def select_runs(heads: list[Cmd], account, ready_lag, service: dict[str, float],
   floor = min((service[run] for run in ready if run in service), default=0.0)
 
   def rank(cmd: Cmd) -> tuple:
-    return round(-ready_lag(cmd.run), 3), service.get(cmd.run, floor), tuple(map(int, cmd.entry_id.split("-")))
+    return round(-ready_lag(cmd.run), 3), service.get(cmd.run, floor), entry_sort_key(cmd.entry_id)
 
   if not (runs := [cmd.run for cmd in sorted(ready.values(), key=rank)]):
     return []

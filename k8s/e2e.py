@@ -272,7 +272,7 @@ def main() -> None:
     workers = live_workers()
     procs = {pod: processes(pod) for pod in daemons()}
     jobs = gateway_get("/api/v1/scheduling").get("state", {}).get("jobs", {})
-    owners = [j["owner"].split("@", 1)[0] for j in jobs.values() if j.get("owner")]
+    owners = [j["owner"][0] for j in jobs.values() if j.get("owner")]
     check_processes(placed, workers, procs, owners)
     engines = sum(s["pid"] is not None for s in workers.values())
     return f"{len(placed)} workers, {engines} owned process groups, and no stray processes or leases"

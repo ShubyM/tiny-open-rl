@@ -25,7 +25,7 @@ RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery
 CASES = [
   (FAIRNESS, "select_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
   (FAIRNESS, "select_runs", "[:width]", "[:1]", ORDER),
-  (FAIRNESS, "select_runs", 'tuple(map(int, cmd.entry_id.split("-")))', "cmd.entry_id", ORDER),
+  (FAIRNESS, "select_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),

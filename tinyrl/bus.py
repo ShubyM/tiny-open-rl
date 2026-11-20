@@ -21,7 +21,7 @@ from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge
 from tinyrl.control.fairness import Demand, Worker, blocks, plan_gpus, select_runs
 from tinyrl.helpers import getenv
-from tinyrl.types import Cmd, Ev, NodeReply, NodeReport, Op, Reply, Role, Run, Turn, TurnResult, parse_uri, unpack_snap
+from tinyrl.types import Cmd, Ev, NodeReply, NodeReport, Op, Reply, Role, Run, Turn, TurnResult, parse_uri
 
 LIVE_SECONDS, SESSION_GRACE = 30, getenv("SESSION_GRACE", 60)
 REPLY_TTL, READ_REPLY_TTL, SESSION_TTL = getenv("REPLY_TTL", 3600), 60, getenv("SESSION_TTL", 7 * 24 * 3600)
@@ -162,13 +162,8 @@ class Pending:
   since: float = 0.0
 
 
-def entry_sort_key(entry_id: str) -> tuple[int, int]:
-  ms, seq = entry_id.split("-", 1)
-  return int(ms), int(seq)
-
-
-def owner_token(node: str, boot_id: str, worker: str) -> str:
-  return f"{worker}@{node}:{boot_id}"
+def owner_token(node: str, boot_id: str, worker: str) -> list[str]:
+  return [worker, node, boot_id]
 
 
 def make_checkpoint(uri: str, size: int, *, version: str, ttl=None, owned=False) -> dict:
@@ -195,8 +190,7 @@ class Bus:
     self.work_event, self.seq = asyncio.Event(), max((c["seq"] for c in self.disk.cmds.values()), default=0)
     self.dirty_runs, self.service_dirty = set(), False
     self.plan_due = self.gc_due = 0.0  # monotonic deadlines: 0 runs the planner, or the sweep, at the next chance
-    self.plan_state, now = scheduler.from_state(self.snapshot_state()), time.monotonic()
-    self.plan_state.service = self.service
+    self.plan_state, now = scheduler.from_plan(self.meta.get("plan", {})), time.monotonic()
     for req_id, c in sorted(self.disk.cmds.items(), key=lambda kv: kv[1]["seq"]):
       if (rid := c["run"]) not in self.pending:
         continue
@@ -204,10 +198,11 @@ class Bus:
       self.pending[rid][c["eid"]] = Pending(cmd, c.get("turn"), now)
       self.disk.queued_bytes += len(cmd.body)
       if tid := c.get("turn"):
-        wid = (self.runs[rid].get("owner") or "").split("@", 1)[0]
+        wid = (self.runs[rid].get("owner") or [""])[0]
         self.active_turns[tid] = (c.get("node", ""), c.get("boot", ""), Turn(tid, "train", wid, cmds=[cmd]))
     owned = bool(self.active_turns) or any(r["live"] and r.get("owner") for r in self.runs.values())
     self.reap_after = now + LEASE_MS / 1000 if owned else 0.0
+    self.state()
 
   def is_sampler(self, run_id: str) -> bool:
     return bool((run := self.runs.get(run_id)) and run["record"]["role"] == Role.SAMPLER)
@@ -280,7 +275,7 @@ class Bus:
       c["steps"] += 1
     if charge:
       c["cmds"], c["busy_ms"] = c["cmds"] + 1, c["busy_ms"] + charge.busy_ms
-      c["wait_ms"] += max(0, charge.started_ms - int(cmd.entry_id.split("-")[0]))
+      c["wait_ms"] += max(0, charge.started_ms - types.entry_sort_key(cmd.entry_id)[0])
       c["tokens"] += cmd.cost if reply.ok else 0
 
   # ***** sessions & runs *****
@@ -330,29 +325,21 @@ class Bus:
     self.record_event(Ev.RUN_CREATED, ev)
     self.wake_all()
 
-  def snapshot_state(self, *, backlogs: bool = True, counters: bool = False) -> dict:
-    nodes, runs, queues = {}, {}, {}
-    for nid, n in self.nodes.items():
-      on = {wid: list(w.resident) for wid, w in n.workers.items() if w.resident}
-      pids = {wid: w.pid for wid, w in n.workers.items() if w.pid is not None}
-      nodes[nid] = {"gpus": n.gpus, "memory": n.memory, "draining": n.draining, "lag": n.lag, "on": on, "pids": pids}
-    for rid in sorted(self.runs):
-      if (row := self.runs[rid])["live"]:
-        extra = {"counters": dict(row["counters"])} if counters else {}
-        runs[rid] = {"record": dict(row["record"]), "owner": row["owner"], **extra}
-        if backlogs:
-          queues[rid] = len(self.pending.get(rid, ()))
-    plan = dict(self.meta.get("plan", {}))
-    return {"nodes": nodes, "runs": runs, "queues": queues, "plan": plan, "service": dict(self.service)}
-
-  async def read_state(self, *, backlogs: bool = True, counters: bool = False) -> dict:
-    self.reap_dead_nodes()
-    return self.snapshot_state(backlogs=backlogs, counters=counters)
+  def state(self) -> scheduler.State:
+    """The planner's state with the nodes, runs and queues of this moment."""
+    s, live = self.plan_state, {rid: row for rid, row in sorted(self.runs.items()) if row["live"]}
+    s.nodes = {nid: (n.gpus, n.memory) for nid, n in self.nodes.items() if not n.draining}
+    s.jobs, s.service = scheduler.jobs(live, {rid: len(q) for rid, q in self.pending.items()}), self.service
+    return s
 
   async def live_nodes(self, details: bool = False) -> dict:
     self.reap_dead_nodes()
-    snap = self.snapshot_state(backlogs=False)["nodes"]
-    return snap if details else {nid: info["gpus"] for nid, info in snap.items()}
+    out = {}
+    for nid, n in self.nodes.items():
+      on = {wid: list(w.resident) for wid, w in n.workers.items() if w.resident}
+      pids = {wid: w.pid for wid, w in n.workers.items() if w.pid is not None}
+      out[nid] = {"gpus": n.gpus, "memory": n.memory, "draining": n.draining, "lag": n.lag, "on": on, "pids": pids}
+    return out if details else {nid: n.gpus for nid, n in self.nodes.items()}
 
   async def get_run(self, run_id: str) -> dict | None:
     if (row := self.runs.get(run_id)) is None:
@@ -473,7 +460,7 @@ class Bus:
         if mutated and not deleting:
           row["pos"] = cmd.entry_id
           if row["snap"]:
-            self.checkpoints.pop(unpack_snap(row["snap"])[0], None)
+            self.checkpoints.pop(row["snap"][0], None)
             row["snap"] = None
         elif deleting:
           row.update(live=False, owner=None, snap=None)
@@ -508,7 +495,7 @@ class Bus:
           self.commit(cmd, err, tid, clear_owner=True)
         elif (p := self.pending.get(cmd.run, {}).get(cmd.entry_id)) and p.turn == tid:
           p.turn = None  # queued again, in its old place
-    self.clear_owners(lambda _, o: o.endswith(f"@{node_id}:{boot_id}"))
+    self.clear_owners(lambda _, o: o[1:] == [node_id, boot_id])
     self.wake_all()
 
   def reap_dead_nodes(self) -> None:
@@ -519,7 +506,7 @@ class Bus:
       self.reap_after, live = 0.0, {(n.node, n.boot_id) for n in self.nodes.values()}
       for tn, tb in {t[:2] for t in self.active_turns.values()} - live:
         self.reap_node(tn, tb)
-      self.clear_owners(lambda _, o: "@" in o and ":" in o and tuple(o.split("@", 1)[1].rsplit(":", 1)) not in live)
+      self.clear_owners(lambda _, o: tuple(o[1:]) not in live)
 
   def observe_node(self, report: NodeReport) -> NodeRuntime:
     now, node = time.monotonic(), self.nodes.get(report.node)
@@ -580,7 +567,7 @@ class Bus:
         with self.db:
           if res.ok and res.saved:
             ckpt = self.save_checkpoint(res.saved)
-            row["snap"] = f"{ckpt['tinker_path']}\n{ckpt['version']}"
+            row["snap"] = [ckpt["tinker_path"], ckpt["version"]]
           self.runs.save(rid)
       if w:
         w.loaded.discard(rid)
@@ -596,7 +583,7 @@ class Bus:
 
   def reconcile(self) -> list[tuple[Ev, dict]]:
     old, self.plan_due = self.meta.get("plan", {}), time.monotonic() + scheduler.TICK_MS / 1000
-    self.plan_state, changes = scheduler.step(scheduler.from_state(self.snapshot_state()))
+    self.plan_state, changes = scheduler.step(self.state())
     self.plan_state.service = self.service  # ready_lag reads service billed since this step
     if (plan := scheduler.to_plan(self.plan_state)) != old:
       with self.db:
@@ -758,7 +745,7 @@ class Bus:
         elif cmd.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER):
           ver = uuid.uuid4().hex
         need_snap = row["snap"] and not (w and rid in w.loaded) and cmd.op != Op.LOAD_WEIGHTS
-        saved = unpack_snap(row["snap"])[1] if need_snap else None
+        saved = row["snap"][1] if need_snap else None
         self.issue(
           node,
           Turn(
@@ -878,8 +865,8 @@ class Bus:
     return self.reconcile()
 
   async def read_events(self, after: str = "0-0", count: int = 10_000) -> list[types.Event]:
-    cutoff = entry_sort_key(after)
-    return [ev for ev in self.events if entry_sort_key(ev.id) > cutoff][:count]
+    cutoff = types.entry_sort_key(after)
+    return [ev for ev in self.events if types.entry_sort_key(ev.id) > cutoff][:count]
 
 
 class ControlClient:

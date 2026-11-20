@@ -282,15 +282,15 @@ class Stress(BusTest):
 
   async def dump(self, run: str, request: str) -> None:
     """Where a command that got no reply is stuck."""
-    raw = await self.bus.read_state()
     row = {k: str(v)[:80] for k, v in (self.bus.runs.get(run) or {}).items() if k != "record"}
-    plan, out = raw["plan"], [f"--- {request} at {time.monotonic() - self.started:.1f}s", f"row {row}"]
+    plan, out = self.bus.meta.get("plan", {}), [f"--- {request} at {time.monotonic() - self.started:.1f}s"]
+    out.append(f"row {row}")
     out.append(f"queue {await self.bus.queued_and_in_flight(run)}")
     out.append(
       f"home {plan.get('home', {}).get(run)} procs { {n: p['node'] for n, p in plan.get('procs', {}).items()} }"
     )
     out.append(
-      f"lag { {a: round(v) for a, v in plan.get('lag', {}).items()} } service { {a: round(v) for a, v in raw['service'].items()} }"
+      f"lag { {a: round(v) for a, v in plan.get('lag', {}).items()} } service { {a: round(v) for a, v in self.bus.service.items()} }"
     )
     for node in self.nodes.values():
       on = {k: h.resident for k, h in node.workers.items() if h.resident}
@@ -448,7 +448,7 @@ class Stress(BusTest):
       chaos.cancel()
       await asyncio.gather(chaos, return_exceptions=True)
     elapsed, capacity = time.monotonic() - started, sum(n.gpus for n in self.nodes.values())
-    service = (await self.bus.read_state())["service"]
+    service = dict(self.bus.service)
 
     # Delete everything, then nothing may be left behind.
     for run in trainers:
@@ -458,15 +458,12 @@ class Stress(BusTest):
       await self.bus.delete_run(session)
     try:
       async with asyncio.timeout(30):
-        while (await self.bus.read_state())["plan"].get("procs") or any(
-          n.workers or n.active for n in self.nodes.values()
-        ):
+        while self.bus.plan_state.procs or any(n.workers or n.active for n in self.nodes.values()):
           await asyncio.sleep(0.05)
     except TimeoutError:
-      plan = (await self.bus.read_state())["plan"]
       workers = {n.id: sorted(n.workers) for n in self.nodes.values()}
       self.problems.append(
-        f"did not settle after deleting every run: procs {sorted(plan.get('procs', {}))} workers {workers}"
+        f"did not settle after deleting every run: procs {sorted(self.bus.plan_state.procs)} workers {workers}"
       )
     left = {
       "queues": sorted(self.bus.pending),

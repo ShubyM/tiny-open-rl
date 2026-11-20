@@ -61,7 +61,7 @@ class TestNode(NodeDaemon):
 
   async def bind(self, proc: str, *runs: str):
     """Pin `proc` hosting `runs` onto this node in the controller's plan and announce this node."""
-    state = scheduler.from_state(await self.control.read_state())
+    state = self.control.state()
     for r in runs:
       spec = state.jobs[r].spec
       if spec.role == Role.SAMPLER:
@@ -70,27 +70,19 @@ class TestNode(NodeDaemon):
       state.procs[proc] = scheduler.Proc(spec, self.id)
       if spec.role == Role.TRAINER:
         state.home[r] = proc
-    with self.control.db:
-      self.control.meta["plan"] = scheduler.to_plan(state)
-    self.control.plan_state, self.control.plan_due = state, 0.0
+    self.control.plan_due = 0.0
     await self.tick()
     return self.workers.get(proc)
 
   def drop_local(self, proc: str):
     """Remove `proc` from this node's plan so the next exchange closes/detaches it."""
-    plan = dict(self.control.meta.get("plan", {}))
-    procs = dict(plan.get("procs", {}))
-    if proc in procs:
-      procs[proc] = {**procs[proc], "node": None}
-      plan["procs"] = procs
-      with self.control.db:
-        self.control.meta["plan"] = plan
-      self.control.plan_due = 0.0
+    if p := self.control.plan_state.procs.get(proc):
+      p.node, self.control.plan_due = None, 0.0
     self.notify()
 
   async def worker_for(self, run: str) -> str | None:
     await self.tick()
-    state = scheduler.from_state(await self.control.read_state())
+    state = self.control.state()
     ps = state.procs_of(run)
     return ps[0] if ps else None
 
@@ -103,7 +95,7 @@ class TestNode(NodeDaemon):
         if not q.get("queued") and not q.get("in_flight") and not self.active and not self.staging:
           break
         await asyncio.sleep(0.002)
-    state = scheduler.from_state(await self.control.read_state())
+    state = self.control.state()
     ps = state.procs_of(run)
     return self.workers.get(ps[0]) if ps else None
 
