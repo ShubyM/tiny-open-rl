@@ -469,7 +469,7 @@ class Stress(BusTest):
         f"did not settle after deleting every run: procs {sorted(plan.get('procs', {}))} workers {workers}"
       )
     left = {
-      "queues": sorted(self.bus.queues),
+      "queues": sorted(self.bus.pending),
       "writing": sorted(r for r, row in self.bus.runs.items() if row.get("writing")),
       "owners": [r for r in trainers if (self.bus.runs.get(r) or {}).get("owner")],
       "on GPUs": {n.id: dict(n.occ.on) for n in self.nodes.values() if n.occ.on},

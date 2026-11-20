@@ -29,22 +29,16 @@ CASES = [
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (
-    BUS,
-    "commit_trainer_cmd",
-    "if acct and charge and charge.gpu_ms",
-    "if reply.ok and acct and charge and charge.gpu_ms",
-    BILLING,
-  ),
+  (BUS, "commit", "if acct and charge and charge.gpu_ms", "if reply.ok and acct and charge and charge.gpu_ms", BILLING),
   (BUS, "exchange_sync", "if report.boot_id in self.reaped_boots:", "if False:", CLAIM),
   (
     BUS,
-    "commit_sample_cmd",
-    "if not claims or (entry := claims.get(cmd.entry_id)) is None or entry[1] != turn_id:",
-    "if cmd.request_id in self.sample_replies:",
+    "commit",
+    "if (p := queue.get(cmd.entry_id)) is None or p.turn != turn:",
+    "if cmd.request_id in self.box(cmd.run).replies:",
     DEDUP,
   ),
-  (BUS, "commit_trainer_cmd", "if mutated and not deleting:", "if reply.ok and mutated and not deleting:", RECOVERY),
+  (BUS, "commit", "if mutated and not deleting:", "if reply.ok and mutated and not deleting:", RECOVERY),
 ]
 
 

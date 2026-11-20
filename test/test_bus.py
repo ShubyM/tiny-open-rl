@@ -109,7 +109,7 @@ class TestBus(BusTest):
     await self.bus.delete_run(run_id)
     self.assertIsNone(await self.bus.submit_command(run_id, Op.OPTIM_STEP, b""))
     self.assertEqual(await self.bus.queued_and_in_flight(run_id), {"live": False})
-    self.assertNotIn(run_id, self.bus.queues)
+    self.assertNotIn(run_id, self.bus.pending)
 
   async def test_delete_removes_owned_checkpoints_and_keeps_saved_weights(self):
     run = await self.new_run()
@@ -120,7 +120,7 @@ class TestBus(BusTest):
     [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
     await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[TurnResult(turn.id, "train", turn.worker, reply=ok())]))
     self.assertEqual(await self.bus.wait_for_reply(request, 5), ok())
-    self.assertNotIn(run, self.bus.queues)
+    self.assertNotIn(run, self.bus.pending)
     self.assertIsNone((await self.bus.get_run(run)).get("snap"))
     self.assertIsNone((await self.bus.get_run(run)).get("owner"))
     self.assertNotIn(run, (await self.bus.read_state())["runs"])
@@ -169,12 +169,12 @@ class TestBus(BusTest):
   async def test_expired_dedupe_keys_are_swept_less_often_than_the_tick(self):
     await self.bus.maintain()
     with self.bus.db:
-      self.bus.seen["run:1"] = ["run/1-1", 0.0]
+      self.bus.disk.seen["run:1"] = ["run/1-1", 0.0]
     await self.bus.maintain()
-    self.assertIn("run:1", self.bus.seen)
+    self.assertIn("run:1", self.bus.disk.seen)
     self.bus.gc_due = 0.0
     await self.bus.maintain()
-    self.assertNotIn("run:1", self.bus.seen)
+    self.assertNotIn("run:1", self.bus.disk.seen)
 
   async def test_reaped_boot_id_is_fenced_and_gets_reset_without_overwriting_checkpoint(self):
     run = await self.new_run()
@@ -264,7 +264,7 @@ class TestBus(BusTest):
     [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
     cmd = turn.cmds[0]
     results = [
-      self.bus.commit_sample_cmd(cmd, ok(replica=i), turn.id, Charge(busy_ms=40, gpu_ms=40.5 + i)) for i in range(5)
+      self.bus.commit(cmd, ok(replica=i), turn.id, charge=Charge(busy_ms=40, gpu_ms=40.5 + i)) for i in range(5)
     ]
     self.assertEqual(sum(results), 1)
     winner = results.index(True)
@@ -274,8 +274,8 @@ class TestBus(BusTest):
     service = (await self.bus.read_state())["service"]["bob"]
     self.assertEqual(service, 40.5 + winner)
 
-    self.bus.sample_replies.pop(req, None)
-    self.assertFalse(self.bus.commit_sample_cmd(cmd, ok(late=True), turn.id, Charge(busy_ms=100, gpu_ms=100)))
+    self.bus.ram.drop_reply(req)
+    self.assertFalse(self.bus.commit(cmd, ok(late=True), turn.id, charge=Charge(busy_ms=100, gpu_ms=100)))
     with self.assertRaises(PromiseGoneError):
       await self.bus.wait_for_reply(req, 0)
     self.assertEqual(await self.bus.get_run(sid), run)
@@ -322,7 +322,7 @@ class TestBus(BusTest):
     await self.bus.end_session("s")
     self.assertEqual((await self.bus.queued_and_in_flight(run_id))["queued"], 1)
     self.assertTrue(self.bus.sessions["s"]["active"])
-    self.bus.queues[run_id].clear()
+    self.bus.pending[run_id].clear()
     await self.bus.end_session("s")
     self.assertEqual((await self.bus.queued_and_in_flight(run_id))["queued"], 1)
     await self.bus.delete_run(run_id)
