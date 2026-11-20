@@ -169,6 +169,28 @@ class TestBus(BusTest):
     await self.bus.maintain()
     self.assertNotIn("run:1", self.bus.disk.seen)
 
+  async def test_state_prunes_deleted_runs_and_late_result_does_not_leak_open_grad(self):
+    run_id = await self.new_run()
+    req = await self.bus.submit_command(run_id, Op.FORWARD_BACKWARD, b"")
+    [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
+    await self.bus.delete_run(run_id)
+    st = self.bus.state()
+    self.assertNotIn(run_id, st.home)
+    self.assertFalse(st.busy(turn.worker))
+    self.assertFalse((await self.bus.wait_for_reply(req, 0)).ok)
+    await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(turn, ok(), loaded=True)]))
+    w = self.bus.nodes["n1"].workers[turn.worker]
+    self.assertEqual((w.open_grad, w.loaded), (set(), set()))
+
+  async def test_sample_turn_ignores_trainer_checkpoint_effects(self):
+    sid = await self.new_run(role=Role.SAMPLER)
+    await self.bus.submit_command(sid, Op.SAMPLE, b"{}")
+    [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
+    saved = {"uri": f"tinker://{sid}/weights/bad", "size": 1, "version": "v1"}
+    await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(turn, ok(), saved=saved)]))
+    self.assertFalse(self.bus.db.conn.in_transaction)
+    self.assertIsNone(await self.bus.get_checkpoint(saved["uri"]))
+
   async def test_reaped_boot_id_is_fenced_and_gets_reset_without_overwriting_checkpoint(self):
     run = await self.new_run()
     first = await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")

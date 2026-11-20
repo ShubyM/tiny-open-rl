@@ -62,9 +62,6 @@ class RamKV:
   def delete(self, ns: str, key: str) -> None:
     self.rows.pop((ns, key), None)
 
-  def load(self, ns: str) -> list:
-    return []
-
 
 class Table(dict):
   """In-memory dict persisted to a namespace in `KV`."""

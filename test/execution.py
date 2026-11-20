@@ -70,7 +70,7 @@ class TestNode(NodeDaemon):
       state.procs[proc] = scheduler.Proc(spec, self.id)
       if spec.role == Role.TRAINER:
         state.home[r] = proc
-    self.control.plan_due = 0.0
+    self.control.plan_state, self.control.plan_due = state, 0.0
     await self.tick()
     return self.workers.get(proc)
 

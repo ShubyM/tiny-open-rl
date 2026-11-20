@@ -45,7 +45,8 @@ def gpu_memory_mib() -> int:
 
 def failed(turn: Turn, exc: Exception, charge: Charge | None = None, **times) -> TurnResult:
   """The result of a turn that broke: every command it carried gets the error."""
-  return TurnResult(turn.id, False, [(c.request_id, Reply.error(exc), charge) for c in turn.cmds], **times)
+  rep = Reply.error(exc)
+  return TurnResult(turn.id, False, [(c.request_id, rep, charge) for c in turn.cmds], **times)
 
 
 class WorkerHandle:

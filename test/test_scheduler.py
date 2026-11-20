@@ -916,7 +916,7 @@ class TestMultiNodeExecution(BusTest):
     raise AssertionError(f"no live owner found for {run}")
 
   async def test_the_plan_is_written_only_when_it_changes(self):
-    from tinyrl.bus import Table
+    from tinyrl.kv import Table
     from tinyrl.types import NodeReport
 
     await self.bus.exchange(NodeReport("n", "bn", 1))

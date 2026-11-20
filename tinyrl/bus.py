@@ -10,7 +10,7 @@ import time
 import uuid
 import weakref
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 from tinyrl import types
 from tinyrl.control import scheduler
@@ -60,7 +60,9 @@ class Box:
 
   def __init__(self, kv: KV | RamKV):
     self.kv, self.queued_bytes = kv, 0
-    self.cmds, self.replies, self.seen = (Table(kv, ns) for ns in ("cmds", "replies", "seen"))
+    self.cmds, self.replies, self.seen = (
+      Table(kv, ns) if isinstance(kv, KV) else {} for ns in ("cmds", "replies", "seen")
+    )
     self.reply_bytes = sum(m[3] for m in self.replies.values())
 
   def drop_reply(self, request_id: str) -> None:
@@ -115,7 +117,7 @@ class Bus:
         self.active_turns[tid] = (c.get("node", ""), c.get("boot", ""), Turn(tid, "train", wid, cmds=[cmd]))
     owned = bool(self.active_turns) or any(r["live"] and r.get("owner") for r in self.runs.values())
     self.reap_after = now + LEASE_MS / 1000 if owned else 0.0
-    self.state()
+    self.plan_state = self.state()
 
   def is_sampler(self, run_id: str) -> bool:
     return bool((run := self.runs.get(run_id)) and run["record"]["role"] == Role.SAMPLER)
@@ -241,9 +243,10 @@ class Bus:
   def state(self) -> scheduler.State:
     """The planner's state with the nodes, runs and queues of this moment."""
     s, live = self.plan_state, {rid: row for rid, row in sorted(self.runs.items()) if row["live"]}
-    s.nodes = {nid: (n.gpus, n.memory) for nid, n in self.nodes.items() if not n.draining}
-    s.jobs, s.service = scheduler.jobs(live, {rid: len(q) for rid, q in self.pending.items()}), self.service
-    return s
+    nodes = {nid: (n.gpus, n.memory) for nid, n in self.nodes.items() if not n.draining}
+    jobs = scheduler.jobs(live, {rid: len(q) for rid, q in self.pending.items()})
+    home = {r: p for r, p in s.home.items() if r in jobs}
+    return replace(s, nodes=nodes, home=home, jobs=jobs, service=self.service)
 
   async def live_nodes(self, details: bool = False) -> dict:
     self.reap_dead_nodes()
@@ -269,6 +272,10 @@ class Bus:
 
   async def delete_run(self, run_id: str) -> None:
     box = self.box(run_id)
+    if box is self.disk:
+      err = Reply.error(RuntimeError(f"run {run_id} was deleted"))
+      for p in [p for p in list(self.pending.get(run_id, {}).values()) if p.turn]:
+        self.commit(p.cmd, err, p.turn, clear_owner=True)
     with self.db:
       if row := self.runs.get(run_id):
         row.update(live=False, owner=None, snap=None, writing=None)
@@ -300,8 +307,15 @@ class Bus:
     self.seq += 1
     cmd = Cmd(run_id, f"{time.time_ns() // 1_000_000}-{self.seq}", Op(op), body, cost)
     with box.kv:
-      box.kv.put("blobs", f"c:{cmd.request_id}", body)
-      box.cmds[cmd.request_id] = {"run": run_id, "eid": cmd.entry_id, "op": str(cmd.op), "cost": cost, "seq": self.seq}
+      if box is self.disk:
+        box.kv.put("blobs", f"c:{cmd.request_id}", body)
+        box.cmds[cmd.request_id] = {
+          "run": run_id,
+          "eid": cmd.entry_id,
+          "op": str(cmd.op),
+          "cost": cost,
+          "seq": self.seq,
+        }
       if seq_id is not None:
         box.seen[f"{run_id}:{seq_id}"] = [cmd.request_id, time.time() + SESSION_TTL]
     box.queued_bytes += len(body)
@@ -316,9 +330,11 @@ class Bus:
       now = time.time()
       if (m := box.replies.get(request_id)) and m[2] > now:
         if (body := box.kv.get("blobs", f"r:{request_id}")) is not None:
-          with box.kv:  # a read shortens the reply's life, and moves it to the back of the eviction order
-            del box.replies[request_id]
-            box.replies[request_id] = [m[0], m[1], min(m[2], now + min(REPLY_TTL, READ_REPLY_TTL)), m[3]]
+          m[2] = min(m[2], now + min(REPLY_TTL, READ_REPLY_TTL))
+          with box.kv:
+            if box is self.ram:  # move to the back of the eviction order
+              del box.replies[request_id]
+            box.replies[request_id] = m
           return Reply(bool(m[0]), m[1], body)
       if box is self.ram and entry_id not in self.pending.get(run_id, ()):
         raise PromiseGoneError(f"sampling promise gone: {request_id}")
@@ -460,19 +476,21 @@ class Bus:
       w.hold_until = now + min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, sw))
 
     unanswered = {c.request_id: c for c in turn.cmds}
+    effects = {"mutated": res.mutated, "saved": res.saved, "clear_owner": not res.ok} if turn.kind == "train" else {}
     for req_id, rep, ch in res.results:
       if (cmd := unanswered.pop(req_id, None)) is None:
         continue
-      effects = {"mutated": res.mutated, "saved": res.saved, "clear_owner": not res.ok}
-      if self.commit(cmd, rep, turn.id, charge=ch, **effects) and w and res.ok and ch and ch.gpu_ms:
-        w.gpu_ms += ch.gpu_ms
-        w.run_service[cmd.run] = w.run_service.get(cmd.run, w.service_floor) + ch.gpu_ms
-      if w and res.ok and turn.kind == "train":
-        w.idle_since = now
-        (w.loaded.add if res.loaded else w.loaded.discard)(cmd.run)
-        (w.open_grad.add if cmd.op == Op.FORWARD_BACKWARD and rep.ok else w.open_grad.discard)(cmd.run)
+      if self.commit(cmd, rep, turn.id, charge=ch, **effects) and w and res.ok:
+        if ch and ch.gpu_ms:
+          w.gpu_ms += ch.gpu_ms
+          w.run_service[cmd.run] = w.run_service.get(cmd.run, w.service_floor) + ch.gpu_ms
+        if turn.kind == "train":
+          w.idle_since = now
+          (w.loaded.add if res.loaded else w.loaded.discard)(cmd.run)
+          (w.open_grad.add if cmd.op == Op.FORWARD_BACKWARD and rep.ok else w.open_grad.discard)(cmd.run)
     for cmd in unanswered.values():
-      self.commit(cmd, Reply.error(RuntimeError(f"its {turn.kind} turn failed")), turn.id, clear_owner=True)
+      err = Reply.error(RuntimeError(f"its {turn.kind} turn failed"))
+      self.commit(cmd, err, turn.id, clear_owner=turn.kind == "train")
     if turn.kind == "snapshot":
       rid, row = turn.args["run"], self.runs.get(turn.args["run"])
       if row and row.get("owner") == owner_token(node_id, boot_id, turn.worker):
@@ -755,11 +773,11 @@ class Bus:
     now = time.time()
     expired = [u for u, c in self.checkpoints.items() if c["expires_at"] is not None and c["expires_at"] <= now]
     with self.db:
+      self.flush_dirty()
       for u in expired:
         del self.checkpoints[u]
       if time.monotonic() >= self.gc_due:  # these tables grow with every command, so scan them rarely
         self.gc_due = time.monotonic() + GC_S
-        self.flush_dirty()
         for box in (self.disk, self.ram):
           for k in [k for k, m in box.replies.items() if m[2] <= now]:
             box.drop_reply(k)
