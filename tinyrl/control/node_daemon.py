@@ -17,7 +17,9 @@ import time
 import uuid
 from collections import Counter
 
-from tinyrl.bus import LEASE_MS, connect
+import msgspec
+
+from tinyrl.bus import LEASE_MS, Bus
 from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge, Wave
 from tinyrl.control.process import Process
@@ -367,6 +369,36 @@ class NodeDaemon:
     self.draining = True
     await self.clear_local(self.sweeping)
     await asyncio.to_thread(self.store.close)
+
+
+class ControlClient:
+  """Async HTTP client for the controller's single `POST /internal/exchange` RPC."""
+
+  def __init__(self, url: str | None = None):
+    self.url = (getenv("CONTROL_URL", "http://127.0.0.1:8000") if url is None else url).rstrip("/")
+    self.session = None
+
+  async def aclose(self) -> None:
+    if self.session and not self.session.closed:
+      await self.session.close()
+      self.session = None
+
+  async def exchange(self, report: NodeReport, wait_ms: int = 0) -> NodeReply:
+    import aiohttp
+
+    if self.session is None or self.session.closed:
+      self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+    t = aiohttp.ClientTimeout(total=max(5.0, wait_ms / 1000 + 5.0))
+    url, params = f"{self.url}/internal/exchange", {"wait_ms": str(wait_ms)}
+    async with self.session.post(url, params=params, data=msgspec.msgpack.encode(report), timeout=t) as r:
+      if r.status >= 400:
+        raise aiohttp.ClientError(f"control server returned {r.status}")
+      return msgspec.msgpack.decode(await r.read(), type=NodeReply)
+
+
+def connect(target: str | None = None) -> Bus | ControlClient:
+  url = target if target is not None else os.getenv("CONTROL_URL", "")
+  return ControlClient(url) if url.startswith(("http://", "https://")) else Bus(target)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
   SEED=3 CHAOS=1 python -m test.stress_fleet
 
 SEED picks the cluster and the workload. CHAOS=1 also cancels workers, kills model processes, loses, drains and adds
-nodes, and cuts nodes off from Redis while clients run. It is not part of the suite: run a range of seeds by hand.
+nodes, and cuts nodes off from the controller while clients run. It is not part of the suite: run a range of seeds by hand.
 
 Half of each client's training cycles are pipelined, like the SDK's futures. A second Model replays exactly what each
 client was told succeeded, and at the end each run's saved state must equal it: the system may fail a command, but it
@@ -31,7 +31,8 @@ from test.helpers import BusTest, FakeEngine, new_id, serve_control, tiny
 from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
-from tinyrl.bus import ControlClient, Op, Role, Run
+from tinyrl.bus import Op, Role, Run
+from tinyrl.control.node_daemon import ControlClient
 from tinyrl.storage.store import Store
 from tinyrl.workers.model import Model
 from tinyrl.workers.trainer import Trainer

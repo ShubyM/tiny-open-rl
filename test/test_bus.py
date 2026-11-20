@@ -6,8 +6,9 @@ import unittest
 from unittest import mock
 
 from test.helpers import BusTest, finished, new_id, serve_control
-from tinyrl.bus import BackpressureError, Bus, ControlClient, PromiseGoneError
+from tinyrl.bus import BackpressureError, Bus, PromiseGoneError
 from tinyrl.control.accounting import Charge
+from tinyrl.control.node_daemon import ControlClient
 from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run, WorkerStatus
 
 

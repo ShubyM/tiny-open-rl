@@ -1,4 +1,4 @@
-"""Immutable safetensors checkpoints. Redis binds each logical name to a version after the trainer commits.
+"""Immutable safetensors checkpoints. The Bus binds each logical name to a version after the trainer commits.
 
 Local saves rename a completed directory into objects/<id>. Bucket saves stage the same files in the node cache,
 serve them to peers, and upload a per-version manifest last so readers see only complete versions.

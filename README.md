@@ -41,9 +41,9 @@ flowchart TD
   T -->|Checkpoints| C[("Store")]
 ```
 
-The control plane runs in one process (`tinyrl/bus.py`) and talks to every node daemon through a single RPC: `POST /internal/exchange`. A node reports its live workers, staged checkpoints, and completed turn results; the controller atomically commits finished results, reconciles cluster placement, selects the next fair GPU turns, and replies with acknowledgements and concrete turns to execute.
+The control plane runs in one process (`tinyrl/bus.py`) and talks to every node daemon through a single RPC: `POST /internal/exchange`. A node reports its live workers, staged checkpoints, and completed turn results; the controller atomically commits finished results, selects the next fair GPU turns, and replies with acknowledgements and the turns the node does not hold yet. Cluster placement is reconciled on a 100 ms tick, or at once when a run or node comes or goes.
 
-- **Durable training, RAM sampling.** Accepted trainer commands persist in a transactional SQLite WAL key-value store (`TINYRL_DB`) so replies, run positions, checkpoints, and service accounting commit together atomically. High-QPS sampling queues and replies stay in RAM with bounded memory backpressure (`429`) and `410` on lost promises so the Tinker SDK resubmits transparently.
+- **Durable training, RAM sampling.** Accepted trainer commands persist in a transactional SQLite WAL key-value store (`TINYRL_DB`) so replies, run positions, checkpoints, and service accounting commit together atomically. High-QPS sampling queues and replies stay in RAM with bounded memory backpressure (`429`) and `410` on lost promises so the Tinker SDK resubmits transparently. Both kinds of command take one path; only the store under it differs ([kv.py](tinyrl/kv.py)).
 - **Cluster placement & GPU turns.** Each training run has one trainer home; compatible LoRA runs can share a trainer. Sampler sessions use any replica in a pool sized from its combined backlog and available GPUs. Inside `exchange`, the controller grants GPU blocks with fairness, switch-cost hysteresis, open-gradient holds, and gang reservations, while each node daemon owns only process supervision and physical GPU handoff (`prepare`).
 - **Trainers & samplers:** Trainers run as isolated synchronous PyTorch/PEFT processes (FSDP via `torchrun` across multiple GPUs) with bf16 forward, fp32 master weights + AdamW state, chunked logprobs, and pinned host-memory parking when yielding a GPU. Samplers drive isolated vLLM processes (or a custom `ENGINE=module:Class`).
 - **Checkpoints:** Pure `safetensors` via [store.py](tinyrl/storage/store.py) (`put`/`get`), committed atomically under the worker's ownership token. Bucket saves stage in `CKPT_CACHE` and upload asynchronously; other nodes can fetch pending versions directly from the writer node.
@@ -56,12 +56,13 @@ The control plane runs in one process (`tinyrl/bus.py`) and talks to every node 
 
 | File | Responsibility |
 |---|---|
-| [tinyrl/bus.py](tinyrl/bus.py) | Single-process controller: transactional KV trainer state, RAM sampling, `exchange` scheduler, and msgpack client |
+| [tinyrl/bus.py](tinyrl/bus.py) | Single-process controller: runs, commands and replies (on disk for trainers, in RAM for samplers), checkpoints, and the `exchange` scheduler |
+| [tinyrl/kv.py](tinyrl/kv.py) | SQLite WAL key-value store, its RAM twin, and write-through tables |
 | [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, `/internal/exchange` RPC, checkpoints, and Prometheus `/metrics` |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs and numpy encoding |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | Pure cluster placement: runs to workers, workers to nodes |
 | [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | Monotonic GPU-time accounting across overlapping calls |
-| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | Thin turn executor: `exchange` loop, process supervision, physical GPU handoff (`prepare`), prefetch, and drain |
+| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | Thin turn executor: `exchange` loop and its msgpack client, process supervision, physical GPU handoff (`prepare`), prefetch, and drain |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | Private Unix IPC and process-group management |
 | [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | Model memory and GPU-width estimation |
 | [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | Synchronous trainer command loop and checkpoint metadata |

@@ -6,7 +6,7 @@ from time import monotonic_ns, time_ns
 
 @dataclass
 class Charge:
-  started_ms: int = field(default_factory=lambda: time_ns() // 1_000_000)  # Redis stream IDs use Unix time
+  started_ms: int = field(default_factory=lambda: time_ns() // 1_000_000)  # entry ids start with Unix time
   busy_ms: int = 0
   gpu_ms: float = 0.0
 

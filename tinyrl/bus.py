@@ -1,4 +1,4 @@
-"""Single-process control plane: transactional KV trainer state, RAM sampling, and one `exchange` RPC."""
+"""Single-process control plane: one command path (on disk for trainers, in RAM for samplers) and one `exchange` RPC."""
 
 from __future__ import annotations
 
@@ -6,21 +6,18 @@ import asyncio
 import contextlib
 import itertools
 import json
-import os
-import sqlite3
 import time
 import uuid
 import weakref
 from collections import deque
 from dataclasses import asdict, dataclass
 
-import msgspec
-
 from tinyrl import types
 from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge
 from tinyrl.control.fairness import Demand, Worker, blocks, plan_gpus, select_runs
 from tinyrl.helpers import getenv
+from tinyrl.kv import KV, RamKV, Table
 from tinyrl.types import Cmd, Ev, NodeReply, NodeReport, Op, Reply, Role, Run, Turn, TurnResult, parse_uri
 
 LIVE_SECONDS, SESSION_GRACE = 30, getenv("SESSION_GRACE", 60)
@@ -56,90 +53,6 @@ class NodeRuntime:
     self.node, self.boot_id, self.gpus, self.memory = node, boot_id, gpus, memory
     self.draining, self.lag, self.until, self.next_wake = False, 0.0, 0.0, None
     self.workers, self.staged, self.stage_errors = {}, set(), {}
-
-
-class KV:
-  """Transactional SQLite key-value store backing `Table` dicts and on-disk binary blobs."""
-
-  def __init__(self, path: str):
-    if path != ":memory:":
-      os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    self.conn = sqlite3.connect(path, isolation_level="IMMEDIATE")
-    for p in ("journal_mode=WAL", "synchronous=NORMAL", "busy_timeout=5000", "auto_vacuum=INCREMENTAL"):
-      self.conn.execute(f"PRAGMA {p}")
-    self.conn.execute("CREATE TABLE IF NOT EXISTS kv (ns TEXT, k TEXT, v BLOB, PRIMARY KEY (ns, k))")
-    self.conn.commit()
-    self.close = self.conn.close
-
-  def __enter__(self):
-    return self.conn.__enter__()
-
-  def __exit__(self, *exc):
-    return self.conn.__exit__(*exc)
-
-  def get(self, ns: str, key: str) -> bytes | None:
-    row = self.conn.execute("SELECT v FROM kv WHERE ns=? AND k=?", (ns, key)).fetchone()
-    return bytes(row[0]) if row else None
-
-  def put(self, ns: str, key: str, value: str | bytes) -> None:
-    self.conn.execute("INSERT OR REPLACE INTO kv VALUES (?, ?, ?)", (ns, key, value))
-
-  def delete(self, ns: str, key: str) -> None:
-    self.conn.execute("DELETE FROM kv WHERE ns=? AND k=?", (ns, key))
-
-  def load(self, ns: str) -> list[tuple[str, str]]:
-    return self.conn.execute("SELECT k, v FROM kv WHERE ns=?", (ns,)).fetchall()
-
-
-class Table(dict):
-  """In-memory dict persisted to a namespace in `KV`."""
-
-  def __init__(self, kv: KV, ns: str):
-    self.kv, self.ns = kv, ns
-    super().__init__((k, msgspec.msgpack.decode(v)) for k, v in kv.load(ns))
-
-  def __setitem__(self, key: str, value) -> None:
-    super().__setitem__(key, value)
-    self.kv.put(self.ns, key, msgspec.msgpack.encode(value))
-
-  def __delitem__(self, key: str) -> None:
-    super().__delitem__(key)
-    self.kv.delete(self.ns, key)
-
-  def pop(self, key: str, *default):
-    if key not in self:
-      return default[0] if default else super().pop(key)
-    val = self[key]
-    del self[key]
-    return val
-
-  def save(self, key: str) -> None:
-    self[key] = self[key]
-
-
-class RamKV:
-  """`KV` without the disk, for sampling, which a restart may forget."""
-
-  def __init__(self):
-    self.rows = {}
-
-  def __enter__(self):
-    return self
-
-  def __exit__(self, *exc):
-    return False
-
-  def get(self, ns: str, key: str) -> bytes | None:
-    return self.rows.get((ns, key))
-
-  def put(self, ns: str, key: str, value: str | bytes) -> None:
-    self.rows[ns, key] = value
-
-  def delete(self, ns: str, key: str) -> None:
-    self.rows.pop((ns, key), None)
-
-  def load(self, ns: str) -> list:
-    return []
 
 
 class Box:
@@ -867,33 +780,3 @@ class Bus:
   async def read_events(self, after: str = "0-0", count: int = 10_000) -> list[types.Event]:
     cutoff = types.entry_sort_key(after)
     return [ev for ev in self.events if types.entry_sort_key(ev.id) > cutoff][:count]
-
-
-class ControlClient:
-  """Async HTTP client for the controller's single `POST /internal/exchange` RPC."""
-
-  def __init__(self, url: str | None = None):
-    self.url = (getenv("CONTROL_URL", "http://127.0.0.1:8000") if url is None else url).rstrip("/")
-    self.session = None
-
-  async def aclose(self) -> None:
-    if self.session and not self.session.closed:
-      await self.session.close()
-      self.session = None
-
-  async def exchange(self, report: NodeReport, wait_ms: int = 0) -> NodeReply:
-    import aiohttp
-
-    if self.session is None or self.session.closed:
-      self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
-    t = aiohttp.ClientTimeout(total=max(5.0, wait_ms / 1000 + 5.0))
-    url, params = f"{self.url}/internal/exchange", {"wait_ms": str(wait_ms)}
-    async with self.session.post(url, params=params, data=msgspec.msgpack.encode(report), timeout=t) as r:
-      if r.status >= 400:
-        raise aiohttp.ClientError(f"control server returned {r.status}")
-      return msgspec.msgpack.decode(await r.read(), type=NodeReply)
-
-
-def connect(target: str | None = None) -> Bus | ControlClient:
-  url = target if target is not None else os.getenv("CONTROL_URL", "")
-  return ControlClient(url) if url.startswith(("http://", "https://")) else Bus(target)
