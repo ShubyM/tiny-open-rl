@@ -79,6 +79,7 @@ class Cmd:
   op: Op
   body: bytes
   cost: int = 1
+  refs: tuple[str, ...] = ()
 
   @property
   def request_id(self) -> str:
@@ -108,19 +109,9 @@ class Event:
 
 
 @dataclass(frozen=True)
-class WorkerStatus:
-  worker: str
-  gpus: tuple[int, ...] = ()
-  bound: tuple[int, ...] = ()
-  pid: int | None = None
-  loaded: tuple[str, ...] = ()
-  park_s: float = 0.0
-
-
-@dataclass(frozen=True)
 class Turn:
   id: str
-  kind: str  # "train" | "sample" | "snapshot" | "close"
+  kind: str  # "train" | "sample" | "park" | "snapshot" | "close"
   worker: str
   spec: WorkerSpec = WorkerSpec()
   gpus: tuple[int, ...] = ()
@@ -150,7 +141,7 @@ class NodeReport:
   memory: int = 0
   draining: bool = False
   lag: float = 0.0
-  workers: list[WorkerStatus] = field(default_factory=list)
+  pids: dict[str, int | None] | None = None
   finished: list[TurnResult] = field(default_factory=list)
   staged: list[str] = field(default_factory=list)
   stage_errors: dict[str, str] = field(default_factory=dict)

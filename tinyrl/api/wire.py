@@ -55,12 +55,9 @@ def unpack_stability(raw: bytes) -> tuple[np.ndarray, np.ndarray]:
 def parse_spans(spans) -> tuple[Span, ...]:
   out = []
   for s in spans:
-    if (which := s.WhichOneof("span")) == "sampled_tokens":
-      p = s.sampled_tokens
-      out.append(Span("sampled", p.sequence_id, p.offset, p.length))
-    elif which == "prompt_tokens":
-      p = s.prompt_tokens
-      out.append(Span("prompt", p.sequence_id, p.offset, p.length))
+    if (which := s.WhichOneof("span")) in ("sampled_tokens", "prompt_tokens"):
+      p = getattr(s, which)
+      out.append(Span("sampled" if which == "sampled_tokens" else "prompt", p.sequence_id, p.offset, p.length))
   return tuple(out)
 
 
@@ -132,35 +129,6 @@ def loss_config(req: pb.ForwardBackwardRequest) -> dict[str, float | str]:
   return dict(req.loss_fn_config)
 
 
-def from_json(body: dict, forward_only: bool = False) -> pb.ForwardBackwardRequest:
-  """Turn the JSON forward_backward that SDKs before 0.25 send into the same protobuf, so the trainer reads one format."""
-  fb = body.get("forward_backward_input") or body.get("forward_input") or {}
-  req = pb.ForwardBackwardRequest(
-    model_id=body["model_id"],
-    loss_fn=fb.get("loss_fn") or "cross_entropy",
-    forward_only=forward_only or bool(body.get("forward_only")),
-  )
-
-  for k, v in (fb.get("loss_fn_config") or {}).items():
-    value = pb.LossConfigValue(text=v) if isinstance(v, str) else pb.LossConfigValue(number=v)
-    req.loss_fn_config_v2[k].CopyFrom(value)
-
-  for d in fb.get("data", []):
-    datum = req.data.add()
-    tokens = [token for chunk in d["model_input"]["chunks"] for token in chunk["tokens"]]
-    datum.model_input.add().encoded_text.tokens = np.array(tokens, np.int32).tobytes()
-
-    for name, value in d.get("loss_fn_inputs", {}).items():
-      if not isinstance(value, dict):  # older clients send bare lists
-        value = {"data": value}
-      is_int = value.get("dtype", "int64" if name == "target_tokens" else "float32") == "int64"
-      array = np.array(value["data"], np.int64 if is_int else np.float32)
-      tensor = pb.Tensor(dense=array.tobytes(), dtype=pb.DTYPE_INT64 if is_int else pb.DTYPE_FLOAT32, shape=array.shape)
-      datum.loss_fn_inputs[name].CopyFrom(tensor)
-
-  return req
-
-
 # ***** outputs *****
 
 
@@ -173,33 +141,6 @@ def output(logprobs: list[np.ndarray], metrics: dict[str, float]) -> bytes:
     field.data = np.concatenate(logprobs).astype(np.float32).tobytes()
     field.offsets = np.cumsum([0] + [4 * len(x) for x in logprobs], dtype=np.int64).tobytes()
   return out.SerializeToString()
-
-
-def output_json(raw: bytes) -> dict:
-  """Decode a ForwardBackwardOutput, for clients that did not ask for protobuf."""
-  out = pb.ForwardBackwardOutput.FromString(raw)
-
-  rows = []
-  for record in out.loss_fn_outputs:
-    columns = {name: unbatch(tensor) for name, tensor in record.fields.items()}
-    for i in range(record.num_datums):
-      rows.append({name: tensor_json(values[i]) for name, values in columns.items()})
-
-  return {
-    "type": "forward_backward",
-    "loss_fn_output_type": out.loss_fn_output_type,
-    "metrics": dict(out.metrics),
-    "loss_fn_outputs": rows,
-  }
-
-
-def unbatch(tensor: pb.BatchedTensor) -> list[np.ndarray]:
-  offsets = np.frombuffer(tensor.offsets, np.int64)
-  return [to_numpy(tensor.dtype, tensor.data[start:end]) for start, end in zip(offsets[:-1], offsets[1:])]
-
-
-def tensor_json(x: np.ndarray) -> dict:
-  return {"data": x.tolist(), "dtype": "int64" if x.dtype.kind == "i" else "float32", "shape": list(x.shape)}
 
 
 @dataclass(frozen=True)
@@ -233,35 +174,3 @@ def sample_output(
   if topk_prompt is not None:
     pack_topk(out.topk_prompt_logprobs, topk_prompt)
   return out.SerializeToString()
-
-
-def _format_topk(tk_pb):
-  ids = np.frombuffer(tk_pb.token_ids, np.int32).reshape(tk_pb.length, tk_pb.k)
-  lps = np.frombuffer(tk_pb.logprobs, np.float32).reshape(tk_pb.length, tk_pb.k)
-  return [
-    None
-    if ids[i, 0] == 0 and lps[i, 0] == MASK_LOGPROB
-    else [[int(tid), float(lp)] for tid, lp in zip(ids[i], lps[i]) if not (tid == 0 and lp == MASK_LOGPROB)]
-    for i in range(tk_pb.length)
-  ]
-
-
-def sample_json(raw: bytes) -> dict:
-  out = pb.SampleResponse.FromString(raw)
-  sequences = []
-  for seq in out.sequences:
-    item = {
-      "stop_reason": "stop" if seq.stop_reason == pb.STOP_REASON_STOP else "length",
-      "tokens": np.frombuffer(seq.tokens, np.int32).tolist(),
-      "logprobs": np.frombuffer(seq.logprobs, np.float32).tolist(),
-    }
-    if seq.HasField("topk_sampled_logprobs"):
-      item["topk_logprobs"] = _format_topk(seq.topk_sampled_logprobs)
-    sequences.append(item)
-
-  res = {"type": "sample", "sequences": sequences}
-  if out.prompt_logprobs:
-    res["prompt_logprobs"] = [None if np.isnan(x) else float(x) for x in np.frombuffer(out.prompt_logprobs, np.float32)]
-  if out.HasField("topk_prompt_logprobs"):
-    res["topk_prompt_logprobs"] = _format_topk(out.topk_prompt_logprobs)
-  return res

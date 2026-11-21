@@ -61,8 +61,6 @@ def encode_stability(request_id: str, out: Out) -> dict[str, bytes]:
 
 
 class Sampler:
-  records_stability = True
-
   def __init__(self, base: str, lora: bool, env=None, engine=None):
     self.env = dict(os.environ if env is None else env)
     module, name = self.env.get("ENGINE", "tinyrl.workers.vllm:VLLM").split(":")

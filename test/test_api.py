@@ -14,7 +14,6 @@ import torch
 
 from test.execution import TestNode
 from test.helpers import BusTest, tiny
-from test.test_wire import json_body
 from tinyrl import bus
 from tinyrl.api import gateway, wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
@@ -103,20 +102,19 @@ class TestAPI(BusTest):
     info = (await self.post("get_info", json={"model_id": run_id})).json()
     self.assertEqual(info["model_data"], {"model_name": "tiny", "tokenizer_id": "tiny"})
 
-  async def test_json_clients_get_json(self):
+  async def test_forward_only_matches_forward_backward_logprobs(self):
     run_id = await self.create_model()
-    fwdbwd = await self.result(await self.post("forward_backward", json={**json_body(), "model_id": run_id}))
-    forward_body = {"model_id": run_id, "forward_input": json_body()["forward_backward_input"]}
-    forward = await self.result(await self.post("forward", json=forward_body))
+    fb_req = pb.ForwardBackwardRequest.FromString(proto_body(run_id, n=3))
+    fwdbwd = await self.result(await self.post("forward_backward", content=fb_req.SerializeToString(), headers=PROTO))
+    fb_req.forward_only = True
+    forward = await self.result(await self.post("forward_backward", content=fb_req.SerializeToString(), headers=PROTO))
 
-    fwdbwd, forward = fwdbwd.json(), forward.json()
-    self.assertEqual(fwdbwd["type"], "forward_backward")
-    self.assertEqual(len(fwdbwd["loss_fn_outputs"]), 2)
-    self.assertEqual(fwdbwd["loss_fn_outputs"][0]["logprobs"]["shape"], [3])
+    out_fb = pb.ForwardBackwardOutput.FromString(fwdbwd.content)
+    out_fwd = pb.ForwardBackwardOutput.FromString(forward.content)
+    self.assertEqual(out_fb.loss_fn_outputs[0].num_datums, 2)
     # dropout is off, so the forward pass gives the same logprobs as the forward_backward pass
     self.assertEqual(
-      [row["logprobs"]["data"] for row in forward["loss_fn_outputs"]],
-      [row["logprobs"]["data"] for row in fwdbwd["loss_fn_outputs"]],
+      out_fwd.loss_fn_outputs[0].fields["logprobs"].data, out_fb.loss_fn_outputs[0].fields["logprobs"].data
     )
 
   async def test_checkpoints(self):
@@ -195,7 +193,6 @@ class TestAPI(BusTest):
       self.assertEqual((await self.post(path, **kwargs)).status_code, 404)
 
     self.assertEqual((await self.post("forward_backward", content=b"\xff\xff", headers=PROTO)).status_code, 400)
-    self.assertEqual((await self.post("forward_backward", json={"forward_backward_input": {}})).status_code, 400)
 
     # a call that fails in the trainer comes back as a 200 with the error, which is what the SDK reads
     failed = await self.result(
@@ -370,9 +367,10 @@ class TestAPI(BusTest):
 
     await self.drain(run_id)
 
-    out1 = (await self.result(r1)).json()
+    out1 = await self.result(r1)
     out2 = (await self.result(r2)).json()
-    self.assertEqual(out1["type"], "forward_backward")
+    self.assertEqual(out1.headers["content-type"], wire.PROTO)
+    self.assertEqual(pb.ForwardBackwardOutput.FromString(out1.content).loss_fn_outputs[0].num_datums, 2)
     self.assertEqual(out2["type"], "save_weights_for_sampler")
     self.assertIn("path", out2)
 
@@ -388,10 +386,10 @@ class TestAPI(BusTest):
     r1 = res1.json()
     self.assertNotEqual(r1["request_id"], r2["request_id"])
 
-    out1 = (await self.result(res1)).json()
-    out2 = (await self.result(res2)).json()
-    self.assertEqual(out1["type"], "forward_backward")
-    self.assertEqual(out2["type"], "forward_backward")
+    out1 = await self.result(res1)
+    out2 = await self.result(res2)
+    self.assertEqual(pb.ForwardBackwardOutput.FromString(out1.content).loss_fn_outputs[0].num_datums, 2)
+    self.assertEqual(pb.ForwardBackwardOutput.FromString(out2.content).loss_fn_outputs[0].num_datums, 2)
 
   async def test_a_call_on_a_deleted_run_is_a_404_with_or_without_a_seq_id(self):
     run_id = await self.create_model()

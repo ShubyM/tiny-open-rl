@@ -300,7 +300,7 @@ class Stress(BusTest):
       )
       for proc, h in node.workers.items():
         out.append(
-          f"  {proc} role={h.spec.role.value} gpus={h.spec.gpus} loaded={sorted(h.loaded)} state={h.state.value} readers={h.readers}"
+          f"  {proc} role={h.spec.role.value} gpus={h.spec.gpus} loaded={sorted(h.loaded)} resident={h.resident}"
         )
     print("\n".join(out), file=sys.stderr)
 

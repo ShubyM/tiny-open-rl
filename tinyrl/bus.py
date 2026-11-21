@@ -13,7 +13,6 @@ from collections import Counter, deque
 from dataclasses import asdict, dataclass, replace
 
 from tinyrl import types
-from tinyrl.api import wire
 from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge
 from tinyrl.control.fairness import Demand, Worker, admit_samples, blocks, plan_gpus, rank_runs
@@ -47,7 +46,7 @@ class WorkerRuntime:
     self.id, self.spec, self.resident, self.bound, self.pid = wid, spec, resident, bound, pid
     self.loaded, self.open_grad, self.run_service = set(loaded), set(), {}
     self.hold_until = self.idle_since = self.gpu_ms = self.service_floor = 0.0
-    self.park_s, self.active_turns = park_s, set()
+    self.park_s, self.active_turns, self.broken = park_s, set(), False
 
 
 class NodeRuntime:
@@ -113,7 +112,9 @@ class Bus:
     for req_id, c in sorted(self.disk.cmds.items(), key=lambda kv: kv[1]["seq"]):
       if (rid := c["run"]) not in self.pending:
         continue
-      cmd = Cmd(rid, c["eid"], Op(c["op"]), self.db.get("blobs", f"c:{req_id}") or b"", c["cost"])
+      cmd = Cmd(
+        rid, c["eid"], Op(c["op"]), self.db.get("blobs", f"c:{req_id}") or b"", c["cost"], tuple(c.get("refs", ()))
+      )
       self.pending[rid][c["eid"]] = Pending(cmd, c.get("turn"), now)
       self.disk.queued_bytes += len(cmd.body)
       if tid := c.get("turn"):
@@ -299,7 +300,13 @@ class Bus:
     return e[0] if e and e[1] > time.time() else None
 
   async def submit_command(
-    self, run_id: str, op: Op, body: bytes, seq_id: int | None = None, cost: int = 1
+    self,
+    run_id: str,
+    op: Op,
+    body: bytes,
+    seq_id: int | None = None,
+    cost: int = 1,
+    refs: tuple[str, ...] = (),
   ) -> str | None:
     if existing := await self.seen_request(run_id, seq_id):
       return existing
@@ -309,7 +316,7 @@ class Bus:
     if box is self.ram and box.queued_bytes + len(body) > SAMPLE_QUEUE_BYTES:
       raise BackpressureError("sampling queue memory limit reached")
     self.seq += 1
-    cmd = Cmd(run_id, f"{time.time_ns() // 1_000_000}-{self.seq}", Op(op), body, cost)
+    cmd = Cmd(run_id, f"{time.time_ns() // 1_000_000}-{self.seq}", Op(op), body, cost, refs)
     with box.kv:
       if box is self.disk:
         box.kv.put("blobs", f"c:{cmd.request_id}", body)
@@ -319,6 +326,7 @@ class Bus:
           "op": str(cmd.op),
           "cost": cost,
           "seq": self.seq,
+          **({"refs": list(refs)} if refs else {}),
         }
       if seq_id is not None:
         box.seen[f"{run_id}:{seq_id}"] = [cmd.request_id, time.time() + SESSION_TTL]
@@ -454,17 +462,15 @@ class Bus:
     node.gpus, node.memory, node.draining, node.lag = report.gpus, report.memory, report.draining, report.lag
     node.until, node.staged = now + LEASE_MS / 1000, set(report.staged)
     node.stage_errors.update(report.stage_errors)
-    reported = {ws.worker: ws for ws in report.workers}
-    for wid, ws in reported.items():
-      if w := node.workers.get(wid):
-        w.pid, w.park_s, w.bound = ws.pid, ws.park_s, ws.bound or w.bound
-        if not w.active_turns:
-          w.resident, w.loaded = ws.gpus, set(ws.loaded)
-      elif proc := self.plan_state.procs.get(wid):
-        node.workers[wid] = WorkerRuntime(wid, proc.spec, ws.gpus, ws.bound, ws.pid, ws.loaded, ws.park_s)
-    for wid in [k for k, w in node.workers.items() if not w.active_turns and k not in reported]:
-      del node.workers[wid]
-      self.clear_owners(lambda _, o, t=owner_token(node.node, node.boot_id, wid): o == t)
+    if report.pids is not None:
+      for wid, pid in report.pids.items():
+        if w := node.workers.get(wid):
+          w.pid = pid
+        elif proc := self.plan_state.procs.get(wid):
+          node.workers[wid] = WorkerRuntime(wid, proc.spec, pid=pid)
+      for wid in [k for k, w in node.workers.items() if not w.active_turns and k not in report.pids]:
+        del node.workers[wid]
+        self.clear_owners(lambda _, o, t=owner_token(node.node, node.boot_id, wid): o == t)
     return node
 
   def finish_once(self, node_id: str, boot_id: str, res: TurnResult) -> None:
@@ -476,7 +482,7 @@ class Bus:
     if w:
       w.active_turns.discard(res.turn_id)
     if w and res.ok and res.resume_s > 0:
-      sw = (res.park_s + res.resume_s) / max(0.01, SWITCH_BUDGET) if res.park_s else 0.0
+      sw = (w.park_s + res.resume_s) / max(0.01, SWITCH_BUDGET) if w.park_s else 0.0
       w.hold_until = now + min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, sw))
 
     if cmd := turn.cmd:
@@ -500,7 +506,9 @@ class Bus:
         self.stability_bytes += len(blob)
       while self.stability_bytes > STABILITY_BYTES and len(self.stability) > 1:
         self.stability_bytes -= len(self.stability.pop(next(iter(self.stability)))[0])
-    if turn.kind == "snapshot":
+    if turn.kind == "park" and w and res.ok:
+      w.resident, w.park_s = (), res.park_s
+    elif turn.kind == "snapshot":
       rid, row = turn.args["run"], self.runs.get(turn.args["run"])
       if row and row.get("owner") == owner_token(node_id, boot_id, turn.worker):
         row["owner"] = row["writing"] = None
@@ -512,13 +520,14 @@ class Bus:
       if w:
         w.loaded.discard(rid)
         w.open_grad.discard(rid)
-    elif turn.kind == "close":
-      self.clear_owners(lambda _, o, t=owner_token(node_id, boot_id, turn.worker): o == t)
     if w and res.ok and w.run_service:
       w.service_floor = max(w.service_floor, min(w.run_service.values()))
-    drop_w = turn.kind == "close" or turn.args.get("close") or (not res.ok and turn.kind in ("train", "sample"))
+    if w and not res.ok and turn.kind in ("train", "sample", "park"):
+      w.broken = True
+    drop_w = turn.kind == "close" or turn.args.get("close") or bool(w and w.broken and not w.active_turns)
     if drop_w and node:
       node.workers.pop(turn.worker, None)
+      self.clear_owners(lambda _, o, t=owner_token(node_id, boot_id, turn.worker): o == t)
     self.wake_all()
 
   def reconcile(self) -> list[tuple[Ev, dict]]:
@@ -545,9 +554,6 @@ class Bus:
       w.resident = turn.gpus
       if not w.bound and (turn.spec.role == Role.SAMPLER or turn.spec.gpus > 1):
         w.bound = turn.gpus
-      for o in node.workers.values():
-        if o.id != w.id and o.resident and not set(o.resident).isdisjoint(turn.gpus):
-          o.resident = ()
     if cmd := turn.cmd:
       self.pending[cmd.run][cmd.entry_id] = Pending(cmd, turn.id, now)
       if turn.kind == "train":
@@ -603,7 +609,7 @@ class Bus:
 
     # Phase 1: Drain, evict moved/blocked workers, and detach runs reassigned off a worker (off-GPU).
     for wid, w in list(node.workers.items()):
-      if w.active_turns:
+      if w.active_turns or w.broken:
         continue
       tok = owner_token(node.node, node.boot_id, wid)
       owned = [rid for rid, r in self.runs.items() if r["live"] and r.get("owner") == tok]
@@ -633,10 +639,14 @@ class Bus:
     # Phase 2: Gather ready commands + off-GPU checkpoint prefetch, then assign GPUs via plan_gpus.
     prefetch, ready_by, workers_plan, occupied, linger_at = set(), {}, {}, set(), []
     for wid, proc in sorted(placed.items()):
-      if wid in evicting:
+      w = node.workers.get(wid)
+      parking = bool(
+        w and any(self.active_turns[t][2].kind == "park" for t in w.active_turns if t in self.active_turns)
+      )
+      if wid in evicting or (w and (w.broken or parking)):
         continue
       spec = proc.spec
-      w = node.workers.get(wid) or WorkerRuntime(wid, spec)
+      w = w or WorkerRuntime(wid, spec)
       active = bool(w.active_turns)
       if active and w.resident:
         occupied.update(w.resident)
@@ -660,16 +670,21 @@ class Bus:
       hold = float("inf") if (active and spec.role == Role.TRAINER) else w.hold_until
       workers_plan[wid] = Worker(spec.gpus, spec.exclusive, demand, w.resident, w.bound, gang, hold, lag, w.gpu_ms)
 
+    occupied.update(g for wid, w in node.workers.items() if wid not in workers_plan for g in w.resident)
     keep, wake_at = plan_gpus(workers_plan, node.gpus, now, occupied)
     node.next_wake = min((d for d in (wake_at, *linger_at) if d is not None and d > now), default=None)
+
+    # Park any idle resident whose GPUs were reassigned before another worker enters them.
+    for wid, w in list(node.workers.items()):
+      if w.resident and not w.active_turns and not w.broken and keep.get(wid) != w.resident:
+        self.issue(node, Turn(uuid.uuid4().hex[:12], "park", wid, w.spec))
 
     # Phase 3: Issue concrete turns for granted GPU blocks (continuous slot refill for samplers).
     for wid, gpus in keep.items():
       w, spec, ready = node.workers.get(wid), placed[wid].spec, ready_by.get(wid, [])
-      if any(
-        o.id != wid and o.active_turns and o.resident and not set(o.resident).isdisjoint(gpus)
-        for o in node.workers.values()
-      ):
+      if any(o.resident and not set(o.resident).isdisjoint(gpus) for o in node.workers.values() if o.id != wid):
+        continue
+      if w and (w.broken or (w.resident and w.resident != gpus)):
         continue
       if not ready:
         continue
@@ -691,17 +706,14 @@ class Bus:
           ver = uuid.uuid4().hex
         need_snap = row["snap"] and not (w and rid in w.loaded) and cmd.op != Op.LOAD_WEIGHTS
         args = {"record": dict(row["record"]), "saved": row["snap"][1] if need_snap else None, "version": ver}
-        if cmd.op == Op.FORWARD_BACKWARD and b"stable_reinforce" in cmd.body:
-          with contextlib.suppress(ValueError):
-            req = wire.parse(cmd.body)
-            if req.loss_fn == "stable_reinforce":
-              wall, stab = time.time(), {}
-              for sid in wire.referenced_sequences(req):
-                if (item := self.stability.get(sid)) and item[1] > wall:
-                  del self.stability[sid]
-                  self.stability[sid] = (item[0], wall + STABILITY_TTL)
-                  stab[sid] = item[0]
-              args["stability"] = stab
+        if cmd.refs:
+          wall, stab = time.time(), {}
+          for sid in cmd.refs:
+            if (item := self.stability.get(sid)) and item[1] > wall:
+              del self.stability[sid]
+              self.stability[sid] = (item[0], wall + STABILITY_TTL)
+              stab[sid] = item[0]
+          args["stability"] = stab
         self.issue(node, Turn(uuid.uuid4().hex[:12], "train", wid, spec, gpus, cmd, args=args))
         continue
       live = [self.active_turns[t][2] for t in (w.active_turns if w else ()) if t in self.active_turns]

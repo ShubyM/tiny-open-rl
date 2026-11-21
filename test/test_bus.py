@@ -9,7 +9,7 @@ from test.helpers import BusTest, finished, new_id, serve_control
 from tinyrl.bus import BackpressureError, Bus, PromiseGoneError
 from tinyrl.control.accounting import Charge
 from tinyrl.control.node_daemon import ControlClient
-from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run, WorkerStatus
+from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run
 
 
 def ok(**body) -> Reply:
@@ -227,9 +227,7 @@ class TestBus(BusTest):
     self.assertIsNotNone(req1)
 
     # Draining n1 issues an off-GPU snapshot turn.
-    drain_reply = await self.bus.exchange(
-      NodeReport("n1", "b1", 1, draining=True, workers=[WorkerStatus(t1.worker, (0,), loaded=(run_id,))])
-    )
+    drain_reply = await self.bus.exchange(NodeReport("n1", "b1", 1, draining=True))
     [snap_turn] = drain_reply.turns
     self.assertEqual((snap_turn.kind, snap_turn.gpus, snap_turn.args["run"]), ("snapshot", (), run_id))
     snap_ver = snap_turn.args["version"]
@@ -248,9 +246,7 @@ class TestBus(BusTest):
     self.assertIsNotNone(await self.bus.get_checkpoint(parked_uri))
 
     await self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
-    [mut] = (
-      await self.bus.exchange(NodeReport("n2", "b2", 1, workers=[WorkerStatus(ro.worker, (0,), loaded=(run_id,))]))
-    ).turns
+    [mut] = (await self.bus.exchange(NodeReport("n2", "b2", 1))).turns
     await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(mut, ok(), mutated=True, loaded=True)]))
     self.assertIsNone((await self.bus.get_run(run_id)).get("snap"))
     self.assertIsNone(await self.bus.get_checkpoint(parked_uri))

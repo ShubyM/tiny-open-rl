@@ -525,7 +525,7 @@ class TestTrainer(BusTest):
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
     )
     await self.node.drain(run)
-    await self.node.drop_handle(self.node.workers["p"])  # a lost process has no detached snapshot
+    await self.node.drop_worker("p", self.node.workers["p"])  # a lost process has no detached snapshot
     await self.node.tick()
     ids = await self.submit(
       run,

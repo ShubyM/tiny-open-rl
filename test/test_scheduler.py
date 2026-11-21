@@ -15,8 +15,8 @@ from test.helpers import BusTest, FakeEngine, new_id, tiny
 from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
-from tinyrl.api import wire
-from tinyrl.bus import QUANTUM_MS, Cmd, Ev, Op, Role, Run
+from tinyrl.api.proto import tinker_public_pb2 as pb
+from tinyrl.bus import QUANTUM_MS, Bus, Cmd, Ev, Op, Reply, Role, Run
 from tinyrl.control import scheduler
 from tinyrl.control.fairness import Demand, Worker, plan_gpus, rank_runs, update_lag, waterfill
 from tinyrl.control.node_daemon import NodeDaemon
@@ -570,9 +570,11 @@ class TestLocalQuantum(unittest.TestCase):
       service[run] += 3 if run == "saving" else 1
     self.assertEqual(service, {"saving": 9, "training": 9})
 
-  def test_prepare_enforces_gpu_exclusivity_under_concurrent_handoffs(self):
+  def test_park_handoffs_enforce_gpu_exclusivity_under_contention(self):
     async def run():
-      node = self.make_daemon(4)
+      bus = Bus(":memory:")
+      store = Store(tempfile.mkdtemp())
+      node = NodeDaemon(bus, gpus=4, node="n", gpu_mib=0, store=store)
       active_gpus: dict[str, tuple[int, ...]] = {}
       violations: list[str] = []
 
@@ -595,24 +597,29 @@ class TestLocalQuantum(unittest.TestCase):
         async def close(self):
           active_gpus.pop(self.wid, None)
 
+        async def call(self, method, *args):
+          await asyncio.sleep(0)
+          return Reply(True, "application/json", b"{}"), {"loaded": True}
+
       node.open_trainer = lambda wid, width, env: FakeModel(wid)
-      rng = random.Random(7)
-      specs = [
-        (f"p{i}", Spec(Role.TRAINER, "b", gpus=w), tuple(range(g, g + w)))
-        for i, (g, w) in enumerate([(0, 2), (2, 2), (0, 1), (1, 1), (2, 1), (3, 1)])
-      ]
-
-      async def use(wid, spec, gpus):
-        h, _, _ = await node.prepare(wid, spec, gpus)
-        await asyncio.sleep(0)
-        await node.release(h)
-
-      for _ in range(40):
-        batch = rng.sample(specs, 3)
-        await asyncio.gather(*(use(*item) for item in batch))
-        flat = [g for h in node.workers.values() for g in h.resident]
-        self.assertEqual(len(flat), len(set(flat)))
-      self.assertEqual(violations, [])
+      try:
+        runs = []
+        for i, width in enumerate([2, 2, 1, 1, 1, 1]):
+          rid = f"r{i}"
+          await bus.create_run(Run(rid, f"b{i}", 0, gpus=width, account=f"a{i}"))
+          runs.append(rid)
+        reqs = [await bus.submit_command(r, Op.OPTIM_STEP, b"{}") for r in runs for _ in range(3)]
+        with mock.patch("tinyrl.bus.QUANTUM_MS", 0), mock.patch("tinyrl.bus.CYCLE_GRACE_MS", 0):
+          async with asyncio.timeout(15):
+            while not all([(await bus.wait_for_reply(rq, 0)) is not None for rq in reqs]):
+              await node.step_once(wait_ms=0)
+              flat = [g for h in node.workers.values() for g in h.resident]
+              self.assertEqual(len(flat), len(set(flat)))
+              await asyncio.sleep(0.001)
+        self.assertEqual(violations, [])
+      finally:
+        await node.close()
+        await bus.aclose()
 
     asyncio.run(run())
 
@@ -1121,7 +1128,7 @@ class TestMultiNodeExecution(BusTest):
       for req in reqs:
         reply = await self.bus.wait_for_reply(req, 10)
         self.assertTrue(reply.ok)
-        self.assertEqual(len(wire.sample_json(reply.body)["sequences"]), 1)
+        self.assertEqual(len(pb.SampleResponse.FromString(reply.body).sequences), 1)
 
     self.assertEqual((await self.bus.get_run(sid))["tokens"], total_cmds * 50)
     svc_before = self.bus.service["team-s"]

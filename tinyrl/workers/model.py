@@ -200,19 +200,10 @@ def batches(lengths: list[int], budget: int) -> list[list[int]]:
   return passes
 
 
-def pad(rows: list[np.ndarray], lengths: list[int], dtype, device: torch.device) -> torch.Tensor:
-  """Right-pad rows with zeros into one [rows, max(lengths)] tensor, keeping the first lengths[i] values of row i."""
+def pad(rows: list[np.ndarray], lengths: list[int], dtype, device: torch.device, fill=0) -> torch.Tensor:
+  """Right-pad rows into one [rows, max(lengths), *tail] tensor, keeping the first lengths[i] values of row i."""
   width = -(-max(lengths) // 128) * 128 if device.type == "cuda" else max(lengths)
-  out = np.zeros((len(rows), width), dtype)
-  for i, (row, n) in enumerate(zip(rows, lengths)):
-    out[i, :n] = row[:n]
-  return torch.from_numpy(out).to(device)
-
-
-def pad_2d(rows: list[np.ndarray], lengths: list[int], fill, dtype, device: torch.device) -> torch.Tensor:
-  width = -(-max(lengths) // 128) * 128 if device.type == "cuda" else max(lengths)
-  k = rows[0].shape[1]
-  out = np.full((len(rows), width, k), fill, dtype)
+  out = np.full((len(rows), width, *rows[0].shape[1:]), fill, dtype)
   for i, (row, n) in enumerate(zip(rows, lengths)):
     out[i, :n] = row[:n]
   return torch.from_numpy(out).to(device)
@@ -300,32 +291,22 @@ def target_logprobs(
     loss = LigerFusedLinearCrossEntropyLoss(reduction="none", softcap=softcap)(w, hidden, targets.flatten(), b)
     return -loss.view(targets.shape)
 
-  if topk_ids is None:
-
-    def chunk_logprobs(h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-      logits = head(h)
-      if softcap:
-        logits = torch.tanh(logits / softcap) * softcap
-      logits = logits.float()
-      return logits.gather(-1, t[:, None])[:, 0] - logits.logsumexp(-1)
-
-    chunks = zip(hidden.split(CHUNK), targets.flatten().split(CHUNK))
-    return torch.cat([checkpoint(chunk_logprobs, h, t, use_reentrant=False) for h, t in chunks]).view(targets.shape)
-
-  def chunk_head_logprobs(h: torch.Tensor, t: torch.Tensor, tk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+  def chunk_lp(h: torch.Tensor, t: torch.Tensor, tk: torch.Tensor | None = None):
     logits = head(h)
     if softcap:
       logits = torch.tanh(logits / softcap) * softcap
     logits = logits.float()
     lse = logits.logsumexp(-1)
-    return logits.gather(-1, t[:, None])[:, 0] - lse, logits.gather(-1, tk) - lse[:, None]
+    lp = logits.gather(-1, t[:, None])[:, 0] - lse
+    return lp if tk is None else (lp, logits.gather(-1, tk) - lse[:, None])
 
+  if topk_ids is None:
+    chunks = zip(hidden.split(CHUNK), targets.flatten().split(CHUNK))
+    return torch.cat([checkpoint(chunk_lp, h, t, use_reentrant=False) for h, t in chunks]).view(targets.shape)
   k = topk_ids.shape[-1]
   chunks = zip(hidden.split(CHUNK), targets.flatten().split(CHUNK), topk_ids.reshape(-1, k).split(CHUNK))
-  pairs = [checkpoint(chunk_head_logprobs, h, t, tk, use_reentrant=False) for h, t, tk in chunks]
-  lp = torch.cat([p[0] for p in pairs]).view(targets.shape)
-  head_lp = torch.cat([p[1] for p in pairs]).view(*targets.shape, k)
-  return lp, head_lp
+  pairs = [checkpoint(chunk_lp, h, t, tk, use_reentrant=False) for h, t, tk in chunks]
+  return torch.cat([p[0] for p in pairs]).view(targets.shape), torch.cat([p[1] for p in pairs]).view(*targets.shape, k)
 
 
 # ***** model *****
@@ -502,8 +483,8 @@ class Model:
             s_ids = [stab[0][i] for i in batch] or [np.zeros((1, k), np.int64)]
             s_lps = [stab[1][i] for i in batch] or [np.full((1, k), wire.MASK_LOGPROB, np.float32)]
             s_msk = [stab[2][i] for i in batch] or [np.zeros(1, np.float32)]
-            topk_ids = pad_2d(s_ids, blens, 0, np.int64, lm.device)
-            extra["samp_head_logp"] = pad_2d(s_lps, blens, wire.MASK_LOGPROB, np.float32, lm.device)
+            topk_ids = pad(s_ids, blens, np.int64, lm.device)
+            extra["samp_head_logp"] = pad(s_lps, blens, np.float32, lm.device, wire.MASK_LOGPROB)
             extra["sampled_mask"] = pad(s_msk, blens, np.float32, lm.device)
           with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
             res = target_logprobs(lm, x["ids"], x["targets"], topk_ids)

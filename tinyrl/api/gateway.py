@@ -12,13 +12,11 @@ import datetime
 import json
 import time
 import uuid
-from typing import Any
 
 import msgspec
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel
 
 from tinyrl.api import wire
 from tinyrl.bus import COUNTERS, BackpressureError, Bus, PromiseGoneError
@@ -29,64 +27,6 @@ from tinyrl.types import NodeReport, Op, Role, Run, parse_uri
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
 CKPT_TTL = getenv("CKPT_TTL", 0)  # the TTL of a checkpoint saved without one, at least 3600. 0 keeps it until deleted
-
-
-# ***** requests *****
-
-
-class SessionRequest(BaseModel):
-  session_id: str
-
-
-class CreateSessionRequest(BaseModel):
-  tags: list[str] = []  # TINKER_TAGS: open-rl clients ask for full fine-tuning with openrl.fine_tuning_type=full
-  user_metadata: dict[str, Any] | None = None
-
-
-class CreateModelRequest(BaseModel):
-  base_model: str
-  session_id: str = ""
-  lora_config: dict[str, Any] | None = None
-  user_metadata: dict[str, Any] | None = None
-  model_seq_id: int | None = None
-
-
-class ModelRequest(BaseModel):
-  model_id: str
-  seq_id: int | None = None
-
-
-class OptimStepRequest(ModelRequest):
-  adam_params: dict[str, Any] = {}
-
-
-class SaveRequest(ModelRequest):
-  path: str | None = None
-  sampling_session_seq_id: int | None = None
-  ttl_seconds: int | None = None
-
-  def checkpoint(self, kind: str, *, owned: bool = False) -> dict:
-    seq = self.sampling_session_seq_id if self.sampling_session_seq_id is not None else self.seq_id
-    name = self.path or f"step-{seq if seq is not None else time.time_ns()}"
-    seconds = self.ttl_seconds if self.ttl_seconds is not None or owned else CKPT_TTL or None
-    return {"uri": checkpoint_uri(self.model_id, kind, name), "ttl_seconds": ttl(seconds)}
-
-
-class TTLRequest(BaseModel):
-  ttl_seconds: int | None = None
-
-
-class LoadRequest(ModelRequest):
-  path: str
-  optimizer: bool = False
-
-
-class FutureRequest(BaseModel):
-  request_id: str
-
-
-class WeightsInfoRequest(BaseModel):
-  tinker_path: str
 
 
 def ttl(seconds: int | None) -> int | None:
@@ -114,6 +54,13 @@ def checkpoint_uri(run: str, kind: str, name: str) -> str:
   if not name or name.startswith("/") or ".." in f"{run}/{kind}/{name}".split("/"):
     raise ValueError(f"bad checkpoint name {name}")
   return f"tinker://{run}/{kind}/{name}"
+
+
+def save_args(d: dict, kind: str, *, owned: bool = False) -> dict:
+  seq = d["sampling_session_seq_id"] if d.get("sampling_session_seq_id") is not None else d.get("seq_id")
+  name = d.get("path") or f"step-{seq if seq is not None else time.time_ns()}"
+  seconds = d.get("ttl_seconds") if d.get("ttl_seconds") is not None or owned else CKPT_TTL or None
+  return {"uri": checkpoint_uri(d["model_id"], kind, name), "ttl_seconds": ttl(seconds)}
 
 
 def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = False) -> FastAPI:
@@ -156,10 +103,12 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
       raise HTTPException(404, f"no {kind} {run_id}")
     return record
 
-  async def submit(run: str, op: Op, body: bytes | dict, seq_id: int | None = None, cost: int = 1) -> dict[str, str]:
+  async def submit(
+    run: str, op: Op, body: bytes | dict, seq_id: int | None = None, cost: int = 1, refs: tuple[str, ...] = ()
+  ) -> dict[str, str]:
     if isinstance(body, dict):
       body = json.dumps(body).encode()
-    request_id = await bus.submit_command(run, op, body, seq_id, cost)
+    request_id = await bus.submit_command(run, op, body, seq_id, cost, refs)
     if request_id is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
@@ -227,44 +176,43 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
     return {"supported_models": []}
 
   @api.post("/api/v1/create_session")
-  async def create_session(req: CreateSessionRequest | None = None):
+  async def create_session(req: Request):
+    d = json.loads(raw) if (raw := await req.body()) else {}
     session_id = f"sess-{uuid.uuid4().hex[:12]}"
-    req = req or CreateSessionRequest()
-    await bus.heartbeat_session(session_id, dict(t.partition("=")[::2] for t in req.tags) | (req.user_metadata or {}))
+    tags = dict(t.partition("=")[::2] for t in d.get("tags") or ())
+    await bus.heartbeat_session(session_id, tags | (d.get("user_metadata") or {}))
     return {"type": "create_session", "session_id": session_id}
 
   @api.post("/api/v1/session_heartbeat")
-  async def session_heartbeat(req: SessionRequest):
-    await bus.heartbeat_session(req.session_id)
+  async def session_heartbeat(req: Request):
+    await bus.heartbeat_session((await req.json())["session_id"])
     return {"type": "session_heartbeat"}
 
   @api.post("/api/v1/create_model")
-  async def create_model(req: CreateModelRequest):
-    session = await bus.get_session(req.session_id) or {}
-    metadata, lora = session.get("metadata", {}) | (req.user_metadata or {}), req.lora_config or {}
+  async def create_model(req: Request):
+    d = await req.json()
+    sid, seq, base = d.get("session_id") or "", d.get("model_seq_id"), d["base_model"]
+    session = await bus.get_session(sid) or {}
+    metadata, lora = session.get("metadata", {}) | (d.get("user_metadata") or {}), d.get("lora_config") or {}
     rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
-
-    seq = req.model_seq_id
-    run = f"{req.session_id}-{seq}" if req.session_id and seq is not None else str(uuid.uuid4())
-
-    base, account = req.base_model, str(metadata.get("openrl.account") or "")
-    raw_gpus = metadata.get("openrl.gpus")
+    run = f"{sid}-{seq}" if sid and seq is not None else str(uuid.uuid4())
+    account, raw_gpus = str(metadata.get("openrl.account") or ""), metadata.get("openrl.gpus")
     gpus = (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")) if raw_gpus is None else int(raw_gpus)
     if gpus < 1:
       raise ValueError(f"openrl.gpus must be at least 1, got {gpus}")
     if not await bus.get_run(run):
-      await bus.create_run(Run(run, base, rank, req.session_id, None, lora, exclusive, gpus=gpus, account=account))
+      await bus.create_run(Run(run, base, rank, sid, None, lora, exclusive, gpus=gpus, account=account))
     return await submit(run, Op.CREATE_MODEL, {"base_model": base, "rank": rank, "lora": lora}, seq)
 
   @api.post("/api/v1/get_info")
-  async def get_info(req: ModelRequest):
-    run = await require_run(req.model_id)
-
+  async def get_info(req: Request):
+    mid = (await req.json())["model_id"]
+    run = await require_run(mid)
     # the SDK reads LoRA shaped metadata, even for a full fine-tune
     return {
       "type": "get_info",
-      "model_id": req.model_id,
+      "model_id": mid,
       "model_name": run["base"],
       "is_lora": True,
       "lora_rank": run["rank"] or 16,
@@ -273,61 +221,58 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
 
   # ***** training *****
 
-  async def submit_fb(data: dict, forward_only: bool = False) -> dict[str, str]:
-    req = wire.from_json(data, forward_only=forward_only)
-    return await submit(
-      data["model_id"], Op.FORWARD_BACKWARD, req.SerializeToString(), data.get("seq_id"), wire.cost(req)
-    )
-
   @api.post("/api/v1/forward_backward")
   async def forward_backward(request: Request):
     body = await request.body()
-    if request.headers.get("content-type", "").startswith(wire.PROTO):
-      parsed = wire.parse(body)
-      return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
-    return await submit_fb(json.loads(body))
-
-  @api.post("/api/v1/forward")  # SDKs before 0.25
-  async def forward(request: Request):
-    return await submit_fb(await request.json(), forward_only=True)
+    parsed = wire.parse(body)
+    refs = tuple(wire.referenced_sequences(parsed)) if parsed.loss_fn == "stable_reinforce" else ()
+    return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed), refs)
 
   @api.post("/api/v1/optim_step")
-  async def optim_step(req: OptimStepRequest):
-    return await submit(req.model_id, Op.OPTIM_STEP, {"adam_params": req.adam_params}, req.seq_id)
+  async def optim_step(req: Request):
+    d = await req.json()
+    return await submit(d["model_id"], Op.OPTIM_STEP, {"adam_params": d.get("adam_params") or {}}, d.get("seq_id"))
 
   @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
-  async def save_weights(req: SaveRequest):
-    return await submit(req.model_id, Op.SAVE_WEIGHTS, req.checkpoint("weights"), req.seq_id)
+  async def save_weights(req: Request):
+    d = await req.json()
+    return await submit(d["model_id"], Op.SAVE_WEIGHTS, save_args(d, "weights"), d.get("seq_id"))
 
   @api.post("/api/v1/save_weights_for_sampler")
-  async def save_weights_for_sampler(req: SaveRequest):
-    if request_id := await bus.seen_request(req.model_id, req.seq_id):
-      return {"request_id": request_id, "model_id": req.model_id}
-
-    train = await require_run(req.model_id)
+  async def save_weights_for_sampler(req: Request):
+    d = await req.json()
+    mid, seq = d["model_id"], d.get("seq_id")
+    if request_id := await bus.seen_request(mid, seq):
+      return {"request_id": request_id, "model_id": mid}
+    train = await require_run(mid)
     # a sampling session's weights, which its run owns
-    owned = req.path is None or req.sampling_session_seq_id is not None
-    args = req.checkpoint("sampler_weights", owned=owned)
+    owned = d.get("path") is None or d.get("sampling_session_seq_id") is not None
+    args = save_args(d, "sampler_weights", owned=owned)
     if owned:
-      sid = await open_sampler(train["base"], args["uri"], train.get("session", ""))
-      args.update(sampling_session_id=sid, owned=True)
-    return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
+      args.update(
+        sampling_session_id=await open_sampler(train["base"], args["uri"], train.get("session", "")), owned=True
+      )
+    return await submit(mid, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, seq)
 
   @api.post("/api/v1/load_weights")
-  async def load_weights(req: LoadRequest):
-    uri = checkpoint_uri(req.model_id, "weights", req.path)
-    return await submit(req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer}, req.seq_id)
+  async def load_weights(req: Request):
+    d = await req.json()
+    uri = checkpoint_uri(d["model_id"], "weights", d["path"])
+    return await submit(
+      d["model_id"], Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": bool(d.get("optimizer"))}, d.get("seq_id")
+    )
 
   @api.post("/api/v1/weights_info")
-  async def weights_info(req: WeightsInfoRequest):
+  async def weights_info(req: Request):
     """What the SDK asks before it resumes from a checkpoint: how to create a run like the one that saved it. The checkpoint
     says so itself, as its run is deleted soon after its client stops."""
+    tinker_path = (await req.json())["tinker_path"]
     try:
-      meta = await asyncio.to_thread(store.read_meta, await bus.checkpoint_version(req.tinker_path))
+      meta = await asyncio.to_thread(store.read_meta, await bus.checkpoint_version(tinker_path))
     except (OSError, IndexError, ValueError):
       meta = {}
     if "base" not in meta:
-      raise HTTPException(404, f"no checkpoint {req.tinker_path} that names its base model")
+      raise HTTPException(404, f"no checkpoint {tinker_path} that names its base model")
     made = meta["targets"]
     trained = {"train_unembed": "lm_head" in made, "train_mlp": "gate_proj" in made, "train_attn": "q_proj" in made}
     # the SDK reads LoRA shaped metadata, even for a full fine-tune
@@ -336,19 +281,18 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
     )
 
   @api.post("/api/v1/delete_model")
-  async def delete_model(req: ModelRequest):
-    await submit(req.model_id, Op.DELETE_MODEL, {}, req.seq_id)  # queued behind the run's work, which still finishes
+  async def delete_model(req: Request):
+    d = await req.json()
+    await submit(
+      d["model_id"], Op.DELETE_MODEL, {}, d.get("seq_id")
+    )  # queued behind the run's work, which still finishes
     return {"status": "ok"}
 
   @api.post("/api/v1/retrieve_future")
-  async def retrieve_future(req: FutureRequest, accept: str = Header("")):
-    reply = await bus.wait_for_reply(req.request_id, WAIT)
-    if reply is None:
-      return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
-    if reply.content_type == wire.PROTO and wire.PROTO not in accept:
-      if req.request_id.startswith("samp-"):
-        return wire.sample_json(reply.body)
-      return wire.output_json(reply.body)  # an older client, which reads JSON
+  async def retrieve_future(req: Request):
+    rid = (await req.json())["request_id"]
+    if (reply := await bus.wait_for_reply(rid, WAIT)) is None:
+      return {"type": "try_again", "request_id": rid, "queue_state": "active"}
     return Response(reply.body, media_type=reply.content_type)
 
   # ***** sampling *****
@@ -361,8 +305,7 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
 
   @api.post("/api/v1/join_sampling_session")
   async def join_sampling_session(req: Request):
-    data = await req.json()
-    sid = data.get("sampling_session_id")
+    sid = (await req.json()).get("sampling_session_id")
     await require_run(sid, "session")
     return {"type": "join_sampling_session", "client_counter": await bus.join_sampling_session(sid)}
 
@@ -374,28 +317,22 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
   @api.post("/api/v1/asample")
   async def asample(req: Request):
     data = await req.json()
-    prompt = data.get("prompt", {})
-    chunks = prompt.get("chunks", [])
+    chunks = data.get("prompt", {}).get("chunks", [])
     if not all(c.get("type") == "encoded_text" for c in chunks):
       raise ValueError("only encoded_text chunks are supported")
     tokens = [int(t) for c in chunks for t in c.get("tokens", [])]
     if not tokens:
       raise ValueError("prompt is empty")
-
     if data.get("target_prompt_logprobs") is not None or data.get("prompt_alt_tokens_k", 0) > 0:
       raise ValueError("target_prompt_logprobs and prompt_alt_tokens are not supported")
-
-    last_n = data.get("prompt_logprobs_last_n")
-    if last_n is not None:
+    if (last_n := data.get("prompt_logprobs_last_n")) is not None:
       if not data.get("prompt_logprobs"):
         raise ValueError("prompt_logprobs must be true if prompt_logprobs_last_n is set")
       if not (1 <= last_n <= len(tokens) - 1):
         raise ValueError("prompt_logprobs_last_n must be between 1 and len(tokens) - 1")
 
     sid = data.get("sampling_session_id") or await open_sampler(data.get("base_model"), data.get("model_path"))
-
-    num_samples = int(data.get("num_samples", 1))
-    params = data.get("sampling_params", {})
+    num_samples, params = int(data.get("num_samples", 1)), data.get("sampling_params", {})
     job = {
       "prompt": tokens,
       "num_samples": num_samples,
@@ -411,7 +348,6 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
       "topk_sample": int(data.get("topk_sample_logprobs", 0)),
       "record_stability_info": bool(data.get("record_stability_info")),
     }
-
     res = await submit(sid, Op.SAMPLE, job, data.get("seq_id"), len(tokens) + num_samples * job["max_tokens"])
     return {
       "request_id": res["request_id"],
@@ -438,8 +374,8 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
       raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
 
   @api.put("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}/ttl")
-  async def set_checkpoint_ttl(run: str, checkpoint_id: str, req: TTLRequest):
-    if not await bus.set_checkpoint_ttl(f"tinker://{run}/{checkpoint_id}", ttl(req.ttl_seconds)):
+  async def set_checkpoint_ttl(run: str, checkpoint_id: str, req: Request):
+    if not await bus.set_checkpoint_ttl(f"tinker://{run}/{checkpoint_id}", ttl((await req.json()).get("ttl_seconds"))):
       raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
 
   # ***** inspection *****
@@ -453,8 +389,7 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
 
   @api.get("/api/v1/sessions/{session_id}")
   async def session_info(session_id: str):
-    session = await bus.get_session(session_id)
-    if session is None:
+    if (session := await bus.get_session(session_id)) is None:
       raise HTTPException(404, f"no session {session_id}")
     return session
 
