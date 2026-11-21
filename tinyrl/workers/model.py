@@ -93,6 +93,56 @@ def gspo(logprobs, weights, sampler_logprobs, advantages, config, *, sequence_ra
   return torch.nan_to_num(-objective * weights, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def stable_reinforce(
+  logprobs,
+  weights,
+  sampler_logprobs,
+  advantages,
+  config,
+  *,
+  train_head_logp=None,
+  samp_head_logp=None,
+  sampled_mask=None,
+  **_,
+):
+  """Truncated importance sampling + top-k tail-rescaled score centering + sampler-learner KL (Marek & Ryabinin 2026)."""
+  if bad := set(config) - {"kl_coeff", "kl_estimator", "tis_cap"}:
+    raise ValueError(f"unknown config keys: {bad}")
+  kl_coeff, kl_est, tis_cap = (
+    float(config.get("kl_coeff", 0.01)),
+    config.get("kl_estimator", "k1"),
+    float(config.get("tis_cap", 2.0)),
+  )
+  if not math.isfinite(kl_coeff) or kl_coeff < 0:
+    raise ValueError(f"kl_coeff must be finite and >= 0, got {kl_coeff}")
+  if kl_est not in ("k1", "k3"):
+    raise ValueError(f"unknown kl_estimator {kl_est!r}, expected 'k1' or 'k3'")
+  if not math.isfinite(tis_cap) or tis_cap <= 0:
+    raise ValueError(f"tis_cap must be finite and > 0, got {tis_cap}")
+  log_ratio = (logprobs - sampler_logprobs).clamp(-20, 20)
+  ratio = log_ratio.exp()
+  w_tok = ratio.clamp(max=tis_cap).detach()
+  mask = torch.ones_like(logprobs) if sampled_mask is None else sampled_mask
+  if train_head_logp is not None and samp_head_logp is not None:
+    valid = samp_head_logp > (wire.MASK_LOGPROB + 1.0)
+    q_head = torch.where(valid, samp_head_logp.exp(), 0.0)
+    p_head = torch.where(valid, train_head_logp.detach().exp(), 0.0)
+    head_ratio = (train_head_logp.detach() - torch.where(valid, samp_head_logp, 0.0)).clamp(-20, 20).exp()
+    head_w = torch.where(valid, head_ratio.clamp(max=tis_cap), 0.0)
+    q_tail = (1.0 - q_head.sum(-1, keepdim=True)).clamp(min=0.0)
+    p_tail = (1.0 - p_head.sum(-1, keepdim=True)).clamp(min=0.0)
+    tail_scale = torch.where(
+      p_tail > 1e-12, (tis_cap * q_tail / p_tail.clamp(min=1e-12)).clamp(max=1.0), (q_tail > 1e-12).to(q_tail.dtype)
+    )
+    residual = (q_head * head_w - tail_scale * p_head).detach()
+    correction = (residual * torch.where(valid, train_head_logp, 0.0)).sum(-1) * mask
+  else:
+    correction = 0.0
+  pg = -advantages * (w_tok * logprobs - correction)
+  kl = (-log_ratio if kl_est == "k1" else (ratio - 1.0) - log_ratio) * mask
+  return torch.nan_to_num((pg + kl_coeff * kl) * weights, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 LOSSES = {
   "cross_entropy": cross_entropy,
   "importance_sampling": importance_sampling,
@@ -100,6 +150,7 @@ LOSSES = {
   "cispo": cispo,
   "dro": dro,
   "gspo": gspo,
+  "stable_reinforce": stable_reinforce,
 }
 
 
@@ -146,13 +197,57 @@ def batches(lengths: list[int], budget: int) -> list[list[int]]:
   return passes
 
 
-def pad(rows: list[np.ndarray], lengths: list[int], dtype, device: torch.device) -> torch.Tensor:
-  """Right-pad rows with zeros into one [rows, max(lengths)] tensor, keeping the first lengths[i] values of row i."""
+def pad(rows: list[np.ndarray], lengths: list[int], dtype, device: torch.device, fill=0) -> torch.Tensor:
+  """Right-pad rows into one [rows, max(lengths), *tail] tensor, keeping the first lengths[i] values of row i."""
   width = -(-max(lengths) // 128) * 128 if device.type == "cuda" else max(lengths)
-  out = np.zeros((len(rows), width), dtype)
+  out = np.full((len(rows), width, *rows[0].shape[1:]), fill, dtype)
   for i, (row, n) in enumerate(zip(rows, lengths)):
     out[i, :n] = row[:n]
   return torch.from_numpy(out).to(device)
+
+
+def align_stability(
+  data: list[wire.Datum], lengths: list[int], stability: dict[str, bytes] | None
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+  """Validate StableReinforce provenance spans and build per-datum (topk_ids, topk_lps, sampled_mask)."""
+  unpacked = {sid: wire.unpack_stability(raw) for sid, raw in (stability or {}).items()}
+  k = max((ids.shape[1] for ids, _ in unpacked.values()), default=1)
+  all_ids, all_lps, all_mask = [], [], []
+  for d, n in zip(data, lengths):
+    if not d.model_spans or not d.loss_spans:
+      raise ValueError("stable_reinforce requires both model_input_spans and loss_fn_input_spans on every datum")
+    if not any(s.kind == "sampled" for s in d.loss_spans):
+      raise ValueError("stable_reinforce requires at least one SampledProvenanceSpan in loss_fn_input_spans")
+    ids = np.zeros((n, k), np.int64)
+    lps = np.full((n, k), wire.MASK_LOGPROB, np.float32)
+    mask = np.zeros(n, np.float32)
+    pos = 0
+    for s in d.loss_spans:
+      end = min(pos + s.length, n)
+      if s.kind == "sampled":
+        if s.offset != 0:
+          raise ValueError(f"SampledProvenanceSpan in loss_fn_input_spans must have offset=0, got {s.offset}")
+        if (rec := unpacked.get(s.sequence_id)) is None:
+          raise ValueError(
+            f"no stability info for sequence_id {s.sequence_id!r}; sample with record_stability_info=True"
+          )
+        s_ids, s_lps = rec
+        if s.length != len(s_ids):
+          raise ValueError(
+            f"SampledProvenanceSpan length {s.length} does not match sequence {s.sequence_id!r} length {len(s_ids)}"
+          )
+        if (take := max(0, end - pos)) > 0:
+          ids[pos:end, : s_ids.shape[1]] = s_ids[:take]
+          lps[pos:end, : s_lps.shape[1]] = s_lps[:take]
+          mask[pos:end] = 1.0
+      pos += s.length
+    adv = d.inputs.get("advantages")
+    if adv is not None and np.any((adv[:n] != 0) & (mask == 0)):
+      raise ValueError("every token with nonzero advantage must fall under a SampledProvenanceSpan")
+    all_ids.append(ids)
+    all_lps.append(lps)
+    all_mask.append(mask)
+  return all_ids, all_lps, all_mask
 
 
 def batch_tensors(data: list[wire.Datum], lengths: list[int], device: torch.device) -> dict[str, torch.Tensor]:
@@ -173,8 +268,10 @@ def batch_tensors(data: list[wire.Datum], lengths: list[int], device: torch.devi
   return out
 
 
-def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-  """The logprob of each target token.
+def target_logprobs(
+  lm: PreTrainedModel, ids: torch.Tensor, targets: torch.Tensor, topk_ids: torch.Tensor | None = None
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+  """The logprob of each target token (and optionally the top-k head tokens for score centering).
 
   The model returns its hidden states instead of logits. The output head and the logsumexp then run CHUNK positions at a time under checkpointing, so the [tokens, vocab] logits never exist all at once.
 
@@ -184,20 +281,29 @@ def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, targets: torch.Tenso
   head = lm.get_output_embeddings()
   softcap = getattr(lm.config.get_text_config(), "final_logit_softcapping", None)  # gemma caps its logits
 
-  if lm.device.type == "cuda" and type(head) is torch.nn.Linear and LigerFusedLinearCrossEntropyLoss:
+  if (
+    topk_ids is None and lm.device.type == "cuda" and type(head) is torch.nn.Linear and LigerFusedLinearCrossEntropyLoss
+  ):
     w, b = head.weight.to(hidden.dtype), head.bias.to(hidden.dtype) if head.bias is not None else None
     loss = LigerFusedLinearCrossEntropyLoss(reduction="none", softcap=softcap)(w, hidden, targets.flatten(), b)
     return -loss.view(targets.shape)
 
-  def chunk_logprobs(h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+  def chunk_lp(h: torch.Tensor, t: torch.Tensor, tk: torch.Tensor | None = None):
     logits = head(h)
     if softcap:
       logits = torch.tanh(logits / softcap) * softcap
     logits = logits.float()
-    return logits.gather(-1, t[:, None])[:, 0] - logits.logsumexp(-1)
+    lse = logits.logsumexp(-1)
+    lp = logits.gather(-1, t[:, None])[:, 0] - lse
+    return lp if tk is None else (lp, logits.gather(-1, tk) - lse[:, None])
 
-  chunks = zip(hidden.split(CHUNK), targets.flatten().split(CHUNK))
-  return torch.cat([checkpoint(chunk_logprobs, h, t, use_reentrant=False) for h, t in chunks]).view(targets.shape)
+  if topk_ids is None:
+    chunks = zip(hidden.split(CHUNK), targets.flatten().split(CHUNK))
+    return torch.cat([checkpoint(chunk_lp, h, t, use_reentrant=False) for h, t in chunks]).view(targets.shape)
+  k = topk_ids.shape[-1]
+  chunks = zip(hidden.split(CHUNK), targets.flatten().split(CHUNK), topk_ids.reshape(-1, k).split(CHUNK))
+  pairs = [checkpoint(chunk_lp, h, t, tk, use_reentrant=False) for h, t, tk in chunks]
+  return torch.cat([p[0] for p in pairs]).view(targets.shape), torch.cat([p[1] for p in pairs]).view(*targets.shape, k)
 
 
 # ***** model *****
@@ -327,7 +433,15 @@ class Model:
       self.lm.set_adapter(run)
     return self.lm
 
-  def forward_backward(self, run: str, data: list[wire.Datum], loss_fn: str, config: dict, forward_only: bool):
+  def forward_backward(
+    self,
+    run: str,
+    data: list[wire.Datum],
+    loss_fn: str,
+    config: dict,
+    forward_only: bool,
+    stability: dict[str, bytes] | None = None,
+  ):
     """Run the loss over every datum, accumulating gradients unless forward_only. Returns each datum's target logprobs, and the loss metrics."""
     if loss_fn not in LOSSES:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
@@ -337,6 +451,7 @@ class Model:
       for d, n in zip(data, lengths):
         if "sequence_ratio_mask" in d.inputs and not np.any(d.inputs["sequence_ratio_mask"][:n] != 0):
           raise ValueError("gspo sequence_ratio_mask must mark at least one token")
+    stab = align_stability(data, lengths, stability) if loss_fn == "stable_reinforce" else None
     lm = self.activate_run(run).train(not forward_only)
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total, revision = 0.0, self.state_revision
@@ -354,10 +469,23 @@ class Model:
         for step in range(steps):
           batch = passes[step] if step < len(passes) else []
           seq = [data[i] for i in batch] or [wire.Datum(np.zeros(1, np.int32), {"weights": np.zeros(1, np.float32)})]
-          x = batch_tensors(seq, [lengths[i] for i in batch] or [1], lm.device)
+          blens = [lengths[i] for i in batch] or [1]
+          x = batch_tensors(seq, blens, lm.device)
+          extra: dict[str, torch.Tensor] = {}
+          if "sequence_ratio_mask" in x:
+            extra["sequence_ratio_mask"] = x["sequence_ratio_mask"]
+          topk_ids = None
+          if stab is not None:
+            k = stab[0][0].shape[1] if stab[0] else 1
+            s_ids = [stab[0][i] for i in batch] or [np.zeros((1, k), np.int64)]
+            s_lps = [stab[1][i] for i in batch] or [np.full((1, k), wire.MASK_LOGPROB, np.float32)]
+            s_msk = [stab[2][i] for i in batch] or [np.zeros(1, np.float32)]
+            topk_ids = pad(s_ids, blens, np.int64, lm.device)
+            extra["samp_head_logp"] = pad(s_lps, blens, np.float32, lm.device, wire.MASK_LOGPROB)
+            extra["sampled_mask"] = pad(s_msk, blens, np.float32, lm.device)
           with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
-            lp = target_logprobs(lm, x["ids"], x["targets"])
-          extra = {"sequence_ratio_mask": x["sequence_ratio_mask"]} if "sequence_ratio_mask" in x else {}
+            res = target_logprobs(lm, x["ids"], x["targets"], topk_ids)
+          lp, extra["train_head_logp"] = res if topk_ids is not None else (res, None)
           loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config, **extra).sum()
           if not forward_only:
             self.state_revision += 1

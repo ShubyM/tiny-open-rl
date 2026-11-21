@@ -70,7 +70,12 @@ class Trainer:
 
   @span("trainer.execute")
   def execute(
-    self, cmd: Cmd, run: dict | None = None, snap: str | None = None, version: str | None = None
+    self,
+    cmd: Cmd,
+    run: dict | None = None,
+    snap: str | None = None,
+    version: str | None = None,
+    stability: dict[str, bytes] | None = None,
   ) -> tuple[Reply, dict]:
     effects, created, revision = {}, False, None
     try:
@@ -91,7 +96,7 @@ class Trainer:
       if cmd.op == Op.FORWARD_BACKWARD:
         req = wire.parse(cmd.body)
         fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
-        logprobs, metrics = self.call_model("forward_backward", *fb)
+        logprobs, metrics = self.call_model("forward_backward", *fb, stability)
         return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), effects
 
       args = json.loads(cmd.body)

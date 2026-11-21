@@ -30,6 +30,7 @@ SWITCH_BUDGET = float(getenv("SWITCH_BUDGET", 0.1))
 MAX_LORAS, MAX_SEQS = types.MAX_LORAS, types.MAX_SEQS
 SAMPLE_QUEUE_BYTES = getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20)
 SAMPLE_REPLY_BYTES = getenv("SAMPLE_REPLY_BYTES", 256 * 2**20)
+STABILITY_TTL, STABILITY_BYTES = getenv("STABILITY_TTL", 24 * 3600), getenv("STABILITY_BYTES", 512 * 2**20)
 COUNTERS = ("steps", "failed", "cmds", "tokens", "busy_ms", "wait_ms")
 GC_S = 10  # how often expired replies, dedupe keys and sessions are swept: their TTLs are a minute or more
 
@@ -103,6 +104,8 @@ class Bus:
     self.service = {k: float(v) for k, v in self.meta.get("service", {}).items()}
     self.pending = {rid: {} for rid, r in self.runs.items() if r["live"]}  # run -> entry id -> Pending, oldest first
     self.nodes, self.reaped_boots, self.active_turns = {}, set(), {}
+    self.stability: dict[str, tuple[bytes, float]] = {}
+    self.stability_bytes = 0
     self.events, self.waiters = deque(maxlen=100_000), weakref.WeakValueDictionary()
     self.work_event, self.seq = asyncio.Event(), max((c["seq"] for c in self.disk.cmds.values()), default=0)
     self.dirty_runs, self.service_dirty = set(), False
@@ -116,6 +119,8 @@ class Bus:
       self.pending[rid][c["eid"]] = Pending(cmd, turn.id if turn else None, now)
       self.disk.queued_bytes += len(cmd.body)
       if turn is not None:
+        if raw_s := self.db.get("blobs", f"s:{req_id}"):
+          turn = replace(turn, args={**turn.args, "stability": msgspec.msgpack.decode(raw_s)})
         self.active_turns[turn.id] = (c["node"], c["boot"], turn)
     owned = bool(self.active_turns) or any(r["live"] and r.get("owner") for r in self.runs.values())
     self.reap_after = now + LEASE_MS / 1000 if owned else 0.0
@@ -181,6 +186,7 @@ class Bus:
       box.queued_bytes -= len(p.cmd.body)
       box.cmds.pop(p.cmd.request_id, None)
       box.kv.delete("blobs", f"c:{p.cmd.request_id}")
+      box.kv.delete("blobs", f"s:{p.cmd.request_id}")
       self.notify(f"reply:{p.cmd.request_id}")
 
   def save_checkpoint(self, saved: dict) -> dict:
@@ -303,7 +309,13 @@ class Bus:
     return e[0] if e and e[1] > time.time() else None
 
   async def submit_command(
-    self, run_id: str, op: Op, body: bytes, seq_id: int | None = None, cost: int = 1
+    self,
+    run_id: str,
+    op: Op,
+    body: bytes,
+    seq_id: int | None = None,
+    cost: int = 1,
+    stability_refs: set[str] | None = None,
   ) -> str | None:
     if existing := await self.seen_request(run_id, seq_id):
       return existing
@@ -314,9 +326,19 @@ class Bus:
       raise BackpressureError("sampling queue memory limit reached")
     self.seq += 1
     cmd = Cmd(run_id, f"{time.time_ns() // 1_000_000}-{self.seq}", Op(op), body, cost)
+    stab = None
+    if box is self.disk and stability_refs:
+      wall, stab = time.time(), {}
+      for sid in stability_refs:
+        if (item := self.stability.get(sid)) and item[1] > wall:
+          del self.stability[sid]
+          self.stability[sid] = (item[0], wall + STABILITY_TTL)
+          stab[sid] = item[0]
     with box.kv:
       if box is self.disk:
         box.kv.put("blobs", f"c:{cmd.request_id}", body)
+        if stab:
+          box.kv.put("blobs", f"s:{cmd.request_id}", msgspec.msgpack.encode(stab))
         box.cmds[cmd.request_id] = {
           "run": run_id,
           "eid": cmd.entry_id,
@@ -385,6 +407,7 @@ class Bus:
     with box.kv:
       box.cmds.pop(cmd.request_id, None)
       box.kv.delete("blobs", f"c:{cmd.request_id}")
+      box.kv.delete("blobs", f"s:{cmd.request_id}")
       box.kv.put("blobs", f"r:{cmd.request_id}", reply.body)
       box.replies[cmd.request_id] = [reply.ok, reply.content_type, time.time() + REPLY_TTL, len(reply.body)]
       box.queued_bytes, box.reply_bytes = box.queued_bytes - len(cmd.body), box.reply_bytes + len(reply.body)
@@ -496,6 +519,15 @@ class Bus:
           w.idle_since = now
           (w.loaded.add if res.loaded else w.loaded.discard)(cmd.run)
           (w.open_grad.add if cmd.op == Op.FORWARD_BACKWARD and rep.ok else w.open_grad.discard)(cmd.run)
+    if turn.kind == "sample" and res.ok and res.stability:
+      exp = time.time() + STABILITY_TTL
+      for sid, blob in res.stability.items():
+        if old := self.stability.pop(sid, None):
+          self.stability_bytes -= len(old[0])
+        self.stability[sid] = (blob, exp)
+        self.stability_bytes += len(blob)
+      while self.stability_bytes > STABILITY_BYTES and len(self.stability) > 1:
+        self.stability_bytes -= len(self.stability.pop(next(iter(self.stability)))[0])
     if turn.kind == "park" and w and res.ok:
       w.resident, w.park_s = (), res.park_s
     elif turn.kind == "snapshot":
@@ -551,7 +583,8 @@ class Bus:
         row["owner"] = owner_token(node.node, node.boot_id, turn.worker)
         with self.db:
           if c := self.disk.cmds.get(cmd.request_id):
-            c["assignment"] = msgspec.msgpack.encode(replace(turn, cmd=None))
+            saved_args = {k: v for k, v in turn.args.items() if k != "stability"}
+            c["assignment"] = msgspec.msgpack.encode(replace(turn, cmd=None, args=saved_args))
             c["node"], c["boot"] = node.node, node.boot_id
             self.disk.cmds.save(cmd.request_id)
           self.runs.save(cmd.run)
@@ -693,6 +726,8 @@ class Bus:
           ver = uuid.uuid4().hex
         need_snap = row["snap"] and not (w and rid in w.loaded) and cmd.op != Op.LOAD_WEIGHTS
         args = {"record": dict(row["record"]), "saved": row["snap"][1] if need_snap else None, "version": ver}
+        if raw_s := self.db.get("blobs", f"s:{cmd.request_id}"):
+          args["stability"] = msgspec.msgpack.decode(raw_s)
         self.issue(node, Turn(uuid.uuid4().hex[:12], "train", wid, spec, gpus, cmd, args=args))
         continue
       live = self.worker_turns(node, wid)
@@ -808,6 +843,8 @@ class Bus:
             del box.seen[k]
         for sid in [s for s, v in self.sessions.items() if not v["active"] and v["seen"] <= now - SESSION_TTL]:
           del self.sessions[sid]
+        for sid in [s for s, (_, exp) in self.stability.items() if exp <= now]:
+          self.stability_bytes -= len(self.stability.pop(sid)[0])
     return len(expired)
 
   async def maintain(self) -> list[tuple[Ev, dict]]:
