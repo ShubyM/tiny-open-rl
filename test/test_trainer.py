@@ -89,8 +89,8 @@ class TestForwardPass(unittest.TestCase):
     advantages, weights = torch.randn(4, 9, generator=g), torch.rand(4, 9, generator=g)
     ratio = torch.exp(logprobs - sampler_logprobs)
 
-    def loss(name: str, **config) -> torch.Tensor:
-      return LOSSES[name](logprobs, weights, sampler_logprobs, advantages, config)
+    def loss(name: str, extra=None, **config) -> torch.Tensor:
+      return LOSSES[name](logprobs, weights, sampler_logprobs, advantages, config, **(extra or {}))
 
     torch.testing.assert_close(loss("cross_entropy"), -logprobs * weights)
     torch.testing.assert_close(loss("importance_sampling"), -ratio * advantages * weights)
@@ -99,8 +99,40 @@ class TestForwardPass(unittest.TestCase):
     torch.testing.assert_close(loss("ppo", clip_low_threshold=0.9, clip_high_threshold=1.1), -clipped * weights)
     kl = (ratio - 1) - (logprobs - sampler_logprobs)
     torch.testing.assert_close(loss("ppo", kl_coeff=0.5) - loss("ppo"), 0.5 * kl * weights)
-    with self.assertRaises(ValueError):
-      loss("ppo", unknown=1.0)
+
+    # CISPO: detached clipped IS ratio times logprob
+    lp_g = logprobs.clone().requires_grad_(True)
+    cispo_val = LOSSES["cispo"](
+      lp_g, weights, sampler_logprobs, advantages, {"clip_low_threshold": 0.5, "clip_high_threshold": 1.2}
+    )
+    torch.testing.assert_close(cispo_val, -ratio.clamp(0.5, 1.2) * advantages * lp_g * weights)
+    cispo_val.sum().backward()
+    torch.testing.assert_close(lp_g.grad, -ratio.clamp(0.5, 1.2) * advantages * weights)
+
+    # DRO: quadratic log-ratio penalty
+    torch.testing.assert_close(
+      loss("dro", beta=0.2), -(logprobs * advantages - 0.1 * (logprobs - sampler_logprobs) ** 2) * weights
+    )
+
+    # GSPO: geometric-mean sequence ratio over sequence_ratio_mask with local-only gradient
+    seq_mask = torch.tensor([[1, 1, 1, 0, 0, 0, 0, 0, 0]] * 4, dtype=torch.float32)
+    lp_g = logprobs.clone().requires_grad_(True)
+    gspo_val = LOSSES["gspo"](
+      lp_g,
+      weights,
+      sampler_logprobs,
+      advantages,
+      {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
+      sequence_ratio_mask=seq_mask,
+    )
+    seq_r = ((logprobs - sampler_logprobs) * seq_mask).sum(-1, keepdim=True).div(3.0).exp()
+    torch.testing.assert_close(gspo_val, -torch.min(seq_r * advantages, seq_r.clamp(0.8, 1.2) * advantages) * weights)
+    gspo_val.sum().backward()
+    self.assertTrue(torch.isfinite(lp_g.grad).all())
+
+    for name in ("ppo", "cispo", "dro", "gspo"):
+      with self.assertRaises(ValueError):
+        loss(name, unknown=1.0)
 
 
 class TestModel(unittest.TestCase):
@@ -158,18 +190,27 @@ class TestModel(unittest.TestCase):
     self.assertAlmostEqual(metrics["loss:sum"], -sum(float(lp.sum()) for lp in logprobs), places=4)
 
   def test_rl_losses_move_logprobs_with_the_advantage(self):
-    for loss in ("importance_sampling", "ppo"):
+    for loss in ("importance_sampling", "ppo", "cispo", "dro", "gspo"):
       model, (a,) = lora_runs()
       datum = counting(10)
       before = model.forward_backward(a, [datum], "cross_entropy", {}, True)[0][0]
 
       inputs = {**datum.inputs, "logprobs": before, "advantages": np.ones(10, np.float32)}
+      if loss == "gspo":
+        inputs["sequence_ratio_mask"] = np.ones(10, np.float32)
       for _ in range(5):
         model.forward_backward(a, [wire.Datum(datum.tokens, inputs)], loss, {}, False)
         model.optim_step(a, {"learning_rate": 1e-2})
 
       after = model.forward_backward(a, [datum], "cross_entropy", {}, True)[0][0]
       self.assertGreater(after.sum(), before.sum(), loss)
+
+    # Empty GSPO sequence_ratio_mask is rejected cleanly.
+    model, (a,) = lora_runs()
+    datum = counting(6)
+    bad = wire.Datum(datum.tokens, {**datum.inputs, "sequence_ratio_mask": np.zeros(6, np.float32)})
+    with self.assertRaisesRegex(ValueError, "sequence_ratio_mask"):
+      model.forward_backward(a, [bad], "gspo", {}, False)
 
   def test_full_fine_tune(self):
     model, run = Model(tiny), new_id()
