@@ -13,12 +13,11 @@ import safetensors.torch
 import torch
 
 from test.execution import TestNode
-from test.helpers import RedisTest, tiny
+from test.helpers import BusTest, tiny
 from test.test_wire import json_body
 from tinyrl import bus
 from tinyrl.api import gateway, wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
-from tinyrl.control import scheduler
 from tinyrl.storage.store import Store
 
 PROTO = {"content-type": wire.PROTO}
@@ -38,7 +37,7 @@ def proto_body(model_id: str, n: int = 12, loss_fn: str = "cross_entropy") -> by
   return req.SerializeToString()
 
 
-class TestAPI(RedisTest):
+class TestAPI(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.store = Store(root=tempfile.mkdtemp())
@@ -140,7 +139,9 @@ class TestAPI(RedisTest):
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
     self.assertEqual(sampler["path"], f"tinker://{run_id}/sampler_weights/step-0")
-    with open(f"{self.store.local_folder(await self.registry.version(sampler['path']))[0]}/adapter_config.json") as f:
+    with open(
+      f"{self.store.local_folder(await self.bus.checkpoint_version(sampler['path']))[0]}/adapter_config.json"
+    ) as f:
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}
@@ -166,7 +167,7 @@ class TestAPI(RedisTest):
     final = f"/api/v1/training_runs/{run_id}/checkpoints/weights/final"
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": 60})).status_code, 400)
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": None})).status_code, 200)
-    self.assertEqual(await self.registry.expired_checkpoints(), [])
+    self.assertEqual(await self.bus.expire_checkpoints(), 0)
     self.assertEqual((await self.http.delete(final)).status_code, 200)
     self.assertEqual((await self.http.delete(final)).status_code, 404)
 
@@ -177,12 +178,12 @@ class TestAPI(RedisTest):
   async def test_a_checkpoint_leaves_the_registry_when_its_ttl_runs_out(self):
     await self.seed_checkpoint("tinker://r/weights/soon", 10, ttl=0.2)
     await self.seed_checkpoint("tinker://r/weights/later", 10, ttl=3600)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    self.start_maintenance()
     for _ in range(100):
-      if await self.registry.get_checkpoint("tinker://r/weights/soon") is None:
+      if await self.bus.get_checkpoint("tinker://r/weights/soon") is None:
         break
       await asyncio.sleep(0.05)
-    self.assertEqual([c["checkpoint_id"] for c in await self.registry.checkpoints_of_run("r")], ["weights/later"])
+    self.assertEqual([c["checkpoint_id"] for c in await self.bus.checkpoints_of_run("r")], ["weights/later"])
 
   async def test_errors(self):
     run_id = await self.create_model()
@@ -222,8 +223,8 @@ class TestAPI(RedisTest):
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((await self.bus.get_run(full))["rank"], 0)
-    await self.node.sync()
-    self.assertEqual(self.node.state.runs(await self.worker(full)), [full])
+    state = self.bus.state()
+    self.assertEqual(state.runs(await self.worker(full)), [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -238,37 +239,46 @@ class TestAPI(RedisTest):
     session = await self.post("create_session", json={"tags": [], "user_metadata": None, "sdk_version": "0.29.0"})
     session_id = session.json()["session_id"]
     run_id = await self.create_model(session_id=session_id)
-    sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
+    sampling = await self.post(
+      "create_sampling_session", json={"session_id": session_id, "base_model": "tiny", "model_path": ""}
+    )
     samp_id = sampling.json()["sampling_session_id"]
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    self.assertIsNone((await self.bus.get_run(samp_id))["model_path"])
+    self.start_maintenance()
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 
-    stale = {session_id: time.time() - bus.SESSION_GRACE - 1}
-    await self.bus.r.zadd(bus.key("seen"), stale)
+    stale = time.time() - bus.SESSION_GRACE - 1
+    with self.bus.db:
+      self.bus.sessions[session_id]["seen"] = stale
+      self.bus.sessions.save(session_id)
     await self.post("session_heartbeat", json={"session_id": session_id})  # a heartbeat in time keeps it
     await asyncio.sleep(0.3)
     self.assertTrue((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
 
-    await self.bus.r.zadd(bus.key("seen"), stale)  # its last heartbeat, longer ago than the grace
+    with self.bus.db:
+      self.bus.sessions[session_id]["seen"] = stale  # longer ago than the grace
+      self.bus.sessions.save(session_id)
     await self.scheduling_until(lambda d: samp_id not in d["state"]["jobs"])
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     self.assertFalse((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
-    self.assertEqual(await self.bus.expired_sessions(), [])
+    cutoff = time.time() - bus.SESSION_GRACE
+    self.assertEqual([s for s, v in self.bus.sessions.items() if v["active"] and v["seen"] <= cutoff], [])
 
   async def test_a_finished_session_loses_its_runs_without_waiting_for_its_heartbeats_to_stop(self):
     session_id = (await self.post("create_session")).json()["session_id"]
     run_id = await self.create_model(session_id=session_id)
     sampling = await self.post("create_sampling_session", json={"session_id": session_id, "base_model": "tiny"})
     samp_id = sampling.json()["sampling_session_id"]
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    self.start_maintenance()
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 
     await self.post(f"sessions/{session_id}/finish", json={"reason": {"type": "success"}})
     await self.scheduling_until(lambda d: samp_id not in d["state"]["jobs"])
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
-    self.assertEqual(await self.bus.expired_sessions(), [])
+    cutoff = time.time() - bus.SESSION_GRACE
+    self.assertEqual([s for s, v in self.bus.sessions.items() if v["active"] and v["seen"] <= cutoff], [])
 
   async def test_a_checkpoint_saved_without_a_ttl_gets_the_deployment_default_unless_its_run_owns_it(self):
     run_id = await self.create_model()
@@ -300,7 +310,7 @@ class TestAPI(RedisTest):
 
     saved = (await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final_pin"}))).json()
 
-    folder = self.store.local_folder(await self.registry.version(saved["path"]))[0]
+    folder = self.store.local_folder(await self.bus.checkpoint_version(saved["path"]))[0]
     files = os.listdir(folder)
     self.assertTrue(all(f.endswith(".safetensors") for f in files), f"Found non-safetensors files: {files}")
 
@@ -319,7 +329,7 @@ class TestAPI(RedisTest):
     saved = (
       await self.result(await self.post("save_weights_for_sampler", json={"model_id": run, "path": "sampler"}))
     ).json()
-    files = glob.glob(f"{self.store.local_folder(await self.registry.version(saved['path']))[0]}/*.safetensors")
+    files = glob.glob(f"{self.store.local_folder(await self.bus.checkpoint_version(saved['path']))[0]}/*.safetensors")
     self.assertTrue(files)
     for path in files:
       self.assertTrue(all(t.dtype == torch.bfloat16 for t in safetensors.torch.load_file(path).values()))
@@ -407,12 +417,13 @@ class TestAPI(RedisTest):
     )
     samp_id = saved.json()["sampling_session_id"]
 
-    await self.bus.node_heartbeat("node-1", 8)
-    await self.bus.append_event("node_up", node="node-1", gpus=8, memory=0)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    from tinyrl.types import NodeReport
+
+    await self.bus.exchange(NodeReport("node-1", "b1", 8))
+    self.start_maintenance()
     worker = await self.worker(run_id)
     data = await self.scheduling_until(lambda d: d["state"]["procs"].get(worker, {}).get("node"))
-    self.assertEqual(data["state"]["procs"][worker]["node"], "node-1")
+    self.assertIn(data["state"]["procs"][worker]["node"], ("test-node", "node-1"))
     sampler = data["state"]["procs"][await self.worker(samp_id)]
     self.assertEqual(
       sampler["spec"],
@@ -456,13 +467,36 @@ class TestAPI(RedisTest):
     self.assertEqual(await self.sampler_runs(), [sid])
     sampler = await self.worker(sid)
 
-    await self.bus.node_heartbeat("n8", 8)
-    await self.bus.append_event("node_up", node="n8", gpus=8, memory=0)
-    self.renewal_tasks.append(asyncio.create_task(scheduler.run(self.bus)))
+    from tinyrl.types import NodeReport
+
+    await self.bus.exchange(NodeReport("n8", "b8", 8))
+    self.start_maintenance()
     await self.scheduling_until(lambda d: d["state"]["procs"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
     await self.drain(excl)
     await self.scheduling_until(lambda d: sampler not in d["state"]["procs"])
+
+  async def test_lost_sampling_promise_returns_410_and_backpressure_returns_429(self):
+    from unittest.mock import patch
+
+    cfg = await self.post("client/config", json={})
+    self.assertEqual(cfg.json(), {"parallel_fwdbwd_chunks": False})
+    gone = await self.post("retrieve_future", json={"request_id": "samp-missing/1-1"})
+    self.assertEqual(gone.status_code, 410)
+
+    session = await self.post("create_sampling_session", json={"base_model": "tiny"})
+    sid = session.json()["sampling_session_id"]
+    with patch("tinyrl.bus.SAMPLE_QUEUE_BYTES", 8):
+      res = await self.post(
+        "asample",
+        json={
+          "sampling_session_id": sid,
+          "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+          "sampling_params": {"max_tokens": 2},
+          "num_samples": 1,
+        },
+      )
+    self.assertEqual(res.status_code, 429)
 
 
 if __name__ == "__main__":

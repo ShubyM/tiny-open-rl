@@ -103,6 +103,7 @@ class Process:
     self.path = f"{self.folder.name}/model.sock"
     self.reader = self.writer = None
     self.broken = self.closed = False
+    self.lock = asyncio.Lock()
     try:
       self.proc = launch([*cmd, self.path], env)
     except BaseException:
@@ -110,26 +111,33 @@ class Process:
       raise
 
   async def call(self, method: str, *args):
-    if self.closed or self.broken:
-      raise RuntimeError("model connection is closed")
-    while self.writer is None:
-      if self.proc.poll() is not None:
-        raise RuntimeError(f"model process exited with {self.proc.returncode}")
+    async with self.lock:
+      if self.closed or self.broken:
+        raise RuntimeError("model connection is closed")
+      while self.writer is None:
+        if self.proc.poll() is not None:
+          raise RuntimeError(f"model process exited with {self.proc.returncode}")
+        try:
+          self.reader, self.writer = await asyncio.open_unix_connection(self.path)
+        except (FileNotFoundError, ConnectionRefusedError):
+          await asyncio.sleep(0.01)
       try:
-        self.reader, self.writer = await asyncio.open_unix_connection(self.path)
-      except (FileNotFoundError, ConnectionRefusedError):
-        await asyncio.sleep(0.01)
-    try:
-      self.writer.write(packet((method, args)))
-      await self.writer.drain()
-      size = int.from_bytes(await self.reader.readexactly(4), "big")
-      ok, result = pickle.loads(await self.reader.readexactly(size))
-    except BaseException:
-      self.broken = True  # a cancelled read cannot be matched to a later command
-      raise
-    if not ok:
-      raise RuntimeError(result)
-    return result
+        self.writer.write(packet((method, args)))
+        await self.writer.drain()
+        size = int.from_bytes(await self.reader.readexactly(4), "big")
+        ok, result = pickle.loads(await self.reader.readexactly(size))
+      except BaseException:
+        self.broken = True  # a cancelled read cannot be matched to a later command
+        raise
+      if not ok:
+        raise RuntimeError(result)
+      return result
+
+  async def resume(self, gpus: tuple[int, ...]) -> None:
+    await self.call("resume", gpus[0] if len(gpus) == 1 else None)
+
+  async def park(self) -> None:
+    await self.call("park")
 
   async def close(self) -> None:
     if self.closed:

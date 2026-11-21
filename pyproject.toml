@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tinyrl"
 version = "0.2.0"
-description = "The Tinker training API on Redis Streams and PyTorch."
+description = "The Tinker training API on an embedded SQLite control plane and PyTorch."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["fastapi", "uvicorn", "redis>=7.1", "protobuf>=5", "numpy", "torch", "transformers>=5", "peft>=0.15", "safetensors", "fsspec", "aiohttp", "nvtx; sys_platform != 'darwin'"]
+dependencies = ["fastapi", "uvicorn", "msgspec", "protobuf>=5", "numpy", "torch", "transformers>=5", "peft>=0.15", "safetensors", "fsspec", "aiohttp", "nvtx; sys_platform != 'darwin'"]
 
 [project.optional-dependencies]
 gcs = ["gcsfs"]

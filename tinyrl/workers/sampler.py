@@ -14,9 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from tinyrl.api import wire
-from tinyrl.bus import Cmd, Reply
-
-MASK_LOGPROB = -99999.0  # the SDK's logprob for a top-k slot that wasn't scored
+from tinyrl.types import Cmd, Reply
 
 
 @dataclass(frozen=True)
@@ -35,7 +33,7 @@ class Out:
 
 def topk(rows: list[dict[int, float] | None], k: int) -> tuple[np.ndarray, np.ndarray]:
   pairs = [sorted(r.items(), key=lambda kv: -kv[1])[:k] if r else [] for r in rows]
-  pairs = [p + [(0, MASK_LOGPROB)] * (k - len(p)) for p in pairs]
+  pairs = [p + [(0, wire.MASK_LOGPROB)] * (k - len(p)) for p in pairs]
   ids = np.array([[t for t, _ in p] for p in pairs], np.int32).reshape(len(rows), k)
   return ids, np.array([[lp for _, lp in p] for p in pairs], np.float32).reshape(len(rows), k)
 
@@ -76,20 +74,28 @@ class Sampler:
       if self.running is None:
         self.running = await self.engine_type.start(self.base, self.lora, self.env)
 
-  async def execute(self, cmd: Cmd, checkpoint: tuple[str, str] | None) -> Reply:
+  async def load(self, checkpoint: tuple[str, str] | None) -> str | None:
+    await self.start()
+    if checkpoint is None:
+      return None
+    path, name = checkpoint
+    async with self.loading:
+      await self.running.load_checkpoint(name, path)
+    return name
+
+  async def execute(self, cmd: Cmd, checkpoint: tuple[str, str] | None, loaded: bool = False) -> Reply:
     try:
-      job, name = json.loads(cmd.body), None
-      await self.start()
-      async with self.loading:
-        if checkpoint:
-          path, name = checkpoint
-          await self.running.load_checkpoint(name, path)
+      job = json.loads(cmd.body)
+      name = checkpoint[1] if loaded and checkpoint else await self.load(checkpoint)
       return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, await self.running.sample(job, name)))
     except Exception as e:
       return Reply.error(e)
 
-  async def resume(self, gpu: int | None = None) -> None:
-    if self.running:
+  async def resume(self, gpus: tuple[int, ...]) -> None:
+    if self.running is None:
+      self.env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+      await self.start()
+    else:
       await self.running.wake()
 
   async def park(self) -> None:

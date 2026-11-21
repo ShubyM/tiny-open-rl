@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import pathlib
 import socket
@@ -10,8 +9,8 @@ import time
 import unittest
 import urllib.request
 
-from test.helpers import start_redis, tiny
-from tinyrl.bus import connect
+from test.helpers import tiny
+from tinyrl.bus import Bus
 
 EXAMPLE = pathlib.Path(__file__).parent.parent / "examples" / "tinker_sdk.py"
 
@@ -33,7 +32,7 @@ def wait_until_up(url: str) -> None:
 
 @unittest.skipUnless(os.getenv("TINKER_PYTHON"), "set TINKER_PYTHON to a python that has the tinker SDK")
 class TestTinkerSDK(unittest.TestCase):
-  """The real Tinker SDK trains through redis, the gateway and a trainer, each its own process."""
+  """The real Tinker SDK trains through the gateway (control plane) and a node daemon, each its own process."""
 
   def test_the_tinker_sdk_trains_through_tinyrl(self):
     tmp = tempfile.mkdtemp()
@@ -43,19 +42,18 @@ class TestTinkerSDK(unittest.TestCase):
     port = free_port()
     env = {
       **os.environ,
-      "REDIS_URL": f"unix://{tmp}/redis.sock",
+      "TINYRL_DB": f"{tmp}/tinyrl.db",
       "PORT": str(port),
+      "CONTROL_URL": f"http://127.0.0.1:{port}",
       "CKPT": f"file://{tmp}/ckpt",  # a URL, so checkpoints go through upload and download as they do on GCS
       "CKPT_CACHE": f"{tmp}/cache",
       "ENGINE": "test.helpers:FakeEngine",  # the sampler's engine, since CI has no GPU for vLLM
     }
-    procs = [start_redis(f"{tmp}/redis.sock")]
+    procs = []
     try:
       procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.api.gateway"], env=env))
-      procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.control.scheduler"], env=env))
-      # starts the trainer
-      procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.control.node_daemon"], env=env))
       wait_until_up(f"http://127.0.0.1:{port}/api/v1/healthz")
+      procs.append(subprocess.Popen([sys.executable, "-m", "tinyrl.control.node_daemon"], env=env))
 
       sdk_env = {**env, "BASE_URL": f"http://127.0.0.1:{port}", "BASE_MODEL": base}
       out = subprocess.run(
@@ -67,9 +65,9 @@ class TestTinkerSDK(unittest.TestCase):
       model_id = out.stdout.split("model ")[1].split()[0]
 
       async def published() -> dict:
-        db = connect(env["REDIS_URL"])
+        db = Bus(env["TINYRL_DB"])
         try:
-          return json.loads(await db.hget(f"tinyrl:ckpt:{model_id}", "sampler_weights/final"))
+          return await db.get_checkpoint(f"tinker://{model_id}/sampler_weights/final")
         finally:
           await db.aclose()
 

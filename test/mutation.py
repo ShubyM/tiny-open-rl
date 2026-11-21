@@ -13,31 +13,32 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = "tinyrl/control/scheduler.py"
 BUS = "tinyrl/bus.py"
+FAIRNESS = "tinyrl/control/fairness.py"
 ACCOUNTING = "tinyrl/control/accounting.py"
 ORDER = "test.test_scheduler.TestLocalQuantum"
 BILLING = "test.test_accounting.TestAccounting"
-CLAIM = "test.test_bus.TestBus.test_old_epoch_cannot_claim_work_or_publish_a_named_or_parked_checkpoint"
+CLAIM = "test.test_bus.TestBus.test_reaped_boot_id_is_fenced_and_gets_reset_without_overwriting_checkpoint"
 DEDUP = "test.test_bus.TestBus.test_competing_sampler_replicas_answer_and_charge_exactly_once"
 RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure"
 
 # (source, function, original expression, faulty replacement, tests that should detect it)
 CASES = [
-  (SCHEDULER, "select_runs", "-state.ready_lag(cmd.run)", "state.ready_lag(cmd.run)", ORDER),
-  (SCHEDULER, "select_runs", "[:width]", "[:1]", ORDER),
-  (SCHEDULER, "select_runs", 'tuple(map(int, cmd.entry_id.split("-")))', "cmd.entry_id", ORDER),
+  (FAIRNESS, "rank_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
+  (FAIRNESS, "admit_samples", "max_seqs - sum(in_flight.values())", "1 - sum(in_flight.values())", BILLING),
+  (FAIRNESS, "rank_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (BUS, "finish_cmd", "if acct and charge.gpu_ms:", "if reply.ok and acct and charge.gpu_ms:", BILLING),
-  (BUS, "take_trainer_command", 'await p.hget(k, "owner") != token.encode()', "False", CLAIM),
+  (BUS, "commit", "if acct and charge and charge.gpu_ms", "if reply.ok and acct and charge and charge.gpu_ms", BILLING),
+  (BUS, "exchange_sync", "if report.boot_id in self.reaped_boots:", "if False:", CLAIM),
   (
     BUS,
-    "commit_sample",
-    'not await p.xrange(key("q", cmd.run), cmd.entry_id, cmd.entry_id)',
-    "await p.exists(fk)",
+    "commit",
+    "if (p := queue.get(cmd.entry_id)) is None or p.turn != turn:",
+    "if cmd.request_id in self.box(cmd.run).replies:",
     DEDUP,
   ),
-  (BUS, "commit_reply", "if mutates and not deleting:", "if reply.ok and mutates and not deleting:", RECOVERY),
+  (BUS, "commit", "if mutated and not deleting:", "if reply.ok and mutated and not deleting:", RECOVERY),
 ]
 
 
@@ -54,7 +55,8 @@ def mutate(source, function, original, replacement):
 
 def run_tests(folder, tests):
   env = os.environ.copy()
-  env.pop("REDIS_URL", None)  # RedisTest starts an isolated server and flushes only that server.
+  env.pop("TINYRL_DB", None)
+  env.pop("CONTROL_URL", None)
   env.pop("PYTHONPATH", None)
   env["TMPDIR"] = str(folder)
   return subprocess.run(

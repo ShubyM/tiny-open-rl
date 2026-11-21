@@ -14,9 +14,9 @@ import torch
 import torch.distributed as dist
 
 from tinyrl.api import wire
-from tinyrl.bus import Cmd, Op, Reply
 from tinyrl.storage.store import Store, nbytes
 from tinyrl.trace import span
+from tinyrl.types import Cmd, Op, Reply
 from tinyrl.workers.model import GradientRecoveryError, Model
 
 RECOVERABLE_ERRORS = (ValueError, KeyError, GradientRecoveryError)
@@ -151,7 +151,7 @@ def main(path: str) -> None:
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
   if int(os.environ.get("WORLD_SIZE", 1)) > 1:
     dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
-    dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", device_id=dev)
+    dist.init_process_group("cpu:gloo,cuda:nccl" if torch.cuda.is_available() else "gloo", device_id=dev)
   try:
     if dist.is_initialized() and dist.get_rank() > 0:
       serve_follower(Model())

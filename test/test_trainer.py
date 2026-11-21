@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 
 import numpy as np
 import torch
@@ -12,7 +13,7 @@ from transformers import LlamaForCausalLM
 
 import tinyrl.workers.model
 from test.execution import TestNode
-from test.helpers import RedisTest, new_id, tiny
+from test.helpers import BusTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl.api import wire
 from tinyrl.bus import Cmd, Op, Run
@@ -301,7 +302,7 @@ class TestModel(unittest.TestCase):
       )
 
 
-class TestTrainer(RedisTest):
+class TestTrainer(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.store = Store(root=tempfile.mkdtemp())
@@ -323,19 +324,25 @@ class TestTrainer(RedisTest):
   async def until(self, predicate):
     async with asyncio.timeout(10):
       while not predicate():
-        self.node.dispatch()
+        await self.node.tick()
         await asyncio.sleep(0.01)
 
   async def finish_worker(self, proc):
-    await self.until(lambda: proc not in self.node.lives)
+    await self.until(lambda: proc not in self.node.workers and not self.node.active)
+
+  async def drain_and_evict(self, proc):
+    self.node.draining = True
+    await self.finish_worker(proc)
+    self.node.draining = False
+    await self.node.tick()
 
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
     await self.bus.create_run(Run(run, "tiny", 0))
     await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
     await self.node.bind(run, run)
+    await self.until(lambda: run in self.node.processes and run not in self.node.workers and not self.node.active)
     child = self.node.processes[run]
-    await self.finish_worker(run)
     self.assertTrue(child.closed)
     self.assertIsNone((await self.bus.get_run(run)).get("owner"))
 
@@ -352,24 +359,23 @@ class TestTrainer(RedisTest):
           )
         await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
         await self.node.drain(r)
-      self.node.drop_local(f"p-{rank}")  # detaches dirty run to store before releasing owner
-      await self.finish_worker(f"p-{rank}")
+      await self.drain_and_evict(f"p-{rank}")  # detaches dirty run to store before releasing owner
       info = await self.bus.get_run(run)
       self.assertIsNone(info.get("owner"))
-      parked = info["snap"].partition("\n")[0]
-      self.assertIsNotNone(await self.registry.get_checkpoint(parked))
+      parked = info["snap"][0]
+      self.assertIsNotNone(await self.bus.get_checkpoint(parked))
       # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
       await self.node.drain(run)
       self.assertFalse((await self.bus.wait_for_reply(invalid, 1)).ok)
-      self.assertEqual((await self.bus.get_run(run))["snap"].partition("\n")[0], parked)
+      self.assertEqual((await self.bus.get_run(run))["snap"][0], parked)
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
       self.assertIsNone((await self.bus.get_run(run)).get("snap"))
-      self.assertIsNone(await self.registry.get_checkpoint(parked))  # recovery cannot replay old state after a crash
+      self.assertIsNone(await self.bus.get_checkpoint(parked))  # recovery cannot replay old state after a crash
 
   async def test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure(self):
     run = new_id()
@@ -383,9 +389,8 @@ class TestTrainer(RedisTest):
     expected = {k: p.detach().clone() for k, p in self.model("p").params[run].items()}
     step = (Op.OPTIM_STEP, {"adam_params": {}})
     for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
-      self.node.drop_local("p")
-      await self.finish_worker("p")
-      parked = (await self.bus.get_run(run))["snap"].partition("\n")[0]
+      await self.drain_and_evict("p")
+      parked = (await self.bus.get_run(run))["snap"][0]
       [request] = await self.submit(run, command)
       await self.node.drain(run)
       reply = await self.bus.wait_for_reply(request, 1)
@@ -395,10 +400,9 @@ class TestTrainer(RedisTest):
       info = await self.bus.get_run(run)
       self.assertEqual(info["pos"], request.rsplit("/", 1)[1])
       self.assertIsNone(info.get("snap"))
-      self.assertIsNone(await self.registry.get_checkpoint(parked))
+      self.assertIsNone(await self.bus.get_checkpoint(parked))
 
-    self.node.drop_local("p")
-    await self.finish_worker("p")
+    await self.drain_and_evict("p")
     [request] = await self.submit(run, step)
     await self.node.drain(run)
     self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
@@ -412,8 +416,8 @@ class TestTrainer(RedisTest):
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
     )
     await self.node.drain(run)
-    self.node.tasks["p"].cancel()  # a lost process has no detached snapshot
-    await self.finish_worker("p")
+    await self.node.drop_handle(self.node.workers["p"])  # a lost process has no detached snapshot
+    await self.node.tick()
     ids = await self.submit(
       run,
       (Op.OPTIM_STEP, {"adam_params": {}}),
@@ -457,6 +461,7 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
             (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
             (Op.FORWARD_BACKWARD, proto_body(run)),
             (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}),
+            (Op.FORWARD_BACKWARD, proto_body(run)),
             (Op.SAVE_WEIGHTS_FOR_SAMPLER, {"uri": f"tinker://{run}/sampler_weights/s1"}),
           ]
           for i, (op, body) in enumerate(commands):
@@ -471,6 +476,14 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")
         for name in expected:
           torch.testing.assert_close(actual[name], expected[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")
+        # Verify parked CPU-side training_state gather matches single-rank weights, grads, and AdamW moments.
+        single.park()
+        await asyncio.wait_for(multi.call("park"), 30)
+        exp_state = store.get(single.save_run(r1, uuid.uuid4().hex)["version"])[0]
+        got_state = store.get((await asyncio.wait_for(multi.call("save_run", r2, uuid.uuid4().hex), 30))["version"])[0]
+        self.assertEqual(exp_state.keys(), got_state.keys(), f"rank {rank} parked state")
+        for name in exp_state:
+          torch.testing.assert_close(got_state[name], exp_state[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")
       finally:
         await multi.close()
 

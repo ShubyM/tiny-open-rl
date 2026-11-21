@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import glob
 import hashlib
@@ -138,9 +139,15 @@ def restore_here(folder: str, target: str) -> None:
     run("mount", "--bind", d, f"/mnt/tinyrl{d}")
     run("mount", "-t", "tmpfs", "tmpfs", d)
     for e in os.scandir(f"/mnt/tinyrl{d}"):
-      if e.is_dir(follow_symlinks=False):
-        os.makedirs(f"{d}/{e.name}")
-        run("mount", "--bind", e.path, f"{d}/{e.name}")
+      try:
+        if e.is_dir(follow_symlinks=False):
+          os.makedirs(f"{d}/{e.name}")
+          run("mount", "--bind", e.path, f"{d}/{e.name}")
+      except (FileNotFoundError, RuntimeError):
+        if os.path.exists(e.path):
+          raise
+        with contextlib.suppress(OSError):
+          os.rmdir(f"{d}/{e.name}")
   os.makedirs(RUN, exist_ok=True)
   run("mount", "-t", "tmpfs", "tmpfs", RUN)
   for f in glob.glob(f"{folder}/keep/*"):

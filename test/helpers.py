@@ -1,16 +1,13 @@
 import asyncio
-import os
-import subprocess
 import tempfile
-import time
 import unittest
 import uuid
 
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from tinyrl.bus import Bus, connect, queue_checkpoint
-from tinyrl.storage.registry import Registry
+from tinyrl.bus import Bus, make_checkpoint
+from tinyrl.types import TurnResult
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -27,83 +24,77 @@ def tiny(name: str = "") -> LlamaForCausalLM:
   return LlamaForCausalLM(config)
 
 
+def finished(turn, reply=None, charge=None, **effects) -> TurnResult:
+  """What a node reports when `turn` ends with `reply` for each command it carried."""
+  return TurnResult(turn.id, True, reply if turn.cmd else None, charge, **effects)
+
+
 def new_id() -> str:
   # run ids are uuids, since PEFT finds an adapter's weights by its name
   return str(uuid.uuid4())
 
 
-def start_redis(socket_path: str) -> subprocess.Popen:
-  args = ["--port", "0", "--unixsocket", socket_path, "--save", "", "--appendonly", "no"]
-  proc = subprocess.Popen([os.getenv("REDIS_SERVER", "redis-server"), *args], stdout=subprocess.DEVNULL)
-  for _ in range(500):
-    if os.path.exists(socket_path):
-      break
-    time.sleep(0.01)
-  return proc
+async def serve_control(bus: Bus, host: str = "127.0.0.1", port: int = 0):
+  """Run the FastAPI gateway (including `/internal/exchange`) on a TCP port for tests."""
+  import socket
+
+  import uvicorn
+
+  from tinyrl.api import gateway
+
+  sock = socket.socket()
+  sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  sock.bind((host, port))
+  sock.listen(128)
+  actual = sock.getsockname()[1]
+  server = uvicorn.Server(uvicorn.Config(gateway.app(bus), host=host, port=actual, log_level="error"))
+  task = asyncio.create_task(server.serve(sockets=[sock]))
+  while not server.started:
+    await asyncio.sleep(0.005)
+
+  class Handle:
+    async def cleanup(self):
+      server.should_exit = True
+      await task
+      sock.close()
+
+  return Handle(), f"http://{host}:{actual}"
 
 
-class RedisTest(unittest.IsolatedAsyncioTestCase):
-  """Starts a throwaway redis-server for the test class, or uses REDIS_URL. Each test gets an empty database."""
-
-  proc: subprocess.Popen | None = None
+class BusTest(unittest.IsolatedAsyncioTestCase):
+  """Starts an isolated SQLite Bus per test."""
 
   async def seed_checkpoint(self, uri, size, *, ttl=None, owned=False, version=None):
-    pipeline = self.bus.r.pipeline()
-    queue_checkpoint(pipeline, uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned)
-    await pipeline.execute()
-
-  @classmethod
-  def setUpClass(cls):
-    if os.getenv("REDIS_URL"):
-      cls.url = os.environ["REDIS_URL"]
-      return
-    socket_path = f"{tempfile.mkdtemp()}/redis.sock"
-    cls.proc = start_redis(socket_path)
-    cls.url = f"unix://{socket_path}"
-
-  @classmethod
-  def tearDownClass(cls):
-    if cls.proc:
-      cls.proc.terminate()
-      cls.proc.wait()
+    with self.bus.db:
+      self.bus.checkpoints[uri] = make_checkpoint(uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned)
 
   async def asyncSetUp(self):
     self.renewal_tasks = []
-    self.bus = Bus(connect(self.url))
-    self.registry = Registry(self.bus)
-    await self.bus.r.flushall()
+    self._db_dir = tempfile.TemporaryDirectory()
+    self.db_path = f"{self._db_dir.name}/tinyrl.db"
+    self.bus = Bus(self.db_path)
+
+  def start_maintenance(self, period: float = 0.02) -> asyncio.Task:
+    async def loop():
+      while True:
+        await self.bus.maintain()
+        await asyncio.sleep(period)
+
+    task = asyncio.create_task(loop())
+    self.renewal_tasks.append(task)
+    return task
 
   async def worker(self, run: str) -> str:
     """The run's primary process, once every new run is assigned the way the scheduler assigns it."""
-    plan = await assign_new_runs(self.bus)
-    return plan["home"][run][0]
+    self.bus.reconcile()
+    return self.bus.state().procs_of(run)[0]
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:
       task.cancel()
     await asyncio.gather(*self.renewal_tasks, return_exceptions=True)
-    await self.bus.r.aclose()
-
-
-async def assign_new_runs(bus) -> dict:
-  """Assign new runs the way the scheduler would, without placing them onto unannounced test nodes."""
-  from tinyrl.control import scheduler
-
-  raw = await bus.read_state()
-  new, changes = scheduler.step(scheduler.from_state(raw | {"nodes": {}}))
-  plan = raw.get("plan") or {}
-  procs = {
-    **plan.get("procs", {}),
-    **{n: v for n, v in scheduler.to_plan(new)["procs"].items() if n not in plan.get("procs", {})},
-  }
-  home = {
-    **{r: ps for r, ps in plan.get("home", {}).items() if r in new.jobs},
-    **{b["run"]: [b["proc"]] for k, b in changes if k == "assigned"},
-  }
-  merged = {**plan, "made": max(plan.get("made", 0), new.made), "procs": procs, "home": home}
-  if merged != plan:
-    await bus.write_plan(merged, [c for c in changes if c[0] == "assigned"])
-  return merged
+    await self.bus.aclose()
+    self._db_dir.cleanup()
 
 
 class FakeEngine:
