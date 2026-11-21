@@ -3,6 +3,7 @@
 forward_backward and SampleResponse travel as protobuf end to end: the gateway forwards the bytes untouched, and the workers read or write tensors straight to them. Every other call is JSON.
 """
 
+import struct
 import sys
 from dataclasses import dataclass
 
@@ -25,9 +26,48 @@ NUMPY_DTYPES = {
 
 
 @dataclass(frozen=True)
+class Span:
+  kind: str  # "prompt" | "sampled"
+  sequence_id: str
+  offset: int
+  length: int
+
+
+@dataclass(frozen=True)
 class Datum:
   tokens: np.ndarray
   inputs: dict[str, np.ndarray]
+  model_spans: tuple[Span, ...] = ()
+  loss_spans: tuple[Span, ...] = ()
+
+
+def pack_stability(ids: np.ndarray, lps: np.ndarray) -> bytes:
+  return struct.pack("<II", *ids.shape) + ids.astype(np.int32).tobytes() + lps.astype(np.float32).tobytes()
+
+
+def unpack_stability(raw: bytes) -> tuple[np.ndarray, np.ndarray]:
+  n, k = struct.unpack("<II", raw[:8])
+  ids = np.frombuffer(raw, np.int32, n * k, 8).reshape(n, k)
+  lps = np.frombuffer(raw, np.float32, n * k, 8 + 4 * n * k).reshape(n, k)
+  return ids, lps
+
+
+def parse_spans(spans) -> tuple[Span, ...]:
+  out = []
+  for s in spans:
+    if (which := s.WhichOneof("span")) in ("sampled_tokens", "prompt_tokens"):
+      p = getattr(s, which)
+      out.append(Span("sampled" if which == "sampled_tokens" else "prompt", p.sequence_id, p.offset, p.length))
+  return tuple(out)
+
+
+def referenced_sequences(req: pb.ForwardBackwardRequest) -> set[str]:
+  return {
+    s.sampled_tokens.sequence_id
+    for d in req.data
+    for s in d.loss_fn_input_spans
+    if s.WhichOneof("span") == "sampled_tokens"
+  }
 
 
 # ***** requests *****
@@ -50,7 +90,14 @@ def datums(req: pb.ForwardBackwardRequest) -> list[Datum]:
   for d in req.data:
     tokens = [chunk_tokens(chunk) for chunk in d.model_input]
     inputs = {name: loss_input(tensor) for name, tensor in d.loss_fn_inputs.items()}
-    out.append(Datum(np.concatenate(tokens) if tokens else np.zeros(0, np.int32), inputs))
+    out.append(
+      Datum(
+        np.concatenate(tokens) if tokens else np.zeros(0, np.int32),
+        inputs,
+        parse_spans(d.model_input_spans),
+        parse_spans(d.loss_fn_input_spans),
+      )
+    )
   return out
 
 

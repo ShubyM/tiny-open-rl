@@ -496,6 +496,143 @@ class TestAPI(BusTest):
       )
     self.assertEqual(res.status_code, 429)
 
+  async def _sample_for_stable_reinforce(self, run_id: str, prompt: list[int]):
+    saved = await self.post("save_weights_for_sampler", json={"model_id": run_id, "sampling_session_seq_id": 0})
+    sid = (await self.result(saved)).json()["sampling_session_id"]
+    sub = await self.post(
+      "asample",
+      json={
+        "sampling_session_id": sid,
+        "prompt": {"chunks": [{"type": "encoded_text", "tokens": prompt}]},
+        "sampling_params": {"max_tokens": 6},
+        "num_samples": 2,
+        "record_stability_info": True,
+      },
+    )
+    self.assertEqual(sub.status_code, 200)
+    seq_ids = sub.json()["sample_sequence_ids"]
+    self.assertEqual(len(seq_ids), 2)
+    await self.drain(sid)
+    out = await self.post(
+      "retrieve_future", json={"request_id": sub.json()["request_id"]}, headers={"accept": wire.PROTO}
+    )
+    return seq_ids, pb.SampleResponse.FromString(out.content)
+
+  def _stable_reinforce_req(
+    self,
+    run_id: str,
+    prompt: list[int],
+    seq_pb,
+    seq_id: str,
+    *,
+    include_spans: bool = True,
+    offset: int = 0,
+    prompt_adv: float = 0.0,
+  ) -> bytes:
+    sampled_tokens = np.frombuffer(seq_pb.tokens, np.int32)
+    sampled_lps = np.frombuffer(seq_pb.logprobs, np.float32)
+    full = np.concatenate([np.array(prompt, np.int32), sampled_tokens])
+    n_prompt, n_samp = len(prompt) - 1, len(sampled_tokens)
+    req = pb.ForwardBackwardRequest(model_id=run_id, loss_fn="stable_reinforce")
+    req.loss_fn_config_v2["kl_coeff"].number = 0.01
+    req.loss_fn_config_v2["kl_estimator"].text = "k3"
+    d = req.data.add()
+    d.model_input.add().encoded_text.tokens = full[:-1].astype(np.int32).tobytes()
+    targets = full[1:].astype(np.int64)
+    lps = np.concatenate([np.zeros(n_prompt, np.float32), sampled_lps])
+    advs = np.concatenate([np.full(n_prompt, prompt_adv, np.float32), np.ones(n_samp, np.float32)])
+    d.loss_fn_inputs["target_tokens"].CopyFrom(
+      pb.Tensor(dense=targets.tobytes(), dtype=pb.DTYPE_INT64, shape=[len(targets)])
+    )
+    d.loss_fn_inputs["logprobs"].CopyFrom(pb.Tensor(dense=lps.tobytes(), dtype=pb.DTYPE_FLOAT32, shape=[len(lps)]))
+    d.loss_fn_inputs["advantages"].CopyFrom(pb.Tensor(dense=advs.tobytes(), dtype=pb.DTYPE_FLOAT32, shape=[len(advs)]))
+    if include_spans:
+      d.model_input_spans.add().prompt_tokens.CopyFrom(
+        pb.PromptProvenanceSpan(sequence_id=seq_id, offset=0, length=len(prompt))
+      )
+      d.model_input_spans.add().sampled_tokens.CopyFrom(
+        pb.SampledProvenanceSpan(sequence_id=seq_id, offset=0, length=n_samp - 1)
+      )
+      d.loss_fn_input_spans.add().prompt_tokens.CopyFrom(
+        pb.PromptProvenanceSpan(sequence_id=seq_id, offset=1, length=n_prompt)
+      )
+      d.loss_fn_input_spans.add().sampled_tokens.CopyFrom(
+        pb.SampledProvenanceSpan(sequence_id=seq_id, offset=offset, length=n_samp)
+      )
+    return req.SerializeToString()
+
+  async def test_stable_reinforce_records_stability_info_and_trains_end_to_end(self):
+    run_id, prompt = await self.create_model(), [1, 2, 3, 4]
+    seq_ids, resp = await self._sample_for_stable_reinforce(run_id, prompt)
+    # Client did not ask for topk_sample_logprobs, so wire reply stays lean while Bus retains stability info.
+    self.assertFalse(resp.sequences[0].HasField("topk_sampled_logprobs"))
+    self.assertIn(seq_ids[0], self.bus.stability)
+
+    # Valid provenance -> succeeds and runs optim_step.
+    fb = await self.post(
+      "forward_backward",
+      content=self._stable_reinforce_req(run_id, prompt, resp.sequences[0], seq_ids[0]),
+      headers=PROTO,
+    )
+    fb_out = await self.result(fb, headers={"accept": wire.PROTO})
+    self.assertEqual(fb_out.status_code, 200)
+    self.assertIn("loss:sum", pb.ForwardBackwardOutput.FromString(fb_out.content).metrics)
+    opt = await self.post("optim_step", json={"model_id": run_id, "adam_params": {"learning_rate": 1e-2}})
+    self.assertEqual((await self.result(opt)).json()["type"], "optim_step")
+
+    # Validation checks: missing spans, unknown sequence_id, nonzero prompt advantage, nonzero offset all fail cleanly.
+    for bad in (
+      self._stable_reinforce_req(run_id, prompt, resp.sequences[0], seq_ids[0], include_spans=False),
+      self._stable_reinforce_req(run_id, prompt, resp.sequences[0], "unknown-seq-id"),
+      self._stable_reinforce_req(run_id, prompt, resp.sequences[0], seq_ids[0], prompt_adv=1.0),
+      self._stable_reinforce_req(run_id, prompt, resp.sequences[0], seq_ids[0], offset=1),
+    ):
+      res = await self.result(await self.post("forward_backward", content=bad, headers=PROTO))
+      self.assertIn("error", res.json())
+
+  async def test_stable_reinforce_survives_sqlite_reopen_after_submission_and_dispatch(self):
+    run_id, prompt = await self.create_model(), [1, 2, 3, 4]
+    seq_ids, resp = await self._sample_for_stable_reinforce(run_id, prompt)
+
+    fb0 = await self.post(
+      "forward_backward",
+      content=self._stable_reinforce_req(run_id, prompt, resp.sequences[0], seq_ids[0]),
+      headers=PROTO,
+    )
+    fb1 = await self.post(
+      "forward_backward",
+      content=self._stable_reinforce_req(run_id, prompt, resp.sequences[1], seq_ids[1]),
+      headers=PROTO,
+    )
+    id0, id1 = fb0.json()["request_id"], fb1.json()["request_id"]
+
+    # Dispatch fb0 and drop the exchange reply; fb1 remains queued. Then wipe RAM by reopening SQLite.
+    first = self.bus.exchange_sync(self.node.build_report())
+    self.assertEqual(len(first.turns), 1)
+    self.assertEqual(first.turns[0].cmd.request_id, id0)
+    self.assertIn(seq_ids[0], first.turns[0].args["stability"])
+
+    await self.bus.aclose()
+    self.bus = bus.Bus(self.db_path)
+    self.node.control = self.bus
+    self.assertEqual(self.bus.stability, {})
+    self.assertIsNotNone(self.bus.db.get("blobs", f"s:{id0}"))
+    self.assertIsNotNone(self.bus.db.get("blobs", f"s:{id1}"))
+
+    # Re-polling from the same node redelivers fb0 verbatim with its durable stability tensors.
+    redelivered = self.bus.exchange_sync(self.node.build_report())
+    self.assertEqual([t.id for t in redelivered.turns], [first.turns[0].id])
+    self.assertEqual(redelivered.turns[0].gpus, first.turns[0].gpus)
+    self.assertEqual(redelivered.turns[0].args["stability"], first.turns[0].args["stability"])
+
+    # Draining executes both the redelivered turn (fb0) and the queued turn (fb1) with empty RAM cache, then cleans up.
+    await self.node.drain(run_id)
+    for req_id in (id0, id1):
+      reply = await self.bus.wait_for_reply(req_id, 1)
+      self.assertTrue(reply.ok, reply.body)
+      self.assertIn("loss:sum", pb.ForwardBackwardOutput.FromString(reply.body).metrics)
+      self.assertIsNone(self.bus.db.get("blobs", f"s:{req_id}"))
+
 
 if __name__ == "__main__":
   unittest.main()

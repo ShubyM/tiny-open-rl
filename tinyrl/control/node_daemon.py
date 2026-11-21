@@ -133,7 +133,7 @@ class WorkerHandle:
         return TurnResult(turn.id, saved=saved)
     if turn.kind == "sample":
       (resume_s, park_s), charge, cmd = await self.ensure_gpu(turn.gpus), Charge(), turn.cmd
-      ver, ckpt, err, load = turn.args.get("version"), None, None, None
+      ver, ckpt, err, load, stab = turn.args.get("version"), None, None, None, {}
       if ver is not None:
         try:
           ckpt = await asyncio.to_thread(store.local_folder, ver)
@@ -142,16 +142,20 @@ class WorkerHandle:
       if ckpt is not None and err is None:
         load_c, waiters, err = await self.load_shared(ckpt)
         load = (load_c, waiters)
-      rep = Reply.error(err) if err is not None else await self.wave.run(self.model.execute(cmd, ckpt, True), charge)
+      rep = (
+        Reply.error(err) if err is not None else await self.wave.run(self.model.execute(cmd, ckpt, True, stab), charge)
+      )
       if load is not None:
         load_c, waiters = load
         charge.started_ms, charge.busy_ms = load_c.started_ms, charge.busy_ms + load_c.busy_ms
         charge.gpu_ms += load_c.gpu_ms / waiters
-      return TurnResult(turn.id, True, rep, charge, resume_s=resume_s, park_s=park_s)
+      return TurnResult(turn.id, True, rep, charge, resume_s=resume_s, park_s=park_s, stability=stab or None)
     if turn.kind == "train":
       (resume_s, park_s), charge, cmd = await self.ensure_gpu(turn.gpus), Charge(), turn.cmd
       async with self.lock:
         args = (turn.args.get("record") or None, turn.args.get("saved"), turn.args.get("version"))
+        if (stab := turn.args.get("stability")) is not None:
+          args = (*args, stab)
         rep, eff = await Wave(turn.spec.gpus).run(self.model.call("execute", cmd, *args), charge)
         loaded = bool(eff.get("loaded"))
         (self.loaded.add if loaded else self.loaded.discard)(cmd.run)
