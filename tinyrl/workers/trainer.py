@@ -51,32 +51,17 @@ class Trainer:
         os._exit(1)
       raise
 
-  def save(
-    self,
-    run: str,
-    uri: str,
-    sampler: bool = False,
-    ttl_seconds: int | None = None,
-    owned: bool = False,
-    version: str | None = None,
-  ) -> dict:
+  def save(self, run: str, uri: str, sampler: bool = False, ttl_seconds=None, owned=False, version=None) -> dict:
     tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
-    version = self.store.put(tensors, meta, version=version)
-    size = sum(map(nbytes, tensors.values()))
-    return {"uri": uri, "size": size, "ttl": ttl_seconds, "owned": owned, "version": version}
+    ver, size = self.store.put(tensors, meta, version=version), sum(map(nbytes, tensors.values()))
+    info = {k: meta[k] for k in ("base", "rank", "lora", "targets") if k in meta}
+    return {"uri": uri, "size": size, "ttl": ttl_seconds, "owned": owned, "version": ver, "meta": info}
 
   def load_run(self, run: str, version: str | None, optimizer: bool, gradients: bool) -> None:
     self.call_model("restore_run", run, *self.store.get(version), optimizer, gradients)
 
   @span("trainer.execute")
-  def execute(
-    self,
-    cmd: Cmd,
-    run: dict | None = None,
-    snap: str | None = None,
-    version: str | None = None,
-    stability: dict[str, bytes] | None = None,
-  ) -> tuple[Reply, dict]:
+  def execute(self, cmd: Cmd, run: dict | None = None, snap=None, version=None, stability=None) -> tuple[Reply, dict]:
     effects, created, revision = {}, False, None
     try:
       if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
@@ -95,6 +80,9 @@ class Trainer:
       revision = self.model.state_revision  # restoring the parked state itself leaves its snapshot valid
       if cmd.op == Op.FORWARD_BACKWARD:
         req = wire.parse(cmd.body)
+        if stability is None and req.loss_fn == "stable_reinforce":
+          reqs = {sid.rpartition(":")[0] for sid in wire.referenced_sequences(req)}
+          stability = {k: v for rid in reqs if rid for k, v in self.store.get_stability(rid).items()}
         fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
         logprobs, metrics = self.call_model("forward_backward", *fb, stability)
         return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), effects

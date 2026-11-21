@@ -16,8 +16,8 @@ from test.execution import TestNode
 from test.helpers import BusTest, new_id, tiny
 from test.test_api import proto_body
 from tinyrl.api import wire
-from tinyrl.bus import Cmd, Op, Run
 from tinyrl.storage.store import Store
+from tinyrl.types import Cmd, Op, Run
 from tinyrl.workers.model import LOSSES, Model, batches, target_logprobs
 from tinyrl.workers.trainer import Trainer
 
@@ -432,7 +432,7 @@ class TestTrainer(BusTest):
 
   async def submit(self, run: str, *cmds: tuple[Op, dict | bytes]) -> list[str]:
     return [
-      await self.bus.submit_command(run, op, body if isinstance(body, bytes) else json.dumps(body).encode())
+      self.bus.submit_command(run, op, body if isinstance(body, bytes) else json.dumps(body).encode())
       for op, body in cmds
     ]
 
@@ -446,7 +446,7 @@ class TestTrainer(BusTest):
         await asyncio.sleep(0.01)
 
   async def finish_worker(self, proc):
-    await self.until(lambda: proc not in self.node.workers and not self.node.active)
+    await self.until(lambda: proc not in self.node.workers and not self.node.busy())
 
   async def drain_and_evict(self, proc):
     self.node.draining = True
@@ -456,19 +456,19 @@ class TestTrainer(BusTest):
 
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
-    await self.bus.create_run(Run(run, "tiny", 0))
+    self.bus.create_run(Run(run, "tiny", 0))
     await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
     await self.node.bind(run, run)
-    await self.until(lambda: run in self.node.processes and run not in self.node.workers and not self.node.active)
+    await self.until(lambda: run in self.node.processes and run not in self.node.workers and not self.node.busy())
     child = self.node.processes[run]
     self.assertTrue(child.closed)
-    self.assertIsNone((await self.bus.get_run(run)).get("owner"))
+    self.assertIsNone((self.bus.get_run(run)).get("owner"))
 
   async def test_graceful_replacement_registers_and_restores_weights_optimizer_and_pending_gradients(self):
     for rank, lora, width in ((4, LORA, 2), (0, {}, 1)):
       ctrl, run = new_id(), new_id()
       for r, proc in ((run, f"p-{rank}"), (ctrl, f"ctrl-{rank}")):
-        await self.bus.create_run(Run(r, "tiny", rank, lora=lora, gpus=width))
+        self.bus.create_run(Run(r, "tiny", rank, lora=lora, gpus=width))
         await self.node.bind(proc, r)
         await self.submit(r, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": rank, "lora": lora}))
         for _ in range(2):
@@ -478,26 +478,26 @@ class TestTrainer(BusTest):
         await self.submit(r, (Op.FORWARD_BACKWARD, proto_body(r)))  # pause between accumulation and optimizer step
         await self.node.drain(r)
       await self.drain_and_evict(f"p-{rank}")  # detaches dirty run to store before releasing owner
-      info = await self.bus.get_run(run)
+      info = self.bus.get_run(run)
       self.assertIsNone(info.get("owner"))
       parked = info["snap"][0]
-      self.assertIsNotNone(await self.bus.get_checkpoint(parked))
+      self.assertIsNotNone(self.bus.get_checkpoint(parked))
       # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
       await self.node.drain(run)
       self.assertFalse((await self.bus.wait_for_reply(invalid, 1)).ok)
-      self.assertEqual((await self.bus.get_run(run))["snap"][0], parked)
+      self.assertEqual((self.bus.get_run(run))["snap"][0], parked)
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
-      self.assertIsNone((await self.bus.get_run(run)).get("snap"))
-      self.assertIsNone(await self.bus.get_checkpoint(parked))  # recovery cannot replay old state after a crash
+      self.assertIsNone((self.bus.get_run(run)).get("snap"))
+      self.assertIsNone(self.bus.get_checkpoint(parked))  # recovery cannot replay old state after a crash
 
   async def test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure(self):
     run = new_id()
-    await self.bus.create_run(Run(run, "tiny", 0))
+    self.bus.create_run(Run(run, "tiny", 0))
     await self.node.bind("p", run)
     await self.submit(
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.FORWARD_BACKWARD, proto_body(run))
@@ -508,17 +508,17 @@ class TestTrainer(BusTest):
     step = (Op.OPTIM_STEP, {"adam_params": {}})
     for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
       await self.drain_and_evict("p")
-      parked = (await self.bus.get_run(run))["snap"][0]
+      parked = (self.bus.get_run(run))["snap"][0]
       [request] = await self.submit(run, command)
       await self.node.drain(run)
       reply = await self.bus.wait_for_reply(request, 1)
       self.assertFalse(reply.ok)
       if command == step:
         self.assertIn("accumulated gradients were discarded", reply.body.decode())
-      info = await self.bus.get_run(run)
-      self.assertEqual(info["pos"], request.rsplit("/", 1)[1])
+      info = self.bus.get_run(run)
+      self.assertEqual(info["status"], "live")
       self.assertIsNone(info.get("snap"))
-      self.assertIsNone(await self.bus.get_checkpoint(parked))
+      self.assertIsNone(self.bus.get_checkpoint(parked))
 
     await self.drain_and_evict("p")
     [request] = await self.submit(run, step)
@@ -528,13 +528,15 @@ class TestTrainer(BusTest):
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     run, uri = new_id(), "tinker://saved/weights/step-1"
-    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
+    self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
     await self.node.bind("p", run)
     await self.submit(
       run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 4, "lora": LORA}), (Op.SAVE_WEIGHTS, {"uri": uri})
     )
     await self.node.drain(run)
-    await self.node.drop_worker("p", self.node.workers["p"])  # a lost process has no detached snapshot
+    self.node.workers["p"].model.kill()  # a lost process has no detached snapshot
+    await self.node.tick()
+    await asyncio.gather(*self.node.tasks())
     await self.node.tick()
     ids = await self.submit(
       run,

@@ -40,19 +40,16 @@ def topk(rows: list[dict[int, float] | None], k: int) -> tuple[np.ndarray, np.nd
 
 def encode(job: dict, out: Out) -> bytes:
   """The SampleResponse protobuf for an engine's output, with prompt rows before prompt_logprobs_last_n unscored."""
-  prompt, last_n = job["prompt"], job["prompt_logprobs_last_n"]
+  prompt, last_n, k = job["prompt"], job["prompt_logprobs_last_n"], job["topk_sample"]
   rows = [r if i >= (len(prompt) - last_n if last_n else 1) else None for i, r in enumerate(out.prompt)]
-  prompt_lp = (
-    np.array([r[t] if r else np.nan for r, t in zip(rows, prompt)], np.float32) if job["prompt_logprobs"] else None
-  )
-  k = job["topk_sample"]
+  plp = np.array([r[t] if r else np.nan for r, t in zip(rows, prompt)], np.float32) if job["prompt_logprobs"] else None
   seqs = [
     wire.SampleOut(
       s.stop, np.array(s.tokens, np.int32), np.array(s.logprobs, np.float32), topk(s.top, k) if k else None
     )
     for s in out.seqs
   ]
-  return wire.sample_output(seqs, prompt_lp, topk(rows, job["topk_prompt"]) if job["topk_prompt"] else None)
+  return wire.sample_output(seqs, plp, topk(rows, job["topk_prompt"]) if job["topk_prompt"] else None)
 
 
 def encode_stability(request_id: str, out: Out) -> dict[str, bytes]:
@@ -88,15 +85,13 @@ class Sampler:
       await self.running.load_checkpoint(name, path)
     return name
 
-  async def execute(
-    self, cmd: Cmd, checkpoint: tuple[str, str] | None, loaded: bool = False, stability: dict[str, bytes] | None = None
-  ) -> Reply:
+  async def execute(self, cmd: Cmd, checkpoint: tuple[str, str] | None, loaded: bool = False, store=None) -> Reply:
     try:
       job = json.loads(cmd.body)
       name = checkpoint[1] if loaded and checkpoint else await self.load(checkpoint)
       out = await self.running.sample(job, name)
-      if stability is not None and job.get("record_stability_info"):
-        stability.update(await asyncio.to_thread(encode_stability, cmd.request_id, out))
+      if store is not None and job.get("record_stability_info"):
+        await asyncio.to_thread(store.put_stability, cmd.request_id, encode_stability(cmd.request_id, out))
       return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, out))
     except Exception as e:
       return Reply.error(e)

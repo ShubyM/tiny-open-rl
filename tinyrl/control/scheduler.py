@@ -1,7 +1,4 @@
-"""Pure cluster placement and EEVDF lag update (`run -> procs -> node`).
-
-Called synchronously inside the controller's `exchange` and `maintain` paths — zero I/O, zero locks.
-"""
+"""Pure cluster placement and EEVDF lag update (`run -> proc -> node`). Zero I/O, zero locks."""
 
 from __future__ import annotations
 
@@ -29,9 +26,8 @@ class Job:
   spec: Spec
   train_run: str | None = None
   account: str = ""
-  owner: list[str] | None = None  # [proc, node, boot id] of the worker holding its weights
+  owner: tuple[str, str, str] | list[str] | None = None  # (proc, node, boot_id) holding its weights
   backlog: int = 0
-  record: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -75,7 +71,6 @@ class State:
     return max((self.ready_lag(r) for r in self.runs(proc) if self.ready(r)), default=0.0)
 
   def ready_lag(self, run: str) -> float:
-    """The account's lag, less service completed since the last update."""
     account = self.account(run)
     return self.lag.get(account, 0.0) - max(0.0, self.service.get(account, 0.0) - self.seen.get(account, 0.0))
 
@@ -106,28 +101,11 @@ class State:
     return name
 
 
-def jobs(runs: dict[str, dict], backlog: dict[str, int]) -> dict[str, Job]:
-  """Every live run as the planner sees it: its worker spec, account, owner and queue length."""
-  out = {}
-  for r, row in runs.items():
-    rec = row["record"]
-    excl, tr, role = bool(rec.get("exclusive")), rec.get("train_run"), Role(rec.get("role", "trainer"))
-    spec = Spec(role, rec.get("base", ""), rec.get("rank", 0) > 0, excl, tr if excl else None, int(rec.get("gpus", 1)))
-    acct = rec.get("account") or ("" if tr else rec.get("session", ""))
-    out[r] = Job(spec, tr, acct, row.get("owner"), backlog.get(r, 0), rec)
-  return {r: j for r, j in out.items() if not j.spec.train_run or j.spec.train_run in out}
-
-
 def from_plan(plan: dict) -> State:
-  """What `to_plan` saved. The Bus fills in the nodes, jobs and service of the moment before each step."""
-  procs = {
-    n: Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))
-    for n, p in plan.get("procs", {}).items()
-  }
-  fv = [{a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights")]
-  return State(
-    int(plan.get("made", 0)), procs=procs, home=dict(plan.get("home", {})), lag=fv[0], seen=fv[1], weights=fv[2]
-  )
+  mk = lambda p: Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))  # noqa: E731
+  procs, home = {n: mk(p) for n, p in plan.get("procs", {}).items()}, dict(plan.get("home", {}))
+  lag, seen, w = ({a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights"))
+  return State(int(plan.get("made", 0)), procs=procs, home=home, lag=lag, seen=seen, weights=w)
 
 
 def to_plan(s: State) -> dict:
@@ -139,28 +117,24 @@ def settings(gpus: int, gpu_bytes: int) -> dict[str, str]:
   return {"TINYRL_KV_BYTES": str(24 * 2**30)} if gpu_bytes >= 64 * 2**30 else {}
 
 
-# ***** placement, elastic scaling, and cross-node rebalance *****
-
-
 def choose_node(s: State, proc: str, only_spare: bool = False) -> str | None:
-  """A node that can host `proc`: one with room for it and its sampler, then its trainer's node, then the least used."""
+  """Pick a node for `proc`: room for a full-FT sampler pair first, then its trainer's node, then least used."""
   spec = s.procs[proc].spec
   near = {s.procs[p].node for r in s.runs(proc) if (p := s.home.get(s.jobs[r].train_run or ""))}
   sampled = {j.train_run for j in s.jobs.values()}
 
-  def placement_rank(node: str) -> tuple:
+  def rank(node: str) -> tuple:
     unpaired = [n for n, p in s.procs_on(node) if p.spec.role == Role.TRAINER and not p.spec.lora]
     owed = sum(s.procs[n].spec.gpus for n in unpaired if not (sampled & set(s.runs(n))))
     used, capacity = s.used(node), s.nodes[node][0]
     paired = spec.gpus * (2 if spec.role == Role.TRAINER and not spec.lora else 1)
     return capacity - used - owed < paired, node not in near, used / capacity
 
-  nodes = [n for n in sorted(s.nodes) if s.can_host(n, spec, spare=only_spare)]
-  return min(nodes, key=placement_rank, default=None)
+  return min((n for n in sorted(s.nodes) if s.can_host(n, spec, spare=only_spare)), key=rank, default=None)
 
 
 def rebalance_target(s: State, name: str) -> str | None:
-  """Move busy `name` off an oversubscribed node: to a spare node, or across nodes once lag reaches `REBALANCE_MS`."""
+  """Move busy `name` off an oversubscribed node: to a spare node, or across nodes once lag hits `REBALANCE_MS`."""
   p = s.procs[name]
   if not s.busy(name) or s.spare(p.node) >= 0:
     return None
@@ -169,8 +143,7 @@ def rebalance_target(s: State, name: str) -> str | None:
     return min(spare, key=lambda n: s.used(n) / s.nodes[n][0])
 
   def floor(node: str) -> float:
-    on = (s.lag_of(h) for h, q in s.procs_on(node) if not q.spec.exclusive and s.busy(h))
-    return min(on, default=float("inf"))
+    return min((s.lag_of(h) for h, q in s.procs_on(node) if not q.spec.exclusive and s.busy(h)), default=float("inf"))
 
   here = (round(s.load(p.node, name), 6), round(floor(p.node), 3))
   opts = [(round(s.load(n), 6), round(floor(n), 3), n) for n in fit if s.lag_of(name) - floor(n) >= REBALANCE_MS - 1e-9]
@@ -178,7 +151,6 @@ def rebalance_target(s: State, name: str) -> str | None:
 
 
 def demand(s: State, cap: float) -> dict[str, float]:
-  """The GPUs each account could use now: one run's worth per ready run, more when a sampler exceeds `MAX_SEQS`."""
   biggest, want = max((g for g, _ in s.nodes.values()), default=0), {}
   for r, j in s.jobs.items():
     if s.ready(r) and j.spec.gpus <= biggest:
@@ -189,7 +161,6 @@ def demand(s: State, cap: float) -> dict[str, float]:
 
 
 def drop_lost(s: State, out: list) -> None:
-  """Forget the homes of runs that are gone, and unplace processes whose node vanished or has no room for them."""
   s.home = {r: p for r, p in s.home.items() if r in s.jobs}
   for name, p in sorted(s.procs.items()):
     if p.node and (p.node not in s.nodes or not s.can_host(p.node, p.spec, name)):
@@ -198,7 +169,6 @@ def drop_lost(s: State, out: list) -> None:
 
 
 def assign(s: State, out: list) -> None:
-  """Give every homeless training run a process: the matching shareable one with the fewest runs, or a new one."""
   for r, j in sorted(s.jobs.items()):
     if j.spec.role == Role.TRAINER and r not in s.home:
       match = [n for n, p in sorted(s.procs.items()) if j.spec.shareable and p.spec == j.spec]
@@ -207,7 +177,6 @@ def assign(s: State, out: list) -> None:
 
 
 def merge_and_split(s: State, out: list) -> None:
-  """Coalesce crowded LoRA trainers, and split busy ones onto spare GPUs."""
   for name, p in sorted(list(s.procs.items())):
     if p.spec.role != Role.TRAINER or not p.spec.shareable or not p.node:
       continue
@@ -227,7 +196,6 @@ def merge_and_split(s: State, out: list) -> None:
 
 
 def size_samplers(s: State, out: list) -> None:
-  """Maintain one stateless sampler pool per active Spec: scale out on spare GPUs, scale in past backlog."""
   by_spec: dict[Spec, list[Job]] = {}
   for _, j in sorted(s.jobs.items()):
     if j.spec.role == Role.SAMPLER:
@@ -253,7 +221,6 @@ def size_samplers(s: State, out: list) -> None:
 
 
 def collect_and_place(s: State, out: list) -> None:
-  """Remove empty processes, then place the unplaced ones."""
   held = {j.owner[0] for j in s.jobs.values() if j.owner and j.owner[1] in s.nodes}
   for name in [n for n in sorted(s.procs) if not s.runs(n) and n not in held]:
     if s.procs.pop(name).node:
@@ -265,7 +232,6 @@ def collect_and_place(s: State, out: list) -> None:
 
 
 def rebalance(s: State, out: list) -> None:
-  """Fill spare nodes, evacuate exclusive-squeezed processes, or rotate across nodes once lag reaches `REBALANCE_MS`."""
   for name, p in sorted(s.procs.items()):
     if p.node and not p.spec.exclusive and (target := rebalance_target(s, name)):
       p.node = target
@@ -273,7 +239,6 @@ def rebalance(s: State, out: list) -> None:
 
 
 def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
-  """Pure planner transition: update lag, then run the placement phases in order."""
   s, out = copy.deepcopy(state), []
   cap = float(sum(g for g, _ in s.nodes.values()))
   s.lag, s.seen = update_lag(s.lag, s.seen, s.service, cap, demand(s, cap), s.weights)

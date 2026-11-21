@@ -18,7 +18,7 @@ class InlineProcess:
     if self.closed:
       raise EOFError("the model process exited")
     result = getattr(self.trainer, method)(*args)
-    await asyncio.sleep(0)  # let other coroutines run between model calls
+    await asyncio.sleep(0)
     return result
 
   async def resume(self, gpus):
@@ -57,6 +57,9 @@ class TestNode(NodeDaemon):
   async def tick(self):
     return await self.step_once(wait_ms=0)
 
+  def tasks(self) -> list[asyncio.Task]:
+    return [t for w in self.workers.values() for t in (*(tk for _, tk in w.running.values()), w.op_task) if t]
+
   async def bind(self, proc: str, *runs: str):
     """Pin `proc` hosting `runs` onto this node in the controller's plan and announce this node."""
     state = self.control.state()
@@ -73,28 +76,24 @@ class TestNode(NodeDaemon):
     return self.workers.get(proc)
 
   def drop_local(self, proc: str):
-    """Remove `proc` from this node's plan so the next exchange closes/detaches it."""
     if p := self.control.plan_state.procs.get(proc):
       p.node, self.control.plan_due = None, 0.0
     self.notify()
 
   async def worker_for(self, run: str) -> str | None:
     await self.tick()
-    state = self.control.state()
-    ps = state.procs_of(run)
+    ps = self.control.state().procs_of(run)
     return ps[0] if ps else None
 
   async def drain(self, run: str):
-    """Run real `exchange` ticks until all queued/in-flight commands for `run` finish."""
     async with asyncio.timeout(15):
       while True:
         await self.tick()
-        q = await self.control.queued_and_in_flight(run)
-        if not q.get("queued") and not q.get("in_flight") and not self.active and not self.staging:
+        q = self.control.queued_and_in_flight(run)
+        if not q.get("queued") and not q.get("in_flight") and not self.busy():
           break
         await asyncio.sleep(0.002)
-    state = self.control.state()
-    ps = state.procs_of(run)
+    ps = self.control.state().procs_of(run)
     return self.workers.get(ps[0]) if ps else None
 
   async def aclose(self):

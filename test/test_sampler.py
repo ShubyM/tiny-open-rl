@@ -12,8 +12,8 @@ from test.helpers import BusTest, FakeEngine, tiny
 from tinyrl.api import wire
 from tinyrl.api.gateway import app
 from tinyrl.api.proto import tinker_public_pb2 as pb
-from tinyrl.bus import Op, Role, Run
 from tinyrl.storage.store import Store
+from tinyrl.types import Op, Role, Run
 from tinyrl.workers.sampler import Out, Seq, encode
 
 JOB = {
@@ -89,7 +89,7 @@ class TestSampler(BusTest):
     store = Store(tempfile.mkdtemp())
     node = self.node(store)
     self.pump(node)
-    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app(self.bus, store)), base_url="http://test")
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app(self.bus)), base_url="http://test")
     self.addAsyncCleanup(client.aclose)
 
     async def call(path: str, body: dict) -> dict:
@@ -123,18 +123,18 @@ class TestSampler(BusTest):
     self.assertEqual(len(pb.SampleResponse.FromString(raw.content).sequences), 1)
 
   async def test_a_tensor_parallel_sampler_takes_turns_on_both_its_gpus(self):
-    await self.bus.create_run(Run("t1", "base", 0))
-    await self.bus.create_run(Run("samp-1", "base", 1, role=Role.SAMPLER, gpus=2))
+    self.bus.create_run(Run("t1", "base", 0))
+    self.bus.create_run(Run("samp-1", "base", 1, role=Role.SAMPLER, gpus=2))
     node = self.node(gpus=2)
     self.pump(node, sched=True)
-    create = await self.bus.submit_command("t1", Op.CREATE_MODEL, b'{"base_model":"base","rank":0,"lora":{}}')
+    create = self.bus.submit_command("t1", Op.CREATE_MODEL, b'{"base_model":"base","rank":0,"lora":{}}')
     self.assertTrue((await self.bus.wait_for_reply(create, 5)).ok)
     for run, op, body in [
       ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
       ("samp-1", Op.SAMPLE, JOB),
       ("t1", Op.OPTIM_STEP, {"adam_params": {}}),
     ]:
-      reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, json.dumps(body).encode()), 5)
+      reply = await self.bus.wait_for_reply(self.bus.submit_command(run, op, json.dumps(body).encode()), 5)
       self.assertIsNotNone(reply)
       self.assertTrue(reply.ok, reply.body)
 
@@ -142,8 +142,8 @@ class TestSampler(BusTest):
     store = Store(tempfile.mkdtemp())
     for i in range(4):
       uri = f"tinker://r{i}/sampler_weights/s0"
-      await self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": True, "config": {}}))
-      await self.bus.create_run(Run(f"s{i}", "base", 4, role=Role.SAMPLER, model_path=uri, account="alice"))
+      self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": True, "config": {}}))
+      self.bus.create_run(Run(f"s{i}", "base", 4, role=Role.SAMPLER, model_path=uri, account="alice"))
     active, peak, parallel = {}, 0, 0
 
     class WaveEngine(FakeEngine):
@@ -162,9 +162,9 @@ class TestSampler(BusTest):
 
     node = self.node(store, gpus=1, engine=WaveEngine)
     requests = [
-      await self.bus.submit_command(f"s{i}", Op.SAMPLE, json.dumps(JOB).encode()) for i in range(4) for _ in range(2)
+      self.bus.submit_command(f"s{i}", Op.SAMPLE, json.dumps(JOB).encode()) for i in range(4) for _ in range(2)
     ]
-    with mock.patch("tinyrl.bus.MAX_LORAS", 3):
+    with mock.patch("tinyrl.types.MAX_LORAS", 3):
       await node.bind("sampler", "s0", "s1", "s2", "s3")
       self.pump(node)
       self.assertTrue(all([(await self.bus.wait_for_reply(request, 5)).ok for request in requests]))
@@ -174,9 +174,9 @@ class TestSampler(BusTest):
   async def test_failed_boot_answers_waiting_heads_and_leaves_later_work_unclaimed(self):
     store = Store(tempfile.mkdtemp())
     uri = "tinker://r/sampler_weights/new"
-    await self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": True, "config": {}}))
-    await self.bus.create_run(Run("first", "base", 4, role=Role.SAMPLER))
-    await self.bus.create_run(Run("later", "base", 4, role=Role.SAMPLER, model_path=uri))
+    self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": True, "config": {}}))
+    self.bus.create_run(Run("first", "base", 4, role=Role.SAMPLER))
+    self.bus.create_run(Run("later", "base", 4, role=Role.SAMPLER, model_path=uri))
     booting, finish_boot = asyncio.Event(), asyncio.Event()
 
     class Broken(FakeEngine):
@@ -187,15 +187,17 @@ class TestSampler(BusTest):
         raise RuntimeError("engine boot failed")
 
     node = self.node(store, gpus=1, engine=Broken)
-    first = await self.bus.submit_command("first", Op.SAMPLE, json.dumps(JOB).encode())
+    first = self.bus.submit_command("first", Op.SAMPLE, json.dumps(JOB).encode())
     await node.bind("sampler", "first", "later")
     try:
       await asyncio.wait_for(booting.wait(), 5)
-      later = await self.bus.submit_command("later", Op.SAMPLE, json.dumps(JOB).encode())
-      self.assertEqual(await self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
+      later = self.bus.submit_command("later", Op.SAMPLE, json.dumps(JOB).encode())
+      self.assertEqual(self.bus.queued_and_in_flight("later"), {"live": True, "queued": 1, "in_flight": []})
       finish_boot.set()
-      await asyncio.gather(*(t for _, t in node.active.values()))
+      await asyncio.gather(*node.tasks())
       await node.tick()
+      if ts := node.tasks():
+        await asyncio.gather(*ts)
       reply = await self.bus.wait_for_reply(first, 5)
       self.assertIsNotNone(reply)
       self.assertFalse(reply.ok)
@@ -212,8 +214,8 @@ class TestSampler(BusTest):
     store = Store(tempfile.mkdtemp())
     paths = {f"s{i}": f"tinker://r{i}/sampler_weights/s0" for i in (1, 2)}
     for run, uri in paths.items():
-      await self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": False, "config": {}}))
-      await self.bus.create_run(Run(run, "base", 0, role=Role.SAMPLER, model_path=uri))
+      self.seed_checkpoint(uri, 0, version=store.put({}, {"base": "base", "lora": False, "config": {}}))
+      self.bus.create_run(Run(run, "base", 0, role=Role.SAMPLER, model_path=uri))
     case = self
 
     class UnmixedEngine(FakeEngine):
@@ -224,26 +226,24 @@ class TestSampler(BusTest):
         return await super().sample(job, name)
 
     node = self.node(store, engine=UnmixedEngine, gpus=1)
-    requests = [
-      await self.bus.submit_command(run, Op.SAMPLE, json.dumps(JOB).encode()) for run in ("s1", "s2", "s1", "s2")
-    ]
+    requests = [self.bus.submit_command(run, Op.SAMPLE, json.dumps(JOB).encode()) for run in ("s1", "s2", "s1", "s2")]
     await node.bind("sampler:fft:base", "s1", "s2")
     self.pump(node)
     self.assertTrue(all([(await self.bus.wait_for_reply(request, 5)).ok for request in requests]))
     engine = node.samplers["sampler:fft:base"].running
-    request = await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    request = self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
     self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
     before = set(engine.loaded)
-    await self.seed_checkpoint(paths["s1"], 0, version=store.put({}, {"base": "base", "lora": False, "config": {}}))
-    request = await self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
+    self.seed_checkpoint(paths["s1"], 0, version=store.put({}, {"base": "base", "lora": False, "config": {}}))
+    request = self.bus.submit_command("s1", Op.SAMPLE, json.dumps(JOB).encode())
     self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
     self.assertNotEqual(engine.loaded, before)
 
   async def test_a_new_preparation_error_replies_while_its_process_is_waiting_for_gpu(self):
     store = Store(tempfile.mkdtemp())
-    await self.bus.create_run(Run("busy", "busy-base", 4, role=Role.SAMPLER))
+    self.bus.create_run(Run("busy", "busy-base", 4, role=Role.SAMPLER))
     for run, path in (("ready", None), ("broken", "tinker://r/sampler_weights/missing")):
-      await self.bus.create_run(Run(run, "base", 4, role=Role.SAMPLER, model_path=path))
+      self.bus.create_run(Run(run, "base", 4, role=Role.SAMPLER, model_path=path))
     sampling, finish = asyncio.Event(), asyncio.Event()
 
     class Occupied(FakeEngine):
@@ -257,16 +257,16 @@ class TestSampler(BusTest):
     await node.bind("busy", "busy")
     await node.bind("waiting", "ready", "broken")
     self.pump(node)
-    holding = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
+    holding = self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode())
     try:
       await asyncio.wait_for(sampling.wait(), 5)
-      ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
-      broken = await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode())
+      ready = self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
+      broken = self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode())
       reply = await self.bus.wait_for_reply(broken, 3)
       self.assertIsNotNone(reply, "a healthy head waiting for GPU must not hold up a preparation error")
       self.assertFalse(reply.ok)
       self.assertIn("no checkpoint at", json.loads(reply.body)["error"])
-      self.assertEqual(await self.bus.queued_and_in_flight("ready"), {"live": True, "queued": 1, "in_flight": []})
+      self.assertEqual(self.bus.queued_and_in_flight("ready"), {"live": True, "queued": 1, "in_flight": []})
       self.assertIsNone(await self.bus.wait_for_reply(holding, 0))
     finally:
       finish.set()
@@ -274,8 +274,8 @@ class TestSampler(BusTest):
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
 
   async def test_a_busy_holder_yields_its_gpu_after_its_quantum(self):
-    await self.bus.create_run(Run("busy", "base-a", 4, role=Role.SAMPLER, account="a"))
-    await self.bus.create_run(Run("ready", "base-b", 4, role=Role.SAMPLER, account="b"))
+    self.bus.create_run(Run("busy", "base-a", 4, role=Role.SAMPLER, account="a"))
+    self.bus.create_run(Run("ready", "base-b", 4, role=Role.SAMPLER, account="b"))
     order, sampling, finish = [], asyncio.Event(), asyncio.Event()
 
     class Recording(FakeEngine):
@@ -290,15 +290,15 @@ class TestSampler(BusTest):
 
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
     with (
-      mock.patch("tinyrl.bus.QUANTUM_MS", 15),
-      mock.patch("tinyrl.bus.MAX_SEQS", 1),
+      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
+      mock.patch("tinyrl.control.node_daemon.MAX_SEQS", 1),
     ):
-      first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode(), cost=10)
+      first = self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode(), cost=10)
       self.pump(node, sched=True)
       await asyncio.wait_for(sampling.wait(), 5)
-      ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode(), cost=10)
+      ready = self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB | {"prompt": [22]}).encode(), cost=10)
       tail = [
-        await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [p]}).encode(), cost=10)
+        self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [p]}).encode(), cost=10)
         for p in (33, 44, 55)
       ]
       await asyncio.sleep(0.03)  # let busy's 15ms quantum expire
@@ -309,15 +309,15 @@ class TestSampler(BusTest):
     self.assertLess(order.index([22]), order.index([55]))
 
   async def test_invalid_backlog_does_not_starve_a_ready_sibling(self):
-    await self.bus.create_run(Run("broken", "base", 4, role=Role.SAMPLER, model_path="tinker://x/sampler_weights/gone"))
-    await self.bus.create_run(Run("ready", "base", 4, role=Role.SAMPLER))
-    requests = [await self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(32)]
-    ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
+    self.bus.create_run(Run("broken", "base", 4, role=Role.SAMPLER, model_path="tinker://x/sampler_weights/gone"))
+    self.bus.create_run(Run("ready", "base", 4, role=Role.SAMPLER))
+    requests = [self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(32)]
+    ready = self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
     bus, queued = self.bus, []
 
     class Ready(FakeEngine):
       async def sample(self, job, name):
-        queued.append((await bus.queued_and_in_flight("broken"))["queued"])
+        queued.append((bus.queued_and_in_flight("broken"))["queued"])
         return await super().sample(job, name)
 
     node = self.node(gpus=1, engine=Ready)
@@ -326,11 +326,11 @@ class TestSampler(BusTest):
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
     self.assertGreater(queued[0], 0, "ready work waited for the whole invalid backlog")
     self.assertFalse((await self.bus.wait_for_reply(requests[-1], 5)).ok)
-    self.assertEqual((await self.bus.get_run("broken"))["failed"], len(requests))
+    self.assertEqual((self.bus.get_run("broken"))["failed"], len(requests))
 
   async def test_high_priority_sampler_account_runs_before_overserved_sibling(self):
-    await self.bus.create_run(Run("high", "base", 4, role=Role.SAMPLER, account="alice"))
-    await self.bus.create_run(Run("low", "base", 4, role=Role.SAMPLER, account="bob"))
+    self.bus.create_run(Run("high", "base", 4, role=Role.SAMPLER, account="alice"))
+    self.bus.create_run(Run("low", "base", 4, role=Role.SAMPLER, account="bob"))
     order = []
 
     class OrderEngine(FakeEngine):
@@ -340,8 +340,8 @@ class TestSampler(BusTest):
 
     node = self.node(gpus=1, engine=OrderEngine)
     await node.bind("sampler", "high", "low")
-    req_low = await self.bus.submit_command("low", Op.SAMPLE, json.dumps(JOB | {"prompt": [1]}).encode())
-    req_high = await self.bus.submit_command("high", Op.SAMPLE, json.dumps(JOB | {"prompt": [2]}).encode())
+    req_low = self.bus.submit_command("low", Op.SAMPLE, json.dumps(JOB | {"prompt": [1]}).encode())
+    req_high = self.bus.submit_command("high", Op.SAMPLE, json.dumps(JOB | {"prompt": [2]}).encode())
     self.bus.service["bob"] = 1000.0
     self.pump(node)
     self.assertTrue((await self.bus.wait_for_reply(req_high, 5)).ok)

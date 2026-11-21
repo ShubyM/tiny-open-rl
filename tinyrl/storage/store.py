@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import fsspec
+import msgspec
 
 if TYPE_CHECKING:
   import torch
@@ -41,6 +42,7 @@ MAX_SHARDS = 16
 STREAM_CHUNK = 256 * 1024 * 1024
 # trim_cache() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
 CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)
+STABILITY_TTL = getenv("STABILITY_TTL", 24 * 3600)
 
 
 def object_id(name: str) -> bool:
@@ -313,8 +315,23 @@ class Store:
     paths = self.weight_files(version)
     return {k: v for shard in parallel(load_file, paths) for k, v in shard.items()}, header(paths[0])
 
-  def read_meta(self, version: str) -> dict:
-    return header(self.weight_files(version)[0])
+  def _stability_dir(self) -> Path:
+    return Path(self.cache if self.remote else self.base, "stability")
+
+  def put_stability(self, request_id: str, blobs: dict[str, bytes]) -> None:
+    key, data = hashlib.sha256(request_id.encode()).hexdigest()[:32], msgspec.msgpack.encode(blobs)
+    (d := self._stability_dir()).mkdir(parents=True, exist_ok=True)
+    (tmp := d / f"{key}.{uuid.uuid4().hex[:8]}.tmp").write_bytes(data)
+    tmp.replace(d / key)
+    if self.remote:
+      self.fs.pipe_file(f"{self.base}/stability/{key}", data)
+
+  def get_stability(self, request_id: str) -> dict[str, bytes]:
+    key = hashlib.sha256(request_id.encode()).hexdigest()[:32]
+    if (local := self._stability_dir() / key).is_file():
+      return msgspec.msgpack.decode(local.read_bytes())
+    raw = self.fs.cat_file(r) if self.remote and self.fs.exists(r := f"{self.base}/stability/{key}") else None
+    return msgspec.msgpack.decode(raw) if raw else {}
 
   def versions(self) -> set[str]:
     found = {os.path.basename(p).removesuffix(".writing") for p in self.fs.glob(f"{self.base}/objects/*")}
@@ -338,6 +355,10 @@ class Store:
             shutil.rmtree(Path(self.cache, version + suffix), ignore_errors=True)
         else:
           shutil.rmtree(path + ".writing", ignore_errors=True)
+    if (stab := self._stability_dir()).is_dir():
+      for e in os.scandir(stab):
+        if e.stat().st_mtime <= time.time() - STABILITY_TTL:
+          Path(e.path).unlink(missing_ok=True)
     self.trim_cache()
 
   def trim_cache(self) -> None:

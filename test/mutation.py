@@ -12,7 +12,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = "tinyrl/control/scheduler.py"
-BUS = "tinyrl/bus.py"
+LEDGER = "tinyrl/control/ledger.py"
+SAMPLES = "tinyrl/control/samples.py"
 FAIRNESS = "tinyrl/control/fairness.py"
 ACCOUNTING = "tinyrl/control/accounting.py"
 ORDER = "test.test_scheduler.TestLocalQuantum"
@@ -24,21 +25,15 @@ RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery
 # (source, function, original expression, faulty replacement, tests that should detect it)
 CASES = [
   (FAIRNESS, "rank_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
-  (FAIRNESS, "admit_samples", "max_seqs - sum(in_flight.values())", "1 - sum(in_flight.values())", BILLING),
+  (FAIRNESS, "admit_samples", "while len(out) < slots and runs:", "while len(out) < 1 and runs:", BILLING),
   (FAIRNESS, "rank_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (BUS, "commit", "if acct and charge and charge.gpu_ms", "if reply.ok and acct and charge and charge.gpu_ms", BILLING),
-  (BUS, "exchange_sync", "if report.boot_id in self.reaped_boots:", "if False:", CLAIM),
-  (
-    BUS,
-    "commit",
-    "if (p := queue.get(cmd.entry_id)) is None or p.turn != turn:",
-    "if cmd.request_id in self.box(cmd.run).replies:",
-    DEDUP,
-  ),
-  (BUS, "commit", "if mutated and not deleting:", "if reply.ok and mutated and not deleting:", RECOVERY),
+  (LEDGER, "_bill", "if charge and charge.gpu_ms", "if reply.ok and charge and charge.gpu_ms", BILLING),
+  (LEDGER, "_fence", "if boot_id in self.reaped_boots", "if False", CLAIM),
+  (SAMPLES, "complete", "entry.owner != owner", "False", DEDUP),
+  (LEDGER, "_finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
 ]
 
 
@@ -58,6 +53,7 @@ def run_tests(folder, tests):
   env.pop("TINYRL_DB", None)
   env.pop("CONTROL_URL", None)
   env.pop("PYTHONPATH", None)
+  env["PYTHONPATH"] = str(folder)
   env["TMPDIR"] = str(folder)
   return subprocess.run(
     [sys.executable, "-B", "-m", "test.mutation", *tests],

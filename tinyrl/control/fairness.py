@@ -1,21 +1,14 @@
-"""GPU fairness from fleet service to one dispatch — pure data in, pure data out.
-
-update_lag compares each account's fair share with its billed GPU time.
-plan_gpus assigns GPU blocks to workers. rank_runs and admit_samples choose commands to run.
-"""
+"""GPU fairness from fleet service to local block selection and command order — pure data in, pure data out."""
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 
 from tinyrl.types import Cmd, entry_sort_key
 
-
-class Demand(StrEnum):
-  IDLE = "idle"
-  READY = "ready"
-  FINISH_STEP = "finish_step"  # The trainer may keep its GPUs across the optimizer-step boundary.
+Demand = StrEnum("Demand", "IDLE READY FINISH_STEP")  # FINISH_STEP holds GPUs across forward_backward -> optim_step
 
 
 @dataclass(frozen=True)
@@ -41,7 +34,6 @@ def waterfill(capacity: float, demand: dict[str, float], weights: dict[str, floa
     level = min(pending[a] / weight[a] for a in pending)
     if level * total_weight >= capacity - 1e-9:
       return rates | {a: capacity * weight[a] / total_weight for a in pending}
-    # Satisfy accounts capped by demand, then divide the remaining capacity among the rest.
     for a in [a for a in pending if pending[a] / weight[a] <= level + 1e-9]:
       rates[a] = pending.pop(a)
       capacity -= rates[a]
@@ -54,13 +46,12 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
   accounts = lag.keys() | service.keys() | demand.keys()
   used = {a: max(0.0, service.get(a, 0.0) - seen.get(a, 0.0)) for a in accounts}
   seen = seen | {a: max(seen.get(a, 0.0), v) for a, v in service.items()}
-  # The last command can finish between ticks. Include the account whose service just arrived.
   rates = waterfill(max(cap, 1.0), {a: max(demand.get(a, 0), float(used[a] > 0)) for a in accounts}, weights)
   work, total_rate = sum(used.values()), sum(rates.values())
   if work > 0 and total_rate > 0:
     for a, rate in rates.items():
       lag[a] = lag.get(a, 0.0) + work * (rate / total_rate) - used[a]
-    # Idle accounts can repay a negative balance, but cannot bank credit for later.
+    # Idle accounts repay negative debt as active peers run, without banking positive credit.
     weight = {a: max(1e-9, float((weights or {}).get(a, 1.0))) for a in accounts}
     active_weight = sum(weight[a] for a in rates)
     for a in lag.keys() - rates.keys():
@@ -72,41 +63,30 @@ def rank_runs(heads: list[Cmd], ready_lag, service: dict[str, float]) -> list[st
   """Order ready runs by account EEVDF lag, least per-run service, then numeric arrival order."""
   ready = {cmd.run: cmd for cmd in reversed(heads)}
   floor = min((service[run] for run in ready if run in service), default=0.0)
-  return [
-    cmd.run
-    for cmd in sorted(
-      ready.values(),
-      key=lambda cmd: (round(-ready_lag(cmd.run), 3), service.get(cmd.run, floor), entry_sort_key(cmd.entry_id)),
-    )
-  ]
+  key = lambda cmd: (round(-ready_lag(cmd.run), 3), service.get(cmd.run, floor), entry_sort_key(cmd.entry_id))  # noqa: E731
+  return [c.run for c in sorted(ready.values(), key=key)]
 
 
-def admit_samples(heads, queued, account, ready_lag, service, ver_of, in_flight, active_vers, max_seqs, max_loras):
-  """Continuously admit ready sample commands up to engine concurrency & LoRA limits, fairly across accounts."""
-  if (slots := max_seqs - sum(in_flight.values())) <= 0 or not heads:
+def admit_samples(heads, queued, account, ready_lag, service, ver_of, active_acct, active_vers, slots, max_loras):
+  """Fill up to `slots` for the leading account (draining first if another account leads), capped by `max_loras`."""
+  if slots <= 0 or not heads:
     return []
-  vers, by_acct = set(active_vers), {}
-  for r in rank_runs(heads, ready_lag, service):
-    if (v := ver_of(r)) in vers or len(vers) < max_loras:
+  ranked = rank_runs(heads, ready_lag, service)
+  target = account(ranked[0])
+  if active_acct and target != active_acct:
+    return []
+  vers, runs = set(active_vers), deque()
+  for r in ranked:
+    if account(r) == target and ((v := ver_of(r)) in vers or len(vers) < max_loras):
       vers.add(v)
-      by_acct.setdefault(account(r), []).append(r)
-  qs = {r: list(queued(r, slots)) for rs in by_acct.values() for r in rs}
-  avail = {a: sum(len(qs[r]) for r in rs) for a, rs in by_acct.items()}
-  alloc, order = dict.fromkeys(by_acct, 0), {a: i for i, a in enumerate(by_acct)}
-  for _ in range(slots):
-    if not (cand := [a for a in by_acct if alloc[a] < avail[a]]):
-      break
-    best = min(cand, key=lambda a: (in_flight.get(a, 0) + alloc[a], order[a]))
-    alloc[best] += 1
+      if q := deque(queued(r, slots)):
+        runs.append(q)
   out = []
-  for a, rs in by_acct.items():
-    take, idx = alloc[a], 0
-    while take > 0 and rs:
-      if qs[r := rs[idx % len(rs)]]:
-        out.append(qs[r].pop(0))
-        take, idx = take - 1, idx + 1
-      else:
-        rs.remove(r)
+  while len(out) < slots and runs:
+    q = runs.popleft()
+    out.append(q.popleft())
+    if q:
+      runs.append(q)
   return out
 
 
@@ -115,15 +95,12 @@ def blocks(total: int, width: int) -> list[tuple[int, ...]]:
   return [tuple(range(i, i + width)) for i in range(0, total - width + 1, step)] if 1 <= width <= total else []
 
 
-def plan_gpus(
-  workers: dict[str, Worker], total: int, now: float, occupied: set[int] = frozenset()
-) -> tuple[dict[str, tuple[int, ...]], float | None]:
-  """Return desired blocks and the next contested quantum deadline. The node enforces the handoff."""
+def plan_gpus(workers: dict[str, Worker], total: int, now: float, occupied: set[int] = frozenset()):
+  """Choose each local worker's GPU block and the next contested quantum deadline."""
   held = occupied | {g for w in workers.values() for g in w.current}
   pinned = {g for w in workers.values() if w.gang for g in w.bound}
   exclusive_waiting = any(w.exclusive and w.demand != Demand.IDLE and not w.current for w in workers.values())
 
-  # Keep exclusive residents. Other busy residents finish their quantum or training step unless an exclusive needs in.
   keep, deadlines = {}, []
   for name, w in workers.items():
     if not w.current:
@@ -155,9 +132,8 @@ def plan_gpus(
         exclusive_gpus.update(block)
     else:
       waiting = True
-      # Leave room for this gang to assemble before another waiter can take part of its block.
       reserved.update(next((b for b in options if exclusive_gpus.isdisjoint(b)), ()))
 
-  # An uncontested resident can stay warm even after its turn expires.
+  # An uncontested resident stays warm after its quantum expires.
   keep.update((name, w.current) for name, w in workers.items() if w.current and taken.isdisjoint(w.current))
   return keep, min(deadlines, default=None) if waiting else None

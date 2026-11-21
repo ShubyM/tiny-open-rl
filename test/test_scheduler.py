@@ -16,10 +16,9 @@ from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
 from tinyrl.api.proto import tinker_public_pb2 as pb
-from tinyrl.bus import QUANTUM_MS, Cmd, Ev, Op, Role, Run
 from tinyrl.control import scheduler
 from tinyrl.control.fairness import Demand, Worker, admit_samples, plan_gpus, rank_runs, update_lag, waterfill
-from tinyrl.control.node_daemon import NodeDaemon, WorkerHandle
+from tinyrl.control.node_daemon import QUANTUM_MS, NodeDaemon, WorkerHandle
 from tinyrl.control.scheduler import (
   REBALANCE_MS,
   Job,
@@ -31,7 +30,7 @@ from tinyrl.control.scheduler import (
   to_plan,
 )
 from tinyrl.storage.store import Store
-from tinyrl.types import MAX_SEQS
+from tinyrl.types import MAX_SEQS, Cmd, Ev, Op, Role, Run
 from tinyrl.workers.model import Model
 
 GIB = 2**30
@@ -45,7 +44,18 @@ class Cluster:
 
   def settle(self) -> list[tuple[Ev, dict]]:
     self.s.nodes = {n: (v["gpus"], v["memory"]) for n, v in self.nodes.items()}
-    self.s.jobs, self.s.service = scheduler.jobs(self.runs, self.queues), dict(self.service)
+    jobs = {}
+    for r, row in self.runs.items():
+      rec = row["record"]
+      excl, tr, role = bool(rec.get("exclusive")), rec.get("train_run"), Role(rec.get("role", "trainer"))
+      spec = Spec(
+        role, rec.get("base", ""), rec.get("rank", 0) > 0, excl, tr if excl else None, int(rec.get("gpus", 1))
+      )
+      jobs[r] = Job(
+        spec, tr, rec.get("account") or ("" if tr else rec.get("session", "")), row.get("owner"), self.queues.get(r, 0)
+      )
+    self.s.jobs = {r: j for r, j in jobs.items() if not j.spec.train_run or j.spec.train_run in jobs}
+    self.s.service = dict(self.service)
     self.s, changes = step(self.s)
     return changes
 
@@ -577,19 +587,17 @@ class TestLocalQuantum(unittest.TestCase):
     }
     heads = [q[0] for q in queues.values()]
     admitted = admit_samples(
-      heads,
-      lambda r, n: queues[r][:n],
-      lambda r: "B",
-      lambda r: 0.0,
-      {},
-      lambda r: None,
-      {"A": 6},
-      set(),
-      8,
-      16,
+      heads, lambda r, n: queues[r][:n], lambda r: "B", lambda r: 0.0, {}, lambda r: None, "B", (), 2, 16
     )
     self.assertEqual(len(admitted), 2)
     self.assertEqual({c.run for c in admitted}, {"b1", "b2"})
+    # When another account leads, stop admitting so the in-flight wave drains cleanly.
+    self.assertEqual(
+      admit_samples(
+        heads, lambda r, n: queues[r][:n], lambda r: "B", lambda r: 0.0, {}, lambda r: None, "A", (), 2, 16
+      ),
+      [],
+    )
 
   def test_local_guard_enforces_gpu_exclusivity_under_concurrent_handoffs(self):
     async def run():
@@ -623,24 +631,16 @@ class TestLocalQuantum(unittest.TestCase):
         for i, (g, w) in enumerate([(0, 2), (2, 2), (0, 1), (1, 1), (2, 1), (3, 1)])
       ]
 
-      async def use(wid, spec, gpus):
-        h = node.workers.setdefault(wid, WorkerHandle(wid, spec, FakeModel(wid)))
-        async with node.gpu_cond:
-          h.active += 1
-        try:
-          await node.claim_gpus(h, gpus)
-          await h.ensure_gpu(gpus)
-          await asyncio.sleep(0)
-        finally:
-          async with node.gpu_cond:
-            h.active -= 1
-            if h.active == 0:
-              h.claimed = ()
-            node.gpu_cond.notify_all()
-
       for _ in range(40):
-        batch = rng.sample(specs, 3)
-        await asyncio.gather(*(use(*item) for item in batch))
+        cands = {}
+        for wid, spec, gpus in rng.sample(specs, 3):
+          h = node.workers.setdefault(wid, WorkerHandle(wid, spec, FakeModel(wid)))
+          cands[wid] = Worker(spec.gpus, False, Demand.READY, h.resident, gpus, spec.gpus > 1)
+        keep, _ = plan_gpus(cands, 4, 1.0)
+        for wid, h in list(node.workers.items()):
+          if h.resident and keep.get(wid) != h.resident:
+            await h.park()
+        await asyncio.gather(*(node.workers[wid].ensure_gpu(gpus) for wid, gpus in keep.items()))
         flat = [g for h in node.workers.values() for g in h.resident]
         self.assertEqual(len(flat), len(set(flat)))
       self.assertEqual(violations, [])
@@ -926,7 +926,7 @@ class TestMultiNodeExecution(BusTest):
     self.start_maintenance(0.01)
 
   async def submit(self, run: str, op: Op, body: bytes = b"", cost: int = 100) -> str:
-    req = await self.bus.submit_command(run, op, body, cost=cost)
+    req = self.bus.submit_command(run, op, body, cost=cost)
     assert req is not None
     return req
 
@@ -937,7 +937,7 @@ class TestMultiNodeExecution(BusTest):
 
   async def create(self, run: str, rank: int = 0, lora: dict | None = None, **kw) -> None:
     cfg = {} if lora is None else lora
-    await self.bus.create_run(Run(run, "tiny", rank, lora=cfg, **kw))
+    self.bus.create_run(Run(run, "tiny", rank, lora=cfg, **kw))
     await self.submit(run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": rank, "lora": cfg}).encode())
 
   async def until(self, pred, timeout: float = 10.0) -> None:
@@ -953,11 +953,10 @@ class TestMultiNodeExecution(BusTest):
     raise AssertionError(f"no live owner found for {run}")
 
   async def test_the_plan_is_written_only_when_it_changes(self):
-    from tinyrl.kv import Table
-    from tinyrl.types import NodeReport
+    from tinyrl.control.db import Table
 
-    await self.bus.exchange(NodeReport("n", "bn", 1))
-    await self.bus.create_run(Run("r", "tiny", 4, lora=LORA, account="acct"))
+    await self.bus.heartbeat("n", "bn", 1)
+    self.bus.create_run(Run("r", "tiny", 4, lora=LORA, account="acct"))
     writes, orig_set = 0, Table.__setitem__
 
     def count_writes(tbl, k, v):
@@ -967,14 +966,14 @@ class TestMultiNodeExecution(BusTest):
       orig_set(tbl, k, v)
 
     with mock.patch.object(Table, "__setitem__", count_writes):
-      await self.bus.maintain()  # the run gets a process, and the process a node
-      await self.bus.maintain()  # nothing changed
+      self.bus.maintain()  # the run gets a process, and the process a node
+      self.bus.maintain()  # nothing changed
       self.bus.service["acct"] = self.bus.service.get("acct", 0.0) + 5.0
-      await self.bus.maintain()  # account service moved
-      await self.bus.create_run(Run("r2", "tiny", 4, lora=LORA, account="acct"))
-      await self.bus.maintain()  # a run joined the process
+      self.bus.maintain()  # account service moved
+      self.bus.create_run(Run("r2", "tiny", 4, lora=LORA, account="acct"))
+      self.bus.maintain()  # a run joined the process
       self.bus.nodes.pop("n", None)
-      await self.bus.exchange(NodeReport("m", "bm", 1))  # the process moved to m
+      await self.bus.heartbeat("m", "bm", 1)  # the process moved to m
     self.assertEqual(writes, 4)
 
   async def test_new_node_rebalances_mid_accumulation_with_exact_model_parameters(self):
@@ -1010,7 +1009,7 @@ class TestMultiNodeExecution(BusTest):
     for r in (r1, r2):
       uri = f"tinker://{r}/weights/after-rebalance"
       await self.run_cmd(r, Op.SAVE_WEIGHTS, json.dumps({"uri": uri}).encode())
-      version = await self.bus.checkpoint_version(uri)
+      version = self.bus.checkpoint_version(uri)
       actual, _ = await asyncio.to_thread(self.nodes[0].store.get, version)
       torch.testing.assert_close(actual, expected)
 
@@ -1025,14 +1024,14 @@ class TestMultiNodeExecution(BusTest):
         return await super().sample(job, name)
 
     with (
-      mock.patch("tinyrl.bus.QUANTUM_MS", 15),
-      mock.patch("tinyrl.bus.MAX_SEQS", 2),
+      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
+      mock.patch("tinyrl.control.node_daemon.MAX_SEQS", 2),
     ):
       await self.add_node("shared", gpus=1, engine=BusySampler)
       self.start_scheduler()
       await self.create("train", account="team")
       await self.run_cmd("train", Op.FORWARD_BACKWARD, proto_body("train", 6))
-      await self.bus.create_run(Run("sample", "tiny", 4, role=Role.SAMPLER, account="team"))
+      self.bus.create_run(Run("sample", "tiny", 4, role=Role.SAMPLER, account="team"))
       for _ in range(64):
         await self.submit("sample", Op.SAMPLE, json.dumps(JOB).encode())
       try:
@@ -1042,7 +1041,7 @@ class TestMultiNodeExecution(BusTest):
         release.set()
       for request in requests:
         self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
-      self.assertGreater((await self.bus.queued_and_in_flight("sample"))["queued"], 0)
+      self.assertGreater((self.bus.queued_and_in_flight("sample"))["queued"], 0)
 
   async def test_shared_trainer_splits_gpu_time_by_account_not_run_count(self):
     node = await self.add_node("single-gpu")
@@ -1064,12 +1063,12 @@ class TestMultiNodeExecution(BusTest):
 
     self.start_scheduler()
     for run, account in accounts.items():
-      await self.bus.create_run(Run(run, "tiny", 4, lora=LORA, account=account))
+      self.bus.create_run(Run(run, "tiny", 4, lora=LORA, account=account))
       await self.run_cmd(run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode())
     with mock.patch.object(InlineProcess, "call", timed_call):
       for run in accounts:
         for _ in range(100):
-          await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+          self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
       async with asyncio.timeout(30):
         while len(completed) < 80:
           await asyncio.sleep(0.005)
@@ -1095,7 +1094,7 @@ class TestMultiNodeExecution(BusTest):
       (await self.submit(r, Op.FORWARD_BACKWARD, proto_body(r, 9)), await self.submit(r, Op.OPTIM_STEP, opt))
       for r in (r1, r2)
     ]
-    await self.bus.maintain()
+    self.bus.maintain()
     s1 = self.bus.state()
     self.assertNotEqual(s1.home[r1], s1.home[r2])
     self.assertEqual({s1.procs[s1.home[r]].node for r in (r1, r2)}, {"node-a", "node-b"})
@@ -1138,10 +1137,10 @@ class TestMultiNodeExecution(BusTest):
     self.start_scheduler()
 
     sid = new_id()
-    await self.bus.create_run(Run(sid, "tiny", 4, role=Role.SAMPLER, account="team-s"))
+    self.bus.create_run(Run(sid, "tiny", 4, role=Role.SAMPLER, account="team-s"))
     total_cmds = 12
     payload = json.dumps(JOB).encode()
-    with mock.patch("tinyrl.bus.MAX_SEQS", 2), mock.patch("tinyrl.control.scheduler.MAX_SEQS", 4):
+    with mock.patch("tinyrl.control.node_daemon.MAX_SEQS", 2), mock.patch("tinyrl.control.scheduler.MAX_SEQS", 4):
       reqs = [await self.submit(sid, Op.SAMPLE, payload, cost=50) for _ in range(total_cmds)]
 
       async def scaled_out() -> bool:
@@ -1154,7 +1153,7 @@ class TestMultiNodeExecution(BusTest):
         self.assertTrue(reply.ok)
         self.assertEqual(len(pb.SampleResponse.FromString(reply.body).sequences), 1)
 
-    self.assertEqual((await self.bus.get_run(sid))["tokens"], total_cmds * 50)
+    self.assertEqual((self.bus.get_run(sid))["tokens"], total_cmds * 50)
     svc_before = self.bus.service["team-s"]
     self.assertGreaterEqual(svc_before, total_cmds * 20.0)
 
@@ -1166,10 +1165,10 @@ class TestMultiNodeExecution(BusTest):
     # Simulate the active sampler's node dying mid-sample -> surviving node reclaims and answers.
     st = self.bus.state()
     active_node = st.procs[st.procs_of(sid)[0]].node
-    req = await self.bus.submit_command(sid, Op.SAMPLE, payload, cost=50)
-    self.bus.nodes[active_node].until = 0.0
+    req = self.bus.submit_command(sid, Op.SAMPLE, payload, cost=50)
+    self.bus.nodes[active_node]["until"] = 0.0
     self.assertTrue((await self.bus.wait_for_reply(req, 5)).ok)
-    self.assertEqual((await self.bus.get_run(sid))["tokens"], (total_cmds + 1) * 50)
+    self.assertEqual((self.bus.get_run(sid))["tokens"], (total_cmds + 1) * 50)
     self.assertGreater(self.bus.service["team-s"], svc_before)
 
   async def test_controller_enforces_gpu_exclusivity_oversized_rejection_and_single_writer(self):
@@ -1214,7 +1213,7 @@ class TestMultiNodeExecution(BusTest):
     await self.create(a, account="alice")
     await self.run_cmd(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
     pa = self.bus.state().home[a]
-    w_a = self.bus.nodes["node-a"].workers[pa]
+    w_a = self.nodes[0].workers[pa]
     # Push `a` past its minimum quantum (into OVERTIME) without touching `b` yet.
     self.assertGreaterEqual(w_a.hold_until, before + QUANTUM_MS / 1000)
     w_a.hold_until = expired = time.monotonic() - 1.0

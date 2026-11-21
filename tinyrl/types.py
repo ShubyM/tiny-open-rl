@@ -1,4 +1,4 @@
-"""Domain types shared by the gateway, control plane, and workers (stdlib only)."""
+"""Domain types shared by the gateway, controller, node daemon, and workers (stdlib only)."""
 
 from __future__ import annotations
 
@@ -6,37 +6,19 @@ import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from tinyrl.control.accounting import Charge
-
 MAX_LORAS, MAX_SEQS = 16, 256  # vLLM engine limits: --max-loras and max captured CUDA-graph batch size
 
-
-class Op(StrEnum):
-  CREATE_MODEL = "create_model"
-  FORWARD_BACKWARD = "forward_backward"
-  OPTIM_STEP = "optim_step"
-  SAVE_WEIGHTS = "save_weights"
-  SAVE_WEIGHTS_FOR_SAMPLER = "save_weights_for_sampler"
-  LOAD_WEIGHTS = "load_weights"
-  DELETE_MODEL = "delete_model"
-  SAMPLE = "sample"
+Role = StrEnum("Role", "TRAINER SAMPLER")
+Ev = StrEnum("Ev", "RUN_CREATED ASSIGNED RUN_DELETED NODE_UP NODE_LOST PLACED UNPLACED")
+RunStatus = StrEnum("RunStatus", "FRESH LIVE SAVED LOST DELETED")  # fresh -> live <-> saved, live -> lost, * -> deleted
+Op = StrEnum(
+  "Op",
+  "CREATE_MODEL FORWARD_BACKWARD OPTIM_STEP SAVE_WEIGHTS SAVE_WEIGHTS_FOR_SAMPLER LOAD_WEIGHTS DELETE_MODEL SAMPLE",
+)
 
 
-class Ev(StrEnum):
-  """Cluster trace events: runs and nodes coming and going, and planner decisions."""
-
-  RUN_CREATED = "run_created"
-  ASSIGNED = "assigned"
-  RUN_DELETED = "run_deleted"
-  NODE_UP = "node_up"
-  NODE_LOST = "node_lost"
-  PLACED = "placed"
-  UNPLACED = "unplaced"
-
-
-class Role(StrEnum):
-  TRAINER = "trainer"
-  SAMPLER = "sampler"
+class FencedError(RuntimeError):
+  """Raised when a stale or expired node incarnation calls the controller (maps to HTTP 409)."""
 
 
 @dataclass(frozen=True)
@@ -71,6 +53,11 @@ class Run:
   gpus: int = 1
   account: str = ""
 
+  @property
+  def spec(self) -> WorkerSpec:
+    tr = self.train_run if self.exclusive else None
+    return WorkerSpec(self.role, self.base, self.rank > 0, self.exclusive, tr, self.gpus)
+
 
 @dataclass(frozen=True)
 class Cmd:
@@ -94,9 +81,8 @@ class Reply:
   @classmethod
   def error(cls, exc: Exception) -> Reply:
     cat = "user" if isinstance(exc, (ValueError, KeyError)) else "server"
-    return cls(
-      False, "application/json", json.dumps({"error": f"{type(exc).__name__}: {exc}", "category": cat}).encode()
-    )
+    msg = json.dumps({"error": f"{type(exc).__name__}: {exc}", "category": cat}).encode()
+    return cls(False, "application/json", msg)
 
 
 @dataclass(frozen=True)
@@ -108,73 +94,31 @@ class Event:
 
 
 @dataclass(frozen=True)
-class WorkerStatus:
+class Assignment:
   worker: str
-  gpus: tuple[int, ...] = ()
-  bound: tuple[int, ...] = ()
-  pid: int | None = None
-  loaded: tuple[str, ...] = ()
-  park_s: float = 0.0
-
-
-@dataclass(frozen=True)
-class Turn:
-  id: str
-  kind: str  # "train" | "sample" | "park" | "snapshot" | "close"
-  worker: str
-  spec: WorkerSpec = WorkerSpec()
-  gpus: tuple[int, ...] = ()
-  cmd: Cmd | None = None
-  args: dict = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class TurnResult:
-  turn_id: str
-  ok: bool = True
-  reply: Reply | None = None
-  charge: Charge | None = None
-  mutated: bool = False
-  loaded: bool = False
-  saved: dict | None = None
-  resume_s: float = 0.0
-  park_s: float = 0.0
-  stability: dict[str, bytes] | None = None
-
-
-@dataclass(frozen=True)
-class NodeReport:
-  node: str
-  boot_id: str
-  gpus: int
-  memory: int = 0
-  draining: bool = False
+  spec: WorkerSpec
+  runs: tuple[str, ...] = ()
+  versions: tuple[str, ...] = ()
+  ready: bool = False
+  closing: tuple[str, ...] = ()
   lag: float = 0.0
-  workers: list[WorkerStatus] = field(default_factory=list)
-  finished: list[TurnResult] = field(default_factory=list)
-  staged: list[str] = field(default_factory=list)
-  stage_errors: dict[str, str] = field(default_factory=dict)
-  want_sweep: bool = False
-  active: list[str] = field(default_factory=list)  # turns this node already holds
 
 
 @dataclass(frozen=True)
-class NodeReply:
-  acknowledged: list[str] = field(default_factory=list)
-  turns: list[Turn] = field(default_factory=list)
-  prefetch: list[str] = field(default_factory=list)
-  live_versions: list[str] | None = None
-  reset: bool = False
+class Work:
+  cmd: Cmd
+  account: str = ""
+  run: dict | None = None
+  snap: str | None = None
+  version: str | None = None
 
 
 def entry_sort_key(entry_id: str) -> tuple[int, int]:
-  """An entry id `<ms>-<seq>` as numbers, which sort in the order the ids were made."""
   ms, seq = entry_id.split("-", 1)
   return int(ms), int(seq)
 
 
 def parse_uri(uri: str) -> tuple[str, str]:
-  """Split a validated `tinker://<run>/<checkpoint_id>` URI into `(run, checkpoint_id)`."""
   run, sep, cid = uri.removeprefix("tinker://").partition("/") if uri.startswith("tinker://") else ("", "", "")
   if not (sep and run and cid) or cid.startswith("/") or ".." in f"{run}/{cid}".split("/"):
     raise ValueError(f"bad checkpoint URI {uri}")

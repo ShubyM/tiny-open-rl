@@ -10,8 +10,8 @@ import unittest
 
 from test.helpers import BusTest, new_id, serve_control, tiny
 from test.test_process import require_unix
-from tinyrl.bus import Op, Reply, Run
 from tinyrl.storage.store import Store
+from tinyrl.types import Op, Reply, Run
 
 LEASE_MS = 2000
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
@@ -65,7 +65,7 @@ class TestLease(BusTest):
     await asyncio.wait_for(wait(), timeout)
 
   async def call(self, run: str, op: Op, body: dict) -> Reply:
-    request = await self.bus.submit_command(run, op, json.dumps(body).encode())
+    request = self.bus.submit_command(run, op, json.dumps(body).encode())
     reply = await self.bus.wait_for_reply(request, 60)
     self.assertIsNotNone(reply)
     return reply
@@ -75,57 +75,57 @@ class TestLease(BusTest):
     base = f"{self.folder.name}/base"
     tiny().save_pretrained(base)
     run = new_id()
-    await self.bus.create_run(Run(run, base, 4, lora=LORA))
+    self.bus.create_run(Run(run, base, 4, lora=LORA))
     first = self.daemon()
     self.start_maintenance()
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
-    old_owner = (await self.bus.get_run(run))["owner"]
+    old_owner = (self.bus.get_run(run))["owner"]
     proc_name = old_owner[0]
-    [first_node] = await self.bus.live_nodes()
+    [first_node] = self.bus.live_nodes()
     second = self.daemon()
 
     async def both_up():
-      return len(await self.bus.live_nodes()) == 2
+      return len(self.bus.live_nodes()) == 2
 
     await self.until(both_up)
     await asyncio.sleep(1.5 * LEASE_MS / 1000)
-    self.assertEqual((await self.bus.get_run(run))["owner"], old_owner)
+    self.assertEqual((self.bus.get_run(run))["owner"], old_owner)
 
     async def reported():
-      node = (await self.bus.live_nodes(details=True)).get(first_node, {})
+      node = (self.bus.live_nodes(details=True)).get(first_node, {})
       return node.get("pids", {}).get(proc_name)
 
     await self.until(reported)
     model_pid = await reported()
     os.killpg(model_pid, signal.SIGSTOP)
     try:
-      request = await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+      request = self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
 
       async def pending():
-        return bool((await self.bus.queued_and_in_flight(run))["in_flight"])
+        return bool((self.bus.queued_and_in_flight(run))["in_flight"])
 
       await self.until(pending)
       first.send_signal(signal.SIGSTOP)
       os.killpg(model_pid, signal.SIGCONT)  # the child may run while its parent cannot publish a result
-      self.bus.nodes[first_node].until = 0.0  # its heartbeat ran out
+      self.bus.nodes[first_node]["until"] = 0.0  # its heartbeat ran out
       expected = await self.bus.wait_for_reply(request, 30)
       self.assertFalse(expected.ok)
       self.assertIn("lost ownership", json.loads(expected.body)["error"])
-      self.assertNotEqual((await self.bus.get_run(run)).get("owner"), old_owner)
+      self.assertNotEqual((self.bus.get_run(run)).get("owner"), old_owner)
     finally:
       first.send_signal(signal.SIGCONT)
       with contextlib.suppress(ProcessLookupError):
         os.killpg(model_pid, signal.SIGCONT)
 
     async def first_reaped():
-      nodes = await self.bus.live_nodes(details=True)
+      nodes = self.bus.live_nodes(details=True)
       return first_node in nodes and not nodes[first_node]["pids"] and not nodes[first_node]["on"]
 
     await self.until(first_reaped)
     self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)
-    self.assertEqual((await self.bus.queued_and_in_flight(run))["in_flight"], [])
+    self.assertEqual((self.bus.queued_and_in_flight(run))["in_flight"], [])
     other = new_id()
-    await self.bus.create_run(Run(other, base, 4, lora=LORA))
+    self.bus.create_run(Run(other, base, 4, lora=LORA))
     self.assertTrue((await self.call(other, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
     self.assertIsNone(second.poll())
 
@@ -134,19 +134,19 @@ class TestLease(BusTest):
     base = f"{self.folder.name}/base"
     tiny().save_pretrained(base)
     run = new_id()
-    await self.bus.create_run(Run(run, base, 4, lora=LORA))
+    self.bus.create_run(Run(run, base, 4, lora=LORA))
     proc = self.daemon()
     self.start_maintenance()
     self.assertTrue((await self.call(run, Op.CREATE_MODEL, {"base_model": base, "rank": 4, "lora": LORA})).ok)
     proc.terminate()
     self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
-    info = await self.bus.get_run(run)
+    info = self.bus.get_run(run)
     self.assertIsNone(info.get("owner"))
     uri, version = info["snap"]
     tensors, meta = self.store.get(version)
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])
-    self.assertIsNotNone(await self.bus.get_checkpoint(uri))
+    self.assertIsNotNone(self.bus.get_checkpoint(uri))
 
 
 if __name__ == "__main__":

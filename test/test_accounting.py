@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from test.execution import TestNode
 from test.helpers import BusTest
-from tinyrl.bus import Op, Reply, Role, Run
 from tinyrl.control.node_daemon import WorkerHandle
 from tinyrl.storage.store import Store
+from tinyrl.types import Op, Reply, Role, Run
 
 
 class TestAccounting(BusTest):
@@ -17,22 +17,19 @@ class TestAccounting(BusTest):
     store = Store(root=folder.name)
     runs = list(accounts)
     for run, account in accounts.items():
-      await self.bus.create_run(Run(run, "base", 4, role=role, account=account, gpus=2))
+      self.bus.create_run(Run(run, "base", 4, role=role, account=account, gpus=2))
     node = TestNode(self.bus, store=store, gpus=2, node="node")
     self.addAsyncCleanup(node.aclose)
     await node.bind("worker", *runs)
-    if node.active:
-      await asyncio.gather(*(t for _, t in node.active.values()))
-      await node.tick()
+    if ts := node.tasks():
+      await asyncio.gather(*ts)
     spec = self.bus.plan_state.procs["worker"].spec
     return node, spec
 
   async def step_turn(self, node: TestNode):
-    reply = await node.tick()
-    if node.active:
-      await asyncio.gather(*(t for _, t in node.active.values()))
     await node.tick()
-    return reply
+    if ts := node.tasks():
+      await asyncio.gather(*ts)
 
   async def test_sampler_shares_busy_time_until_the_short_request_fails(self):
     node, spec = await self.setup_node(Role.SAMPLER, short="alice", long="alice")
@@ -49,23 +46,25 @@ class TestAccounting(BusTest):
     model = SimpleNamespace(execute=sample, resume=AsyncMock(), park=AsyncMock(), close=AsyncMock(), proc=None)
     node.workers["worker"] = WorkerHandle("worker", spec, model, resident=(0, 1), bound=(0, 1))
     for run in ("short", "long"):
-      await self.bus.submit_command(run, Op.SAMPLE, b"{}", cost=999)
+      self.bus.submit_command(run, Op.SAMPLE, b"{}", cost=999)
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=[0, 0, 10_000_000, 30_000_000]):
       await self.step_turn(node)
-    w = self.bus.nodes["node"].workers["worker"]
+    w = node.workers["worker"]
     self.assertEqual(w.run_service, {"short": 10, "long": 50})
     self.assertEqual(w.gpu_ms, 60)
     self.assertEqual(self.bus.service, {"alice": 60})
-    short, long = await self.bus.get_run("short"), await self.bus.get_run("long")
+    short, long = self.bus.get_run("short"), self.bus.get_run("long")
     self.assertEqual((short["busy_ms"], short["failed"], short["tokens"]), (10, 1, 0))
     self.assertEqual((long["busy_ms"], long["failed"], long["tokens"]), (30, 0, 999))
 
   async def test_checkpoint_load_is_charged_once_across_requests_even_if_it_fails(self):
     node, spec = await self.setup_node(Role.SAMPLER, a1="alice", a2="alice", b="bob")
     now, uri = 0, "tinker://trainer/sampler_weights/shared"
-    await self.seed_checkpoint(uri, 100, version="version")
+    self.seed_checkpoint(uri, 100, version="version")
+    from dataclasses import replace
+
     for run in ("a1", "a2"):
-      self.bus.runs[run]["record"]["model_path"] = uri
+      self.bus.runs[run].run = replace(self.bus.runs[run].run, model_path=uri)
     cache_dir = tempfile.TemporaryDirectory()
     self.addCleanup(cache_dir.cleanup)
     node.store.local_folder = Mock(return_value=(cache_dir.name, "version"))
@@ -91,7 +90,7 @@ class TestAccounting(BusTest):
     with patch("tinyrl.control.accounting.monotonic_ns", lambda: now):
       for _ in range(2):
         for run in ("a1", "a1", "a2", "b"):
-          await self.bus.submit_command(run, Op.SAMPLE, b"{}")
+          self.bus.submit_command(run, Op.SAMPLE, b"{}")
         # First tick prefetches version off-GPU; wait for prefetch then run waves for alice & bob.
         await node.tick()
         if node.staging:
@@ -100,18 +99,18 @@ class TestAccounting(BusTest):
         await self.step_turn(node)
     self.assertEqual(model.load.await_count, 2)
     self.assertEqual(model.execute.await_count, 5)
-    w = self.bus.nodes["node"].workers["worker"]
+    w = node.workers["worker"]
     self.assertAlmostEqual(w.run_service["a1"], 80 / 3)
     self.assertAlmostEqual(w.run_service["a2"], 40 / 3)
     self.assertAlmostEqual(self.bus.service["alice"], 40)
-    self.assertEqual((await self.bus.get_run("a1"))["failed"], 2)
+    self.assertEqual((self.bus.get_run("a1"))["failed"], 2)
 
   async def test_three_sampler_sessions_get_the_same_gpu_time_as_one(self):
     accounts = {"a1": "alice", "a2": "alice", "a3": "alice", "b": "bob"}
     node, spec = await self.setup_node(Role.SAMPLER, **accounts)
     for run in accounts:
       for _ in range(6):
-        await self.bus.submit_command(run, Op.SAMPLE, b"{}")
+        self.bus.submit_command(run, Op.SAMPLE, b"{}")
 
     now = 0
 
@@ -124,7 +123,7 @@ class TestAccounting(BusTest):
     model = SimpleNamespace(execute=sample, resume=AsyncMock(), park=AsyncMock(), close=AsyncMock(), proc=None)
     node.workers["worker"] = WorkerHandle("worker", spec, model, resident=(0, 1), bound=(0, 1))
     with (
-      patch("tinyrl.bus.MAX_SEQS", 2),
+      patch("tinyrl.control.node_daemon.MAX_SEQS", 2),
       patch("tinyrl.control.accounting.monotonic_ns", lambda: now),
     ):
       for _ in range(6):
@@ -132,7 +131,7 @@ class TestAccounting(BusTest):
         await self.step_turn(node)
 
     self.assertEqual(self.bus.service, {"alice": 72, "bob": 72})
-    w = self.bus.nodes["node"].workers["worker"]
+    w = node.workers["worker"]
     self.assertEqual(w.run_service, {"a1": 24, "a2": 24, "a3": 24, "b": 72})
 
   async def test_backlogged_training_runs_of_one_account_alternate_equal_cost_steps(self):
@@ -147,7 +146,7 @@ class TestAccounting(BusTest):
     node.workers["worker"] = WorkerHandle("worker", spec, model, resident=(0, 1), bound=(0, 1))
     for run in ("first", "second"):  # All "first" heads arrive before all "second" heads.
       for _ in range(4):
-        await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}")
+        self.bus.submit_command(run, Op.OPTIM_STEP, b"{}")
       await asyncio.sleep(0.002)
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=range(0, 16_000_000, 1_000_000)):
       for _ in range(8):
@@ -165,17 +164,17 @@ class TestAccounting(BusTest):
       proc=None,
     )
     node.workers["worker"] = WorkerHandle("worker", spec, model, resident=(0, 1), bound=(0, 1))
-    await self.bus.submit_command("run", Op.LOAD_WEIGHTS, b'{"uri":"tinker://run/weights/missing"}')
+    self.bus.submit_command("run", Op.LOAD_WEIGHTS, b'{"uri":"tinker://run/weights/missing"}')
     await self.step_turn(node)
     model.call.assert_not_awaited()
-    w = self.bus.nodes["node"].workers["worker"]
+    w = node.workers["worker"]
     self.assertEqual(w.gpu_ms, 0)
     self.assertEqual(self.bus.service, {})
-    await self.bus.submit_command("run", Op.OPTIM_STEP, b"{}")
+    self.bus.submit_command("run", Op.OPTIM_STEP, b"{}")
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=[0, 250_000]):
       await self.step_turn(node)
     self.assertEqual(w.run_service, {"run": 0.5})
     self.assertEqual(w.gpu_ms, 0.5)
     self.assertEqual(self.bus.service, {"run-account": 0.5})
-    run = await self.bus.get_run("run")
+    run = self.bus.get_run("run")
     self.assertEqual((run["cmds"], run["failed"], run["steps"], run["tokens"]), (1, 2, 0, 0))
