@@ -45,16 +45,16 @@ GRAD_CKPT = getenv("GRAD_CKPT", -1)  # gradient checkpointing (-1 leaves LoRA un
 #   advantages        per-token advantages, for the RL losses
 
 
-def cross_entropy(logprobs, weights, sampler_logprobs, advantages, config):
+def cross_entropy(logprobs, weights, sampler_logprobs, advantages, config, **_):
   return -logprobs * weights
 
 
-def importance_sampling(logprobs, weights, sampler_logprobs, advantages, config):
+def importance_sampling(logprobs, weights, sampler_logprobs, advantages, config, **_):
   ratio = (logprobs - sampler_logprobs).clamp(-20, 20).exp()
   return torch.nan_to_num(-ratio * advantages * weights, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def ppo(logprobs, weights, sampler_logprobs, advantages, config):
+def ppo(logprobs, weights, sampler_logprobs, advantages, config, **_):
   if bad := set(config) - {"clip_range", "kl_coeff", "clip_low_threshold", "clip_high_threshold"}:
     raise ValueError(f"unknown config keys: {bad}")
   c, kl = config.get("clip_range", 0.2), config.get("kl_coeff", 0.0)
@@ -65,7 +65,42 @@ def ppo(logprobs, weights, sampler_logprobs, advantages, config):
   return -(objective - kl * ((ratio - 1) - log_ratio)) * weights
 
 
-LOSSES = {"cross_entropy": cross_entropy, "importance_sampling": importance_sampling, "ppo": ppo}
+def cispo(logprobs, weights, sampler_logprobs, advantages, config, **_):
+  if bad := set(config) - {"clip_low_threshold", "clip_high_threshold"}:
+    raise ValueError(f"unknown config keys: {bad}")
+  low, high = float(config.get("clip_low_threshold", 0.0)), float(config.get("clip_high_threshold", 4.0))
+  ratio = (logprobs - sampler_logprobs).clamp(-20, 20).exp().clamp(low, high).detach()
+  return torch.nan_to_num(-ratio * advantages * logprobs * weights, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def dro(logprobs, weights, sampler_logprobs, advantages, config, **_):
+  if bad := set(config) - {"beta"}:
+    raise ValueError(f"unknown config keys: {bad}")
+  beta = float(config.get("beta", 0.05))
+  return -(logprobs * advantages - 0.5 * beta * (logprobs - sampler_logprobs) ** 2) * weights
+
+
+def gspo(logprobs, weights, sampler_logprobs, advantages, config, *, sequence_ratio_mask=None, **_):
+  """GSPO-token: geometric-mean sequence ratio clipped per token, with local-only policy gradient."""
+  if bad := set(config) - {"clip_low_threshold", "clip_high_threshold"}:
+    raise ValueError(f"unknown config keys: {bad}")
+  low, high = float(config.get("clip_low_threshold", 1 - 3e-4)), float(config.get("clip_high_threshold", 1 + 4e-4))
+  diff = logprobs - sampler_logprobs
+  mask = (weights != 0).float() if sequence_ratio_mask is None else (sequence_ratio_mask != 0).float()
+  mean_log_ratio = (diff * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True).clamp(min=1.0)
+  seq_ratio = (mean_log_ratio.detach() + (logprobs - logprobs.detach())).clamp(-20, 20).exp()
+  objective = torch.min(seq_ratio * advantages, seq_ratio.clamp(low, high) * advantages)
+  return torch.nan_to_num(-objective * weights, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+LOSSES = {
+  "cross_entropy": cross_entropy,
+  "importance_sampling": importance_sampling,
+  "ppo": ppo,
+  "cispo": cispo,
+  "dro": dro,
+  "gspo": gspo,
+}
 
 
 # ***** forward pass *****
@@ -126,13 +161,16 @@ def batch_tensors(data: list[wire.Datum], lengths: list[int], device: torch.devi
   def column(name: str, default: float, dtype) -> torch.Tensor:
     return pad([d.inputs.get(name, np.full(n, default)) for d, n in zip(data, lengths)], lengths, dtype, device)
 
-  return {
+  out = {
     "ids": pad([d.tokens for d in data], lengths, np.int64, device),
     "targets": column("target_tokens", 0, np.int64),
     "weights": column("weights", 1.0, np.float32),
     "sampler_logprobs": column("logprobs", 0.0, np.float32),
     "advantages": column("advantages", 0.0, np.float32),
   }
+  if any("sequence_ratio_mask" in d.inputs for d in data):
+    out["sequence_ratio_mask"] = column("sequence_ratio_mask", 0.0, np.float32)
+  return out
 
 
 def target_logprobs(lm: PreTrainedModel, ids: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -294,8 +332,12 @@ class Model:
     if loss_fn not in LOSSES:
       raise ValueError(f"unknown loss_fn {loss_fn}, this trainer has {', '.join(LOSSES)}")
 
-    lm = self.activate_run(run).train(not forward_only)
     lengths = [min(len(d.tokens), len(d.inputs["target_tokens"])) for d in data]
+    if loss_fn == "gspo":
+      for d, n in zip(data, lengths):
+        if "sequence_ratio_mask" in d.inputs and not np.any(d.inputs["sequence_ratio_mask"][:n] != 0):
+          raise ValueError("gspo sequence_ratio_mask must mark at least one token")
+    lm = self.activate_run(run).train(not forward_only)
     logprobs: list[np.ndarray] = [np.zeros(0, np.float32)] * len(data)
     total, revision = 0.0, self.state_revision
     world, rank = (dist.get_world_size(), dist.get_rank()) if dist.is_initialized() else (1, 0)
@@ -315,7 +357,8 @@ class Model:
           x = batch_tensors(seq, [lengths[i] for i in batch] or [1], lm.device)
           with torch.autocast(lm.device.type, dtype=torch.bfloat16, enabled=gpu):
             lp = target_logprobs(lm, x["ids"], x["targets"])
-          loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config).sum()
+          extra = {"sequence_ratio_mask": x["sequence_ratio_mask"]} if "sequence_ratio_mask" in x else {}
+          loss = LOSSES[loss_fn](lp, x["weights"], x["sampler_logprobs"], x["advantages"], config, **extra).sum()
           if not forward_only:
             self.state_revision += 1
             (loss * world).backward()  # FSDP averages gradients over ranks, and the loss is a sum
