@@ -15,7 +15,7 @@ from test.helpers import BusTest, FakeEngine, new_id, tiny
 from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
-from tinyrl.api import wire
+from tinyrl.api.proto import tinker_public_pb2 as pb
 from tinyrl.bus import QUANTUM_MS, Cmd, Ev, Op, Role, Run
 from tinyrl.control import scheduler
 from tinyrl.control.fairness import Demand, Worker, admit_samples, plan_gpus, rank_runs, update_lag, waterfill
@@ -1152,7 +1152,7 @@ class TestMultiNodeExecution(BusTest):
       for req in reqs:
         reply = await self.bus.wait_for_reply(req, 10)
         self.assertTrue(reply.ok)
-        self.assertEqual(len(wire.sample_json(reply.body)["sequences"]), 1)
+        self.assertEqual(len(pb.SampleResponse.FromString(reply.body).sequences), 1)
 
     self.assertEqual((await self.bus.get_run(sid))["tokens"], total_cmds * 50)
     svc_before = self.bus.service["team-s"]

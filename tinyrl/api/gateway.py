@@ -16,7 +16,7 @@ from typing import Any
 
 import msgspec
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
@@ -273,23 +273,11 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
 
   # ***** training *****
 
-  async def submit_fb(data: dict, forward_only: bool = False) -> dict[str, str]:
-    req = wire.from_json(data, forward_only=forward_only)
-    return await submit(
-      data["model_id"], Op.FORWARD_BACKWARD, req.SerializeToString(), data.get("seq_id"), wire.cost(req)
-    )
-
   @api.post("/api/v1/forward_backward")
   async def forward_backward(request: Request):
     body = await request.body()
-    if request.headers.get("content-type", "").startswith(wire.PROTO):
-      parsed = wire.parse(body)
-      return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
-    return await submit_fb(json.loads(body))
-
-  @api.post("/api/v1/forward")  # SDKs before 0.25
-  async def forward(request: Request):
-    return await submit_fb(await request.json(), forward_only=True)
+    parsed = wire.parse(body)
+    return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
 
   @api.post("/api/v1/optim_step")
   async def optim_step(req: OptimStepRequest):
@@ -341,14 +329,10 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
     return {"status": "ok"}
 
   @api.post("/api/v1/retrieve_future")
-  async def retrieve_future(req: FutureRequest, accept: str = Header("")):
+  async def retrieve_future(req: FutureRequest):
     reply = await bus.wait_for_reply(req.request_id, WAIT)
     if reply is None:
       return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
-    if reply.content_type == wire.PROTO and wire.PROTO not in accept:
-      if req.request_id.startswith("samp-"):
-        return wire.sample_json(reply.body)
-      return wire.output_json(reply.body)  # an older client, which reads JSON
     return Response(reply.body, media_type=reply.content_type)
 
   # ***** sampling *****

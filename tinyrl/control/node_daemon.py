@@ -69,8 +69,7 @@ class WorkerHandle:
       if self.resident == gpus:
         return 0.0, 0.0
       t0, park_s = time.monotonic(), self.park_s
-      with span("node.resume"):
-        await self.model.resume(gpus)
+      await self.model.resume(gpus)
       self.resident, self.claimed = gpus, ()
       if not self.bound and (self.spec.role == Role.SAMPLER or self.spec.gpus > 1):
         self.bound = gpus
@@ -81,8 +80,7 @@ class WorkerHandle:
       if self.exited():
         raise RuntimeError("worker exited before park")
       t0 = time.monotonic()
-      with span("node.park"):
-        await self.model.park()
+      await self.model.park()
       self.resident, self.claimed, self.park_s = (), (), time.monotonic() - t0
       return self.park_s
 
@@ -109,8 +107,7 @@ class WorkerHandle:
   async def close(self) -> None:
     while True:
       try:
-        with span("node.close"):
-          await self.model.close()
+        await self.model.close()
         self.resident = self.claimed = ()
         return
       except Exception as exc:
@@ -145,19 +142,17 @@ class WorkerHandle:
       if ckpt is not None and err is None:
         load_c, waiters, err = await self.load_shared(ckpt)
         load = (load_c, waiters)
-      with span("node.execute"):
-        rep = Reply.error(err) if err is not None else await self.wave.run(self.model.execute(cmd, ckpt, True), charge)
-        if load is not None:
-          load_c, waiters = load
-          charge.started_ms, charge.busy_ms = load_c.started_ms, charge.busy_ms + load_c.busy_ms
-          charge.gpu_ms += load_c.gpu_ms / waiters
+      rep = Reply.error(err) if err is not None else await self.wave.run(self.model.execute(cmd, ckpt, True), charge)
+      if load is not None:
+        load_c, waiters = load
+        charge.started_ms, charge.busy_ms = load_c.started_ms, charge.busy_ms + load_c.busy_ms
+        charge.gpu_ms += load_c.gpu_ms / waiters
       return TurnResult(turn.id, True, rep, charge, resume_s=resume_s, park_s=park_s)
     if turn.kind == "train":
       (resume_s, park_s), charge, cmd = await self.ensure_gpu(turn.gpus), Charge(), turn.cmd
       async with self.lock:
-        with span("node.execute"):
-          args = (turn.args.get("record") or None, turn.args.get("saved"), turn.args.get("version"))
-          rep, eff = await Wave(turn.spec.gpus).run(self.model.call("execute", cmd, *args), charge)
+        args = (turn.args.get("record") or None, turn.args.get("saved"), turn.args.get("version"))
+        rep, eff = await Wave(turn.spec.gpus).run(self.model.call("execute", cmd, *args), charge)
         loaded = bool(eff.get("loaded"))
         (self.loaded.add if loaded else self.loaded.discard)(cmd.run)
         if DEBUG:
@@ -225,11 +220,10 @@ class NodeDaemon:
       return
 
     async def stage():
-      with span("node.prepare"):
-        try:
-          return await asyncio.to_thread(self.store.local_folder, version)
-        except Exception as exc:
-          return exc
+      try:
+        return await asyncio.to_thread(self.store.local_folder, version)
+      except Exception as exc:
+        return exc
 
     self.staging[version] = task = asyncio.create_task(stage())
     task.add_done_callback(lambda _: self.notify())
@@ -344,7 +338,8 @@ class NodeDaemon:
     try:
       if turn.kind in ("train", "sample"):
         await self.claim_gpus(h, turn.gpus)
-      res = await h.run(turn, self.store)
+      with span(f"node.{turn.kind}"):
+        res = await h.run(turn, self.store)
       if turn.kind == "close" or turn.args.get("close"):
         async with self.gpu_cond:
           if self.workers.get(turn.worker) is h:
