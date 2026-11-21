@@ -18,11 +18,10 @@ from test.test_trainer import LORA, counting
 from tinyrl.api import wire
 from tinyrl.bus import QUANTUM_MS, Cmd, Ev, Op, Role, Run
 from tinyrl.control import scheduler
-from tinyrl.control.fairness import Demand, Worker, plan_gpus, select_runs, update_lag, waterfill
+from tinyrl.control.fairness import Demand, Worker, plan_gpus, rank_runs, update_lag, waterfill
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.control.scheduler import (
   REBALANCE_MS,
-  SCALE_BATCH,
   Job,
   Proc,
   Spec,
@@ -32,6 +31,7 @@ from tinyrl.control.scheduler import (
   to_plan,
 )
 from tinyrl.storage.store import Store
+from tinyrl.types import MAX_SEQS
 from tinyrl.workers.model import Model
 
 GIB = 2**30
@@ -282,8 +282,8 @@ class TestCluster(unittest.TestCase):
     c.run("wide", gpus=4, backlog=1, account="wide")  # wider than any node: nothing
     c.run("t", rank=4, backlog=9, account="t")  # a trainer is one process however long its queue
     c.run("x", role="sampler", train_run="t", exclusive=True, backlog=9, account="x")  # so is an exclusive sampler
-    c.run("s", role="sampler", base="m", backlog=3 * SCALE_BATCH, account="s")  # a shared sampler: a replica per batch
-    c.run("big", role="sampler", base="n", backlog=99 * SCALE_BATCH, account="big")  # up to every GPU there is
+    c.run("s", role="sampler", base="m", backlog=3 * MAX_SEQS, account="s")  # a shared sampler: a replica per MAX_SEQS
+    c.run("big", role="sampler", base="n", backlog=99 * MAX_SEQS, account="big")  # up to every GPU there is
     self.assertEqual(scheduler.demand(c.s, 4.0), {"t": 1, "x": 1, "s": 3, "big": 4})
 
   def test_a_backlogged_shared_sampler_gets_a_replica_per_batch_and_an_exclusive_one_does_not(self):
@@ -291,15 +291,15 @@ class TestCluster(unittest.TestCase):
     for node in "abcde":
       c.node(node, 1)
     c.run("t")
-    c.run("x", role="sampler", train_run="t", exclusive=True, backlog=3 * SCALE_BATCH)
-    c.run("s", role="sampler", backlog=3 * SCALE_BATCH)
+    c.run("x", role="sampler", train_run="t", exclusive=True, backlog=3 * MAX_SEQS)
+    c.run("s", role="sampler", backlog=3 * MAX_SEQS)
     self.assertEqual((len(c.s.procs_of("x")), len(set(c.s.procs_of("s")))), (1, 3))
 
   def test_unplaced_sampler_pool_does_not_scale_out_onto_busy_single_gpu_node(self):
     spec = Spec(Role.SAMPLER, "tiny", lora=True, gpus=1)
     state = State(
       nodes={"n1": (1, 0)},
-      jobs={"s1": Job(spec, backlog=4 * SCALE_BATCH, account="alice")},
+      jobs={"s1": Job(spec, backlog=4 * MAX_SEQS, account="alice")},
     )
     new, _ = step(state)
     self.assertEqual(len(new.procs), 1)
@@ -312,10 +312,10 @@ class TestCluster(unittest.TestCase):
     first = c.run("s", role="sampler")
     c.s.procs["p9"] = Proc(c.s.procs[first].spec, "b")
     c.runs["o"], c.queues["o"] = dict(c.runs["s"]), 0
-    c.queue("s", 2 * SCALE_BATCH)
+    c.queue("s", 2 * MAX_SEQS)
     c.settle()
     self.assertEqual(c.s.procs_of("s"), [first, "p9"])  # the existing replica on b, not a third process
-    c.queue("s", 3 * SCALE_BATCH)
+    c.queue("s", 3 * MAX_SEQS)
     c.queue("o", 1)
     c.settle()
     self.assertEqual(len(c.s.procs_of("s")), 3)  # a third replica spawns on b's other GPU
@@ -326,12 +326,23 @@ class TestCluster(unittest.TestCase):
     c = Cluster()
     c.node("a", 1)
     c.node("b", 1)
-    self.assertEqual(c.run("s1", role="sampler"), c.run("s2", role="sampler"))
+    self.assertEqual(c.run("s1", role="sampler", rank=4), c.run("s2", role="sampler", rank=4))
     c.queue("s1", 1)
     c.queue("s2", 1)
     c.settle()
     self.assertEqual(c.s.procs_of("s1"), c.s.procs_of("s2"))
     self.assertEqual(len(c.s.procs_of("s1")), 1)
+
+  def test_two_busy_fft_samplers_scale_out_onto_spare_gpu(self):
+    c = Cluster()
+    c.node("a", 1)
+    c.node("b", 1)
+    c.run("f1", role="sampler", rank=0)
+    c.run("f2", role="sampler", rank=0)
+    c.queue("f1", 1)
+    c.queue("f2", 1)
+    c.settle()
+    self.assertEqual(len(c.s.procs_of("f1")), 2)
 
   def test_idle_lora_trainers_stay_split_while_their_node_has_room(self):
     c = Cluster()
@@ -391,7 +402,7 @@ class TestCluster(unittest.TestCase):
     first = c.run("s", role="sampler")
     c.s.procs["p9"] = Proc(c.s.procs[first].spec, None)
     c.runs["o"], c.queues["o"] = dict(c.runs["s"]), 0
-    c.queue("s", 2 * SCALE_BATCH)
+    c.queue("s", 2 * MAX_SEQS)
     c.settle()
     self.assertEqual(c.s.procs_of("s"), [first])
 
@@ -439,7 +450,7 @@ class TestCluster(unittest.TestCase):
 
   def test_sampler_settings_follow_the_node(self):
     self.assertEqual(scheduler.settings(1, 24 * GIB), {})
-    self.assertEqual(scheduler.settings(2, 80 * GIB), {"TINYRL_WARM_SAMPLER": "1", "TINYRL_KV_BYTES": str(24 * GIB)})
+    self.assertEqual(scheduler.settings(2, 80 * GIB), {"TINYRL_KV_BYTES": str(24 * GIB)})
 
   def test_exclusive_evacuates_squeezed_shareable_procs_and_never_overcommits(self):
     c = Cluster()
@@ -516,7 +527,7 @@ class TestLocalQuantum(unittest.TestCase):
     service = {"slow": 0.0, "fast": 0.0}
     state = State()
     for _ in range(11):
-      [run] = select_runs(heads, state.account, state.ready_lag, service, 1)
+      run = rank_runs(heads, state.ready_lag, service)[0]
       service[run] += 10 if run == "slow" else 1
     self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
 
@@ -527,12 +538,10 @@ class TestLocalQuantum(unittest.TestCase):
       Cmd("first", "9-2", Op.OPTIM_STEP, b""),
     ]
     state = State(jobs={cmd.run: Job(Spec(), account="alice") for cmd in heads})
-    self.assertEqual(
-      select_runs(heads, state.account, state.ready_lag, {}, width=3), ["first", "same_ms_later", "later"]
-    )
+    self.assertEqual(rank_runs(heads, state.ready_lag, {}), ["first", "same_ms_later", "later"])
     # Sub-microsecond float drift from split waves must not outrank run service or arrival order.
     tiny_drift = {"later": 1e-12, "same_ms_later": 0.0, "first": 0.0}
-    self.assertEqual(select_runs(heads, lambda r: r, tiny_drift.__getitem__, {}, width=1), ["first"])
+    self.assertEqual(rank_runs(heads, tiny_drift.__getitem__, {})[0], "first")
 
   def test_account_lag_precedes_run_service_and_arrival(self):
     cluster = Cluster()
@@ -548,8 +557,7 @@ class TestLocalQuantum(unittest.TestCase):
       Cmd("save", "2-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""),
       Cmd("waiting", "3-0", Op.OPTIM_STEP, b""),
     ]
-    self.assertEqual(select_runs(heads, state.account, state.ready_lag, {"waiting": 1000}, width=1), ["waiting"])
-    self.assertEqual(select_runs(heads, state.account, state.ready_lag, {"waiting": 1000}, width=3), ["waiting"])
+    self.assertEqual(rank_runs(heads, state.ready_lag, {"waiting": 1000})[0], "waiting")
 
   def test_continuous_sampler_saves_share_a_trainer_with_training_work(self):
     cluster = Cluster()
@@ -558,7 +566,7 @@ class TestLocalQuantum(unittest.TestCase):
     heads = [Cmd("saving", "1-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""), Cmd("training", "2-0", Op.OPTIM_STEP, b"")]
     service = {"saving": 0, "training": 0}
     for _ in range(12):
-      [run] = select_runs(heads, cluster.s.account, cluster.s.ready_lag, service, width=1)
+      run = rank_runs(heads, cluster.s.ready_lag, service)[0]
       service[run] += 3 if run == "saving" else 1
     self.assertEqual(service, {"saving": 9, "training": 9})
 
@@ -597,9 +605,7 @@ class TestLocalQuantum(unittest.TestCase):
       async def use(wid, spec, gpus):
         h, _, _ = await node.prepare(wid, spec, gpus)
         await asyncio.sleep(0)
-        async with node.gpu_cond:
-          h.busy = False
-          node.gpu_cond.notify_all()
+        await node.release(h)
 
       for _ in range(40):
         batch = rng.sample(specs, 3)
@@ -989,7 +995,7 @@ class TestMultiNodeExecution(BusTest):
 
     with (
       mock.patch("tinyrl.bus.QUANTUM_MS", 15),
-      mock.patch("tinyrl.bus.SAMPLE_COMMANDS", 2),
+      mock.patch("tinyrl.bus.MAX_SEQS", 2),
     ):
       await self.add_node("shared", gpus=1, engine=BusySampler)
       self.start_scheduler()
@@ -1102,9 +1108,9 @@ class TestMultiNodeExecution(BusTest):
 
     sid = new_id()
     await self.bus.create_run(Run(sid, "tiny", 4, role=Role.SAMPLER, account="team-s"))
-    total_cmds = 2 * SCALE_BATCH + 4
+    total_cmds = 12
     payload = json.dumps(JOB).encode()
-    with mock.patch("tinyrl.bus.SAMPLE_COMMANDS", 2):
+    with mock.patch("tinyrl.bus.MAX_SEQS", 2), mock.patch("tinyrl.control.scheduler.MAX_SEQS", 4):
       reqs = [await self.submit(sid, Op.SAMPLE, payload, cost=50) for _ in range(total_cmds)]
 
       async def scaled_out() -> bool:

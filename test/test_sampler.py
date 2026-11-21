@@ -146,13 +146,14 @@ class TestSampler(BusTest):
           if not active[name]:
             del active[name]
 
-    node = self.node(store, engine=WaveEngine)
+    node = self.node(store, gpus=1, engine=WaveEngine)
     requests = [
       await self.bus.submit_command(f"s{i}", Op.SAMPLE, json.dumps(JOB).encode()) for i in range(4) for _ in range(2)
     ]
-    await node.bind("sampler", "s0", "s1", "s2", "s3")
-    self.pump(node)
-    self.assertTrue(all([(await self.bus.wait_for_reply(request, 5)).ok for request in requests]))
+    with mock.patch("tinyrl.bus.MAX_LORAS", 3):
+      await node.bind("sampler", "s0", "s1", "s2", "s3")
+      self.pump(node)
+      self.assertTrue(all([(await self.bus.wait_for_reply(request, 5)).ok for request in requests]))
     self.assertLessEqual(peak, 3)
     self.assertGreater(parallel, 1)
 
@@ -208,7 +209,7 @@ class TestSampler(BusTest):
         case.assertEqual(self.loaded, {name})
         return await super().sample(job, name)
 
-    node = self.node(store, engine=UnmixedEngine)
+    node = self.node(store, engine=UnmixedEngine, gpus=1)
     requests = [
       await self.bus.submit_command(run, Op.SAMPLE, json.dumps(JOB).encode()) for run in ("s1", "s2", "s1", "s2")
     ]
@@ -276,7 +277,7 @@ class TestSampler(BusTest):
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
     with (
       mock.patch("tinyrl.bus.QUANTUM_MS", 15),
-      mock.patch("tinyrl.bus.SAMPLE_COMMANDS", 1),
+      mock.patch("tinyrl.bus.MAX_SEQS", 1),
     ):
       first = await self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode(), cost=10)
       self.pump(node, sched=True)

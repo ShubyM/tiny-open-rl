@@ -1,7 +1,7 @@
 """GPU fairness from fleet service to one dispatch — pure data in, pure data out.
 
 update_lag compares each account's fair share with its billed GPU time.
-plan_gpus assigns GPU blocks to workers. select_runs picks one account for a worker's batch.
+plan_gpus assigns GPU blocks to workers. rank_runs and admit_samples choose commands to run.
 """
 
 from __future__ import annotations
@@ -68,18 +68,44 @@ def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, w
   return {a: v for a, v in lag.items() if a in rates or v < -1e-9}, seen
 
 
-def select_runs(heads: list[Cmd], account, ready_lag, service: dict[str, float], width: int) -> list[str]:
-  """Choose one ready account, then batch up to `width` of its least-served runs."""
+def rank_runs(heads: list[Cmd], ready_lag, service: dict[str, float]) -> list[str]:
+  """Order ready runs by account EEVDF lag, least per-run service, then numeric arrival order."""
   ready = {cmd.run: cmd for cmd in reversed(heads)}
   floor = min((service[run] for run in ready if run in service), default=0.0)
+  return [
+    cmd.run
+    for cmd in sorted(
+      ready.values(),
+      key=lambda cmd: (round(-ready_lag(cmd.run), 3), service.get(cmd.run, floor), entry_sort_key(cmd.entry_id)),
+    )
+  ]
 
-  def rank(cmd: Cmd) -> tuple:
-    return round(-ready_lag(cmd.run), 3), service.get(cmd.run, floor), entry_sort_key(cmd.entry_id)
 
-  if not (runs := [cmd.run for cmd in sorted(ready.values(), key=rank)]):
+def admit_samples(heads, queued, account, ready_lag, service, ver_of, in_flight, active_vers, max_seqs, max_loras):
+  """Continuously admit ready sample commands up to engine concurrency & LoRA limits, fairly across accounts."""
+  if (slots := max_seqs - sum(in_flight.values())) <= 0 or not heads:
     return []
-  chosen = account(runs[0])
-  return [run for run in runs if account(run) == chosen][:width]
+  vers, by_acct = set(active_vers), {}
+  for r in rank_runs(heads, ready_lag, service):
+    if (v := ver_of(r)) in vers or len(vers) < max_loras:
+      vers.add(v)
+      by_acct.setdefault(account(r), []).append(r)
+  qs = {r: list(queued(r, slots)) for rs in by_acct.values() for r in rs}
+  demand = {a: in_flight.get(a, 0) + sum(len(qs[r]) for r in by_acct.get(a, ())) for a in in_flight | by_acct}
+  caps, out = waterfill(max_seqs, demand), []
+  need = {a: max(0, int(caps[a]) - in_flight.get(a, 0)) for a in by_acct}
+  rem = slots - sum(need.values())
+  for a, rs in by_acct.items():
+    take = need[a] + (1 if rem > 0 and sum(len(qs[r]) for r in rs) > need[a] else 0)
+    rem -= take - need[a]
+    idx = 0
+    while take > 0 and rs:
+      if qs[r := rs[idx % len(rs)]]:
+        out.append(qs[r].pop(0))
+        take, idx = take - 1, idx + 1
+      else:
+        rs.remove(r)
+  return out
 
 
 def blocks(total: int, width: int) -> list[tuple[int, ...]]:

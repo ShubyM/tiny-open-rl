@@ -23,9 +23,9 @@ RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery
 
 # (source, function, original expression, faulty replacement, tests that should detect it)
 CASES = [
-  (FAIRNESS, "select_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
-  (FAIRNESS, "select_runs", "[:width]", "[:1]", ORDER),
-  (FAIRNESS, "select_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
+  (FAIRNESS, "rank_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
+  (FAIRNESS, "admit_samples", "max_seqs - sum(in_flight.values())", "1 - sum(in_flight.values())", BILLING),
+  (FAIRNESS, "rank_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),

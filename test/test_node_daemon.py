@@ -18,7 +18,7 @@ from test.test_sampler import JOB
 from tinyrl.bus import Op, Role, Run
 from tinyrl.control.node_daemon import NodeDaemon, WorkerHandle
 from tinyrl.storage.store import Store
-from tinyrl.types import WorkerSpec
+from tinyrl.types import Turn, WorkerSpec
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -290,8 +290,7 @@ class TestNodeDaemon(BusTest):
     try:
       # Directly ask prepare() to place `proc` on GPU 1 while GPU 0 is held by `other`.
       got, _, _ = await node.prepare(proc, handle.spec, (1,))
-      async with node.gpu_cond:
-        got.busy = False
+      await node.release(got)
       self.assertEqual(got.model.proc.pid, first)
       self.assertEqual(got.resident, (1,))
     finally:
@@ -410,6 +409,60 @@ class TestNodeDaemon(BusTest):
     self.assertTrue(child.closed)
     self.assertEqual(node.workers, {})
     self.assertNotEqual(node.boot_id, old_boot)
+
+  async def test_snapshot_waits_for_concurrent_park_without_colliding(self):
+    node, a, b = self.node(gpus=1), new_id(), new_id()
+    for run, base in ((a, "a"), (b, "b")):
+      await self.bus.create_run(Run(run, base, 4, lora=LORA))
+    await node.bind("holder", a)
+    await self.create(a, "a", node)
+    holder = node.workers["holder"]
+    child, call = holder.model, holder.model.call
+    in_flight, overlap = [0], []
+    parking, release = asyncio.Event(), asyncio.Event()
+
+    async def checked(method, *args):
+      in_flight[0] += 1
+      if in_flight[0] > 1:
+        overlap.append(method)
+      try:
+        if method == "park":
+          parking.set()
+          await release.wait()
+        return await call(method, *args)
+      finally:
+        in_flight[0] -= 1
+
+    child.call = checked
+    await node.bind("contender", b)
+    req = await self.bus.submit_command(
+      b, Op.CREATE_MODEL, json.dumps({"base_model": "b", "rank": 4, "lora": LORA}).encode()
+    )
+    try:
+      await self.until(parking.is_set, node)
+      snap = self.background(
+        node.execute_turn(
+          Turn(
+            "t-snap",
+            "snapshot",
+            "holder",
+            holder.spec,
+            (),
+            args={"run": a, "version": new_id().replace("-", ""), "drop": True},
+          )
+        )
+      )
+      for _ in range(5):
+        await asyncio.sleep(0)
+      self.assertFalse(snap.done())
+      self.assertEqual(overlap, [])
+    finally:
+      release.set()
+    res = await snap
+    self.assertTrue(res.ok)
+    self.assertIsNotNone(res.saved)
+    self.assertEqual(overlap, [])
+    await self.reply(req, node)
 
 
 if __name__ == "__main__":

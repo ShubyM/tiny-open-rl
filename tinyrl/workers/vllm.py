@@ -8,7 +8,6 @@ import glob
 import json
 import os
 import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -20,10 +19,11 @@ from tinyrl.control.process import launch, reap, target_pid
 from tinyrl.storage import models
 from tinyrl.storage.store import header
 from tinyrl.trace import span
+from tinyrl.types import MAX_LORAS, MAX_SEQS
 from tinyrl.workers import snapshot
 from tinyrl.workers.sampler import Out, Seq
 
-CUDAGRAPH_CONFIG = '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128,256]}'
+CUDAGRAPH_CONFIG = json.dumps({"cudagraph_capture_sizes": [1 << i for i in range(MAX_SEQS.bit_length())]})
 KERNEL_CONFIG = '{"enable_flashinfer_autotune":false}'
 
 
@@ -81,14 +81,16 @@ class VLLM:
     options = dict(os.environ if env is None else env)
     path = await asyncio.to_thread(models.local, base)  # served under the reference's name, which requests use
     flags = ["--enable-sleep-mode", "--language-model-only"]
-    flags += ["--enable-lora", "--max-lora-rank", "64", "--max-loras", "16", "--max-cpu-loras", "64"] if lora else []
+    flags += (
+      ["--enable-lora", "--max-lora-rank", "64", "--max-loras", str(MAX_LORAS), "--max-cpu-loras", "64"] if lora else []
+    )
     visible = options.get("CUDA_VISIBLE_DEVICES", "0")
     if (tp := len(visible.split(","))) > 1:
       flags += ["--tensor-parallel-size", str(tp)]
     env = {
       "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",  # its FlashAttention 4 kernels compile at each start unless cached
       "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": os.path.expanduser("~/.cache/flash-attention-cute"),
-      **{k: v for k, v in options.items() if k not in {"TINYRL_KV_BYTES", "TINYRL_WARM_SAMPLER"}},
+      **{k: v for k, v in options.items() if k != "TINYRL_KV_BYTES"},
       "VLLM_SERVER_DEV_MODE": "1",
       "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
     }
@@ -126,7 +128,7 @@ class VLLM:
       except Exception:
         print(f"the snapshot in {folder} did not restore, so vLLM boots", file=sys.stderr, flush=True)
         traceback.print_exc()
-        shutil.rmtree(folder, ignore_errors=True)
+        return await boot()
     os.makedirs(snapshot.RUN, exist_ok=True)
     name = f"{snapshot.RUN}/{os.urandom(4).hex()}"
     saving = (

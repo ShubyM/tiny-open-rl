@@ -12,11 +12,10 @@ from dataclasses import dataclass, field
 
 from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
-from tinyrl.types import Ev, Role
+from tinyrl.types import MAX_LORAS, MAX_SEQS, Ev, Role
 from tinyrl.types import WorkerSpec as Spec
 
-REBALANCE_MS = getenv("REBALANCE_MS", 20_000)
-SCALE_BATCH, TICK_MS = getenv("SCALE_BATCH", 4), getenv("TICK_MS", 100)
+REBALANCE_MS, TICK_MS = getenv("REBALANCE_MS", 20_000), getenv("TICK_MS", 100)
 
 
 @dataclass
@@ -137,8 +136,7 @@ def to_plan(s: State) -> dict:
 
 
 def settings(gpus: int, gpu_bytes: int) -> dict[str, str]:
-  env = {"TINYRL_WARM_SAMPLER": "1"} if gpus >= 2 else {}
-  return env | ({"TINYRL_KV_BYTES": str(24 * 2**30)} if gpu_bytes >= 64 * 2**30 else {})
+  return {"TINYRL_KV_BYTES": str(24 * 2**30)} if gpu_bytes >= 64 * 2**30 else {}
 
 
 # ***** placement, elastic scaling, and cross-node rebalance *****
@@ -180,11 +178,11 @@ def rebalance_target(s: State, name: str) -> str | None:
 
 
 def demand(s: State, cap: float) -> dict[str, float]:
-  """The GPUs each account could use now: one run's worth per ready run, more for a backlogged elastic sampler."""
+  """The GPUs each account could use now: one run's worth per ready run, more when a sampler exceeds `MAX_SEQS`."""
   biggest, want = max((g for g, _ in s.nodes.values()), default=0), {}
   for r, j in s.jobs.items():
     if s.ready(r) and j.spec.gpus <= biggest:
-      reps = min(int(cap) // j.spec.gpus, max(1, j.backlog // max(1, SCALE_BATCH))) if j.spec.elastic else 1
+      reps = min(int(cap) // j.spec.gpus, max(1, (j.backlog + MAX_SEQS - 1) // MAX_SEQS)) if j.spec.elastic else 1
       a = s.account(r)
       want[a] = want.get(a, 0.0) + reps * j.spec.gpus
   return want
@@ -237,7 +235,10 @@ def size_samplers(s: State, out: list) -> None:
   for spec, js in by_spec.items():
     pool = [n for n, p in sorted(s.procs.items()) if p.spec == spec]
     placed = [n for n in pool if s.procs[n].node]
-    want = 1 if spec.exclusive else max(1, sum(j.backlog for j in js) // max(1, SCALE_BATCH))
+    ready = [j for j in js if j.backlog > 0]
+    by_seqs = (sum(j.backlog for j in ready) + MAX_SEQS - 1) // MAX_SEQS
+    by_slots = (len(ready) + (cap := MAX_LORAS if spec.lora else 1) - 1) // cap
+    want = 1 if spec.exclusive else max(1, by_seqs, by_slots)
     keep = placed[:want] if placed else (pool[:1] or [s.add_proc(spec)])
     for name in pool:
       if name not in keep and s.procs.pop(name).node:

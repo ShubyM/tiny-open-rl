@@ -11,8 +11,6 @@ from tinyrl.workers.trainer import Trainer
 
 
 class InlineProcess:
-  warm_pending = False
-
   def __init__(self, trainer: Trainer):
     self.trainer, self.proc, self.closed, self.pid = trainer, self, False, None
 

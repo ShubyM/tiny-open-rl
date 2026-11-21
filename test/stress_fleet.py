@@ -299,7 +299,9 @@ class Stress(BusTest):
         f"{node.id}: gpus={node.gpus} on={on} physical={node.occ.on} draining={node.draining} active={list(node.active)}"
       )
       for proc, h in node.workers.items():
-        out.append(f"  {proc} role={h.spec.role.value} gpus={h.spec.gpus} loaded={sorted(h.loaded)} busy={h.busy}")
+        out.append(
+          f"  {proc} role={h.spec.role.value} gpus={h.spec.gpus} loaded={sorted(h.loaded)} state={h.state.value} readers={h.readers}"
+        )
     print("\n".join(out), file=sys.stderr)
 
   async def train(self, run: str, account: str, rank: int, rng: random.Random) -> None:

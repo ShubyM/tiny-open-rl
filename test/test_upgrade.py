@@ -12,7 +12,7 @@ class TestPopulatedUpgrade(BusTest):
     second = await self.bus.submit_command("t", Op.OPTIM_STEP, b"\xff")
     reply1 = await self.bus.exchange(NodeReport("n1", "b1", 1))
     [t1] = reply1.turns
-    self.assertEqual(t1.cmds[0].request_id, first)
+    self.assertEqual(t1.cmd.request_id, first)
 
     # n1 disappears; n2 takes over after n1 is reaped, first command fails and tail runs on n2.
     self.bus.nodes["n1"].until = 0.0
@@ -20,7 +20,7 @@ class TestPopulatedUpgrade(BusTest):
     self.assertFalse((await self.bus.wait_for_reply(first, 0)).ok)
     self.assertEqual((await self.bus.get_run("t"))["failed"], 1)
     [t2] = reply2.turns
-    self.assertEqual((t2.cmds[0].request_id, t2.cmds[0].body), (second, b"\xff"))
+    self.assertEqual((t2.cmd.request_id, t2.cmd.body), (second, b"\xff"))
     await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(t2, OK, mutated=True)]))
     self.assertEqual(await self.bus.wait_for_reply(second, 0), OK)
 
@@ -29,14 +29,13 @@ class TestPopulatedUpgrade(BusTest):
     first = await self.bus.submit_command("s", Op.SAMPLE, b"{}")
     reply1 = await self.bus.exchange(NodeReport("n1", "b1", 1))
     [t1] = reply1.turns
-    self.assertEqual([c.request_id for c in t1.cmds], [first])
+    self.assertEqual(t1.cmd.request_id, first)
 
     second = await self.bus.submit_command("s", Op.SAMPLE, b"{}")
     self.bus.nodes["n1"].until = 0.0
     reply2 = await self.bus.exchange(NodeReport("n2", "b2", 1))
-    [t2] = reply2.turns
-    self.assertEqual([c.request_id for c in t2.cmds], [first, second])
-    await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(t2, OK)]))
+    self.assertEqual([t.cmd.request_id for t in reply2.turns], [first, second])
+    await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(t, OK) for t in reply2.turns]))
     self.assertEqual(await self.bus.wait_for_reply(first, 0), OK)
     self.assertEqual(await self.bus.wait_for_reply(second, 0), OK)
     self.assertEqual(await self.bus.queued_and_in_flight("s"), {"live": True, "queued": 0, "in_flight": []})

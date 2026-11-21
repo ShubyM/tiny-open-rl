@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections import Counter
+from enum import StrEnum
 
 import msgspec
 
@@ -44,15 +44,31 @@ def gpu_memory_mib() -> int:
 
 
 def failed(turn: Turn, exc: Exception, charge: Charge | None = None, **times) -> TurnResult:
-  """The result of a turn that broke: every command it carried gets the error."""
-  rep = Reply.error(exc)
-  return TurnResult(turn.id, False, [(c.request_id, rep, charge) for c in turn.cmds], **times)
+  """The result of a turn that broke: its command (if any) gets the error."""
+  return TurnResult(turn.id, False, Reply.error(exc) if turn.cmd else None, charge, **times)
+
+
+class WorkerState(StrEnum):
+  IDLE = "idle"
+  RESUMING = "resuming"
+  BUSY = "busy"
+  PARKING = "parking"
+  CLOSED = "closed"
 
 
 class WorkerHandle:
   def __init__(self, wid: str, spec: WorkerSpec, model, resident=(), bound=()):
     self.id, self.spec, self.model, self.resident, self.bound = wid, spec, model, resident, bound
-    self.loaded, self.busy, self.parking, self.park_s = set(), False, False, 0.0
+    self.loaded, self.state, self.readers, self.park_s = set(), WorkerState.IDLE, 0, 0.0
+    self.wave, self.loads = Wave(spec.gpus), {}
+
+  @property
+  def busy(self) -> bool:
+    return self.state != WorkerState.IDLE or self.readers > 0
+
+  @property
+  def parking(self) -> bool:
+    return self.state == WorkerState.PARKING
 
   def exited(self) -> bool:
     return bool((p := getattr(self.model, "proc", None)) and p.poll() is not None)
@@ -68,7 +84,7 @@ class NodeDaemon:
     self.gpus, self.id, self.boot_id = gpus, node or f"{socket.gethostname()}-{os.getpid()}", uuid.uuid4().hex[:12]
     self.gpu_mib = gpu_memory_mib() if gpu_mib is None else gpu_mib
     self.workers, self.active, self.staging, self.staged_paths, self.stage_errors = {}, {}, {}, {}, {}
-    self.gpu_cond, self.changed, self.draining = asyncio.Condition(), asyncio.Event(), False
+    self.gpu_cond, self.changed, self.draining, self.reaping = asyncio.Condition(), asyncio.Event(), False, set()
     self.last_exchange, self.lag, self.swept, self.sweeping = time.monotonic(), 0.0, 0.0, None
 
   def notify(self) -> None:
@@ -107,9 +123,8 @@ class NodeDaemon:
     staged = [v for v, (f, _) in list(self.staged_paths.items()) if os.path.isdir(f) or not self.staged_paths.pop(v)]
     stage_errors, self.stage_errors, statuses = self.stage_errors, {}, []
     for h in list(self.workers.values()):
-      if h.exited() and not h.busy and not h.parking:
-        h.parking = True
-        asyncio.create_task(self.drop_handle(h))
+      if h.exited() and not h.busy:
+        self.reap_exited(h)
         continue
       statuses.append(WorkerStatus(h.id, h.resident, h.bound, h.pid(), tuple(sorted(h.loaded)), h.park_s))
     sweep = not self.draining and time.time() - self.swept > SWEEP_S and (not self.sweeping or self.sweeping.done())
@@ -191,16 +206,43 @@ class NodeDaemon:
 
   # ***** physical GPU handoff and turn execution *****
 
+  def reap_exited(self, h: WorkerHandle) -> None:
+    async def run() -> None:
+      async with self.exclusive(h.id) as cur:
+        if cur is h and cur.exited():
+          await self.drop_handle(cur)
+
+    task = asyncio.create_task(run())
+    self.reaping.add(task)
+    task.add_done_callback(lambda t: (self.reaping.discard(t), self.notify()))
+
   async def release(self, h: WorkerHandle, *, drop: bool = False, park: bool = False) -> None:
     async with self.gpu_cond:
       if drop:
-        self.workers.pop(h.id, None)
-        h.resident, h.busy, h.parking = (), False, False
+        if self.workers.get(h.id) is h:
+          del self.workers[h.id]
+        h.resident, h.state, h.readers = (), WorkerState.CLOSED, 0
       elif park:
-        h.resident, h.parking = (), False
-      else:
-        h.busy = False
+        h.resident, h.state = (), WorkerState.IDLE
+      elif h.readers > 0:
+        h.readers -= 1
+      elif h.state != WorkerState.CLOSED:
+        h.state = WorkerState.IDLE
       self.gpu_cond.notify_all()
+
+  @contextlib.asynccontextmanager
+  async def exclusive(self, wid: str, *, live_only: bool = False):
+    async with self.gpu_cond:
+      while (h := self.workers.get(wid)) and h.busy:
+        await self.gpu_cond.wait()
+      if h is None or (live_only and h.exited()):
+        yield None
+        return
+      h.state = WorkerState.BUSY
+    try:
+      yield h
+    finally:
+      await self.release(h)
 
   async def drop_handle(self, handle: WorkerHandle) -> None:
     while True:
@@ -226,25 +268,38 @@ class NodeDaemon:
       await self.drop_handle(handle)
 
   async def prepare(self, wid: str, spec: WorkerSpec, gpus: tuple[int, ...]) -> tuple[WorkerHandle, float, float]:
-    """Ensure `wid` is resident and busy on `gpus`, parking overlapping residents first."""
+    """Ensure `wid` is resident on `gpus`. Resident samplers take a shared lease; handoffs drain and park overlaps."""
     while True:
       async with self.gpu_cond:
         h = self.workers.get(wid)
         overlap = [
           o for o in self.workers.values() if o.id != wid and o.resident and not set(o.resident).isdisjoint(gpus)
         ]
-        if (h and (h.busy or h.parking)) or any(o.busy or o.parking for o in overlap):
+        if (
+          spec.role == Role.SAMPLER
+          and h is not None
+          and h.state == WorkerState.IDLE
+          and h.resident == gpus
+          and not (overlap or h.exited())
+        ):
+          h.readers += 1
+          return h, 0.0, 0.0
+        if (h and h.busy) or any(o.busy for o in overlap):
           await self.gpu_cond.wait()
           continue
         need_park = h and (h.exited() or (h.resident and h.resident != gpus))
         if to_park := overlap + ([h] if need_park else []):
           for o in to_park:
-            o.parking = True
+            o.state = WorkerState.PARKING
         else:
           if h is None:
             self.workers[wid] = h = self.spawn_worker(wid, spec, gpus)
-          warm = h.resident == gpus and not getattr(h.model, "warm_pending", False)
-          h.busy, h.resident, park_s = True, gpus, h.park_s
+          warm = h.resident == gpus
+          h.resident, park_s = gpus, h.park_s
+          if warm and spec.role == Role.SAMPLER:
+            h.state, h.readers = WorkerState.IDLE, h.readers + 1
+          else:
+            h.state = WorkerState.BUSY if warm else WorkerState.RESUMING
           if not h.bound and (spec.role == Role.SAMPLER or spec.gpus > 1):
             h.bound = gpus
           break
@@ -257,35 +312,56 @@ class NodeDaemon:
         with span("node.resume"):
           await h.model.resume(gpus)
         resume_s = time.monotonic() - t0
-      except Exception:
-        await self.drop_handle(h)
+      except BaseException:
+        await asyncio.shield(self.drop_handle(h))
         raise
+      async with self.gpu_cond:
+        if spec.role == Role.SAMPLER:
+          h.state, h.readers = WorkerState.IDLE, 1
+        else:
+          h.state = WorkerState.BUSY
+        self.gpu_cond.notify_all()
     return h, resume_s, park_s
+
+  async def load_shared(self, h: WorkerHandle, ckpt: tuple[str, str]) -> tuple[Charge, int, Exception | None]:
+    """Coalesce concurrent loads of the same checkpoint on a sampler so load GPU time is billed once."""
+    if (entry := h.loads.get(ckpt)) is None:
+      charge, waiters = Charge(), [0]
+
+      async def do_load() -> Exception | None:
+        try:
+          await h.wave.run(h.model.load(ckpt), charge)
+          return None
+        except Exception as exc:
+          return exc
+        finally:
+          h.loads.pop(ckpt, None)
+
+      h.loads[ckpt] = entry = (asyncio.create_task(do_load()), charge, waiters)
+    task, charge, waiters = entry
+    waiters[0] += 1
+    err = await task
+    return charge, waiters[0], err
 
   async def execute_turn(self, turn: Turn) -> TurnResult:
     try:
       if turn.kind in ("train", "sample"):
         return await self.run_gpu_turn(turn)
-      if turn.kind == "snapshot":
-        if not (h := self.workers.get(turn.worker)) or h.exited():
-          return TurnResult(turn.id)
-        rid, ver = turn.args["run"], turn.args.get("version")
-        saved = await h.model.call("save_run", rid, ver) if ver and rid in h.loaded else None
-        if turn.args.get("drop") and rid in h.loaded:
-          await h.model.call("drop_run", rid)
-        h.loaded.discard(rid)
-        if turn.args.get("close"):
-          await self.drop_handle(h)
-        return TurnResult(turn.id, saved=saved)
-      if turn.kind == "close":
-        async with self.gpu_cond:
-          while (h := self.workers.get(turn.worker)) and (h.busy or h.parking):
-            await self.gpu_cond.wait()
+      if turn.kind in ("snapshot", "close"):
+        async with self.exclusive(turn.worker, live_only=turn.kind == "snapshot") as h:
           if h is None:
             return TurnResult(turn.id)
-          h.busy = True
-        await self.drop_handle(h)
-        return TurnResult(turn.id)
+          if turn.kind == "close":
+            await self.drop_handle(h)
+            return TurnResult(turn.id)
+          rid, ver = turn.args["run"], turn.args.get("version")
+          saved = await h.model.call("save_run", rid, ver) if ver and rid in h.loaded else None
+          if turn.args.get("close"):
+            await self.drop_handle(h)
+          elif rid in h.loaded:
+            await h.model.call("drop_run", rid)
+          h.loaded.discard(rid)
+          return TurnResult(turn.id, saved=saved)
       raise ValueError(f"unknown turn kind {turn.kind}")
     except asyncio.CancelledError:
       raise
@@ -294,10 +370,9 @@ class NodeDaemon:
 
   async def run_gpu_turn(self, turn: Turn) -> TurnResult:
     h, resume_s, park_s = await self.prepare(turn.worker, turn.spec, turn.gpus)
-    charge = Charge()
+    charge, cmd = Charge(), turn.cmd
     try:
       if turn.kind == "train":
-        [cmd] = turn.cmds
         with span("node.execute"):
           args = (turn.args.get("record") or None, turn.args.get("saved"), turn.args.get("version"))
           rep, eff = await Wave(turn.spec.gpus).run(h.model.call("execute", cmd, *args), charge)
@@ -306,53 +381,39 @@ class NodeDaemon:
         if DEBUG:
           print(f"{turn.worker} {cmd.request_id} {cmd.op:24s} {charge.busy_ms:9d} ms")
         mut, saved = bool(eff.get("mutated")), eff.get("saved")
-        return TurnResult(turn.id, True, [(cmd.request_id, rep, charge)], mut, loaded, saved, resume_s, park_s)
-      if not turn.cmds:
-        return TurnResult(turn.id, resume_s=resume_s, park_s=park_s)
-      inputs, errors = {}, {}
-      for rid, ver in turn.args.get("versions", {}).items():
-        if ver is None:
-          inputs[rid] = None
-        else:
-          try:
-            inputs[rid] = await asyncio.to_thread(self.store.local_folder, ver)
-          except Exception as exc:
-            inputs[rid], errors[ver] = ver, exc
-      wave, uses, loads, results = Wave(turn.spec.gpus), Counter(inputs[c.run] for c in turn.cmds), {}, []
-      for ckpt in uses:
-        if ckpt is not None and ckpt not in errors:
-          loads[ckpt] = load = Charge()
-          try:
-            await wave.run(h.model.load(ckpt), load)
-          except Exception as exc:
-            errors[ckpt] = exc
-
-      async def answer(cmd) -> None:
-        c, inp = Charge(), inputs[cmd.run]
-        with span("node.execute"):
-          rep = Reply.error(err) if (err := errors.get(inp)) else await wave.run(h.model.execute(cmd, inp, True), c)
-          if load := loads.get(inp):
-            c.started_ms, c.busy_ms = load.started_ms, c.busy_ms + load.busy_ms
-            c.gpu_ms += load.gpu_ms / uses[inp]
-        results.append((cmd.request_id, rep, c))
-
-      async with asyncio.TaskGroup() as group:
-        for cmd in turn.cmds:
-          group.create_task(answer(cmd))
-      return TurnResult(turn.id, results=results, resume_s=resume_s, park_s=park_s)
+        return TurnResult(turn.id, True, rep, charge, mut, loaded, saved, resume_s, park_s)
+      ver, ckpt, err, load = turn.args.get("version"), None, None, None
+      if ver is not None:
+        try:
+          ckpt = await asyncio.to_thread(self.store.local_folder, ver)
+        except Exception as exc:
+          err = exc
+      if ckpt is not None and err is None:
+        load_c, waiters, err = await self.load_shared(h, ckpt)
+        load = (load_c, waiters)
+      with span("node.execute"):
+        rep = Reply.error(err) if err is not None else await h.wave.run(h.model.execute(cmd, ckpt, True), charge)
+        if load is not None:
+          load_c, waiters = load
+          charge.started_ms, charge.busy_ms = load_c.started_ms, charge.busy_ms + load_c.busy_ms
+          charge.gpu_ms += load_c.gpu_ms / waiters
+      return TurnResult(turn.id, True, rep, charge, resume_s=resume_s, park_s=park_s)
     except asyncio.CancelledError:
-      await asyncio.shield(self.drop_handle(h))
+      if self.workers.get(h.id) is h:
+        await asyncio.shield(self.drop_handle(h))
       raise
     except Exception as exc:
-      await self.drop_handle(h)
+      if self.workers.get(h.id) is h:
+        await self.drop_handle(h)
       return failed(turn, exc, charge if turn.kind == "train" else None, resume_s=resume_s, park_s=park_s)
     finally:
       await self.release(h)
 
   async def clear_local(self, *extra: asyncio.Task | None) -> None:
-    tasks = [t for t in (*(t for _, t in self.active.values()), *self.staging.values(), *extra) if t]
+    tasks = [t for t in (*(t for _, t in self.active.values()), *self.staging.values(), *self.reaping, *extra) if t]
     self.active.clear()
     self.staging.clear()
+    self.reaping.clear()
     for t in tasks:
       t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)

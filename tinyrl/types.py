@@ -8,6 +8,8 @@ from enum import StrEnum
 
 from tinyrl.control.accounting import Charge
 
+MAX_LORAS, MAX_SEQS = 16, 256  # vLLM engine limits: --max-loras and max captured CUDA-graph batch size
+
 
 class Op(StrEnum):
   CREATE_MODEL = "create_model"
@@ -122,7 +124,7 @@ class Turn:
   worker: str
   spec: WorkerSpec = WorkerSpec()
   gpus: tuple[int, ...] = ()
-  cmds: list[Cmd] = field(default_factory=list)  # a train turn carries exactly one
+  cmd: Cmd | None = None
   args: dict = field(default_factory=dict)
 
 
@@ -130,7 +132,8 @@ class Turn:
 class TurnResult:
   turn_id: str
   ok: bool = True
-  results: list[tuple[str, Reply, Charge | None]] = field(default_factory=list)  # (request id, reply, charge)
+  reply: Reply | None = None
+  charge: Charge | None = None
   mutated: bool = False
   loaded: bool = False
   saved: dict | None = None

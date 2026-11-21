@@ -124,7 +124,7 @@ class TestAccounting(BusTest):
     model = SimpleNamespace(execute=sample, resume=AsyncMock(), park=AsyncMock(), close=AsyncMock(), proc=None)
     node.workers["worker"] = WorkerHandle("worker", spec, model, resident=(0, 1), bound=(0, 1))
     with (
-      patch("tinyrl.bus.SAMPLE_COMMANDS", 1),
+      patch("tinyrl.bus.MAX_SEQS", 2),
       patch("tinyrl.control.accounting.monotonic_ns", lambda: now),
     ):
       for _ in range(6):

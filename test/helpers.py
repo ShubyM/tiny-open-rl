@@ -26,7 +26,7 @@ def tiny(name: str = "") -> LlamaForCausalLM:
 
 def finished(turn, reply=None, charge=None, **effects) -> TurnResult:
   """What a node reports when `turn` ends with `reply` for each command it carried."""
-  return TurnResult(turn.id, results=[(c.request_id, reply, charge) for c in turn.cmds], **effects)
+  return TurnResult(turn.id, True, reply if turn.cmd else None, charge, **effects)
 
 
 def new_id() -> str:

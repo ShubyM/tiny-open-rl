@@ -61,17 +61,12 @@ class Sampler:
     module, name = self.env.get("ENGINE", "tinyrl.workers.vllm:VLLM").split(":")
     self.engine_type = engine or getattr(importlib.import_module(module), name)
     self.base, self.lora = base, lora
-    self.warm = self.env.get("TINYRL_WARM_SAMPLER", "0") != "0"
     self.running = None
     self.loading = asyncio.Lock()
 
   @property
   def proc(self):
     return getattr(self.running, "server", None)
-
-  @property
-  def warm_pending(self) -> bool:
-    return self.warm and self.running is None
 
   async def start(self) -> None:
     """Start the engine, once."""

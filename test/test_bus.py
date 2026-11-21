@@ -28,7 +28,7 @@ class TestBus(BusTest):
 
     reply = await self.bus.exchange(NodeReport("n1", "b1", 1))
     [turn] = reply.turns
-    [cmd] = turn.cmds
+    cmd = turn.cmd
     self.assertEqual(
       (cmd.run, cmd.op, cmd.body, cmd.request_id, cmd.cost), (run_id, Op.OPTIM_STEP, b'{"lr": 1}', request_id, 42)
     )
@@ -137,7 +137,7 @@ class TestBus(BusTest):
 
     reply2 = await self.bus.exchange(NodeReport("n1", "b1", 1, finished=[finished(t1, ok(), loaded=True)]))
     self.assertEqual(reply2.acknowledged, [t1.id])
-    self.assertEqual(reply2.turns[0].cmds[0].request_id, request_ids[1])
+    self.assertEqual(reply2.turns[0].cmd.request_id, request_ids[1])
 
   async def test_a_turn_the_node_already_holds_is_not_sent_again(self):
     run_id = await self.new_run()
@@ -206,7 +206,7 @@ class TestBus(BusTest):
 
     second = await self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
     [t2] = (await self.bus.exchange(NodeReport("n2", "b2", 1))).turns
-    self.assertEqual(t2.cmds[0].request_id, second)
+    self.assertEqual(t2.cmd.request_id, second)
     uri = f"tinker://{run}/weights/step"
     saved = {"uri": uri, "size": 20, "version": "new"}
     await self.bus.exchange(NodeReport("n2", "b2", 1, finished=[finished(t2, ok(), saved=saved)]))
@@ -259,7 +259,7 @@ class TestBus(BusTest):
     sid = await self.new_run(role=Role.SAMPLER, account="bob")
     req = await self.bus.submit_command(sid, Op.SAMPLE, b"{}", cost=100)
     [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
-    cmd = turn.cmds[0]
+    cmd = turn.cmd
     results = [
       self.bus.commit(cmd, ok(replica=i), turn.id, charge=Charge(busy_ms=40, gpu_ms=40.5 + i)) for i in range(5)
     ]
@@ -290,14 +290,14 @@ class TestBus(BusTest):
   async def test_a_sample_in_flight_is_reclaimed_only_from_a_dead_node(self):
     session = await self.new_run(role=Role.SAMPLER)
     requests = [await self.bus.submit_command(session, Op.SAMPLE, b"{}") for _ in range(2)]
-    [t1] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
-    self.assertEqual([c.request_id for c in t1.cmds], requests)
+    t1 = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
+    self.assertEqual([t.cmd.request_id for t in t1], requests)
     # While n1 is alive, n2 gets nothing for those in-flight samples.
     self.assertEqual((await self.bus.exchange(NodeReport("n2", "b2", 1))).turns, [])
     # Once n1 dies, n2 reclaims both in FIFO order.
     self.bus.nodes["n1"].until = 0.0
-    [t2] = (await self.bus.exchange(NodeReport("n2", "b2", 1))).turns
-    self.assertEqual([c.request_id for c in t2.cmds], requests)
+    t2 = (await self.bus.exchange(NodeReport("n2", "b2", 1))).turns
+    self.assertEqual([t.cmd.request_id for t in t2], requests)
 
   async def test_a_dead_node_daemon_stops_counting(self):
     await self.bus.exchange(NodeReport("node-a", "ba", 2))
@@ -331,7 +331,7 @@ class TestBus(BusTest):
     request = await self.bus.submit_command(run_id, Op.SAMPLE, b"{}")
     await self.bus.delete_run(gone)
     [turn] = (await self.bus.exchange(NodeReport("n1", "b1", 1))).turns
-    self.assertEqual([(c.run, c.request_id) for c in turn.cmds], [(run_id, request)])
+    self.assertEqual((turn.cmd.run, turn.cmd.request_id), (run_id, request))
 
 
 class TestControlRestart(unittest.IsolatedAsyncioTestCase):
@@ -362,7 +362,7 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
         req = await bus.submit_command("tr-1", Op.SAVE_WEIGHTS, b"\x00\xff", cost=5)
         reply = await client.exchange(NodeReport("node-a", "boot-a", 1))
         [turn] = reply.turns
-        self.assertEqual(turn.cmds[0].body, b"\x00\xff")
+        self.assertEqual(turn.cmd.body, b"\x00\xff")
         ckpt = {"uri": "tinker://tr-1/weights/v1", "size": 99, "version": "ver1"}
         done = finished(turn, ok(done=1), mutated=True, loaded=True, saved=ckpt)
 
