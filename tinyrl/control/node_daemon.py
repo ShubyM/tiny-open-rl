@@ -375,6 +375,8 @@ class NodeDaemon:
       if turn.kind == "train":
         with span("node.execute"):
           args = (turn.args.get("record") or None, turn.args.get("saved"), turn.args.get("version"))
+          if (stab := turn.args.get("stability")) is not None:
+            args = (*args, stab)
           rep, eff = await Wave(turn.spec.gpus).run(h.model.call("execute", cmd, *args), charge)
         loaded = bool(eff.get("loaded"))
         (h.loaded.add if loaded else h.loaded.discard)(cmd.run)
@@ -382,7 +384,7 @@ class NodeDaemon:
           print(f"{turn.worker} {cmd.request_id} {cmd.op:24s} {charge.busy_ms:9d} ms")
         mut, saved = bool(eff.get("mutated")), eff.get("saved")
         return TurnResult(turn.id, True, rep, charge, mut, loaded, saved, resume_s, park_s)
-      ver, ckpt, err, load = turn.args.get("version"), None, None, None
+      ver, ckpt, err, load, stab = turn.args.get("version"), None, None, None, {}
       if ver is not None:
         try:
           ckpt = await asyncio.to_thread(self.store.local_folder, ver)
@@ -392,12 +394,20 @@ class NodeDaemon:
         load_c, waiters, err = await self.load_shared(h, ckpt)
         load = (load_c, waiters)
       with span("node.execute"):
-        rep = Reply.error(err) if err is not None else await h.wave.run(h.model.execute(cmd, ckpt, True), charge)
+        if err is not None:
+          rep = Reply.error(err)
+        else:
+          call = (
+            h.model.execute(cmd, ckpt, True, stab)
+            if getattr(h.model, "records_stability", False)
+            else h.model.execute(cmd, ckpt, True)
+          )
+          rep = await h.wave.run(call, charge)
         if load is not None:
           load_c, waiters = load
           charge.started_ms, charge.busy_ms = load_c.started_ms, charge.busy_ms + load_c.busy_ms
           charge.gpu_ms += load_c.gpu_ms / waiters
-      return TurnResult(turn.id, True, rep, charge, resume_s=resume_s, park_s=park_s)
+      return TurnResult(turn.id, True, rep, charge, resume_s=resume_s, park_s=park_s, stability=stab or None)
     except asyncio.CancelledError:
       if self.workers.get(h.id) is h:
         await asyncio.shield(self.drop_handle(h))

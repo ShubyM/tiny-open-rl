@@ -13,6 +13,7 @@ from collections import Counter, deque
 from dataclasses import asdict, dataclass, replace
 
 from tinyrl import types
+from tinyrl.api import wire
 from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge
 from tinyrl.control.fairness import Demand, Worker, admit_samples, blocks, plan_gpus, rank_runs
@@ -28,6 +29,7 @@ SWITCH_BUDGET = float(getenv("SWITCH_BUDGET", 0.1))
 MAX_LORAS, MAX_SEQS = types.MAX_LORAS, types.MAX_SEQS
 SAMPLE_QUEUE_BYTES = getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20)
 SAMPLE_REPLY_BYTES = getenv("SAMPLE_REPLY_BYTES", 256 * 2**20)
+STABILITY_TTL, STABILITY_BYTES = getenv("STABILITY_TTL", 24 * 3600), getenv("STABILITY_BYTES", 512 * 2**20)
 COUNTERS = ("steps", "failed", "cmds", "tokens", "busy_ms", "wait_ms")
 GC_S = 10  # how often expired replies, dedupe keys and sessions are swept: their TTLs are a minute or more
 
@@ -101,6 +103,8 @@ class Bus:
     self.service = {k: float(v) for k, v in self.meta.get("service", {}).items()}
     self.pending = {rid: {} for rid, r in self.runs.items() if r["live"]}  # run -> entry id -> Pending, oldest first
     self.nodes, self.reaped_boots, self.active_turns = {}, set(), {}
+    self.stability: dict[str, tuple[bytes, float]] = {}
+    self.stability_bytes = 0
     self.events, self.waiters = deque(maxlen=100_000), weakref.WeakValueDictionary()
     self.work_event, self.seq = asyncio.Event(), max((c["seq"] for c in self.disk.cmds.values()), default=0)
     self.dirty_runs, self.service_dirty = set(), False
@@ -487,6 +491,15 @@ class Bus:
           w.idle_since = now
           (w.loaded.add if res.loaded else w.loaded.discard)(cmd.run)
           (w.open_grad.add if cmd.op == Op.FORWARD_BACKWARD and rep.ok else w.open_grad.discard)(cmd.run)
+    if turn.kind == "sample" and res.ok and res.stability:
+      exp = time.time() + STABILITY_TTL
+      for sid, blob in res.stability.items():
+        if old := self.stability.pop(sid, None):
+          self.stability_bytes -= len(old[0])
+        self.stability[sid] = (blob, exp)
+        self.stability_bytes += len(blob)
+      while self.stability_bytes > STABILITY_BYTES and len(self.stability) > 1:
+        self.stability_bytes -= len(self.stability.pop(next(iter(self.stability)))[0])
     if turn.kind == "snapshot":
       rid, row = turn.args["run"], self.runs.get(turn.args["run"])
       if row and row.get("owner") == owner_token(node_id, boot_id, turn.worker):
@@ -678,6 +691,17 @@ class Bus:
           ver = uuid.uuid4().hex
         need_snap = row["snap"] and not (w and rid in w.loaded) and cmd.op != Op.LOAD_WEIGHTS
         args = {"record": dict(row["record"]), "saved": row["snap"][1] if need_snap else None, "version": ver}
+        if cmd.op == Op.FORWARD_BACKWARD and b"stable_reinforce" in cmd.body:
+          with contextlib.suppress(ValueError):
+            req = wire.parse(cmd.body)
+            if req.loss_fn == "stable_reinforce":
+              wall, stab = time.time(), {}
+              for sid in wire.referenced_sequences(req):
+                if (item := self.stability.get(sid)) and item[1] > wall:
+                  del self.stability[sid]
+                  self.stability[sid] = (item[0], wall + STABILITY_TTL)
+                  stab[sid] = item[0]
+              args["stability"] = stab
         self.issue(node, Turn(uuid.uuid4().hex[:12], "train", wid, spec, gpus, cmd, args=args))
         continue
       live = [self.active_turns[t][2] for t in (w.active_turns if w else ()) if t in self.active_turns]
@@ -794,6 +818,8 @@ class Bus:
             del box.seen[k]
         for sid in [s for s, v in self.sessions.items() if not v["active"] and v["seen"] <= now - SESSION_TTL]:
           del self.sessions[sid]
+        for sid in [s for s, (_, exp) in self.stability.items() if exp <= now]:
+          self.stability_bytes -= len(self.stability.pop(sid)[0])
     return len(expired)
 
   async def maintain(self) -> list[tuple[Ev, dict]]:

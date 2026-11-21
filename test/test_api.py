@@ -498,6 +498,88 @@ class TestAPI(BusTest):
       )
     self.assertEqual(res.status_code, 429)
 
+  async def test_stable_reinforce_records_stability_info_and_trains_end_to_end(self):
+    run_id = await self.create_model()
+    saved = await self.post("save_weights_for_sampler", json={"model_id": run_id, "sampling_session_seq_id": 0})
+    sid = (await self.result(saved)).json()["sampling_session_id"]
+
+    prompt = [1, 2, 3, 4]
+    sub = await self.post(
+      "asample",
+      json={
+        "sampling_session_id": sid,
+        "prompt": {"chunks": [{"type": "encoded_text", "tokens": prompt}]},
+        "sampling_params": {"max_tokens": 6},
+        "num_samples": 2,
+        "record_stability_info": True,
+      },
+    )
+    self.assertEqual(sub.status_code, 200)
+    seq_ids = sub.json()["sample_sequence_ids"]
+    self.assertEqual(len(seq_ids), 2)
+    await self.drain(sid)
+    out = await self.post(
+      "retrieve_future", json={"request_id": sub.json()["request_id"]}, headers={"accept": wire.PROTO}
+    )
+    resp = pb.SampleResponse.FromString(out.content)
+    # Client did not ask for topk_sample_logprobs, so wire reply stays lean while Bus retains stability info.
+    self.assertFalse(resp.sequences[0].HasField("topk_sampled_logprobs"))
+    self.assertIn(seq_ids[0], self.bus.stability)
+
+    sampled_tokens = np.frombuffer(resp.sequences[0].tokens, np.int32)
+    sampled_lps = np.frombuffer(resp.sequences[0].logprobs, np.float32)
+    full = np.concatenate([np.array(prompt, np.int32), sampled_tokens])
+    n_prompt, n_samp = len(prompt) - 1, len(sampled_tokens)
+
+    def make_req(seq_id: str, *, include_spans: bool = True, offset: int = 0, prompt_adv: float = 0.0) -> bytes:
+      req = pb.ForwardBackwardRequest(model_id=run_id, loss_fn="stable_reinforce")
+      req.loss_fn_config_v2["kl_coeff"].number = 0.01
+      req.loss_fn_config_v2["kl_estimator"].text = "k3"
+      d = req.data.add()
+      d.model_input.add().encoded_text.tokens = full[:-1].astype(np.int32).tobytes()
+      targets = full[1:].astype(np.int64)
+      lps = np.concatenate([np.zeros(n_prompt, np.float32), sampled_lps])
+      advs = np.concatenate([np.full(n_prompt, prompt_adv, np.float32), np.ones(n_samp, np.float32)])
+      d.loss_fn_inputs["target_tokens"].CopyFrom(
+        pb.Tensor(dense=targets.tobytes(), dtype=pb.DTYPE_INT64, shape=[len(targets)])
+      )
+      d.loss_fn_inputs["logprobs"].CopyFrom(pb.Tensor(dense=lps.tobytes(), dtype=pb.DTYPE_FLOAT32, shape=[len(lps)]))
+      d.loss_fn_inputs["advantages"].CopyFrom(
+        pb.Tensor(dense=advs.tobytes(), dtype=pb.DTYPE_FLOAT32, shape=[len(advs)])
+      )
+      if include_spans:
+        d.model_input_spans.add().prompt_tokens.CopyFrom(
+          pb.PromptProvenanceSpan(sequence_id=seq_id, offset=0, length=len(prompt))
+        )
+        d.model_input_spans.add().sampled_tokens.CopyFrom(
+          pb.SampledProvenanceSpan(sequence_id=seq_id, offset=0, length=n_samp - 1)
+        )
+        d.loss_fn_input_spans.add().prompt_tokens.CopyFrom(
+          pb.PromptProvenanceSpan(sequence_id=seq_id, offset=1, length=n_prompt)
+        )
+        d.loss_fn_input_spans.add().sampled_tokens.CopyFrom(
+          pb.SampledProvenanceSpan(sequence_id=seq_id, offset=offset, length=n_samp)
+        )
+      return req.SerializeToString()
+
+    # Valid provenance -> succeeds and runs optim_step.
+    fb = await self.post("forward_backward", content=make_req(seq_ids[0]), headers=PROTO)
+    fb_out = await self.result(fb, headers={"accept": wire.PROTO})
+    self.assertEqual(fb_out.status_code, 200)
+    self.assertIn("loss:sum", pb.ForwardBackwardOutput.FromString(fb_out.content).metrics)
+    opt = await self.post("optim_step", json={"model_id": run_id, "adam_params": {"learning_rate": 1e-2}})
+    self.assertEqual((await self.result(opt)).json()["type"], "optim_step")
+
+    # Validation checks: missing spans, unknown sequence_id, nonzero prompt advantage, nonzero offset all fail cleanly.
+    for bad in (
+      make_req(seq_ids[0], include_spans=False),
+      make_req("unknown-seq-id"),
+      make_req(seq_ids[0], prompt_adv=1.0),
+      make_req(seq_ids[0], offset=1),
+    ):
+      res = await self.result(await self.post("forward_backward", content=bad, headers=PROTO))
+      self.assertIn("error", res.json())
+
 
 if __name__ == "__main__":
   unittest.main()

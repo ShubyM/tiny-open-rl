@@ -80,8 +80,14 @@ class TestForwardPass(unittest.TestCase):
 
     with torch.no_grad():
       got = target_logprobs(lm, ids, targets)  # which passes no mask: padding on the right changes no real position
-      want = lm(ids, attention_mask=mask).logits.log_softmax(-1).gather(-1, targets[..., None])[..., 0]
+      want_full = lm(ids, attention_mask=mask).logits.log_softmax(-1)
+      want = want_full.gather(-1, targets[..., None])[..., 0]
+      topk_ids = torch.randint(0, 96, (*shape, 8))
+      got_lp, got_head = target_logprobs(lm, ids, targets, topk_ids)
+      want_head = want_full.gather(-1, topk_ids)
     torch.testing.assert_close(got[mask.bool()], want[mask.bool()])
+    torch.testing.assert_close(got_lp[mask.bool()], want[mask.bool()])
+    torch.testing.assert_close(got_head[mask.bool()], want_head[mask.bool()])
 
   def test_losses_are_their_definitions(self):
     g = torch.Generator().manual_seed(0)
@@ -89,8 +95,8 @@ class TestForwardPass(unittest.TestCase):
     advantages, weights = torch.randn(4, 9, generator=g), torch.rand(4, 9, generator=g)
     ratio = torch.exp(logprobs - sampler_logprobs)
 
-    def loss(name: str, **config) -> torch.Tensor:
-      return LOSSES[name](logprobs, weights, sampler_logprobs, advantages, config)
+    def loss(name: str, extra=None, **config) -> torch.Tensor:
+      return LOSSES[name](logprobs, weights, sampler_logprobs, advantages, config, **(extra or {}))
 
     torch.testing.assert_close(loss("cross_entropy"), -logprobs * weights)
     torch.testing.assert_close(loss("importance_sampling"), -ratio * advantages * weights)
@@ -101,6 +107,101 @@ class TestForwardPass(unittest.TestCase):
     torch.testing.assert_close(loss("ppo", kl_coeff=0.5) - loss("ppo"), 0.5 * kl * weights)
     with self.assertRaises(ValueError):
       loss("ppo", unknown=1.0)
+
+    # CISPO: detached clipped ratio scales logprobs; clipped tokens still receive nonzero gradients.
+    lp_g = logprobs.clone().requires_grad_(True)
+    cispo_val = LOSSES["cispo"](
+      lp_g, weights, sampler_logprobs, advantages, {"clip_low_threshold": 0.5, "clip_high_threshold": 1.2}
+    )
+    torch.testing.assert_close(cispo_val, -(ratio.clamp(0.5, 1.2).detach() * logprobs * advantages) * weights)
+    cispo_val.sum().backward()
+    torch.testing.assert_close(lp_g.grad, -(ratio.clamp(0.5, 1.2) * advantages * weights))
+    with self.assertRaises(ValueError):
+      loss("cispo", unknown=1.0)
+
+    # DRO: logprobs * advantages - 0.5 * beta * (logprobs - sampler_logprobs)^2.
+    torch.testing.assert_close(
+      loss("dro"), -(logprobs * advantages - 0.5 * 0.05 * (logprobs - sampler_logprobs) ** 2) * weights
+    )
+    torch.testing.assert_close(
+      loss("dro", beta=0.2), -(logprobs * advantages - 0.5 * 0.2 * (logprobs - sampler_logprobs) ** 2) * weights
+    )
+    with self.assertRaises(ValueError):
+      loss("dro", unknown=1.0)
+
+    # GSPO: sequence-level geometric mean ratio over sequence_ratio_mask, with local token-only gradient.
+    mask = torch.zeros_like(logprobs)
+    mask[:, 3:] = 1.0
+    seq_lr = ((logprobs.detach() - sampler_logprobs) * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True)
+    s_ratio = torch.exp(seq_lr)
+    want_gspo = -torch.minimum(s_ratio * advantages, s_ratio.clamp(1 - 3e-4, 1 + 4e-4) * advantages) * weights
+    torch.testing.assert_close(loss("gspo", {"sequence_ratio_mask": mask}), want_gspo)
+    with self.assertRaises(ValueError):
+      loss("gspo", unknown=1.0)
+
+    # StableReinforce: k1/k3 KL estimators + config validation.
+    sr_k1 = loss("stable_reinforce", kl_coeff=0.2, kl_estimator="k1")
+    sr_0 = loss("stable_reinforce", kl_coeff=0.0)
+    torch.testing.assert_close(sr_k1 - sr_0, 0.2 * (sampler_logprobs - logprobs) * weights)
+    sr_k3 = loss("stable_reinforce", kl_coeff=0.2, kl_estimator="k3")
+    torch.testing.assert_close(sr_k3 - sr_0, 0.2 * ((ratio - 1) - (logprobs - sampler_logprobs)) * weights)
+    for bad in ({"unknown": 1.0}, {"kl_coeff": -0.1}, {"kl_estimator": "k2"}):
+      with self.assertRaises(ValueError):
+        loss("stable_reinforce", **bad)
+
+  def test_score_centering_cancels_off_policy_and_tim_drift_exactly(self):
+    # Under constant advantage A=1 and mismatched sampler q != p (e.g. different GPU kernels / quantization / staleness),
+    # E_{y ~ q}[grad L_SC(y)] must vanish identically, whereas TIS without score centering has large drift.
+    g = torch.Generator().manual_seed(7)
+    vocab = 16
+    train_logits = torch.randn(vocab, generator=g, requires_grad=True)
+    samp_logits = train_logits.detach() + 0.8 * torch.randn(vocab, generator=g)  # severe TIM / off-policy mismatch
+    q_logp = samp_logits.log_softmax(-1)
+    q_prob = q_logp.exp()
+
+    # Full-vocab top-k (k=vocab) and truncated top-k with tail rescaling (k=6):
+    # for k < vocab, test under the tail-rescaled sampler distribution q_tilde matching the paper's identity.
+    for k in (vocab, 6):
+      topk_vals, topk_ids = torch.topk(q_logp, k)
+      exp_sc = torch.zeros_like(train_logits)
+      exp_tis = torch.zeros_like(train_logits)
+      # Build exact q_tilde distribution for k < vocab (equals q when k == vocab).
+      p_prob = train_logits.detach().log_softmax(-1).exp()
+      q_tilde = torch.zeros_like(q_prob)
+      q_tilde[topk_ids] = topk_vals.exp()
+      if k < vocab:
+        tail_mask = torch.ones(vocab, dtype=torch.bool)
+        tail_mask[topk_ids] = False
+        rho = (1.0 - q_tilde[topk_ids].sum()) / p_prob[tail_mask].sum()
+        q_tilde[tail_mask] = rho * p_prob[tail_mask]
+      q_tilde_lp = q_tilde.log()
+
+      for y in range(vocab):
+        logits = train_logits.detach().clone().requires_grad_(True)
+        p_lp = logits.log_softmax(-1)
+        sc = LOSSES["stable_reinforce"](
+          p_lp[y : y + 1],
+          torch.ones(1),
+          q_tilde_lp[y : y + 1],
+          torch.ones(1),
+          {"kl_coeff": 0.0, "tis_cap": 2.0},
+          train_head_logp=p_lp[topk_ids][None, :],
+          samp_head_logp=topk_vals[None, :],
+          sampled_mask=torch.ones(1),
+        )
+        sc.sum().backward()
+        exp_sc += q_tilde[y] * logits.grad
+
+        logits2 = train_logits.detach().clone().requires_grad_(True)
+        p_lp2 = logits2.log_softmax(-1)
+        tis = LOSSES["stable_reinforce"](
+          p_lp2[y : y + 1], torch.ones(1), q_tilde_lp[y : y + 1], torch.ones(1), {"kl_coeff": 0.0, "tis_cap": 2.0}
+        )
+        tis.sum().backward()
+        exp_tis += q_tilde[y] * logits2.grad
+
+      self.assertLess(exp_sc.abs().max().item(), 1e-5, f"score centering left drift for k={k}")
+      self.assertGreater(exp_tis.abs().max().item(), 1e-2, f"uncentered TIS should have non-zero drift for k={k}")
 
 
 class TestModel(unittest.TestCase):
@@ -158,14 +259,22 @@ class TestModel(unittest.TestCase):
     self.assertAlmostEqual(metrics["loss:sum"], -sum(float(lp.sum()) for lp in logprobs), places=4)
 
   def test_rl_losses_move_logprobs_with_the_advantage(self):
-    for loss in ("importance_sampling", "ppo"):
+    for loss in ("importance_sampling", "ppo", "cispo", "dro", "gspo", "stable_reinforce"):
       model, (a,) = lora_runs()
       datum = counting(10)
       before = model.forward_backward(a, [datum], "cross_entropy", {}, True)[0][0]
-
       inputs = {**datum.inputs, "logprobs": before, "advantages": np.ones(10, np.float32)}
+      stab, spans = None, ()
+      if loss == "gspo":
+        inputs["sequence_ratio_mask"] = np.ones(10, np.float32)
+      elif loss == "stable_reinforce":
+        with torch.no_grad():
+          full_lp = model.lm(torch.from_numpy(datum.tokens[None, :]).long()).logits[0].log_softmax(-1)
+          vals, ids = torch.topk(full_lp, 8, dim=-1)
+        stab = {"seq-0": wire.pack_stability(ids.numpy(), vals.numpy())}
+        spans = (wire.Span("sampled", "seq-0", 0, 10),)
       for _ in range(5):
-        model.forward_backward(a, [wire.Datum(datum.tokens, inputs)], loss, {}, False)
+        model.forward_backward(a, [wire.Datum(datum.tokens, inputs, spans, spans)], loss, {}, False, stab)
         model.optim_step(a, {"learning_rate": 1e-2})
 
       after = model.forward_backward(a, [datum], "cross_entropy", {}, True)[0][0]

@@ -409,6 +409,7 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
       "prompt_logprobs_last_n": last_n,
       "topk_prompt": int(data.get("topk_prompt_logprobs", 0)),
       "topk_sample": int(data.get("topk_sample_logprobs", 0)),
+      "record_stability_info": bool(data.get("record_stability_info")),
     }
 
     res = await submit(sid, Op.SAMPLE, job, data.get("seq_id"), len(tokens) + num_samples * job["max_tokens"])

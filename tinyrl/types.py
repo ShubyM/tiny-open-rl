@@ -139,6 +139,7 @@ class TurnResult:
   saved: dict | None = None
   resume_s: float = 0.0
   park_s: float = 0.0
+  stability: dict[str, bytes] | None = None
 
 
 @dataclass(frozen=True)
