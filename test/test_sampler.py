@@ -5,11 +5,13 @@ import unittest
 from unittest import mock
 
 import httpx
+import numpy as np
 
 from test.execution import TestNode
 from test.helpers import BusTest, FakeEngine, tiny
 from tinyrl.api import wire
 from tinyrl.api.gateway import app
+from tinyrl.api.proto import tinker_public_pb2 as pb
 from tinyrl.bus import Op, Role, Run
 from tinyrl.storage.store import Store
 from tinyrl.workers.sampler import Out, Seq, encode
@@ -67,11 +69,19 @@ class TestSampler(BusTest):
       [None, {2: -1.0, 5: -0.1}, {3: -2.0}],
     )
     job = JOB | {"prompt_logprobs": True, "prompt_logprobs_last_n": 1, "topk_prompt": 2, "topk_sample": 1}
-    res = wire.sample_json(encode(job, out))
-    self.assertEqual(res["prompt_logprobs"], [None, None, -2.0])
-    self.assertEqual(res["topk_prompt_logprobs"], [None, None, [[3, -2.0]]])
-    self.assertEqual(res["sequences"][0]["topk_logprobs"], [[[7, -0.5]]])
-    self.assertEqual(res["sequences"][0]["stop_reason"], "length")
+    res = pb.SampleResponse.FromString(encode(job, out))
+    plp = np.frombuffer(res.prompt_logprobs, np.float32)
+    self.assertTrue(np.isnan(plp[0]) and np.isnan(plp[1]))
+    self.assertEqual(plp[2], -2.0)
+    ptk = res.topk_prompt_logprobs
+    p_ids = np.frombuffer(ptk.token_ids, np.int32).reshape(ptk.length, ptk.k)
+    p_lps = np.frombuffer(ptk.logprobs, np.float32).reshape(ptk.length, ptk.k)
+    self.assertEqual((p_ids[0, 0], p_lps[0, 0]), (0, wire.MASK_LOGPROB))
+    self.assertEqual((p_ids[2, 0], p_lps[2, 0], p_lps[2, 1]), (3, -2.0, wire.MASK_LOGPROB))
+    stk = res.sequences[0].topk_sampled_logprobs
+    self.assertEqual(np.frombuffer(stk.token_ids, np.int32).tolist(), [7])
+    self.assertEqual(np.frombuffer(stk.logprobs, np.float32).tolist(), [-0.5])
+    self.assertEqual(res.sequences[0].stop_reason, pb.STOP_REASON_LENGTH)
 
   async def test_api_samples_base_lora_and_full_finetunes(self):
     base = f"{tempfile.mkdtemp()}/tiny"
@@ -98,15 +108,19 @@ class TestSampler(BusTest):
         "request_id"
       ]
       self.assertTrue((await self.bus.wait_for_reply(request_id, 5)).ok)
-      reply = await call("retrieve_future", {"request_id": request_id})
-      self.assertEqual(reply["prompt_logprobs"], [None, -1.0, -1.0])
-      self.assertEqual(len(reply["sequences"]), 1)
+      raw = await client.post("/api/v1/retrieve_future", json={"request_id": request_id})
+      reply = pb.SampleResponse.FromString(raw.content)
+      plp = np.frombuffer(reply.prompt_logprobs, np.float32)
+      self.assertTrue(np.isnan(plp[0]))
+      self.assertEqual(plp[1:].tolist(), [-1.0, -1.0])
+      self.assertEqual(len(reply.sequences), 1)
     self.assertNotEqual(*samplers)
 
     request_id = (await call("asample", {"base_model": base, "prompt": prompt}))["request_id"]
     self.assertEqual(await node.worker_for(request_id.split("/")[0]), samplers[0])
     self.assertTrue((await self.bus.wait_for_reply(request_id, 5)).ok)
-    self.assertEqual(len((await call("retrieve_future", {"request_id": request_id}))["sequences"]), 1)
+    raw = await client.post("/api/v1/retrieve_future", json={"request_id": request_id})
+    self.assertEqual(len(pb.SampleResponse.FromString(raw.content).sequences), 1)
 
   async def test_a_tensor_parallel_sampler_takes_turns_on_both_its_gpus(self):
     await self.bus.create_run(Run("t1", "base", 0))

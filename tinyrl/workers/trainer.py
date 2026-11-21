@@ -68,63 +68,62 @@ class Trainer:
   def load_run(self, run: str, version: str | None, optimizer: bool, gradients: bool) -> None:
     self.call_model("restore_run", run, *self.store.get(version), optimizer, gradients)
 
+  @span("trainer.execute")
   def execute(
     self, cmd: Cmd, run: dict | None = None, snap: str | None = None, version: str | None = None
   ) -> tuple[Reply, dict]:
-    with span("trainer.execute"):
-      effects, created = {}, False
-      revision = None
-      try:
-        if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
-          if cmd.op == Op.DELETE_MODEL:
-            return ok({"type": cmd.op, "model_id": cmd.run}), effects
-          if not snap and cmd.op != Op.LOAD_WEIGHTS:
-            raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
-          if run is None:
-            raise KeyError(f"no training run {cmd.run}")
-          self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
-          created = True
-          if snap and cmd.op != Op.LOAD_WEIGHTS:
-            self.load_run(cmd.run, snap, optimizer=True, gradients=True)
-            created = False  # recovery succeeded, even if the command that follows is rejected
+    effects, created, revision = {}, False, None
+    try:
+      if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
+        if cmd.op == Op.DELETE_MODEL:
+          return ok({"type": cmd.op, "model_id": cmd.run}), effects
+        if not snap and cmd.op != Op.LOAD_WEIGHTS:
+          raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
+        if run is None:
+          raise KeyError(f"no training run {cmd.run}")
+        self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
+        created = True
+        if snap and cmd.op != Op.LOAD_WEIGHTS:
+          self.load_run(cmd.run, snap, optimizer=True, gradients=True)
+          created = False  # recovery succeeded, even if the command that follows is rejected
 
-        revision = self.model.state_revision  # restoring the parked state itself leaves its snapshot valid
-        if cmd.op == Op.FORWARD_BACKWARD:
-          req = wire.parse(cmd.body)
-          fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
-          logprobs, metrics = self.call_model("forward_backward", *fb)
-          return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), effects
+      revision = self.model.state_revision  # restoring the parked state itself leaves its snapshot valid
+      if cmd.op == Op.FORWARD_BACKWARD:
+        req = wire.parse(cmd.body)
+        fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
+        logprobs, metrics = self.call_model("forward_backward", *fb)
+        return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), effects
 
-        args = json.loads(cmd.body)
-        match cmd.op:
-          case Op.CREATE_MODEL:
-            self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
-          case Op.OPTIM_STEP:
-            metrics = self.call_model("optim_step", cmd.run, args["adam_params"])
-            return ok({"type": cmd.op, "metrics": metrics}), effects
-          case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
-            sampler = cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER
-            effects["saved"] = self.save(
-              cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False), version
-            )
-          case Op.LOAD_WEIGHTS:
-            self.load_run(cmd.run, version, optimizer=args["optimizer"], gradients=False)
-          case Op.DELETE_MODEL:
-            self.drop_run(cmd.run)
-          case _:
-            raise ValueError(f"unknown op {cmd.op}")
-
-        reply = {"type": cmd.op, "model_id": cmd.run, **({"path": args["uri"]} if "uri" in args else {})}
-        if "sampling_session_id" in args:
-          reply["sampling_session_id"] = args["sampling_session_id"]
-        return ok(reply), effects
-      except Exception as e:
-        if created:  # a failed restore must not leave a fresh model serving requests as recovered state
+      args = json.loads(cmd.body)
+      match cmd.op:
+        case Op.CREATE_MODEL:
+          self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
+        case Op.OPTIM_STEP:
+          metrics = self.call_model("optim_step", cmd.run, args["adam_params"])
+          return ok({"type": cmd.op, "metrics": metrics}), effects
+        case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
+          sampler = cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER
+          effects["saved"] = self.save(
+            cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False), version
+          )
+        case Op.LOAD_WEIGHTS:
+          self.load_run(cmd.run, version, optimizer=args["optimizer"], gradients=False)
+        case Op.DELETE_MODEL:
           self.drop_run(cmd.run)
-        return Reply.error(e), effects
-      finally:
-        loaded = cmd.run in self.model.params
-        effects.update(loaded=loaded, mutated=loaded and revision is not None and self.model.state_revision != revision)
+        case _:
+          raise ValueError(f"unknown op {cmd.op}")
+
+      reply = {"type": cmd.op, "model_id": cmd.run, **({"path": args["uri"]} if "uri" in args else {})}
+      if "sampling_session_id" in args:
+        reply["sampling_session_id"] = args["sampling_session_id"]
+      return ok(reply), effects
+    except Exception as e:
+      if created:  # a failed restore must not leave a fresh model serving requests as recovered state
+        self.drop_run(cmd.run)
+      return Reply.error(e), effects
+    finally:
+      loaded = cmd.run in self.model.params
+      effects.update(loaded=loaded, mutated=loaded and revision is not None and self.model.state_revision != revision)
 
   def save_run(self, run: str, version: str) -> dict | None:
     if run in self.model.params:

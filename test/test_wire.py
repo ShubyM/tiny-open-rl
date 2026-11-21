@@ -6,52 +6,7 @@ from tinyrl.api import wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
 
 
-def json_body(n: int = 3, loss_fn: str = "cross_entropy", **config) -> dict:
-  """A forward_backward with two datums, the way SDKs before 0.25 send it."""
-  data = []
-  for start in range(2):
-    data.append(
-      {
-        "model_input": {"chunks": [{"type": "encoded_text", "tokens": list(range(start, start + n))}]},
-        "loss_fn_inputs": {
-          "target_tokens": {"data": list(range(start + 1, start + n + 1)), "dtype": "int64"},
-          "weights": {"data": [0.5] * n, "dtype": "float32"},
-        },
-      }
-    )
-  return {"model_id": "m", "forward_backward_input": {"loss_fn": loss_fn, "loss_fn_config": config, "data": data}}
-
-
 class TestRequests(unittest.TestCase):
-  def test_json_becomes_the_same_protobuf(self):
-    req = wire.parse(wire.from_json(json_body(clip_range=0.3, mode="x")).SerializeToString())
-    self.assertEqual(req.model_id, "m")
-    self.assertEqual(req.loss_fn, "cross_entropy")
-    self.assertFalse(req.forward_only)
-    self.assertEqual(wire.loss_config(req), {"clip_range": 0.3, "mode": "x"})
-
-    datum = wire.datums(req)[1]
-    np.testing.assert_equal(datum.tokens, [1, 2, 3])
-    np.testing.assert_equal(datum.inputs["target_tokens"], [2, 3, 4])
-    np.testing.assert_equal(datum.inputs["weights"], [0.5, 0.5, 0.5])
-    self.assertEqual(datum.tokens.dtype, np.int32)
-    self.assertEqual(datum.inputs["target_tokens"].dtype, np.int64)
-    self.assertEqual(datum.inputs["weights"].dtype, np.float32)
-
-  def test_bare_lists_forward_input_and_forward_only(self):
-    datum = {
-      "model_input": {"chunks": [{"tokens": [5, 6]}]},
-      "loss_fn_inputs": {"target_tokens": [6, 7], "advantages": [1, -1]},
-    }
-    req = wire.parse(
-      wire.from_json({"model_id": "m", "forward_input": {"data": [datum]}}, forward_only=True).SerializeToString()
-    )
-    self.assertTrue(req.forward_only)
-
-    inputs = wire.datums(req)[0].inputs
-    self.assertEqual(inputs["target_tokens"].dtype, np.int64)
-    self.assertEqual(inputs["advantages"].dtype, np.float32)
-
   def test_what_the_sdk_sends(self):
     # int32 tensors, tokens split across chunks, and only the legacy config map
     req = pb.ForwardBackwardRequest(model_id="m", loss_fn="ppo", loss_fn_config={"clip_range": 0.1})
@@ -65,6 +20,12 @@ class TestRequests(unittest.TestCase):
     np.testing.assert_equal(wire.datums(req)[0].tokens, [7, 8, 9])
     np.testing.assert_equal(wire.datums(req)[0].inputs["target_tokens"], [8, 9, 10])
     self.assertAlmostEqual(wire.loss_config(req)["clip_range"], 0.1, places=6)
+
+  def test_v2_loss_config_carries_strings_and_numbers(self):
+    req = pb.ForwardBackwardRequest(model_id="m", loss_fn="stable_reinforce")
+    req.loss_fn_config_v2["clip_range"].CopyFrom(pb.LossConfigValue(number=0.3))
+    req.loss_fn_config_v2["mode"].CopyFrom(pb.LossConfigValue(text="x"))
+    self.assertEqual(wire.loss_config(wire.parse(req.SerializeToString())), {"clip_range": 0.3, "mode": "x"})
 
   def test_rejects_what_it_cannot_train(self):
     def with_tensor(**tensor) -> pb.ForwardBackwardRequest:
@@ -91,26 +52,17 @@ class TestRequests(unittest.TestCase):
 class TestOutputs(unittest.TestCase):
   def test_round_trip(self):
     logprobs = [np.array([-1.5, -0.25], np.float32), np.zeros(0, np.float32), np.array([-3.0], np.float32)]
-    out = wire.output_json(wire.output(logprobs, {"loss:sum": 4.75}))
-
-    self.assertEqual(out["type"], "forward_backward")
-    self.assertEqual(out["loss_fn_output_type"], "ArrayRecord")
-    self.assertEqual(out["metrics"], {"loss:sum": 4.75})
-    self.assertEqual(
-      [row["logprobs"] for row in out["loss_fn_outputs"]],
-      [
-        {"data": [-1.5, -0.25], "dtype": "float32", "shape": [2]},
-        {"data": [], "dtype": "float32", "shape": [0]},
-        {"data": [-3.0], "dtype": "float32", "shape": [1]},
-      ],
-    )
+    out = pb.ForwardBackwardOutput.FromString(wire.output(logprobs, {"loss:sum": 4.75}))
+    self.assertEqual(out.loss_fn_output_type, "ArrayRecord")
+    self.assertEqual(dict(out.metrics), {"loss:sum": 4.75})
+    field = out.loss_fn_outputs[0].fields["logprobs"]
+    offsets = np.frombuffer(field.offsets, np.int64)
+    got = [np.frombuffer(field.data[a:b], np.float32).tolist() for a, b in zip(offsets[:-1], offsets[1:])]
+    self.assertEqual(got, [[-1.5, -0.25], [], [-3.0]])
 
   def test_no_datums(self):
-    self.assertEqual(wire.output_json(wire.output([], {}))["loss_fn_outputs"], [])
-
-
-if __name__ == "__main__":
-  unittest.main()
+    out = pb.ForwardBackwardOutput.FromString(wire.output([], {}))
+    self.assertEqual(len(out.loss_fn_outputs), 0)
 
 
 class TestG2Wire(unittest.TestCase):
@@ -119,3 +71,7 @@ class TestG2Wire(unittest.TestCase):
     tensor = pb.Tensor(dense=array_2d.tobytes(), dtype=pb.DTYPE_INT64, shape=array_2d.shape)
     with self.assertRaisesRegex(ValueError, "shape"):
       wire.loss_input(tensor)
+
+
+if __name__ == "__main__":
+  unittest.main()
