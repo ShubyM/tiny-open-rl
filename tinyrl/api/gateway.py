@@ -156,10 +156,17 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
       raise HTTPException(404, f"no {kind} {run_id}")
     return record
 
-  async def submit(run: str, op: Op, body: bytes | dict, seq_id: int | None = None, cost: int = 1) -> dict[str, str]:
+  async def submit(
+    run: str,
+    op: Op,
+    body: bytes | dict,
+    seq_id: int | None = None,
+    cost: int = 1,
+    stability_refs: set[str] | None = None,
+  ) -> dict[str, str]:
     if isinstance(body, dict):
       body = json.dumps(body).encode()
-    request_id = await bus.submit_command(run, op, body, seq_id, cost)
+    request_id = await bus.submit_command(run, op, body, seq_id, cost, stability_refs)
     if request_id is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
@@ -284,7 +291,8 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
     body = await request.body()
     if request.headers.get("content-type", "").startswith(wire.PROTO):
       parsed = wire.parse(body)
-      return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
+      refs = wire.referenced_sequences(parsed) if parsed.loss_fn == "stable_reinforce" else None
+      return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed), refs)
     return await submit_fb(json.loads(body))
 
   @api.post("/api/v1/forward")  # SDKs before 0.25
@@ -409,6 +417,7 @@ def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = F
       "prompt_logprobs_last_n": last_n,
       "topk_prompt": int(data.get("topk_prompt_logprobs", 0)),
       "topk_sample": int(data.get("topk_sample_logprobs", 0)),
+      "record_stability_info": bool(data.get("record_stability_info")),
     }
 
     res = await submit(sid, Op.SAMPLE, job, data.get("seq_id"), len(tokens) + num_samples * job["max_tokens"])

@@ -16,6 +16,7 @@ import traceback
 import aiohttp
 
 from tinyrl.control.process import launch, reap, target_pid
+from tinyrl.helpers import getenv
 from tinyrl.storage import models
 from tinyrl.storage.store import header
 from tinyrl.trace import span
@@ -25,6 +26,7 @@ from tinyrl.workers.sampler import Out, Seq
 
 CUDAGRAPH_CONFIG = json.dumps({"cudagraph_capture_sizes": [1 << i for i in range(MAX_SEQS.bit_length())]})
 KERNEL_CONFIG = '{"enable_flashinfer_autotune":false}'
+STABILITY_TOPK = getenv("STABILITY_TOPK", 20)
 
 
 def split_stop(stop: str | list | None) -> tuple[list[str], list[int]]:
@@ -81,6 +83,8 @@ class VLLM:
     options = dict(os.environ if env is None else env)
     path = await asyncio.to_thread(models.local, base)  # served under the reference's name, which requests use
     flags = ["--enable-sleep-mode", "--language-model-only"]
+    if STABILITY_TOPK > 20:
+      flags += ["--max-logprobs", str(STABILITY_TOPK)]
     flags += (
       ["--enable-lora", "--max-lora-rank", "64", "--max-loras", str(MAX_LORAS), "--max-cpu-loras", "64"] if lora else []
     )
@@ -240,7 +244,7 @@ class VLLM:
       "n": job["num_samples"],
       "stop": strs,
       "stop_token_ids": ids,
-      "logprobs": max(1, job["topk_sample"]),
+      "logprobs": max(1, job["topk_sample"], STABILITY_TOPK if job.get("record_stability_info") else 0),
       "prompt_logprobs": max(1, job["topk_prompt"]) if scored else None,
       "return_token_ids": True,
       "return_tokens_as_token_ids": True,  # so logprobs are keyed "token_id:<id>", not by text two tokens can share
