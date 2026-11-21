@@ -9,7 +9,7 @@ from test.helpers import BusTest, finished, new_id, serve_control
 from tinyrl.bus import BackpressureError, Bus, PromiseGoneError
 from tinyrl.control.accounting import Charge
 from tinyrl.control.node_daemon import ControlClient
-from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run, WorkerStatus
+from tinyrl.types import Ev, NodeReport, Op, Reply, Role, Run, TurnResult, WorkerStatus
 
 
 def ok(**body) -> Reply:
@@ -383,6 +383,99 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
       finally:
         await client.aclose()
         await runner.cleanup()
+        await bus.aclose()
+
+  async def test_reopen_redelivers_exact_trainer_assignment_verbatim(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      db_path = f"{tmp}/tinyrl.db"
+      bus = Bus(db_path)
+      await bus.create_run(Run("tr-1", "base", 4, account="alice"))
+      await bus.submit_command("tr-1", Op.SAVE_WEIGHTS, b'{"uri":"tinker://tr-1/weights/s1"}')
+      [original] = (await bus.exchange(NodeReport("n1", "b1", 1))).turns
+      self.assertEqual(original.gpus, (0,))
+      self.assertTrue(original.args["version"])
+      self.assertEqual(original.spec.base, "base")
+      await bus.aclose()
+
+      # Drop the response, reopen SQLite, and poll again with active=[] + a contending sampler.
+      bus = Bus(db_path)
+      try:
+        await bus.create_run(Run("samp-1", "base", 4, role=Role.SAMPLER, account="bob"))
+        await bus.submit_command("samp-1", Op.SAMPLE, b"{}")
+        turns = (await bus.exchange(NodeReport("n1", "b1", 1))).turns
+        self.assertEqual([t.kind for t in turns], ["train"])
+        self.assertEqual(turns[0], original)
+      finally:
+        await bus.aclose()
+
+  async def test_reopen_preserves_physical_residency_and_issues_park_before_sampler(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      db_path = f"{tmp}/tinyrl.db"
+      bus = Bus(db_path)
+      await bus.create_run(Run("tr-1", "base", 4, account="alice"))
+      await bus.submit_command("tr-1", Op.OPTIM_STEP, b"{}")
+      [t1] = (await bus.exchange(NodeReport("n1", "b1", 1))).turns
+      await bus.exchange(
+        NodeReport(
+          "n1",
+          "b1",
+          1,
+          workers=[WorkerStatus(t1.worker, (0,), loaded=("tr-1",))],
+          finished=[finished(t1, ok(), mutated=True, loaded=True)],
+        )
+      )
+      await bus.aclose()
+
+      bus = Bus(db_path)
+      try:
+        await bus.create_run(Run("samp-1", "base", 4, role=Role.SAMPLER, account="bob"))
+        await bus.submit_command("samp-1", Op.SAMPLE, b"{}")
+        # Reconnecting node reports physical residency on GPU 0 -> controller must park trainer before issuing sample.
+        reply1 = await bus.exchange(
+          NodeReport("n1", "b1", 1, workers=[WorkerStatus(t1.worker, (0,), loaded=("tr-1",))])
+        )
+        self.assertEqual([(t.kind, t.worker) for t in reply1.turns], [("park", t1.worker)])
+        [park_turn] = reply1.turns
+        reply2 = await bus.exchange(
+          NodeReport(
+            "n1",
+            "b1",
+            1,
+            workers=[WorkerStatus(t1.worker, (), loaded=("tr-1",))],
+            finished=[TurnResult(park_turn.id, True, park_s=0.05)],
+          )
+        )
+        self.assertEqual([t.kind for t in reply2.turns], ["sample"])
+        self.assertEqual(reply2.turns[0].gpus, (0,))
+      finally:
+        await bus.aclose()
+
+  async def test_reopen_preserves_loaded_runs_and_snapshots_on_drain(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      db_path = f"{tmp}/tinyrl.db"
+      bus = Bus(db_path)
+      await bus.create_run(Run("tr-1", "base", 4, account="alice"))
+      await bus.submit_command("tr-1", Op.OPTIM_STEP, b"{}")
+      [t1] = (await bus.exchange(NodeReport("n1", "b1", 1))).turns
+      await bus.exchange(
+        NodeReport(
+          "n1",
+          "b1",
+          1,
+          workers=[WorkerStatus(t1.worker, (0,), loaded=("tr-1",))],
+          finished=[finished(t1, ok(), mutated=True, loaded=True)],
+        )
+      )
+      await bus.aclose()
+
+      bus = Bus(db_path)
+      try:
+        drain = await bus.exchange(
+          NodeReport("n1", "b1", 1, draining=True, workers=[WorkerStatus(t1.worker, (0,), loaded=("tr-1",))])
+        )
+        self.assertEqual([(t.kind, t.args["run"]) for t in drain.turns], [("snapshot", "tr-1")])
+        self.assertIsNotNone((await bus.get_run("tr-1")).get("owner"))
+      finally:
         await bus.aclose()
 
 
