@@ -300,7 +300,7 @@ class Stress(BusTest):
       )
       for proc, h in node.workers.items():
         out.append(
-          f"  {proc} role={h.spec.role.value} gpus={h.spec.gpus} loaded={sorted(h.loaded)} state={h.state.value} readers={h.readers}"
+          f"  {proc} role={h.spec.role.value} gpus={h.spec.gpus} loaded={sorted(h.loaded)} resident={h.resident} active={h.active}"
         )
     print("\n".join(out), file=sys.stderr)
 
@@ -470,7 +470,7 @@ class Stress(BusTest):
       )
     left = {
       "queues": sorted(self.bus.pending),
-      "writing": sorted(r for r, row in self.bus.runs.items() if row.get("writing")),
+      "writing": sorted(t.args["version"] for _, _, t in self.bus.active_turns.values() if t.args.get("version")),
       "owners": [r for r in trainers if (self.bus.runs.get(r) or {}).get("owner")],
       "on GPUs": {n.id: dict(n.occ.on) for n in self.nodes.values() if n.occ.on},
     }

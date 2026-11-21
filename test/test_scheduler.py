@@ -18,8 +18,8 @@ from test.test_trainer import LORA, counting
 from tinyrl.api import wire
 from tinyrl.bus import QUANTUM_MS, Cmd, Ev, Op, Role, Run
 from tinyrl.control import scheduler
-from tinyrl.control.fairness import Demand, Worker, plan_gpus, rank_runs, update_lag, waterfill
-from tinyrl.control.node_daemon import NodeDaemon
+from tinyrl.control.fairness import Demand, Worker, admit_samples, plan_gpus, rank_runs, update_lag, waterfill
+from tinyrl.control.node_daemon import NodeDaemon, WorkerHandle
 from tinyrl.control.scheduler import (
   REBALANCE_MS,
   Job,
@@ -570,7 +570,28 @@ class TestLocalQuantum(unittest.TestCase):
       service[run] += 3 if run == "saving" else 1
     self.assertEqual(service, {"saving": 9, "training": 9})
 
-  def test_prepare_enforces_gpu_exclusivity_under_concurrent_handoffs(self):
+  def test_admit_samples_never_exceeds_free_slots(self):
+    queues = {
+      "b1": [Cmd("b1", f"1-{i}", Op.SAMPLE, b"{}") for i in range(2)],
+      "b2": [Cmd("b2", f"2-{i}", Op.SAMPLE, b"{}") for i in range(2)],
+    }
+    heads = [q[0] for q in queues.values()]
+    admitted = admit_samples(
+      heads,
+      lambda r, n: queues[r][:n],
+      lambda r: "B",
+      lambda r: 0.0,
+      {},
+      lambda r: None,
+      {"A": 6},
+      set(),
+      8,
+      16,
+    )
+    self.assertEqual(len(admitted), 2)
+    self.assertEqual({c.run for c in admitted}, {"b1", "b2"})
+
+  def test_local_guard_enforces_gpu_exclusivity_under_concurrent_handoffs(self):
     async def run():
       node = self.make_daemon(4)
       active_gpus: dict[str, tuple[int, ...]] = {}
@@ -603,9 +624,19 @@ class TestLocalQuantum(unittest.TestCase):
       ]
 
       async def use(wid, spec, gpus):
-        h, _, _ = await node.prepare(wid, spec, gpus)
-        await asyncio.sleep(0)
-        await node.release(h)
+        h = node.workers.setdefault(wid, WorkerHandle(wid, spec, FakeModel(wid)))
+        async with node.gpu_cond:
+          h.active += 1
+        try:
+          await node.claim_gpus(h, gpus)
+          await h.ensure_gpu(gpus)
+          await asyncio.sleep(0)
+        finally:
+          async with node.gpu_cond:
+            h.active -= 1
+            if h.active == 0:
+              h.claimed = ()
+            node.gpu_cond.notify_all()
 
       for _ in range(40):
         batch = rng.sample(specs, 3)

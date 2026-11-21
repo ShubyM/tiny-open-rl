@@ -120,7 +120,7 @@ class WorkerStatus:
 @dataclass(frozen=True)
 class Turn:
   id: str
-  kind: str  # "train" | "sample" | "snapshot" | "close"
+  kind: str  # "train" | "sample" | "park" | "snapshot" | "close"
   worker: str
   spec: WorkerSpec = WorkerSpec()
   gpus: tuple[int, ...] = ()

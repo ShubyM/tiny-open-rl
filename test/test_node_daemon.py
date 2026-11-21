@@ -257,7 +257,7 @@ class TestNodeDaemon(BusTest):
       request = await self.bus.submit_command(
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
       )
-      await self.until(lambda: holder.parking, node)
+      await self.until(lambda: any(t.kind == "park" and t.worker == pa for t, _ in node.active.values()), node)
       pb = self.bus.plan_state.home[b]
       self.assertEqual(holder.resident, (0,))
       self.assertNotIn(pb, node.workers)  # Rule R1: never enters GPU 0 until holder finishes parking
@@ -282,17 +282,15 @@ class TestNodeDaemon(BusTest):
     first = node.workers[proc].model.proc.pid
     # When GPU 0 is occupied, the parked 1-GPU trainer hops to GPU 1 without restarting its subprocess.
     handle = node.workers[proc]
-    await handle.model.park()
-    handle.resident = ()
+    await handle.park()
     other_spec = WorkerSpec(Role.TRAINER, base, False, True, None, 1)
     node.workers["other"] = WorkerHandle("other", other_spec, handle.model, resident=(0,))
     self.bus.nodes[node.id].workers["other"] = self.bus.nodes[node.id].workers[proc]
     try:
-      # Directly ask prepare() to place `proc` on GPU 1 while GPU 0 is held by `other`.
-      got, _, _ = await node.prepare(proc, handle.spec, (1,))
-      await node.release(got)
-      self.assertEqual(got.model.proc.pid, first)
-      self.assertEqual(got.resident, (1,))
+      await node.claim_gpus(handle, (1,))
+      await handle.ensure_gpu((1,))
+      self.assertEqual(handle.model.proc.pid, first)
+      self.assertEqual(handle.resident, (1,))
     finally:
       node.workers.pop("other", None)
       self.bus.nodes[node.id].workers.pop("other", None)

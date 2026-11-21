@@ -91,14 +91,16 @@ def admit_samples(heads, queued, account, ready_lag, service, ver_of, in_flight,
       vers.add(v)
       by_acct.setdefault(account(r), []).append(r)
   qs = {r: list(queued(r, slots)) for rs in by_acct.values() for r in rs}
-  demand = {a: in_flight.get(a, 0) + sum(len(qs[r]) for r in by_acct.get(a, ())) for a in in_flight | by_acct}
-  caps, out = waterfill(max_seqs, demand), []
-  need = {a: max(0, int(caps[a]) - in_flight.get(a, 0)) for a in by_acct}
-  rem = slots - sum(need.values())
+  avail = {a: sum(len(qs[r]) for r in rs) for a, rs in by_acct.items()}
+  alloc, order = dict.fromkeys(by_acct, 0), {a: i for i, a in enumerate(by_acct)}
+  for _ in range(slots):
+    if not (cand := [a for a in by_acct if alloc[a] < avail[a]]):
+      break
+    best = min(cand, key=lambda a: (in_flight.get(a, 0) + alloc[a], order[a]))
+    alloc[best] += 1
+  out = []
   for a, rs in by_acct.items():
-    take = need[a] + (1 if rem > 0 and sum(len(qs[r]) for r in rs) > need[a] else 0)
-    rem -= take - need[a]
-    idx = 0
+    take, idx = alloc[a], 0
     while take > 0 and rs:
       if qs[r := rs[idx % len(rs)]]:
         out.append(qs[r].pop(0))
