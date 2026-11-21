@@ -55,6 +55,11 @@ def encode(job: dict, out: Out) -> bytes:
   return wire.sample_output(seqs, prompt_lp, topk(rows, job["topk_prompt"]) if job["topk_prompt"] else None)
 
 
+def encode_stability(request_id: str, out: Out) -> dict[str, bytes]:
+  k = max((len(r) for s in out.seqs for r in s.top if r), default=1)
+  return {f"{request_id}:{i}": wire.pack_stability(*topk(s.top, k)) for i, s in enumerate(out.seqs)}
+
+
 class Sampler:
   def __init__(self, base: str, lora: bool, env=None, engine=None):
     self.env = dict(os.environ if env is None else env)
@@ -83,11 +88,16 @@ class Sampler:
       await self.running.load_checkpoint(name, path)
     return name
 
-  async def execute(self, cmd: Cmd, checkpoint: tuple[str, str] | None, loaded: bool = False) -> Reply:
+  async def execute(
+    self, cmd: Cmd, checkpoint: tuple[str, str] | None, loaded: bool = False, stability: dict[str, bytes] | None = None
+  ) -> Reply:
     try:
       job = json.loads(cmd.body)
       name = checkpoint[1] if loaded and checkpoint else await self.load(checkpoint)
-      return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, await self.running.sample(job, name)))
+      out = await self.running.sample(job, name)
+      if stability is not None and job.get("record_stability_info"):
+        stability.update(await asyncio.to_thread(encode_stability, cmd.request_id, out))
+      return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, out))
     except Exception as e:
       return Reply.error(e)
 
