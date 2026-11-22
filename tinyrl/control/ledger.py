@@ -449,8 +449,8 @@ class Ledger:
         out.append(Assignment(wid, proc.spec, runs, (), bool(held or heads), closing, lag))
       else:
         pairs = self.ready_samples(proc.spec)
-        rids, vers = tuple(c.run for c, ver in pairs), tuple(sorted({ver for c, ver in pairs if ver}))
-        ready = bool(self.samples.held(tok)) or any(ver is None for c, ver in pairs)
+        rids, vers = tuple(c.run for c, _ in pairs), tuple(sorted({v for _, v in pairs if v}))
+        ready = bool(self.samples.held(tok)) or any(v is None for _, v in pairs)
         out.append(Assignment(wid, proc.spec, rids, vers, ready, (), max(map(ps.ready_lag, rids), default=0.0)))
     return out
 

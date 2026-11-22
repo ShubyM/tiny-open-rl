@@ -215,7 +215,7 @@ class NodeDaemon:
 
   def bg(self, coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
-    task.add_done_callback(lambda done: self.notify())
+    task.add_done_callback(lambda _: self.notify())
     return task
 
   async def call(self, name: str, *args, retry: bool = False, **kw):

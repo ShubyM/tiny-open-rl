@@ -124,7 +124,7 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
   ledger = ledger if ledger is not None else Ledger()
 
   @contextlib.asynccontextmanager
-  async def lifespan(api_app: FastAPI):
+  async def lifespan(_: FastAPI):
     async def maintain_loop():
       while True:
         try:
@@ -148,7 +148,7 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
     for name in ("heartbeat", "take", "finish", "detach")
   }
   for exc, code in ERRORS.items():
-    api.add_exception_handler(exc, lambda req, err, c=code: JSONResponse({"error": f"{type(err).__name__}: {err}"}, c))
+    api.add_exception_handler(exc, lambda _, err, c=code: JSONResponse({"error": f"{type(err).__name__}: {err}"}, c))
 
   @api.post("/internal/{method}")
   async def internal(method: str, request: Request) -> Response:

@@ -34,8 +34,8 @@ class Out:
 def topk(rows: list[dict[int, float] | None], k: int) -> tuple[np.ndarray, np.ndarray]:
   pairs = [sorted(r.items(), key=lambda kv: -kv[1])[:k] if r else [] for r in rows]
   pairs = [p + [(0, wire.MASK_LOGPROB)] * (k - len(p)) for p in pairs]
-  ids = np.array([[t for t, lp in p] for p in pairs], np.int32).reshape(len(rows), k)
-  return ids, np.array([[lp for t, lp in p] for p in pairs], np.float32).reshape(len(rows), k)
+  ids = np.array([[t for t, _ in p] for p in pairs], np.int32).reshape(len(rows), k)
+  return ids, np.array([[lp for _, lp in p] for p in pairs], np.float32).reshape(len(rows), k)
 
 
 def encode(job: dict, out: Out) -> bytes:

@@ -88,8 +88,8 @@ class SampleQueue:
     self.queued_bytes, self.reply_bytes = self.queued_bytes - len(entry.cmd.body), self.reply_bytes + len(reply.body)
     self.replies[req_id] = (reply, time.time() + ttl, False)
     while self.reply_bytes > SAMPLE_REPLY_BYTES and len(self.replies) > 1:
-      victim = next((k for k, (r, exp, rd) in self.replies.items() if rd and r.body), None)
-      victim = victim or next((k for k, (r, exp, rd) in self.replies.items() if k != req_id and r.body), None)
+      victim = next((k for k, (r, _, rd) in self.replies.items() if rd and r.body), None)
+      victim = victim or next((k for k, (r, _, _) in self.replies.items() if k != req_id and r.body), None)
       if victim is None:
         break
       self.reply_bytes -= len(self.replies.pop(victim)[0].body)
@@ -105,6 +105,6 @@ class SampleQueue:
     return flight_status(len(q), [(e.cmd.request_id, e.owner[0], e.since) for e in q.values() if e.owner], now)
 
   def gc(self, now: float) -> None:
-    for k in [k for k, (r, exp, rd) in self.replies.items() if exp <= now]:
+    for k in [k for k, (_, exp, _) in self.replies.items() if exp <= now]:
       self.reply_bytes -= len(self.replies.pop(k)[0].body)
     self.seen = {k: v for k, v in self.seen.items() if v[1] > now}

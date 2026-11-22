@@ -76,10 +76,10 @@ class State:
     return [(n, p) for n, p in self.procs.items() if p.node == node and n != skip]
 
   def used(self, node: str) -> int:
-    return sum(p.spec.gpus for n, p in self.procs_on(node))
+    return sum(p.spec.gpus for _, p in self.procs_on(node))
 
   def excl_used(self, node: str, skip: str = "") -> int:
-    return sum(p.spec.gpus for n, p in self.procs_on(node, skip) if p.spec.exclusive)
+    return sum(p.spec.gpus for _, p in self.procs_on(node, skip) if p.spec.exclusive)
 
   def busy_gpus(self, node: str, skip: str = "") -> int:
     return sum(p.spec.gpus for n, p in self.procs_on(node, skip) if not p.spec.exclusive and self.busy(n))
@@ -186,7 +186,7 @@ def merge_and_split(s: State, out: list) -> None:
 
 def size_samplers(s: State, out: list) -> None:
   by_spec: dict[Spec, list[Job]] = {}
-  for j in (s.jobs[r] for r in sorted(s.jobs)):
+  for _, j in sorted(s.jobs.items()):
     if j.spec.role == Role.SAMPLER:
       by_spec.setdefault(j.spec, []).append(j)
   for spec, js in by_spec.items():

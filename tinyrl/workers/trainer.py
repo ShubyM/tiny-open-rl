@@ -107,8 +107,8 @@ class Trainer:
             self.load_run(cmd.run, version, optimizer=args["optimizer"], gradients=False)
           case Op.DELETE_MODEL:
             self.drop_run(cmd.run)
-          case other:
-            raise ValueError(f"unknown op {other}")
+          case _:
+            raise ValueError(f"unknown op {cmd.op}")
         if reply is None:
           body = {"type": cmd.op, "model_id": cmd.run} | ({"path": args["uri"]} if "uri" in args else {})
           if "sampling_session_id" in args:
