@@ -34,8 +34,8 @@ class Out:
 def topk(rows: list[dict[int, float] | None], k: int) -> tuple[np.ndarray, np.ndarray]:
   pairs = [sorted(r.items(), key=lambda kv: -kv[1])[:k] if r else [] for r in rows]
   pairs = [p + [(0, wire.MASK_LOGPROB)] * (k - len(p)) for p in pairs]
-  ids = np.array([[t for t, _ in p] for p in pairs], np.int32).reshape(len(rows), k)
-  return ids, np.array([[lp for _, lp in p] for p in pairs], np.float32).reshape(len(rows), k)
+  ids = np.array([[t for t, lp in p] for p in pairs], np.int32).reshape(len(rows), k)
+  return ids, np.array([[lp for t, lp in p] for p in pairs], np.float32).reshape(len(rows), k)
 
 
 def encode(job: dict, out: Out) -> bytes:
@@ -62,37 +62,33 @@ class Sampler:
     self.env = dict(os.environ if env is None else env)
     module, name = self.env.get("ENGINE", "tinyrl.workers.vllm:VLLM").split(":")
     self.engine_type = engine or getattr(importlib.import_module(module), name)
-    self.base, self.lora = base, lora
-    self.running = None
-    self.loading = asyncio.Lock()
+    self.base, self.lora, self.running, self.loading = base, lora, None, asyncio.Lock()
 
   @property
   def proc(self):
     return getattr(self.running, "server", None)
 
   async def start(self) -> None:
-    """Start the engine, once."""
     async with self.loading:
       if self.running is None:
         self.running = await self.engine_type.start(self.base, self.lora, self.env)
 
-  async def load(self, checkpoint: tuple[str, str] | None) -> str | None:
+  async def load(self, checkpoint: tuple[str, str]) -> None:
     await self.start()
-    if checkpoint is None:
-      return None
-    path, name = checkpoint
     async with self.loading:
-      await self.running.load_checkpoint(name, path)
-    return name
+      await self.running.load_checkpoint(checkpoint[1], checkpoint[0])
 
-  async def execute(self, cmd: Cmd, checkpoint: tuple[str, str] | None, loaded: bool = False, store=None) -> Reply:
+  async def execute(self, cmd: Cmd, name: str | None = None, store=None) -> Reply:
     try:
       job = json.loads(cmd.body)
-      name = checkpoint[1] if loaded and checkpoint else await self.load(checkpoint)
       out = await self.running.sample(job, name)
-      if store is not None and job.get("record_stability_info"):
-        await asyncio.to_thread(store.put_stability, cmd.request_id, encode_stability(cmd.request_id, out))
-      return Reply(True, wire.PROTO, await asyncio.to_thread(encode, job, out))
+
+      def encode_all() -> bytes:
+        if store is not None and job.get("record_stability_info"):
+          store.put_stability(cmd.request_id, encode_stability(cmd.request_id, out))
+        return encode(job, out)
+
+      return Reply(True, wire.PROTO, await asyncio.to_thread(encode_all))
     except Exception as e:
       return Reply.error(e)
 

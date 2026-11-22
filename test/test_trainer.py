@@ -360,11 +360,11 @@ class TestModel(unittest.TestCase):
       expected = {name: p.detach().clone() for name, p in model.params[run].items()}
       train(model, run, steps=1)
       second = original.save(run, uri)
-      self.assertNotEqual(first["version"], second["version"])
+      self.assertNotEqual(first.version, second.version)
       reply, _ = loaded.execute(
         Cmd(run, "1-0", Op.LOAD_WEIGHTS, json.dumps({"uri": uri, "optimizer": True}).encode()),
         run={"base": "tiny", "rank": 4, "lora": LORA},
-        version=first["version"],
+        version=first.version,
       )
       self.assertTrue(reply.ok, reply.body)
       torch.testing.assert_close(loaded.model.params[run], expected, atol=0, rtol=0)
@@ -381,15 +381,15 @@ class TestModel(unittest.TestCase):
         model.forward_backward(run, [counting(2)], "cross_entropy", {}, False)
         reply, effects = trainer.execute(fail)
         self.assertFalse(reply.ok)
-        self.assertTrue(effects.get("mutated"))
+        self.assertTrue(effects.mutated)
         self.assertTrue(all(p.grad is None for p in model.params[run].values()))
         reply, effects = trainer.execute(Cmd(run, "2", Op.FORWARD_BACKWARD, proto_body(run, loss_fn="unknown")))
         self.assertFalse(reply.ok)
-        self.assertFalse(effects.get("mutated"))
+        self.assertFalse(effects.mutated)
 
-      saved = trainer.save_run(run, new_id().replace("-", ""))
-      body = json.dumps({"uri": saved["uri"], "optimizer": True}).encode()
-      reply, _ = trainer.execute(Cmd(run, "3", Op.LOAD_WEIGHTS, body), version=saved["version"])
+      snap = trainer.save_run(run, new_id().replace("-", ""))
+      body = json.dumps({"uri": f"tinker://{run}/weights/snap", "optimizer": True}).encode()
+      reply, _ = trainer.execute(Cmd(run, "3", Op.LOAD_WEIGHTS, body), version=snap)
       self.assertTrue(reply.ok, reply.body)
       reply, _ = trainer.execute(Cmd(run, "4", Op.OPTIM_STEP, b'{"adam_params":{}}'))
       self.assertTrue(reply.ok, reply.body)
@@ -432,7 +432,12 @@ class TestTrainer(BusTest):
 
   async def submit(self, run: str, *cmds: tuple[Op, dict | bytes]) -> list[str]:
     return [
-      self.bus.submit_command(run, op, body if isinstance(body, bytes) else json.dumps(body).encode())
+      self.bus.submit_command(
+        run,
+        op,
+        body if isinstance(body, bytes) else json.dumps(body).encode(),
+        uri=body.get("uri") if op == Op.LOAD_WEIGHTS and isinstance(body, dict) else None,
+      )
       for op, body in cmds
     ]
 
@@ -480,20 +485,22 @@ class TestTrainer(BusTest):
       await self.drain_and_evict(f"p-{rank}")  # detaches dirty run to store before releasing owner
       info = self.bus.get_run(run)
       self.assertIsNone(info.get("owner"))
-      parked = info["snap"][0]
-      self.assertIsNotNone(self.bus.get_checkpoint(parked))
+      parked = info["snap"]
+      self.assertIn(parked.partition("@")[0], self.bus.live_versions())
       # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
       await self.node.drain(run)
       self.assertFalse((await self.bus.wait_for_reply(invalid, 1)).ok)
-      self.assertEqual((self.bus.get_run(run))["snap"][0], parked)
+      self.assertEqual((self.bus.get_run(run))["snap"], parked)
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
       self.assertIsNone((self.bus.get_run(run)).get("snap"))
-      self.assertIsNone(self.bus.get_checkpoint(parked))  # recovery cannot replay old state after a crash
+      self.assertNotIn(
+        parked.partition("@")[0], self.bus.live_versions()
+      )  # recovery cannot replay old state after a crash
 
   async def test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure(self):
     run = new_id()
@@ -508,7 +515,7 @@ class TestTrainer(BusTest):
     step = (Op.OPTIM_STEP, {"adam_params": {}})
     for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
       await self.drain_and_evict("p")
-      parked = (self.bus.get_run(run))["snap"][0]
+      parked = (self.bus.get_run(run))["snap"]
       [request] = await self.submit(run, command)
       await self.node.drain(run)
       reply = await self.bus.wait_for_reply(request, 1)
@@ -518,7 +525,7 @@ class TestTrainer(BusTest):
       info = self.bus.get_run(run)
       self.assertEqual(info["status"], "live")
       self.assertIsNone(info.get("snap"))
-      self.assertIsNone(self.bus.get_checkpoint(parked))
+      self.assertNotIn(parked.partition("@")[0], self.bus.live_versions())
 
     await self.drain_and_evict("p")
     [request] = await self.submit(run, step)
@@ -590,8 +597,8 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
               single.execute(cmd) if run == r1 else await asyncio.wait_for(multi.call("execute", cmd), 90)
             )
             self.assertEqual(reply.ok, i != 1, reply.body)
-            if checkpoint := effects.get("saved"):
-              saved_versions.append(checkpoint["version"])
+            if checkpoint := effects.saved:
+              saved_versions.append(checkpoint.version)
         expected, actual = (store.get(v)[0] for v in saved_versions)
         self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")
         for name in expected:
@@ -599,8 +606,8 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
         # Verify parked CPU-side training_state gather matches single-rank weights, grads, and AdamW moments.
         single.park()
         await asyncio.wait_for(multi.call("park"), 30)
-        exp_state = store.get(single.save_run(r1, uuid.uuid4().hex)["version"])[0]
-        got_state = store.get((await asyncio.wait_for(multi.call("save_run", r2, uuid.uuid4().hex), 30))["version"])[0]
+        exp_state = store.get(single.save_run(r1, uuid.uuid4().hex))[0]
+        got_state = store.get(await asyncio.wait_for(multi.call("save_run", r2, uuid.uuid4().hex), 30))[0]
         self.assertEqual(exp_state.keys(), got_state.keys(), f"rank {rank} parked state")
         for name in exp_state:
           torch.testing.assert_close(got_state[name], exp_state[name], atol=1e-5, rtol=1e-5, msg=f"rank {rank} {name}")

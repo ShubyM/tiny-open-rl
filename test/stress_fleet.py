@@ -49,7 +49,7 @@ if (
 
 
 class CuttableBus:
-  """Wraps a Bus/RemoteBus so chaos can sever a node from the control plane immediately."""
+  """Wraps a Ledger/ControlClient so chaos can sever a node from the control plane immediately."""
 
   def __init__(self, inner):
     self.inner = inner
@@ -235,9 +235,7 @@ class Stress(BusTest):
       if action in ("cancel", "crash"):
         node = self.nodes[self.rng.choice(nodes)]
         if action == "cancel":
-          live = [
-            (wid, rid, tk) for wid, w in node.workers.items() for rid, (_, tk) in w.running.items() if not tk.done()
-          ]
+          live = [(wid, rid, tk) for wid, w in node.workers.items() for rid, tk in w.running.items() if not tk.done()]
           if not live:
             continue
           wid, rid, tk = self.rng.choice(live)
@@ -287,7 +285,7 @@ class Stress(BusTest):
 
   async def dump(self, run: str, request: str) -> None:
     """Where a command that got no reply is stuck."""
-    row = {k: str(v)[:80] for k, v in (self.bus.runs.get(run) or {}).items() if k != "record"}
+    row = self.bus.get_run(run) or {}
     plan, out = self.bus.meta.get("plan", {}), [f"--- {request} at {time.monotonic() - self.started:.1f}s"]
     out.append(f"row {row}")
     out.append(f"queue {self.bus.queued_and_in_flight(run)}")
@@ -326,7 +324,8 @@ class Stress(BusTest):
       """After any failure the client reloads its last save, as a real client must."""
       for _ in range(40):
         body = json.dumps({"uri": saved, "optimizer": True}).encode()
-        reply = await self.call(run, Op.LOAD_WEIGHTS, body)
+        req = self.bus.submit_command(run, Op.LOAD_WEIGHTS, body, cost=100, uri=saved)
+        reply = await self.reply(run, Op.LOAD_WEIGHTS, req)
         if reply is None:
           return False
         if reply.ok:

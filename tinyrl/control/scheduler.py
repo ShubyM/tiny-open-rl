@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import copy
-import dataclasses
 import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+
+import msgspec
 
 from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
 from tinyrl.types import MAX_LORAS, MAX_SEQS, Ev, Role
 from tinyrl.types import WorkerSpec as Spec
 
-REBALANCE_MS, TICK_MS = getenv("REBALANCE_MS", 20_000), getenv("TICK_MS", 100)
+REBALANCE_MS = getenv("REBALANCE_MS", 20_000)
+PLAN_FIELDS = ("made", "procs", "home", "lag", "seen", "weights")
 
 
 @dataclass
@@ -26,14 +27,14 @@ class Job:
   spec: Spec
   train_run: str | None = None
   account: str = ""
-  owner: tuple[str, str, str] | list[str] | None = None  # (proc, node, boot_id) holding its weights
+  owner: tuple[str, str, str] | None = None  # (proc, node, boot_id) holding its weights
   backlog: int = 0
 
 
 @dataclass
 class State:
   made: int = 0
-  nodes: dict[str, tuple[int, int]] = field(default_factory=dict)
+  nodes: dict[str, int] = field(default_factory=dict)
   procs: dict[str, Proc] = field(default_factory=dict)
   home: dict[str, str] = field(default_factory=dict)  # training run -> single trainer proc
   jobs: dict[str, Job] = field(default_factory=dict)
@@ -56,11 +57,8 @@ class State:
       return [n for n, p in sorted(self.procs.items()) if p.spec == j.spec]
     return [p] if (p := self.home.get(run)) in self.procs else []
 
-  def ready(self, run: str) -> bool:
-    return self.jobs[run].backlog > 0
-
   def busy(self, proc: str) -> bool:
-    return any(self.ready(r) for r in self.runs(proc))
+    return any(self.jobs[r].backlog > 0 for r in self.runs(proc))
 
   def account(self, run: str) -> str:
     if (job := self.jobs.get(run)) is None:
@@ -68,7 +66,7 @@ class State:
     return job.account or (self.account(job.train_run) if job.train_run in self.jobs else run)
 
   def lag_of(self, proc: str) -> float:
-    return max((self.ready_lag(r) for r in self.runs(proc) if self.ready(r)), default=0.0)
+    return max((self.ready_lag(r) for r in self.runs(proc) if self.jobs[r].backlog > 0), default=0.0)
 
   def ready_lag(self, run: str) -> float:
     account = self.account(run)
@@ -78,22 +76,22 @@ class State:
     return [(n, p) for n, p in self.procs.items() if p.node == node and n != skip]
 
   def used(self, node: str) -> int:
-    return sum(p.spec.gpus for _, p in self.procs_on(node))
+    return sum(p.spec.gpus for n, p in self.procs_on(node))
 
   def excl_used(self, node: str, skip: str = "") -> int:
-    return sum(p.spec.gpus for _, p in self.procs_on(node, skip) if p.spec.exclusive)
+    return sum(p.spec.gpus for n, p in self.procs_on(node, skip) if p.spec.exclusive)
 
   def busy_gpus(self, node: str, skip: str = "") -> int:
     return sum(p.spec.gpus for n, p in self.procs_on(node, skip) if not p.spec.exclusive and self.busy(n))
 
   def spare(self, node: str) -> int:
-    return self.nodes[node][0] - self.excl_used(node) - self.busy_gpus(node)
+    return self.nodes[node] - self.excl_used(node) - self.busy_gpus(node)
 
   def load(self, node: str, skip: str = "") -> float:
-    return self.busy_gpus(node, skip) / max(1, self.nodes[node][0] - self.excl_used(node, skip))
+    return self.busy_gpus(node, skip) / max(1, self.nodes[node] - self.excl_used(node, skip))
 
   def can_host(self, node: str, spec: Spec, skip: str = "", spare: bool = False) -> bool:
-    return (self.used(node) if spare else self.excl_used(node, skip)) + spec.gpus <= self.nodes[node][0]
+    return (self.used(node) if spare else self.excl_used(node, skip)) + spec.gpus <= self.nodes[node]
 
   def add_proc(self, spec: Spec, node: str | None = None) -> str:
     self.made = next(n for n in itertools.count(self.made + 1) if f"p{n}" not in self.procs)
@@ -102,19 +100,11 @@ class State:
 
 
 def from_plan(plan: dict) -> State:
-  mk = lambda p: Proc(Spec(**(p["spec"] | {"role": Role(p["spec"]["role"])})), p.get("node"))  # noqa: E731
-  procs, home = {n: mk(p) for n, p in plan.get("procs", {}).items()}, dict(plan.get("home", {}))
-  lag, seen, w = ({a: float(v) for a, v in plan.get(k, {}).items()} for k in ("lag", "seen", "weights"))
-  return State(int(plan.get("made", 0)), procs=procs, home=home, lag=lag, seen=seen, weights=w)
+  return msgspec.convert({k: plan[k] for k in PLAN_FIELDS if k in plan}, State)
 
 
 def to_plan(s: State) -> dict:
-  procs = {n: dataclasses.asdict(p) for n, p in s.procs.items()}
-  return {"made": s.made, "procs": procs, "home": s.home, "lag": s.lag, "seen": s.seen, "weights": s.weights}
-
-
-def settings(gpus: int, gpu_bytes: int) -> dict[str, str]:
-  return {"TINYRL_KV_BYTES": str(24 * 2**30)} if gpu_bytes >= 64 * 2**30 else {}
+  return msgspec.to_builtins({k: getattr(s, k) for k in PLAN_FIELDS})
 
 
 def choose_node(s: State, proc: str, only_spare: bool = False) -> str | None:
@@ -126,7 +116,7 @@ def choose_node(s: State, proc: str, only_spare: bool = False) -> str | None:
   def rank(node: str) -> tuple:
     unpaired = [n for n, p in s.procs_on(node) if p.spec.role == Role.TRAINER and not p.spec.lora]
     owed = sum(s.procs[n].spec.gpus for n in unpaired if not (sampled & set(s.runs(n))))
-    used, capacity = s.used(node), s.nodes[node][0]
+    used, capacity = s.used(node), s.nodes[node]
     paired = spec.gpus * (2 if spec.role == Role.TRAINER and not spec.lora else 1)
     return capacity - used - owed < paired, node not in near, used / capacity
 
@@ -140,7 +130,7 @@ def rebalance_target(s: State, name: str) -> str | None:
     return None
   fit = [n for n in sorted(s.nodes) if s.can_host(n, p.spec)]
   if spare := [n for n in fit if s.spare(n) >= p.spec.gpus]:
-    return min(spare, key=lambda n: s.used(n) / s.nodes[n][0])
+    return min(spare, key=lambda n: s.used(n) / s.nodes[n])
 
   def floor(node: str) -> float:
     return min((s.lag_of(h) for h, q in s.procs_on(node) if not q.spec.exclusive and s.busy(h)), default=float("inf"))
@@ -151,9 +141,9 @@ def rebalance_target(s: State, name: str) -> str | None:
 
 
 def demand(s: State, cap: float) -> dict[str, float]:
-  biggest, want = max((g for g, _ in s.nodes.values()), default=0), {}
+  biggest, want = max(s.nodes.values(), default=0), {}
   for r, j in s.jobs.items():
-    if s.ready(r) and j.spec.gpus <= biggest:
+    if j.backlog > 0 and j.spec.gpus <= biggest:
       reps = min(int(cap) // j.spec.gpus, max(1, (j.backlog + MAX_SEQS - 1) // MAX_SEQS)) if j.spec.elastic else 1
       a = s.account(r)
       want[a] = want.get(a, 0.0) + reps * j.spec.gpus
@@ -180,7 +170,7 @@ def merge_and_split(s: State, out: list) -> None:
   for name, p in sorted(list(s.procs.items())):
     if p.spec.role != Role.TRAINER or not p.spec.shareable or not p.node:
       continue
-    idle_dup = not s.busy(name) and s.used(p.node) > s.nodes[p.node][0]
+    idle_dup = not s.busy(name) and s.used(p.node) > s.nodes[p.node]
     busy_dup = s.spare(p.node) < 0 and not any(s.spare(n) >= p.spec.gpus for n in s.nodes)
     twins = [q for q, pr in sorted(s.procs.items()) if q != name and pr.spec == p.spec]
     if (idle_dup or busy_dup) and twins:
@@ -188,22 +178,20 @@ def merge_and_split(s: State, out: list) -> None:
         s.home[r] = twins[0]
         out.append((Ev.ASSIGNED, {"run": r, "proc": twins[0]}))
       continue
-    while len(busy := [r for r in s.runs(name) if s.ready(r)]) >= 2 and (spot := choose_node(s, name, True)):
-      q = s.add_proc(p.spec, spot)
-      s.home[busy[-1]] = q
+    while len(busy := [r for r in s.runs(name) if s.jobs[r].backlog > 0]) >= 2 and (spot := choose_node(s, name, True)):
+      s.home[busy[-1]] = q = s.add_proc(p.spec, spot)
       out.append((Ev.ASSIGNED, {"run": busy[-1], "proc": q}))
       out.append((Ev.PLACED, {"proc": q, "node": spot, "rule": "place.split"}))
 
 
 def size_samplers(s: State, out: list) -> None:
   by_spec: dict[Spec, list[Job]] = {}
-  for _, j in sorted(s.jobs.items()):
+  for j in (s.jobs[r] for r in sorted(s.jobs)):
     if j.spec.role == Role.SAMPLER:
       by_spec.setdefault(j.spec, []).append(j)
   for spec, js in by_spec.items():
     pool = [n for n, p in sorted(s.procs.items()) if p.spec == spec]
-    placed = [n for n in pool if s.procs[n].node]
-    ready = [j for j in js if j.backlog > 0]
+    placed, ready = [n for n in pool if s.procs[n].node], [j for j in js if j.backlog > 0]
     by_seqs = (sum(j.backlog for j in ready) + MAX_SEQS - 1) // MAX_SEQS
     by_slots = (len(ready) + (cap := MAX_LORAS if spec.lora else 1) - 1) // cap
     want = 1 if spec.exclusive else max(1, by_seqs, by_slots)
@@ -238,9 +226,10 @@ def rebalance(s: State, out: list) -> None:
       out.append((Ev.PLACED, {"proc": name, "node": target, "rule": "place.rebalance"}))
 
 
-def step(state: State) -> tuple[State, list[tuple[Ev, dict]]]:
-  s, out = copy.deepcopy(state), []
-  cap = float(sum(g for g, _ in s.nodes.values()))
+def step(st: State) -> tuple[State, list[tuple[Ev, dict]]]:
+  copied = {k: dict(getattr(st, k)) for k in ("nodes", "home", "jobs", "lag", "seen", "weights")}
+  s = replace(st, procs={k: Proc(p.spec, p.node) for k, p in st.procs.items()}, **copied)
+  cap, out = float(sum(s.nodes.values())), []
   s.lag, s.seen = update_lag(s.lag, s.seen, s.service, cap, demand(s, cap), s.weights)
   for phase in (drop_lost, assign, merge_and_split, size_samplers, collect_and_place, rebalance):
     phase(s, out)

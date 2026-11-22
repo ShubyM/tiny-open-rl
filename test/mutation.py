@@ -18,8 +18,8 @@ FAIRNESS = "tinyrl/control/fairness.py"
 ACCOUNTING = "tinyrl/control/accounting.py"
 ORDER = "test.test_scheduler.TestLocalQuantum"
 BILLING = "test.test_accounting.TestAccounting"
-CLAIM = "test.test_bus.TestBus.test_reaped_boot_id_is_fenced_and_gets_reset_without_overwriting_checkpoint"
-DEDUP = "test.test_bus.TestBus.test_competing_sampler_replicas_answer_and_charge_exactly_once"
+CLAIM = "test.test_ledger.TestLedger.test_reaped_boot_id_is_fenced_and_gets_reset_without_overwriting_checkpoint"
+DEDUP = "test.test_ledger.TestLedger.test_competing_sampler_replicas_answer_and_charge_exactly_once"
 RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure"
 
 # (source, function, original expression, faulty replacement, tests that should detect it)
@@ -30,10 +30,10 @@ CASES = [
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (LEDGER, "_bill", "if charge and charge.gpu_ms", "if reply.ok and charge and charge.gpu_ms", BILLING),
-  (LEDGER, "_fence", "if boot_id in self.reaped_boots", "if False", CLAIM),
+  (LEDGER, "bill", "if charge and charge.gpu_ms", "if reply.ok and charge and charge.gpu_ms", BILLING),
+  (LEDGER, "fence", "if boot_id in self.reaped_boots", "if False", CLAIM),
   (SAMPLES, "complete", "entry.owner != owner", "False", DEDUP),
-  (LEDGER, "_finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
+  (LEDGER, "finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
 ]
 
 

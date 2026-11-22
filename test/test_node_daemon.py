@@ -439,8 +439,7 @@ class TestNodeDaemon(BusTest):
       self.assertEqual(overlap, [])
     finally:
       release.set()
-    saved, lost = await snap
-    self.assertFalse(lost)
+    saved = await snap
     self.assertIsNotNone(saved)
     self.assertEqual(overlap, [])
     await self.reply(req, node)

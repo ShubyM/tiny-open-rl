@@ -1,4 +1,4 @@
-"""Domain types shared by the gateway, controller, node daemon, and workers (stdlib only)."""
+"""Domain and RPC contract types shared by gateway, controller, node daemon, and workers (stdlib only)."""
 
 from __future__ import annotations
 
@@ -11,10 +11,8 @@ MAX_LORAS, MAX_SEQS = 16, 256  # vLLM engine limits: --max-loras and max capture
 Role = StrEnum("Role", "TRAINER SAMPLER")
 Ev = StrEnum("Ev", "RUN_CREATED ASSIGNED RUN_DELETED NODE_UP NODE_LOST PLACED UNPLACED")
 RunStatus = StrEnum("RunStatus", "FRESH LIVE SAVED LOST DELETED")  # fresh -> live <-> saved, live -> lost, * -> deleted
-Op = StrEnum(
-  "Op",
-  "CREATE_MODEL FORWARD_BACKWARD OPTIM_STEP SAVE_WEIGHTS SAVE_WEIGHTS_FOR_SAMPLER LOAD_WEIGHTS DELETE_MODEL SAMPLE",
-)
+OPS = "CREATE_MODEL FORWARD_BACKWARD OPTIM_STEP SAVE_WEIGHTS SAVE_WEIGHTS_FOR_SAMPLER LOAD_WEIGHTS DELETE_MODEL SAMPLE"
+Op = StrEnum("Op", OPS)
 
 
 class FencedError(RuntimeError):
@@ -86,11 +84,41 @@ class Reply:
 
 
 @dataclass(frozen=True)
+class Saved:
+  uri: str
+  version: str
+  size: int
+  ttl: int | None = None
+  owned: bool = False
+  meta: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Effect:
+  loaded: bool = False
+  mutated: bool = False
+  open_grad: bool = False
+  saved: Saved | None = None
+  dead: bool = False
+
+
+@dataclass(frozen=True)
 class Event:
   id: str
   t: float
   kind: str
   body: dict
+
+
+@dataclass(frozen=True)
+class NodeStatus:
+  gpus: int
+  draining: bool = False
+  lag: float = 0.0
+  pids: dict[str, int] = field(default_factory=dict)
+  on: dict[str, tuple[int, ...]] = field(default_factory=dict)
+  live_workers: tuple[str, ...] | None = None
+  want_sweep: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,7 +135,6 @@ class Assignment:
 @dataclass(frozen=True)
 class Work:
   cmd: Cmd
-  account: str = ""
   run: dict | None = None
   snap: str | None = None
   version: str | None = None
@@ -120,6 +147,7 @@ def entry_sort_key(entry_id: str) -> tuple[int, int]:
 
 def parse_uri(uri: str) -> tuple[str, str]:
   run, sep, cid = uri.removeprefix("tinker://").partition("/") if uri.startswith("tinker://") else ("", "", "")
-  if not (sep and run and cid) or cid.startswith("/") or ".." in f"{run}/{cid}".split("/"):
+  parts = f"{run}/{cid}".split("/")
+  if not sep or "" in parts or ".." in parts:
     raise ValueError(f"bad checkpoint URI {uri}")
   return run, cid

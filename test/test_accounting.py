@@ -7,7 +7,7 @@ from test.execution import TestNode
 from test.helpers import BusTest
 from tinyrl.control.node_daemon import WorkerHandle
 from tinyrl.storage.store import Store
-from tinyrl.types import Op, Reply, Role, Run
+from tinyrl.types import Effect, Op, Reply, Role, Run
 
 
 class TestAccounting(BusTest):
@@ -140,7 +140,7 @@ class TestAccounting(BusTest):
 
     async def execute(method, cmd, *args):
       order.append(cmd.run)
-      return Reply(True, "application/json", b"{}"), {}
+      return Reply(True, "application/json", b"{}"), Effect()
 
     model = SimpleNamespace(call=execute, resume=AsyncMock(), park=AsyncMock(), close=AsyncMock(), proc=None)
     node.workers["worker"] = WorkerHandle("worker", spec, model, resident=(0, 1), bound=(0, 1))
@@ -157,14 +157,16 @@ class TestAccounting(BusTest):
     node, spec = await self.setup_node(Role.TRAINER, run="run-account")
     failure = ValueError("bad input")
     model = SimpleNamespace(
-      call=AsyncMock(return_value=(Reply.error(failure), {})),
+      call=AsyncMock(return_value=(Reply.error(failure), Effect())),
       resume=AsyncMock(),
       park=AsyncMock(),
       close=AsyncMock(),
       proc=None,
     )
     node.workers["worker"] = WorkerHandle("worker", spec, model, resident=(0, 1), bound=(0, 1))
-    self.bus.submit_command("run", Op.LOAD_WEIGHTS, b'{"uri":"tinker://run/weights/missing"}')
+    self.bus.submit_command(
+      "run", Op.LOAD_WEIGHTS, b'{"uri":"tinker://run/weights/missing"}', uri="tinker://run/weights/missing"
+    )
     await self.step_turn(node)
     model.call.assert_not_awaited()
     w = node.workers["worker"]

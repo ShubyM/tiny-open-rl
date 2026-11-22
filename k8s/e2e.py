@@ -75,11 +75,11 @@ def live_workers() -> dict[tuple[str, str], dict]:
   sched = gateway_get("/api/v1/scheduling")
   procs = sched.get("state", {}).get("procs", {})
   workers = {}
-  for node, info in sched.get("nodes", {}).items():
-    for worker, pid in info.get("pids", {}).items():
-      key = node.rsplit("-", 1)[0], worker
+  for worker, placed in procs.items():
+    if "pid" in placed and placed.get("node"):
+      key = placed["node"].rsplit("-", 1)[0], worker
       assert key not in workers, f"two live node daemons report {key}"
-      workers[key] = {"pid": pid, "kind": procs.get(worker, {}).get("spec", {})}
+      workers[key] = {"pid": placed["pid"], "kind": placed.get("spec", {})}
   return workers
 
 
@@ -144,7 +144,7 @@ class Run:
     self.name = name
     self.tc = client.create_lora_training_client(MODEL, rank=8, seed=0, user_metadata={"openrl.exclusive": "true"})
     self.run_id = self.tc.model_id
-    ids = tok.encode("tinyrl keeps training when its pods, nodes and Redis go away.", add_special_tokens=False)
+    ids = tok.encode("tinyrl keeps training when its pods and nodes go away.", add_special_tokens=False)
     self.datum = types.Datum(
       model_input=types.ModelInput.from_ints(ids[:-1]),
       loss_fn_inputs={"target_tokens": ids[1:], "weights": [1.0] * (len(ids) - 1)},

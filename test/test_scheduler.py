@@ -43,7 +43,7 @@ class Cluster:
     self.nodes, self.runs, self.queues, self.service, self.s = {}, {}, {}, {}, State()
 
   def settle(self) -> list[tuple[Ev, dict]]:
-    self.s.nodes = {n: (v["gpus"], v["memory"]) for n, v in self.nodes.items()}
+    self.s.nodes = {n: v["gpus"] for n, v in self.nodes.items()}
     jobs = {}
     for r, row in self.runs.items():
       rec = row["record"]
@@ -93,7 +93,7 @@ def apply_gpus(
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
   """Drive pure `plan_gpus` on `Worker` snapshots, resetting `hold_until` only when a worker's block changes."""
   ranked = {
-    p: replace(w, lag=max((state.ready_lag(r) for r in state.runs(p) if state.ready(r)), default=-w.gpu_ms))
+    p: replace(w, lag=max((state.ready_lag(r) for r in state.runs(p) if state.jobs[r].backlog > 0), default=-w.gpu_ms))
     for p, w in workers.items()
   }
   keep, wake_at = plan_gpus(ranked, total, now)
@@ -105,10 +105,10 @@ def apply_gpus(
 
 
 def check_plan_invariants(test: unittest.TestCase, s: State) -> None:
-  for node, (total, _) in s.nodes.items():
+  for node, total in s.nodes.items():
     test.assertLessEqual(s.excl_used(node), total)
   for p in s.procs.values():
-    test.assertTrue(p.node is None or (p.node in s.nodes and p.spec.gpus <= s.nodes[p.node][0]))
+    test.assertTrue(p.node is None or (p.node in s.nodes and p.spec.gpus <= s.nodes[p.node]))
   for r, proc in s.home.items():
     test.assertIn(r, s.jobs)
     test.assertEqual(s.jobs[r].spec.role, Role.TRAINER)
@@ -308,7 +308,7 @@ class TestCluster(unittest.TestCase):
   def test_unplaced_sampler_pool_does_not_scale_out_onto_busy_single_gpu_node(self):
     spec = Spec(Role.SAMPLER, "tiny", lora=True, gpus=1)
     state = State(
-      nodes={"n1": (1, 0)},
+      nodes={"n1": 1},
       jobs={"s1": Job(spec, backlog=4 * MAX_SEQS, account="alice")},
     )
     new, _ = step(state)
@@ -394,7 +394,7 @@ class TestCluster(unittest.TestCase):
 
   def test_an_exclusive_proc_holds_its_gpus_whether_or_not_it_is_busy(self):
     jobs = {"r": Job(Spec(exclusive=True), backlog=1)}
-    s = State(nodes={"n": (2, 0)}, procs={"x": Proc(Spec(exclusive=True), "n")}, home={"r": "x"}, jobs=jobs)
+    s = State(nodes={"n": 2}, procs={"x": Proc(Spec(exclusive=True), "n")}, home={"r": "x"}, jobs=jobs)
     self.assertEqual(s.spare("n"), 1)
 
   def test_crowding_moves_a_shared_proc_and_never_an_exclusive_one(self):
@@ -420,7 +420,7 @@ class TestCluster(unittest.TestCase):
     def target(c_lag: float, n2: int = 1, **extra) -> str | None:
       specs = {"me": (Spec(lora=True, base="me"), "n1", 1), "b": (Spec(lora=True, base="b"), "n1", 1)}
       specs |= {"c": (Spec(lora=True, base="c"), "n2", 1)} | extra
-      s = State(nodes={"n1": (1, 0), "n2": (n2, 0)}, lag={"me": 30000.0, "b": 25000.0, "c": c_lag, "x": -50000.0})
+      s = State(nodes={"n1": 1, "n2": n2}, lag={"me": 30000.0, "b": 25000.0, "c": c_lag, "x": -50000.0})
       for name, (spec, node, backlog) in specs.items():
         s.procs[name], s.home[name], s.jobs[name] = Proc(spec, node), name, Job(spec, account=name, backlog=backlog)
       return scheduler.rebalance_target(s, "me")
@@ -459,8 +459,13 @@ class TestCluster(unittest.TestCase):
     self.assertNotIn("p9", c.s.procs)
 
   def test_sampler_settings_follow_the_node(self):
-    self.assertEqual(scheduler.settings(1, 24 * GIB), {})
-    self.assertEqual(scheduler.settings(2, 80 * GIB), {"TINYRL_KV_BYTES": str(24 * GIB)})
+    seen = {}
+    for mib in (24 * 1024, 80 * 1024):
+      d = NodeDaemon(types.SimpleNamespace(), gpus=1, node="n", gpu_mib=mib, store=Store(root=tempfile.mkdtemp()))
+      d.open_sampler = lambda wid, spec, env, m=mib: seen.setdefault(m, env.get("TINYRL_KV_BYTES"))  # type: ignore[assignment]
+      d.spawn("s", Spec(role=Role.SAMPLER, base="b"), (0,))
+    self.assertIsNone(seen[24 * 1024])
+    self.assertEqual(seen[80 * 1024], str(24 * GIB))
 
   def test_exclusive_evacuates_squeezed_shareable_procs_and_never_overcommits(self):
     c = Cluster()
@@ -528,7 +533,7 @@ class TestCluster(unittest.TestCase):
 class TestLocalQuantum(unittest.TestCase):
   def make_daemon(self, gpus: int) -> NodeDaemon:
     store = Store(tempfile.mkdtemp())
-    node = NodeDaemon(types.SimpleNamespace(r=None), gpus=gpus, node="n", gpu_mib=0, store=store)  # type: ignore[arg-type]
+    node = NodeDaemon(types.SimpleNamespace(), gpus=gpus, node="n", gpu_mib=0, store=store)
     self.addCleanup(store.close)
     return node
 
@@ -954,8 +959,9 @@ class TestMultiNodeExecution(BusTest):
 
   async def test_the_plan_is_written_only_when_it_changes(self):
     from tinyrl.control.db import Table
+    from tinyrl.types import NodeStatus
 
-    await self.bus.heartbeat("n", "bn", 1)
+    await self.bus.heartbeat("n", "bn", NodeStatus(1))
     self.bus.create_run(Run("r", "tiny", 4, lora=LORA, account="acct"))
     writes, orig_set = 0, Table.__setitem__
 
@@ -973,7 +979,7 @@ class TestMultiNodeExecution(BusTest):
       self.bus.create_run(Run("r2", "tiny", 4, lora=LORA, account="acct"))
       self.bus.maintain()  # a run joined the process
       self.bus.nodes.pop("n", None)
-      await self.bus.heartbeat("m", "bm", 1)  # the process moved to m
+      await self.bus.heartbeat("m", "bm", NodeStatus(1))  # the process moved to m
     self.assertEqual(writes, 4)
 
   async def test_new_node_rebalances_mid_accumulation_with_exact_model_parameters(self):

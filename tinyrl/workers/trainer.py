@@ -16,7 +16,7 @@ import torch.distributed as dist
 from tinyrl.api import wire
 from tinyrl.storage.store import Store, nbytes
 from tinyrl.trace import span
-from tinyrl.types import Cmd, Op, Reply
+from tinyrl.types import Cmd, Effect, Op, Reply, Saved
 from tinyrl.workers.model import GradientRecoveryError, Model
 
 RECOVERABLE_ERRORS = (ValueError, KeyError, GradientRecoveryError)
@@ -51,22 +51,28 @@ class Trainer:
         os._exit(1)
       raise
 
-  def save(self, run: str, uri: str, sampler: bool = False, ttl_seconds=None, owned=False, version=None) -> dict:
+  def save(self, run: str, uri: str, sampler: bool = False, ttl_seconds=None, owned=False, version=None) -> Saved:
     tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
     ver, size = self.store.put(tensors, meta, version=version), sum(map(nbytes, tensors.values()))
-    info = {k: meta[k] for k in ("base", "rank", "lora", "targets") if k in meta}
-    return {"uri": uri, "size": size, "ttl": ttl_seconds, "owned": owned, "version": ver, "meta": info}
+    info = {k: meta[k] for k in ("base", "rank", "lora") if k in meta}
+    if info.get("rank"):
+      t = meta.get("targets", ())
+      info["flags"] = {"train_unembed": "lm_head" in t, "train_mlp": "gate_proj" in t, "train_attn": "q_proj" in t}
+    return Saved(uri, ver, size, ttl_seconds, bool(owned), info)
 
   def load_run(self, run: str, version: str | None, optimizer: bool, gradients: bool) -> None:
     self.call_model("restore_run", run, *self.store.get(version), optimizer, gradients)
 
   @span("trainer.execute")
-  def execute(self, cmd: Cmd, run: dict | None = None, snap=None, version=None, stability=None) -> tuple[Reply, dict]:
-    effects, created, revision = {}, False, None
+  def execute(
+    self, cmd: Cmd, run: dict | None = None, snap: str | None = None, version: str | None = None
+  ) -> tuple[Reply, Effect]:
+    reply, saved, created, revision = None, None, False, None
     try:
       if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
         if cmd.op == Op.DELETE_MODEL:
-          return ok({"type": cmd.op, "model_id": cmd.run}), effects
+          reply = ok({"type": cmd.op, "model_id": cmd.run})
+          return reply, Effect()
         if not snap and cmd.op != Op.LOAD_WEIGHTS:
           raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
         if run is None:
@@ -80,47 +86,46 @@ class Trainer:
       revision = self.model.state_revision  # restoring the parked state itself leaves its snapshot valid
       if cmd.op == Op.FORWARD_BACKWARD:
         req = wire.parse(cmd.body)
-        if stability is None and req.loss_fn == "stable_reinforce":
+        stab = None
+        if req.loss_fn == "stable_reinforce":
           reqs = {sid.rpartition(":")[0] for sid in wire.referenced_sequences(req)}
-          stability = {k: v for rid in reqs if rid for k, v in self.store.get_stability(rid).items()}
+          stab = {k: v for rid in reqs if rid for k, v in self.store.get_stability(rid).items()}
         fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
-        logprobs, metrics = self.call_model("forward_backward", *fb, stability)
-        return Reply(True, wire.PROTO, wire.output(logprobs, metrics)), effects
-
-      args = json.loads(cmd.body)
-      match cmd.op:
-        case Op.CREATE_MODEL:
-          self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
-        case Op.OPTIM_STEP:
-          metrics = self.call_model("optim_step", cmd.run, args["adam_params"])
-          return ok({"type": cmd.op, "metrics": metrics}), effects
-        case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
-          sampler = cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER
-          effects["saved"] = self.save(
-            cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False), version
-          )
-        case Op.LOAD_WEIGHTS:
-          self.load_run(cmd.run, version, optimizer=args["optimizer"], gradients=False)
-        case Op.DELETE_MODEL:
-          self.drop_run(cmd.run)
-        case _:
-          raise ValueError(f"unknown op {cmd.op}")
-
-      reply = {"type": cmd.op, "model_id": cmd.run, **({"path": args["uri"]} if "uri" in args else {})}
-      if "sampling_session_id" in args:
-        reply["sampling_session_id"] = args["sampling_session_id"]
-      return ok(reply), effects
+        logprobs, metrics = self.call_model("forward_backward", *fb, stab)
+        reply = Reply(True, wire.PROTO, wire.output(logprobs, metrics))
+      else:
+        args = json.loads(cmd.body)
+        match cmd.op:
+          case Op.CREATE_MODEL:
+            self.call_model("create_run", cmd.run, args["base_model"], args["rank"], args["lora"])
+          case Op.OPTIM_STEP:
+            reply = ok({"type": cmd.op, "metrics": self.call_model("optim_step", cmd.run, args["adam_params"])})
+          case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
+            sampler = cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER
+            saved = self.save(cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False), version)
+          case Op.LOAD_WEIGHTS:
+            self.load_run(cmd.run, version, optimizer=args["optimizer"], gradients=False)
+          case Op.DELETE_MODEL:
+            self.drop_run(cmd.run)
+          case other:
+            raise ValueError(f"unknown op {other}")
+        if reply is None:
+          body = {"type": cmd.op, "model_id": cmd.run} | ({"path": args["uri"]} if "uri" in args else {})
+          if "sampling_session_id" in args:
+            body["sampling_session_id"] = args["sampling_session_id"]
+          reply = ok(body)
     except Exception as e:
       if created:  # a failed restore must not leave a fresh model serving requests as recovered state
         self.drop_run(cmd.run)
-      return Reply.error(e), effects
-    finally:
-      loaded = cmd.run in self.model.params
-      effects.update(loaded=loaded, mutated=loaded and revision is not None and self.model.state_revision != revision)
+      reply = Reply.error(e)
+    loaded = cmd.run in self.model.params
+    mutated = loaded and revision is not None and self.model.state_revision != revision
+    return reply, Effect(loaded, mutated, loaded and cmd.op == Op.FORWARD_BACKWARD and reply.ok, saved)
 
-  def save_run(self, run: str, version: str) -> dict | None:
+  def save_run(self, run: str, version: str) -> str | None:
     if run in self.model.params:
-      return self.save(run, f"tinker://{run}/parked/{version}", owned=True, version=version)
+      return self.store.put(*self.call_model("training_state", run), version=version)
+    return None
 
   def drop_run(self, run: str) -> None:
     if run in self.model.params:

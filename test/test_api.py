@@ -18,6 +18,7 @@ from tinyrl.api import gateway, wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
 from tinyrl.control import ledger as bus
 from tinyrl.storage.store import Store
+from tinyrl.types import NodeStatus
 
 PROTO = {"content-type": wire.PROTO}
 
@@ -162,7 +163,7 @@ class TestAPI(BusTest):
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": 60})).status_code, 400)
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": None})).status_code, 200)
     self.bus.maintain()
-    self.assertEqual(len([c for c in self.bus.checkpoints.values() if c["checkpoint_type"] != "parked"]), 2)
+    self.assertEqual(len(self.bus.list_checkpoints()), 2)
     self.assertEqual((await self.http.delete(final)).status_code, 200)
     self.assertEqual((await self.http.delete(final)).status_code, 404)
 
@@ -412,7 +413,7 @@ class TestAPI(BusTest):
     )
     samp_id = saved.json()["sampling_session_id"]
 
-    await self.bus.heartbeat("node-1", "b1", 8)
+    await self.bus.heartbeat("node-1", "b1", NodeStatus(8))
     self.start_maintenance()
     worker = self.worker(run_id)
     data = await self.scheduling_until(lambda d: d["state"]["procs"].get(worker, {}).get("node"))
@@ -458,7 +459,7 @@ class TestAPI(BusTest):
     self.assertEqual(await self.sampler_runs(), [sid])
     sampler = self.worker(sid)
 
-    await self.bus.heartbeat("n8", "b8", 8)
+    await self.bus.heartbeat("n8", "b8", NodeStatus(8))
     self.start_maintenance()
     await self.scheduling_until(lambda d: d["state"]["procs"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
@@ -598,7 +599,7 @@ class TestAPI(BusTest):
     id0, id1 = fb0.json()["request_id"], fb1.json()["request_id"]
 
     # Claim fb0 and drop the reply; fb1 remains queued. Reopen SQLite and verify both recover and train from Store.
-    plan, _ = await self.bus.heartbeat(self.node.id, self.node.boot_id, self.node.gpus)
+    plan, _ = await self.bus.heartbeat(self.node.id, self.node.boot_id, NodeStatus(self.node.gpus))
     a = next(x for x in plan if run_id in x.runs)
     [first] = self.bus.take(self.node.id, self.node.boot_id, a.worker)
     self.assertEqual(first.cmd.request_id, id0)
@@ -608,7 +609,7 @@ class TestAPI(BusTest):
     self.node.control = self.bus
 
     # Reconnecting from the same node redelivers fb0 verbatim, and draining runs both fb0 and fb1 from Store.
-    await self.bus.heartbeat(self.node.id, self.node.boot_id, self.node.gpus)
+    await self.bus.heartbeat(self.node.id, self.node.boot_id, NodeStatus(self.node.gpus))
     [redelivered] = self.bus.take(self.node.id, self.node.boot_id, a.worker)
     self.assertEqual(redelivered, first)
     await self.node.drain(run_id)
@@ -616,6 +617,33 @@ class TestAPI(BusTest):
       reply = await self.bus.wait_for_reply(req_id, 1)
       self.assertTrue(reply.ok, reply.body)
       self.assertIn("loss:sum", pb.ForwardBackwardOutput.FromString(reply.body).metrics)
+
+  async def test_join_sampler_info_weights_info_and_asample_validation(self):
+    created = await self.post(
+      "create_model", json={"base_model": "tiny", "session_id": None, "lora_config": {"rank": 4}}
+    )
+    run_id = (await self.result(created)).json()["model_id"]
+    save_res = await self.post("save_weights_for_sampler", json={"model_id": run_id, "sampling_session_seq_id": 0})
+    saved = (await self.result(save_res)).json()
+    sid, path = saved["sampling_session_id"], saved["path"]
+
+    info = (await self.http.get(f"/api/v1/samplers/{sid}")).json()
+    self.assertEqual(info, {"sampler_id": sid, "base_model": "tiny", "model_path": path})
+    self.assertEqual(
+      (await self.post("join_sampling_session", json={"sampling_session_id": sid})).json()["client_counter"], 1
+    )
+    self.assertEqual(
+      (await self.post("join_sampling_session", json={"sampling_session_id": sid})).json()["client_counter"], 2
+    )
+
+    winfo = await self.post("weights_info", json={"tinker_path": path})
+    self.assertEqual(winfo.status_code, 200)
+    self.assertEqual(winfo.json()["base_model"], "tiny")
+
+    bad = await self.post(
+      "asample", json={"base_model": "tiny", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "target_prompt_logprobs": True}
+    )
+    self.assertEqual(bad.status_code, 400)
 
 
 if __name__ == "__main__":

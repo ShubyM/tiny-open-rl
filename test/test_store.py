@@ -10,7 +10,7 @@ import torch
 
 from test.helpers import BusTest, new_id
 from tinyrl.storage.store import SHARD_BYTES, Store
-from tinyrl.types import Op, Reply, Run
+from tinyrl.types import Effect, FencedError, NodeStatus, Op, Reply, Run, Saved
 
 
 class TestStore(unittest.TestCase):
@@ -248,7 +248,7 @@ class TestRegistry(BusTest):
     uri = f"tinker://{run}/sampler_weights/session"
     self.seed_checkpoint(uri, 1, ttl=60, owned=True)
     self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
-    [a], _ = await self.bus.heartbeat("n1", "b1", 1)
+    [a], _ = await self.bus.heartbeat("n1", "b1", NodeStatus(1))
     [w] = self.bus.take("n1", "b1", a.worker)
     for _ in range(20):
       self.bus.set_checkpoint_ttl(uri, 600)
@@ -257,7 +257,6 @@ class TestRegistry(BusTest):
     self.assertIsNone(self.bus.get_checkpoint(uri))
 
   async def test_stale_writer_cannot_replace_published_bytes_on_disk_or_in_bucket(self):
-    from tinyrl.types import FencedError
 
     def sweep(store: Store, grace: float) -> None:
       unused = store.versions()
@@ -271,26 +270,25 @@ class TestRegistry(BusTest):
         uri = f"tinker://{run}/weights/final"
         self.bus.create_run(Run(run, "base", 4))
         self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        [a1], _ = await self.bus.heartbeat("n1", b1, 1)
+        [a1], _ = await self.bus.heartbeat("n1", b1, NodeStatus(1))
         [w1] = self.bus.take("n1", b1, a1.worker)
         abandoned = w1.version
         self.bus.nodes["n1"]["until"] = 0.0
         self.bus.maintain()
 
         self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        [a2], _ = await self.bus.heartbeat("n2", b2, 1)
+        [a2], _ = await self.bus.heartbeat("n2", b2, NodeStatus(1))
         [w2] = self.bus.take("n2", b2, a2.worker)
         version = w2.version
         winner = new.put({"w": torch.ones(2)}, version=version)
         sweep(new, grace=0)  # protected even before the reply publishes it
-        good = {"uri": uri, "size": 8, "version": winner}
         reply = Reply(True, "application/json", b"{}")
-        self.bus.finish("n2", b2, a2.worker, w2.cmd.request_id, reply, saved=good)
+        self.bus.finish("n2", b2, a2.worker, w2.cmd.request_id, reply, effect=Effect(saved=Saved(uri, winner, 8)))
         new.upload_pending_saves()
         late = old.put({"w": torch.zeros(2)}, version=abandoned)
         old.upload_pending_saves()
         with self.assertRaises(FencedError):
-          self.bus.finish("n1", b1, a1.worker, w1.cmd.request_id, reply, saved=good | {"version": late})
+          self.bus.finish("n1", b1, a1.worker, w1.cmd.request_id, reply, effect=Effect(saved=Saved(uri, late, 8)))
         reader = Store(root, cache=tempfile.mkdtemp())
         published = self.bus.checkpoint_version(uri)
         self.assertEqual(published, winner)

@@ -7,6 +7,7 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from tinyrl.control.ledger import Ledger, make_checkpoint
+from tinyrl.types import Saved
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -60,7 +61,7 @@ class BusTest(unittest.IsolatedAsyncioTestCase):
   def seed_checkpoint(self, uri, size, *, ttl=None, owned=False, version=None, meta=None):
     with self.bus.db:
       self.bus.checkpoints[uri] = make_checkpoint(
-        uri, size, version=version or uuid.uuid4().hex, ttl=ttl, owned=owned, meta=meta
+        Saved(uri, version or uuid.uuid4().hex, size, ttl=ttl, owned=bool(owned), meta=meta or {})
       )
 
   async def asyncSetUp(self):

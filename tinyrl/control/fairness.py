@@ -75,10 +75,11 @@ def admit_samples(heads, queued, account, ready_lag, service, ver_of, active_acc
   target = account(ranked[0])
   if active_acct and target != active_acct:
     return []
-  vers, runs = set(active_vers), deque()
+  vers, runs = {v for v in active_vers if v is not None}, deque()
   for r in ranked:
-    if account(r) == target and ((v := ver_of(r)) in vers or len(vers) < max_loras):
-      vers.add(v)
+    if account(r) == target and ((v := ver_of(r)) is None or v in vers or len(vers) < max_loras):
+      if v is not None:
+        vers.add(v)
       if q := deque(queued(r, slots)):
         runs.append(q)
   out = []

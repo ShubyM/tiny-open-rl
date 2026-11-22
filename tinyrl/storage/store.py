@@ -315,21 +315,23 @@ class Store:
     paths = self.weight_files(version)
     return {k: v for shard in parallel(load_file, paths) for k, v in shard.items()}, header(paths[0])
 
-  def _stability_dir(self) -> Path:
-    return Path(self.cache if self.remote else self.base, "stability")
+  def stability_path(self, request_id: str) -> tuple[str, Path]:
+    key = hashlib.sha256(request_id.encode()).hexdigest()[:32]
+    return key, Path(self.cache if self.remote else self.base, "stability", key)
 
   def put_stability(self, request_id: str, blobs: dict[str, bytes]) -> None:
-    key, data = hashlib.sha256(request_id.encode()).hexdigest()[:32], msgspec.msgpack.encode(blobs)
-    (d := self._stability_dir()).mkdir(parents=True, exist_ok=True)
-    (tmp := d / f"{key}.{uuid.uuid4().hex[:8]}.tmp").write_bytes(data)
-    tmp.replace(d / key)
+    key, path = self.stability_path(request_id)
+    data = msgspec.msgpack.encode(blobs)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    (tmp := path.parent / f"{key}.{uuid.uuid4().hex[:8]}.tmp").write_bytes(data)
+    tmp.replace(path)
     if self.remote:
       self.fs.pipe_file(f"{self.base}/stability/{key}", data)
 
   def get_stability(self, request_id: str) -> dict[str, bytes]:
-    key = hashlib.sha256(request_id.encode()).hexdigest()[:32]
-    if (local := self._stability_dir() / key).is_file():
-      return msgspec.msgpack.decode(local.read_bytes())
+    key, path = self.stability_path(request_id)
+    if path.is_file():
+      return msgspec.msgpack.decode(path.read_bytes())
     raw = self.fs.cat_file(r) if self.remote and self.fs.exists(r := f"{self.base}/stability/{key}") else None
     return msgspec.msgpack.decode(raw) if raw else {}
 
@@ -349,20 +351,27 @@ class Store:
         with contextlib.suppress(FileNotFoundError):
           self.fs.rm(path, recursive=True)
         if self.remote:
-          for suffix in (".upload", ".uploaded"):
-            Path(self.cache, version + suffix).unlink(missing_ok=True)
+          Path(self.cache, f"{version}.upload").unlink(missing_ok=True)
           for suffix in ("", ".writing"):
             shutil.rmtree(Path(self.cache, version + suffix), ignore_errors=True)
         else:
           shutil.rmtree(path + ".writing", ignore_errors=True)
-    if (stab := self._stability_dir()).is_dir():
-      for e in os.scandir(stab):
-        if e.stat().st_mtime <= time.time() - STABILITY_TTL:
-          Path(e.path).unlink(missing_ok=True)
+    if self.remote:
+      cutoff = time.time() - STABILITY_TTL
+      for p in self.fs.glob(f"{self.base}/stability/*"):
+        with contextlib.suppress(Exception):
+          if float(self.fs.modified(p).timestamp()) <= cutoff:
+            self.fs.rm(p)
     self.trim_cache()
 
   def trim_cache(self) -> None:
-    """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the bucket has: a version still uploading stays."""
+    """Prune expired stability blobs and evict oldest uploaded checkpoints in CKPT_CACHE until under CKPT_CACHE_BYTES."""
+    if os.path.isdir(stab := os.path.join(self.cache if self.remote else self.base, "stability")):
+      cutoff = time.time() - STABILITY_TTL
+      for e in os.scandir(stab):
+        with contextlib.suppress(FileNotFoundError):
+          if e.stat().st_mtime <= cutoff:
+            Path(e.path).unlink(missing_ok=True)
     if not os.path.isdir(self.cache):
       return
     limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2

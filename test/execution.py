@@ -58,7 +58,7 @@ class TestNode(NodeDaemon):
     return await self.step_once(wait_ms=0)
 
   def tasks(self) -> list[asyncio.Task]:
-    return [t for w in self.workers.values() for t in (*(tk for _, tk in w.running.values()), w.op_task) if t]
+    return [t for w in self.workers.values() for t in (*w.running.values(), w.op_task) if t]
 
   async def bind(self, proc: str, *runs: str):
     """Pin `proc` hosting `runs` onto this node in the controller's plan and announce this node."""
