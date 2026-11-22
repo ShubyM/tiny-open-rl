@@ -49,13 +49,15 @@ The controller owns durable facts and cluster placement; each node daemon owns l
 
 ## Code layout
 
-`tinyrl/` is kept small (`python sz.py` counts token-bearing lines; CI caps it at 3,400). Start with [ledger.py](tinyrl/control/ledger.py) and [node_daemon.py](tinyrl/control/node_daemon.py).
+`tinyrl/` is kept small (`python sz.py` counts token-bearing lines). Start with [ledger.py](tinyrl/control/ledger.py) and [node_daemon.py](tinyrl/control/node_daemon.py).
 
 | File | Responsibility |
 |---|---|
-| [tinyrl/control/ledger.py](tinyrl/control/ledger.py) | Sessions, runs, checkpoints, durable trainer queue, and `heartbeat`/`take`/`finish`/`detach` |
-| [tinyrl/control/db.py](tinyrl/control/db.py) | SQLite WAL store, write-through tables, and request/reply blobs |
+| [tinyrl/control/ledger.py](tinyrl/control/ledger.py) | Sessions, runs, checkpoints, placement loop, and `heartbeat`/`take`/`finish`/`detach` |
+| [tinyrl/control/trains.py](tinyrl/control/trains.py) | Durable SQLite FIFO training queues, replies, and `seq_id` deduplication |
 | [tinyrl/control/samples.py](tinyrl/control/samples.py) | In-memory sampling queues and bounded LRU reply cache (`429`/`410`) |
+| [tinyrl/control/nodes.py](tinyrl/control/nodes.py) | Live-node registry, lease expiry, and durable `boot_id` fencing |
+| [tinyrl/control/db.py](tinyrl/control/db.py) | SQLite WAL store, rollback-safe write-through tables, and request/reply blobs |
 | [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | Pure cluster placement (`run -> proc -> node`) and account lag updates |
 | [tinyrl/control/fairness.py](tinyrl/control/fairness.py) | Account waterfilling, run/sample selection, and local GPU block planning |
 | [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | Monotonic GPU-time accounting across overlapping calls |

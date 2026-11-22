@@ -23,13 +23,13 @@ from pydantic import BaseModel
 from tinyrl.api import wire
 from tinyrl.control import estimator
 from tinyrl.control.ledger import COUNTERS, TICK_MS, Ledger
-from tinyrl.control.samples import BackpressureError, PromiseGoneError
+from tinyrl.control.samples import QueueFullError, RequestGoneError
 from tinyrl.helpers import getenv
 from tinyrl.types import FencedError, Op, Role, Run, parse_uri
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply; the SDK gives up after 45s
 CKPT_TTL = getenv("CKPT_TTL", 0)  # default TTL for unowned saves (>= 3600s; 0 keeps until deleted)
-ERRORS = {ValueError: 400, FencedError: 409, PromiseGoneError: 410, BackpressureError: 429}
+ERRORS = {ValueError: 400, FencedError: 409, RequestGoneError: 410, QueueFullError: 429}
 
 
 # ***** request models *****
@@ -205,8 +205,8 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
   async def scheduling():
     nodes, state = ledger.live_nodes(details=True), dataclasses.asdict(ledger.state())
     for proc, placed in state["procs"].items():
-      beat = nodes.get(placed["node"], {})
-      placed |= {dst: beat[src][proc] for src, dst in (("pids", "pid"), ("on", "gpus")) if proc in beat.get(src, {})}
+      info = nodes.get(placed["node"], {})
+      placed |= {dst: info[src][proc] for src, dst in (("pids", "pid"), ("on", "gpus")) if proc in info.get(src, {})}
     return {"nodes": {n: v["gpus"] for n, v in nodes.items()}, "state": state}
 
   api.get("/api/v1/healthz")(lambda: {"status": "ok"})

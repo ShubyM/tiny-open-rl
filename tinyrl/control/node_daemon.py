@@ -50,7 +50,7 @@ class WorkerHandle:
     self.wave, self.loads, self.lock, self.broken = Wave(spec.gpus), {}, asyncio.Lock(), False
 
   @property
-  def roam(self) -> bool:
+  def movable(self) -> bool:
     return self.spec.role == Role.TRAINER and self.spec.gpus == 1 and self.spec.lora
 
   def exited(self) -> bool:
@@ -80,7 +80,7 @@ class WorkerHandle:
       t0, prev = time.monotonic(), self.park_s
       await self.model.resume(gpus)
       now = time.monotonic()
-      self.resident, self.bound = gpus, (self.bound or (() if self.roam else gpus))
+      self.resident, self.bound = gpus, (self.bound or (() if self.movable else gpus))
       sw = (prev + (now - t0)) / max(0.01, SWITCH_BUDGET) if prev else 0.0
       self.hold_until = now + min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, sw))
 
@@ -95,12 +95,12 @@ class WorkerHandle:
   async def detach_run(self, run: str, *, keep_proc: bool = True) -> str | None:
     async with self.lock:
       live = run in self.loaded and not self.exited()
-      snap = await self.model.call("save_run", run, uuid.uuid4().hex) if live and run in self.dirty else None
+      snapshot = await self.model.call("save_run", run, uuid.uuid4().hex) if live and run in self.dirty else None
       if live and keep_proc:
         await self.model.call("drop_run", run)
       for s in (self.loaded, self.dirty, self.open_grad):
         s.discard(run)
-      return snap
+      return snapshot
 
   async def close(self) -> None:
     while True:
@@ -157,7 +157,9 @@ class WorkerHandle:
           eff = Effect()
         else:
           async with self.lock:
-            rep, eff = await self.wave.run(self.model.call("execute", cmd, work.run, work.snap, work.version), charge)
+            rep, eff = await self.wave.run(
+              self.model.call("execute", cmd, work.run, work.snapshot, work.version), charge
+            )
             (self.loaded.add if eff.loaded else self.loaded.discard)(cmd.run)
             self.dirty.add(cmd.run) if eff.mutated else (self.dirty.discard(cmd.run) if not eff.loaded else None)
             (self.open_grad.add if eff.open_grad else self.open_grad.discard)(cmd.run)
@@ -209,11 +211,11 @@ class NodeDaemon:
       env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
       return WorkerHandle(wid, spec, self.open_sampler(wid, spec, env), bound=gpus)
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    roam = spec.gpus == 1 and spec.lora
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(self.gpus) if roam else gpus))
-    return WorkerHandle(wid, spec, self.open_trainer(wid, spec.gpus, env), bound=() if roam else gpus)
+    movable = spec.gpus == 1 and spec.lora
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(self.gpus) if movable else gpus))
+    return WorkerHandle(wid, spec, self.open_trainer(wid, spec.gpus, env), bound=() if movable else gpus)
 
-  def bg(self, coro) -> asyncio.Task:
+  def start_task(self, coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     task.add_done_callback(lambda _: self.notify())
     return task
@@ -251,7 +253,7 @@ class NodeDaemon:
       elif kind == "detach":
         await self.call("detach", w.id, run, await w.detach_run(run), retry=True)
       else:
-        if kind == "evict":
+        if kind == "stop":
           for r in sorted(list(w.loaded)):
             await self.call("detach", w.id, r, await w.detach_run(r, keep_proc=False), retry=True)
         await w.close()
@@ -260,8 +262,8 @@ class NodeDaemon:
     except FencedError:
       self.fenced = True
     except Exception:
-      if kind != "drop":
-        await self.run_op(w, "drop")
+      if kind != "close":
+        await self.run_op(w, "close")
     finally:
       w.op_task = None
 
@@ -274,19 +276,21 @@ class NodeDaemon:
       finally:
         self.staging.pop(ver, None)
 
-    self.staging[ver] = self.bg(fetch())
+    self.staging[ver] = self.start_task(fetch())
 
-  def worker_demand(self, a: Assignment, w: WorkerHandle | None, now: float, linger: list[float]) -> Worker:
+  def worker_demand(self, a: Assignment, w: WorkerHandle | None, now: float, grace_ends: list[float]) -> Worker:
     cur, active = ((w.resident or w.target_gpus) if w else ()), bool(w and w.running)
     if a.spec.role == Role.SAMPLER:
       demand = Demand.READY if (active or a.ready or any(v in self.staged for v in a.versions)) else Demand.IDLE
       hold = w.hold_until if w else 0.0
     else:
       grace = (w.idle_since + CYCLE_GRACE_MS / 1000) if (w and w.resident) else 0.0
-      if ling := grace > now:
-        linger.append(grace)
-      step = active or bool(w and (w.open_grad & set(a.closing))) or (ling and not a.ready and bool(w and w.open_grad))
-      demand = Demand.FINISH_STEP if step else (Demand.READY if (a.ready or ling) else Demand.IDLE)
+      if in_grace := grace > now:
+        grace_ends.append(grace)
+      step = (
+        active or bool(w and (w.open_grad & set(a.closing))) or (in_grace and not a.ready and bool(w and w.open_grad))
+      )
+      demand = Demand.FINISH_STEP if step else (Demand.READY if (a.ready or in_grace) else Demand.IDLE)
       hold = float("inf") if active else (w.hold_until if w else 0.0)
     gpu_ms, gang = (w.gpu_ms if w else 0.0), a.spec.role == Role.TRAINER and a.spec.gpus > 1
     lag = a.lag if (a.ready or a.versions or active) else -gpu_ms
@@ -302,33 +306,33 @@ class NodeDaemon:
       if w.running or w.op_task:
         continue
       if w.broken or w.exited():
-        w.op_task = self.bg(self.run_op(w, "drop"))
+        w.op_task = self.start_task(self.run_op(w, "close"))
         continue
       blocked = not w.resident and bool(w.bound) and bool(excl & set(w.bound))
       rebind = blocked and w.spec.role == Role.TRAINER and wid in desired and desired[wid].ready
       rebind = rebind and any(excl.isdisjoint(b) for b in blocks(self.gpus, w.spec.gpus))
       if wid not in desired or (blocked and w.spec.role == Role.SAMPLER) or rebind:
-        w.op_task = self.bg(self.run_op(w, "evict"))
+        w.op_task = self.start_task(self.run_op(w, "stop"))
       elif w.spec.role == Role.TRAINER and (extra := sorted(w.loaded - set(desired[wid].runs))):
-        w.op_task = self.bg(self.run_op(w, "detach", extra[0]))
+        w.op_task = self.start_task(self.run_op(w, "detach", extra[0]))
     if self.draining:
       self.next_wake = None
       return
 
-    cands, linger = {}, []
+    candidates, grace_ends = {}, []
     for wid, a in sorted(desired.items()):
       for v in set(a.versions) - self.staged.keys() - self.stage_errors.keys() - self.staging.keys():
         self.stage(v)
       if not ((w := self.workers.get(wid)) and (w.broken or w.op_task)):
-        cands[wid] = self.worker_demand(a, w, now, linger)
+        candidates[wid] = self.worker_demand(a, w, now, grace_ends)
     occupied = {
-      g for k, w in self.workers.items() if k not in cands or w.running for g in (w.resident or w.target_gpus)
+      g for k, w in self.workers.items() if k not in candidates or w.running for g in (w.resident or w.target_gpus)
     }
-    keep, wake_at = plan_gpus(cands, self.gpus, now, occupied)
-    self.next_wake = min((d for d in (wake_at, *linger) if d is not None and d > now), default=None)
+    keep, wake_at = plan_gpus(candidates, self.gpus, now, occupied)
+    self.next_wake = min((d for d in (wake_at, *grace_ends) if d is not None and d > now), default=None)
     for wid, w in list(self.workers.items()):
       if w.resident and not w.running and not w.op_task and keep.get(wid) != w.resident:
-        w.op_task = self.bg(self.run_op(w, "park"))
+        w.op_task = self.start_task(self.run_op(w, "park"))
 
     for wid, a in sorted(desired.items()):
       gpus, w = keep.get(wid, ()), self.workers.get(wid)
@@ -357,7 +361,7 @@ class NodeDaemon:
       for item in items:
         if item.cmd.request_id not in w.running:
           w.target_gpus, w.hold_until = gpus, (w.hold_until if w.resident else time.monotonic() + QUANTUM_MS / 1000)
-          w.running[item.cmd.request_id] = self.bg(self.run_work(w, item, gpus, self.staged.get(item.version)))
+          w.running[item.cmd.request_id] = self.start_task(self.run_work(w, item, gpus, self.staged.get(item.version)))
 
   async def step_once(self, wait_ms: int = 0) -> bool:
     if self.fenced or (not self.draining and time.monotonic() - self.last_ok >= LEASE_MS / 1000):

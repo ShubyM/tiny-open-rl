@@ -397,7 +397,7 @@ class TestNodeDaemon(BusTest):
     await self.create(run, "tiny", node)
     old_boot = node.boot_id
     child = node.workers["worker"].model
-    self.bus.reap_node(node.id, old_boot)
+    self.bus.expire_node(node.id, old_boot)
     ok = await node.step_once(wait_ms=0)
     self.assertFalse(ok)
     self.assertTrue(child.closed)

@@ -204,7 +204,7 @@ class Stress(BusTest):
     self.loops.pop(name).cancel()
     await node.close()
     if n := self.bus.nodes.get(name):
-      self.bus.reap_node(name, n["boot_id"])
+      self.bus.expire_node(name, n["boot_id"])
     await node.control.aclose()
 
   async def cut_node(self, name: str) -> None:
@@ -426,7 +426,7 @@ class Stress(BusTest):
       mock.patch("tinyrl.control.scheduler.REBALANCE_MS", 1000),
     ]
     if CHAOS:  # so that a node cut off from the controller is given up on in seconds
-      patches += [mock.patch(f"tinyrl.control.{m}.LEASE_MS", 3000) for m in ("ledger", "node_daemon")]
+      patches += [mock.patch(f"tinyrl.control.{m}.LEASE_MS", 3000) for m in ("nodes", "node_daemon")]
     for p in patches:
       p.start()
       self.addCleanup(p.stop)
@@ -470,8 +470,8 @@ class Stress(BusTest):
         f"did not settle after deleting every run: procs {sorted(self.bus.plan_state.procs)} workers {workers}"
       )
     left = {
-      "queues": sorted([*self.bus.train_q, *self.bus.samples.queues]),
-      "writing": sorted(c["version"] for c in self.bus.cmds.values() if c.get("version")),
+      "queues": sorted([*self.bus.trains.queues, *self.bus.samples.queues]),
+      "writing": sorted(self.bus.trains.versions()),
       "owners": [r for r in trainers if (row := self.bus.runs.get(r)) and row.owner],
       "on GPUs": {n.id: dict(n.occ.on) for n in self.nodes.values() if n.occ.on},
     }

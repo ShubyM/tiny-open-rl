@@ -9,7 +9,7 @@ from test.helpers import BusTest, new_id, serve_control
 from tinyrl.control.accounting import Charge
 from tinyrl.control.ledger import Ledger
 from tinyrl.control.node_daemon import ControlClient
-from tinyrl.control.samples import BackpressureError, PromiseGoneError
+from tinyrl.control.samples import QueueFullError, RequestGoneError
 from tinyrl.types import Effect, Ev, FencedError, NodeStatus, Op, Reply, Role, Run, RunStatus, Saved
 
 
@@ -106,7 +106,7 @@ class TestLedger(BusTest):
     self.bus.delete_run(run_id)
     self.assertIsNone(self.bus.submit_command(run_id, Op.OPTIM_STEP, b""))
     self.assertEqual(self.bus.queued_and_in_flight(run_id), {"live": False})
-    self.assertNotIn(run_id, self.bus.train_q)
+    self.assertNotIn(run_id, self.bus.trains.queues)
 
   async def test_delete_removes_owned_checkpoints_and_keeps_saved_weights(self):
     run = self.new_run()
@@ -117,8 +117,8 @@ class TestLedger(BusTest):
     wid, _ = await self.take_one()
     self.bus.finish("n1", "b1", wid, request, ok())
     self.assertEqual(await self.bus.wait_for_reply(request, 5), ok())
-    self.assertNotIn(run, self.bus.train_q)
-    self.assertIsNone(self.bus.get_run(run).get("snap"))
+    self.assertNotIn(run, self.bus.trains.queues)
+    self.assertIsNone(self.bus.get_run(run).get("snapshot"))
     self.assertIsNone(self.bus.get_run(run).get("owner"))
     self.assertNotIn(run, self.bus.state().jobs)
     self.assertIsNone(self.bus.get_checkpoint(owned))
@@ -158,12 +158,12 @@ class TestLedger(BusTest):
   async def test_expired_dedupe_keys_are_swept_less_often_than_the_tick(self):
     self.bus.maintain()
     with self.bus.db:
-      self.bus.seen["run:1"] = ["run/1-1", 0.0]
+      self.bus.trains.seen["run:1"] = ["run/1-1", 0.0]
     self.bus.maintain()
-    self.assertIn("run:1", self.bus.seen)
+    self.assertIn("run:1", self.bus.trains.seen)
     self.bus.gc_due = 0.0
     self.bus.maintain()
-    self.assertNotIn("run:1", self.bus.seen)
+    self.assertNotIn("run:1", self.bus.trains.seen)
 
   async def test_state_prunes_deleted_runs_and_late_finish_is_ignored(self):
     run_id = self.new_run()
@@ -219,10 +219,10 @@ class TestLedger(BusTest):
     plan, _ = await self.bus.heartbeat("n1", "b1", NodeStatus(1, draining=True, live_workers=(w1,)))
     self.assertEqual(plan, [])
     snap_ver = "a" * 32
-    self.assertTrue(self.bus.detach("n1", "b1", w1, run_id, snap=snap_ver))
+    self.assertTrue(self.bus.detach("n1", "b1", w1, run_id, snapshot=snap_ver))
     info = self.bus.get_run(run_id)
     self.assertIsNone(info.get("owner"))
-    self.assertEqual(info["snap"], snap_ver)
+    self.assertEqual(info["snapshot"], snap_ver)
     self.assertEqual(info["status"], RunStatus.SAVED)
     self.assertIn(snap_ver, self.bus.live_versions())
     self.assertEqual(self.bus.list_checkpoints(run_id), [])  # parked snapshots stay out of user checkpoints
@@ -230,15 +230,15 @@ class TestLedger(BusTest):
     # Read-only SAVE_WEIGHTS on n2 keeps parked snap; mutating OPTIM_STEP clears it.
     req2 = self.bus.submit_command(run_id, Op.SAVE_WEIGHTS, b"{}")
     w2, ro = await self.take_one("n2", "b2", 1)
-    self.assertEqual(ro.snap, snap_ver)
+    self.assertEqual(ro.snapshot, snap_ver)
     self.bus.finish("n2", "b2", w2, req2, ok(), effect=Effect(mutated=False))
     self.assertIn(snap_ver, self.bus.live_versions())
 
     req3 = self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
     [mut] = self.bus.take("n2", "b2", w2)
-    self.assertEqual(mut.snap, snap_ver)
+    self.assertEqual(mut.snapshot, snap_ver)
     self.bus.finish("n2", "b2", w2, req3, ok(), effect=Effect(mutated=True))
-    self.assertIsNone(self.bus.get_run(run_id).get("snap"))
+    self.assertIsNone(self.bus.get_run(run_id).get("snapshot"))
     self.assertNotIn(snap_ver, self.bus.live_versions())
 
   async def test_competing_sampler_replicas_answer_and_charge_exactly_once(self):
@@ -260,7 +260,7 @@ class TestLedger(BusTest):
 
     self.bus.samples.replies.pop(req, None)
     self.assertFalse(self.bus.finish("n1", "b1", wid, req, ok(late=True), Charge(busy_ms=100, gpu_ms=100)))
-    with self.assertRaises(PromiseGoneError):
+    with self.assertRaises(RequestGoneError):
       await self.bus.wait_for_reply(req, 0)
     self.assertEqual(self.bus.get_run(sid), run)
     self.assertEqual(self.bus.service["bob"], service)
@@ -269,9 +269,9 @@ class TestLedger(BusTest):
     sid = self.new_run(role=Role.SAMPLER)
     with mock.patch("tinyrl.control.samples.SAMPLE_QUEUE_BYTES", 16):
       self.bus.submit_command(sid, Op.SAMPLE, b"0123456789")
-      with self.assertRaises(BackpressureError):
+      with self.assertRaises(QueueFullError):
         self.bus.submit_command(sid, Op.SAMPLE, b"0123456789")
-    with self.assertRaises(PromiseGoneError):
+    with self.assertRaises(RequestGoneError):
       await self.bus.wait_for_reply("samp-missing/1-1", 0)
 
   async def test_a_sample_in_flight_is_reclaimed_only_from_a_dead_node(self):
@@ -307,7 +307,7 @@ class TestLedger(BusTest):
     self.bus.end_session("s")
     self.assertEqual(self.bus.queued_and_in_flight(run_id)["queued"], 1)
     self.assertTrue(self.bus.sessions["s"]["active"])
-    self.bus.train_q[run_id].clear()
+    self.bus.trains.queues[run_id].clear()
     self.bus.end_session("s")
     self.assertEqual(self.bus.queued_and_in_flight(run_id)["queued"], 1)
     self.bus.delete_run(run_id)
@@ -389,7 +389,7 @@ class TestLedger(BusTest):
       self.bus.finish("n1", "b1", a.worker, reqs[2], big)
       self.assertEqual(await self.bus.wait_for_reply(reqs[0], 0), big)
       self.assertEqual(await self.bus.wait_for_reply(reqs[2], 0), big)
-      with self.assertRaises(PromiseGoneError):
+      with self.assertRaises(RequestGoneError):
         await self.bus.wait_for_reply(reqs[1], 0)
 
 
@@ -403,7 +403,7 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
       plan, _ = await bus.heartbeat("n1", "b1", NodeStatus(2))
       self.assertEqual(sum(len(bus.take("n1", "b1", a.worker)) for a in plan), 2)
       await bus.aclose()
-      with mock.patch("tinyrl.control.ledger.LEASE_MS", 0):
+      with mock.patch("tinyrl.control.nodes.LEASE_MS", 0):
         bus = Ledger(f"{tmp}/tinyrl.db")
       bus.maintain()
       self.assertEqual([e.kind for e in bus.read_events()].count(Ev.NODE_LOST), 1)
@@ -441,7 +441,7 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await bus.wait_for_reply(req, 0), ok(done=1))
         self.assertEqual(bus.get_session("s1")["metadata"], {"sdk": "0.39"})
         self.assertEqual(bus.checkpoint_version("tinker://tr-1/weights/v1"), "ver1")
-        with self.assertRaises(PromiseGoneError):
+        with self.assertRaises(RequestGoneError):
           await bus.wait_for_reply("samp-lost/1-1", 0)
       finally:
         await client.aclose()
@@ -487,7 +487,7 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
         info = bus.get_run(rid)
         self.assertIsNone(info.get("owner"))
         self.assertEqual(info["status"], RunStatus.SAVED)
-        self.assertIsNotNone(info.get("snap"))
+        self.assertIsNotNone(info.get("snapshot"))
       finally:
         await node.aclose()
         await bus.aclose()

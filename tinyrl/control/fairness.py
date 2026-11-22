@@ -120,8 +120,8 @@ def plan_gpus(workers: dict[str, Worker], total: int, now: float, occupied: set[
     w = workers[name]
     return w.exclusive, round(w.lag, 3), round(-w.gpu_ms, 3), bool(w.current), name
 
-  contenders = [name for name, w in workers.items() if name not in keep and w.demand != Demand.IDLE]
-  for name in sorted(contenders, key=priority, reverse=True):
+  candidates = [name for name, w in workers.items() if name not in keep and w.demand != Demand.IDLE]
+  for name in sorted(candidates, key=priority, reverse=True):
     w = workers[name]
     options = [w.bound] if w.bound else blocks(total, w.gpus)
     if free := [b for b in options if taken.isdisjoint(b) and (b == w.current or reserved.isdisjoint(b))]:

@@ -136,7 +136,7 @@ class Assignment:
 class Work:
   cmd: Cmd
   run: dict | None = None
-  snap: str | None = None
+  snapshot: str | None = None
   version: str | None = None
 
 

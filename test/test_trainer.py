@@ -485,19 +485,19 @@ class TestTrainer(BusTest):
       await self.drain_and_evict(f"p-{rank}")  # detaches dirty run to store before releasing owner
       info = self.bus.get_run(run)
       self.assertIsNone(info.get("owner"))
-      parked = info["snap"]
+      parked = info["snapshot"]
       self.assertIn(parked.partition("@")[0], self.bus.live_versions())
       # Clean detach after a rejected command keeps the same snapshot without rewriting or dropping it.
       [invalid] = await self.submit(run, (Op.FORWARD_BACKWARD, b"not protobuf"))
       await self.node.drain(run)
       self.assertFalse((await self.bus.wait_for_reply(invalid, 1)).ok)
-      self.assertEqual((self.bus.get_run(run))["snap"], parked)
+      self.assertEqual((self.bus.get_run(run))["snapshot"], parked)
       for r in (ctrl, run):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
       self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
-      self.assertIsNone((self.bus.get_run(run)).get("snap"))
+      self.assertIsNone((self.bus.get_run(run)).get("snapshot"))
       self.assertNotIn(
         parked.partition("@")[0], self.bus.live_versions()
       )  # recovery cannot replay old state after a crash
@@ -515,7 +515,7 @@ class TestTrainer(BusTest):
     step = (Op.OPTIM_STEP, {"adam_params": {}})
     for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
       await self.drain_and_evict("p")
-      parked = (self.bus.get_run(run))["snap"]
+      parked = (self.bus.get_run(run))["snapshot"]
       [request] = await self.submit(run, command)
       await self.node.drain(run)
       reply = await self.bus.wait_for_reply(request, 1)
@@ -524,7 +524,7 @@ class TestTrainer(BusTest):
         self.assertIn("accumulated gradients were discarded", reply.body.decode())
       info = self.bus.get_run(run)
       self.assertEqual(info["status"], "live")
-      self.assertIsNone(info.get("snap"))
+      self.assertIsNone(info.get("snapshot"))
       self.assertNotIn(parked.partition("@")[0], self.bus.live_versions())
 
     await self.drain_and_evict("p")

@@ -142,7 +142,7 @@ class TestLease(BusTest):
     self.assertEqual(await asyncio.to_thread(proc.wait, 30), 0)
     info = self.bus.get_run(run)
     self.assertIsNone(info.get("owner"))
-    version = info["snap"]
+    version = info["snapshot"]
     tensors, meta = self.store.get(version)
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])

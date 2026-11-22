@@ -110,15 +110,15 @@ def to_plan(s: State) -> dict:
 def choose_node(s: State, proc: str, only_spare: bool = False) -> str | None:
   """Pick a node for `proc`: room for a full-FT sampler pair first, then its trainer's node, then least used."""
   spec = s.procs[proc].spec
-  near = {s.procs[p].node for r in s.runs(proc) if (p := s.home.get(s.jobs[r].train_run or ""))}
+  preferred = {s.procs[p].node for r in s.runs(proc) if (p := s.home.get(s.jobs[r].train_run or ""))}
   sampled = {j.train_run for j in s.jobs.values()}
 
   def rank(node: str) -> tuple:
     unpaired = [n for n, p in s.procs_on(node) if p.spec.role == Role.TRAINER and not p.spec.lora]
-    owed = sum(s.procs[n].spec.gpus for n in unpaired if not (sampled & set(s.runs(n))))
+    reserved = sum(s.procs[n].spec.gpus for n in unpaired if not (sampled & set(s.runs(n))))
     used, capacity = s.used(node), s.nodes[node]
     paired = spec.gpus * (2 if spec.role == Role.TRAINER and not spec.lora else 1)
-    return capacity - used - owed < paired, node not in near, used / capacity
+    return capacity - used - reserved < paired, node not in preferred, used / capacity
 
   return min((n for n in sorted(s.nodes) if s.can_host(n, spec, spare=only_spare)), key=rank, default=None)
 
@@ -172,16 +172,16 @@ def merge_and_split(s: State, out: list) -> None:
       continue
     idle_dup = not s.busy(name) and s.used(p.node) > s.nodes[p.node]
     busy_dup = s.spare(p.node) < 0 and not any(s.spare(n) >= p.spec.gpus for n in s.nodes)
-    twins = [q for q, pr in sorted(s.procs.items()) if q != name and pr.spec == p.spec]
-    if (idle_dup or busy_dup) and twins:
+    others = [q for q, pr in sorted(s.procs.items()) if q != name and pr.spec == p.spec]
+    if (idle_dup or busy_dup) and others:
       for r in s.runs(name):
-        s.home[r] = twins[0]
-        out.append((Ev.ASSIGNED, {"run": r, "proc": twins[0]}))
+        s.home[r] = others[0]
+        out.append((Ev.ASSIGNED, {"run": r, "proc": others[0]}))
       continue
-    while len(busy := [r for r in s.runs(name) if s.jobs[r].backlog > 0]) >= 2 and (spot := choose_node(s, name, True)):
-      s.home[busy[-1]] = q = s.add_proc(p.spec, spot)
+    while len(busy := [r for r in s.runs(name) if s.jobs[r].backlog > 0]) >= 2 and (node := choose_node(s, name, True)):
+      s.home[busy[-1]] = q = s.add_proc(p.spec, node)
       out.append((Ev.ASSIGNED, {"run": busy[-1], "proc": q}))
-      out.append((Ev.PLACED, {"proc": q, "node": spot, "rule": "place.split"}))
+      out.append((Ev.PLACED, {"proc": q, "node": node, "rule": "place.split"}))
 
 
 def size_samplers(s: State, out: list) -> None:
@@ -199,13 +199,13 @@ def size_samplers(s: State, out: list) -> None:
     for name in pool:
       if name not in keep and s.procs.pop(name).node:
         out.append((Ev.UNPLACED, {"proc": name, "rule": "place.scale_in"}))
-    if want > 1 and s.procs[keep[0]].node is None and (spot := choose_node(s, keep[0])):
-      s.procs[keep[0]].node = spot
-      out.append((Ev.PLACED, {"proc": keep[0], "node": spot, "rule": "place.new"}))
+    if want > 1 and s.procs[keep[0]].node is None and (node := choose_node(s, keep[0])):
+      s.procs[keep[0]].node = node
+      out.append((Ev.PLACED, {"proc": keep[0], "node": node, "rule": "place.new"}))
     if s.procs[keep[0]].node:
-      while len(keep) < want and (spot := choose_node(s, keep[0], True)):
-        keep.append(q := s.add_proc(spec, spot))
-        out.append((Ev.PLACED, {"proc": q, "node": spot, "rule": "place.scale_out"}))
+      while len(keep) < want and (node := choose_node(s, keep[0], True)):
+        keep.append(q := s.add_proc(spec, node))
+        out.append((Ev.PLACED, {"proc": q, "node": node, "rule": "place.scale_out"}))
 
 
 def collect_and_place(s: State, out: list) -> None:
@@ -214,9 +214,9 @@ def collect_and_place(s: State, out: list) -> None:
     if s.procs.pop(name).node:
       out.append((Ev.UNPLACED, {"proc": name, "rule": "place.emptied"}))
   for name in sorted(n for n, p in s.procs.items() if p.node is None):
-    if spot := choose_node(s, name):
-      s.procs[name].node = spot
-      out.append((Ev.PLACED, {"proc": name, "node": spot, "rule": "place.new"}))
+    if node := choose_node(s, name):
+      s.procs[name].node = node
+      out.append((Ev.PLACED, {"proc": name, "node": node, "rule": "place.new"}))
 
 
 def rebalance(s: State, out: list) -> None:

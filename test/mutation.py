@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = "tinyrl/control/scheduler.py"
 LEDGER = "tinyrl/control/ledger.py"
+NODES = "tinyrl/control/nodes.py"
 SAMPLES = "tinyrl/control/samples.py"
 FAIRNESS = "tinyrl/control/fairness.py"
 ACCOUNTING = "tinyrl/control/accounting.py"
@@ -31,7 +32,7 @@ CASES = [
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
   (LEDGER, "bill", "if charge and charge.gpu_ms", "if reply.ok and charge and charge.gpu_ms", BILLING),
-  (LEDGER, "fence", "if boot_id in self.reaped_boots", "if False", CLAIM),
+  (NODES, "fence", "if boot_id in self.expired_boots", "if False", CLAIM),
   (SAMPLES, "complete", "entry.owner != owner", "False", DEDUP),
   (LEDGER, "finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
 ]

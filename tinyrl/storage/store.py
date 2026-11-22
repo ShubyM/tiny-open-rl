@@ -1,4 +1,4 @@
-"""Immutable safetensors checkpoints. The Bus binds each logical name to a version after the trainer commits.
+"""Immutable safetensors checkpoints. The Ledger binds each logical name to a version after the trainer commits.
 
 Local saves rename a completed directory into objects/<id>. Bucket saves stage the same files in the node cache,
 serve them to peers, and upload a per-version manifest last so readers see only complete versions.
@@ -365,7 +365,7 @@ class Store:
     self.trim_cache()
 
   def trim_cache(self) -> None:
-    """Prune expired stability blobs and evict oldest uploaded checkpoints in CKPT_CACHE until under CKPT_CACHE_BYTES."""
+    """Prune expired stability blobs and remove oldest uploaded checkpoints in CKPT_CACHE until under CKPT_CACHE_BYTES."""
     if os.path.isdir(stab := os.path.join(self.cache if self.remote else self.base, "stability")):
       cutoff = time.time() - STABILITY_TTL
       for e in os.scandir(stab):

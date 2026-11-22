@@ -300,7 +300,7 @@ class TestRegistry(BusTest):
         self.bus.delete_checkpoint(uri)
         sweep(reader, grace=0)
         self.assertEqual(reader.versions(), set())
-        self.bus.reap_node("n2", b2)
+        self.bus.expire_node("n2", b2)
 
   async def test_sweep_removes_only_unregistered_staged_uploads(self):
     store = Store(f"memory://tinyrl-test/{uuid.uuid4()}", cache=tempfile.mkdtemp())

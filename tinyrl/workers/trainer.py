@@ -65,7 +65,7 @@ class Trainer:
 
   @span("trainer.execute")
   def execute(
-    self, cmd: Cmd, run: dict | None = None, snap: str | None = None, version: str | None = None
+    self, cmd: Cmd, run: dict | None = None, snapshot: str | None = None, version: str | None = None
   ) -> tuple[Reply, Effect]:
     reply, saved, created, revision = None, None, False, None
     try:
@@ -73,14 +73,14 @@ class Trainer:
         if cmd.op == Op.DELETE_MODEL:
           reply = ok({"type": cmd.op, "model_id": cmd.run})
           return reply, Effect()
-        if not snap and cmd.op != Op.LOAD_WEIGHTS:
+        if not snapshot and cmd.op != Op.LOAD_WEIGHTS:
           raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
         if run is None:
           raise KeyError(f"no training run {cmd.run}")
         self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
         created = True
-        if snap and cmd.op != Op.LOAD_WEIGHTS:
-          self.load_run(cmd.run, snap, optimizer=True, gradients=True)
+        if snapshot and cmd.op != Op.LOAD_WEIGHTS:
+          self.load_run(cmd.run, snapshot, optimizer=True, gradients=True)
           created = False  # recovery succeeded, even if the command that follows is rejected
 
       revision = self.model.state_revision  # restoring the parked state itself leaves its snapshot valid

@@ -13,11 +13,11 @@ SAMPLE_QUEUE_BYTES = getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20)
 SAMPLE_REPLY_BYTES = getenv("SAMPLE_REPLY_BYTES", 256 * 2**20)
 
 
-class PromiseGoneError(LookupError):
-  """Raised when a stateless sampling promise no longer exists in RAM (maps to HTTP 410)."""
+class RequestGoneError(LookupError):
+  """Raised when a sampling request is no longer in memory (maps to HTTP 410)."""
 
 
-class BackpressureError(RuntimeError):
+class QueueFullError(RuntimeError):
   """Raised when in-memory sampling queues hit SAMPLE_QUEUE_BYTES (maps to HTTP 429)."""
 
 
@@ -57,7 +57,7 @@ class SampleQueue:
 
   def submit(self, cmd: Cmd, seq_id: int | None, session_ttl: float) -> None:
     if self.queued_bytes + len(cmd.body) > SAMPLE_QUEUE_BYTES:
-      raise BackpressureError("sampling queue memory limit reached")
+      raise QueueFullError("sampling queue memory limit reached")
     self.queues.setdefault(cmd.run, {})[cmd.entry_id] = self.by_id[cmd.request_id] = Entry(cmd)
     self.queued_bytes += len(cmd.body)
     if seq_id is not None:
@@ -70,7 +70,7 @@ class SampleQueue:
         return hit[0]
       self.reply_bytes -= len(self.replies.pop(req_id)[0].body)
     if req_id not in self.by_id:
-      raise PromiseGoneError(f"sampling promise gone: {req_id}")
+      raise RequestGoneError(f"sampling request not found: {req_id}")
     return None
 
   def queued(self, run_id: str, limit: int | None = None):
@@ -88,11 +88,11 @@ class SampleQueue:
     self.queued_bytes, self.reply_bytes = self.queued_bytes - len(entry.cmd.body), self.reply_bytes + len(reply.body)
     self.replies[req_id] = (reply, time.time() + ttl, False)
     while self.reply_bytes > SAMPLE_REPLY_BYTES and len(self.replies) > 1:
-      victim = next((k for k, (r, _, rd) in self.replies.items() if rd and r.body), None)
-      victim = victim or next((k for k, (r, _, _) in self.replies.items() if k != req_id and r.body), None)
-      if victim is None:
+      oldest = next((k for k, (r, _, read) in self.replies.items() if read and r.body), None)
+      oldest = oldest or next((k for k, (r, _, _) in self.replies.items() if k != req_id and r.body), None)
+      if oldest is None:
         break
-      self.reply_bytes -= len(self.replies.pop(victim)[0].body)
+      self.reply_bytes -= len(self.replies.pop(oldest)[0].body)
     return entry.cmd
 
   def reclaim(self, pred) -> None:
