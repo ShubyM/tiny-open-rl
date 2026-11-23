@@ -17,7 +17,7 @@ class InlineProcess:
   async def call(self, method, *args):
     if self.closed:
       raise EOFError("the model process exited")
-    result = getattr(self.trainer, method)(*args)
+    result = getattr(self.trainer, method)(*((None,) if method == "resume" else args))
     await asyncio.sleep(0)
     return result
 

@@ -78,7 +78,7 @@ class WorkerHandle:
       if self.resident == gpus:
         return
       t0, prev = time.monotonic(), self.park_s
-      await self.model.resume(gpus)
+      await self.model.resume(() if self.spec.role == Role.TRAINER and not self.movable else gpus)
       now = time.monotonic()
       self.resident, self.bound = gpus, (self.bound or (() if self.movable else gpus))
       sw = (prev + (now - t0)) / max(0.01, SWITCH_BUDGET) if prev else 0.0

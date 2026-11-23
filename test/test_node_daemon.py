@@ -444,6 +444,42 @@ class TestNodeDaemon(BusTest):
     self.assertEqual(overlap, [])
     await self.reply(req, node)
 
+  async def test_single_gpu_full_finetune_on_nonzero_gpu_uses_local_default_device(self):
+    seen_env, seen_resume = {}, []
+
+    class RecordingNode(TestNode):
+      def open_trainer(self, worker_id, width, env):
+        seen_env[worker_id] = env.get("CUDA_VISIBLE_DEVICES")
+        proc = super().open_trainer(worker_id, width, env)
+        orig = proc.resume
+
+        async def record(gpus):
+          seen_resume.append((worker_id, gpus))
+          return await orig(gpus)
+
+        proc.resume = record
+        return proc
+
+    node = RecordingNode(self.bus, gpus=2, node="two-gpu")
+    self.addAsyncCleanup(node.aclose)
+    lora_run, full_run = new_id(), new_id()
+    self.bus.create_run(Run(lora_run, "tiny", 4, lora=LORA))
+    self.bus.create_run(Run(full_run, "tiny", 0))
+    await node.bind("lora", lora_run)
+    await node.bind("full", full_run)
+    r1 = self.bus.submit_command(
+      lora_run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
+    )
+    await self.reply(r1, node)
+    r2 = self.bus.submit_command(
+      full_run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 0, "lora": {}}).encode()
+    )
+    await self.reply(r2, node)
+    self.assertEqual(seen_env["lora"], "0,1")
+    self.assertEqual(seen_env["full"], "1")
+    self.assertEqual(seen_resume, [("lora", (0,)), ("full", ())])
+    self.assertEqual(node.workers["full"].bound, (1,))
+
 
 if __name__ == "__main__":
   unittest.main()
