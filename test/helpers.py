@@ -1,13 +1,14 @@
 import asyncio
 import tempfile
+import time
 import unittest
 import uuid
 
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from tinyrl.control.ledger import Ledger, make_checkpoint
-from tinyrl.types import Saved
+from tinyrl.control.ledger import Ledger
+from tinyrl.types import Checkpoint
 
 
 def tiny(name: str = "") -> LlamaForCausalLM:
@@ -59,10 +60,10 @@ class BusTest(unittest.IsolatedAsyncioTestCase):
   """Starts an isolated SQLite Ledger per test."""
 
   def seed_checkpoint(self, uri, size, *, ttl=None, owned=False, version=None, meta=None):
+    now = time.time()
+    exp = now + ttl if ttl else None
     with self.bus.db:
-      self.bus.checkpoints[uri] = make_checkpoint(
-        Saved(uri, version or uuid.uuid4().hex, size, ttl=ttl, owned=bool(owned), meta=meta or {})
-      )
+      self.bus.checkpoints[uri] = Checkpoint(uri, version or uuid.uuid4().hex, size, now, exp, bool(owned), meta or {})
 
   async def asyncSetUp(self):
     self.renewal_tasks = []

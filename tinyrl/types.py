@@ -14,6 +14,8 @@ RunStatus = StrEnum("RunStatus", "FRESH LIVE SAVED LOST DELETED")  # fresh -> li
 OPS = "CREATE_MODEL FORWARD_BACKWARD OPTIM_STEP SAVE_WEIGHTS SAVE_WEIGHTS_FOR_SAMPLER LOAD_WEIGHTS DELETE_MODEL SAMPLE"
 Op = StrEnum("Op", OPS)
 
+Owner = tuple[str, str, str]  # (worker, node, boot_id)
+
 
 class FencedError(RuntimeError):
   """Raised when a stale or expired node incarnation calls the controller (maps to HTTP 409)."""
@@ -84,22 +86,24 @@ class Reply:
 
 
 @dataclass(frozen=True)
-class Saved:
+class Checkpoint:
   uri: str
   version: str
   size: int
-  ttl: int | None = None
+  time: float = 0.0
+  expires_at: float | None = None
   owned: bool = False
   meta: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class Effect:
+  """Local post-command state reported by a Trainer subprocess to its NodeDaemon."""
+
   loaded: bool = False
   mutated: bool = False
   open_grad: bool = False
-  saved: Saved | None = None
-  dead: bool = False
+  checkpoint: Checkpoint | None = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +139,7 @@ class Assignment:
 @dataclass(frozen=True)
 class Work:
   cmd: Cmd
-  run: dict | None = None
+  run: Run | None = None
   snapshot: str | None = None
   version: str | None = None
 

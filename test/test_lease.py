@@ -92,8 +92,8 @@ class TestLease(BusTest):
     self.assertEqual((self.bus.get_run(run))["owner"], old_owner)
 
     async def reported():
-      node = (self.bus.live_nodes(details=True)).get(first_node, {})
-      return node.get("pids", {}).get(proc_name)
+      node = self.bus.node_status().get(first_node)
+      return node.pids.get(proc_name) if node else None
 
     await self.until(reported)
     model_pid = await reported()
@@ -107,7 +107,7 @@ class TestLease(BusTest):
       await self.until(pending)
       first.send_signal(signal.SIGSTOP)
       os.killpg(model_pid, signal.SIGCONT)  # the child may run while its parent cannot publish a result
-      self.bus.nodes[first_node]["until"] = 0.0  # its heartbeat ran out
+      self.bus.nodes[first_node].until = 0.0  # its heartbeat ran out
       expected = await self.bus.wait_for_reply(request, 30)
       self.assertFalse(expected.ok)
       self.assertIn("lost ownership", json.loads(expected.body)["error"])
@@ -118,8 +118,8 @@ class TestLease(BusTest):
         os.killpg(model_pid, signal.SIGCONT)
 
     async def first_reaped():
-      nodes = self.bus.live_nodes(details=True)
-      return first_node in nodes and not nodes[first_node]["pids"] and not nodes[first_node]["on"]
+      node = self.bus.node_status().get(first_node)
+      return node is not None and not node.pids and not node.on
 
     await self.until(first_reaped)
     self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)

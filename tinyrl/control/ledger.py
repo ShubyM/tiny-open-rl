@@ -15,23 +15,23 @@ from tinyrl.control import scheduler
 from tinyrl.control.accounting import Charge
 from tinyrl.control.db import DB, Table
 from tinyrl.control.fairness import admit_samples, rank_runs
-from tinyrl.control.nodes import NodeTable
+from tinyrl.control.nodes import Node, NodeTable
 from tinyrl.control.samples import SampleQueue
 from tinyrl.control.trains import TrainQueue
 from tinyrl.helpers import SWEEP_S, getenv
 from tinyrl.types import (
   Assignment,
+  Checkpoint,
   Cmd,
-  Effect,
   Ev,
   Event,
   NodeStatus,
   Op,
+  Owner,
   Reply,
   Role,
   Run,
   RunStatus,
-  Saved,
   Work,
   entry_sort_key,
   parse_uri,
@@ -47,7 +47,7 @@ class RunRow:
   run: Run
   created: float
   status: RunStatus = RunStatus.FRESH
-  owner: tuple[str, str, str] | None = None  # (worker, node, boot_id)
+  owner: Owner | None = None
   snapshot: str | None = None  # Store version of detached trainer state
   clients: int = 0
   deleted_at: float = 0.0
@@ -58,22 +58,15 @@ class RunRow:
     return self.status != RunStatus.DELETED
 
 
-def make_checkpoint(s: Saved) -> dict:
-  raw, now = (cid := parse_uri(s.uri)[1]).split("/", 1)[0], time.time()
-  kind, exp = {"weights": "training", "sampler_weights": "sampler"}.get(raw, raw), (now + s.ttl if s.ttl else None)
-  row = {"checkpoint_id": cid, "checkpoint_type": kind, "time": now, "tinker_path": s.uri, "size_bytes": s.size}
-  return row | {"expires_at": exp, "owned": bool(s.owned), "version": s.version, "meta": dict(s.meta)}
-
-
 class Ledger:
   def __init__(self, path: str | None = None):
     self.db = DB(getenv("TINYRL_DB", "/tmp/tinyrl.db") if path is None else path)
     self.runs = Table(self.db, "runs", RunRow)
-    self.sessions, self.checkpoints, self.meta = (Table(self.db, n) for n in ("sessions", "checkpoints", "meta"))
+    self.checkpoints = Table(self.db, "checkpoints", Checkpoint)
+    self.sessions, self.meta = Table(self.db, "sessions"), Table(self.db, "meta")
     self.service = {k: float(v) for k, v in self.meta.get("service", {}).items()}
     self.service_dirty = False
-    self.last_plan = dict(self.meta.get("plan", {}))
-    self.plan_state = scheduler.from_plan(self.last_plan)
+    self.plan_state = scheduler.from_plan(self.meta.get("plan", {}))
 
     now = time.monotonic()
     self.samples = SampleQueue()
@@ -120,7 +113,7 @@ class Ledger:
 
   def ckpt_ver(self, rid: str) -> str | None:
     mp = self.runs[rid].run.model_path if rid in self.runs else None
-    return (self.checkpoints.get(mp) or {}).get("version") if mp else None
+    return ckpt.version if mp and (ckpt := self.checkpoints.get(mp)) else None
 
   def bill(self, row: RunRow, cmd: Cmd, reply: Reply, charge: Charge | None) -> None:
     c = row.counters
@@ -150,14 +143,14 @@ class Ledger:
       self.runs.save(rid)
     for k in self.trains.drop(rid):
       self.notify(k)
-    for u in [u for u, c in self.checkpoints.items() if owned_ckpts and parse_uri(u)[0] == rid and c["owned"]]:
+    for u in [u for u, c in self.checkpoints.items() if owned_ckpts and parse_uri(u)[0] == rid and c.owned]:
       del self.checkpoints[u]
 
-  def fence(self, node: str, boot_id: str) -> dict | None:
+  def fence(self, node: str, boot_id: str) -> Node | None:
     self.expire_nodes()
     return self.nodes.fence(node, boot_id)
 
-  def head_train(self, worker: str, tok: tuple[str, str, str]) -> list[Cmd]:
+  def head_train(self, worker: str, tok: Owner) -> list[Cmd]:
     out = []
     for r in self.plan_state.runs(worker):
       if (row := self.runs.get(r)) and row.live and row.owner in (None, tok) and (h := self.trains.head(r)):
@@ -279,17 +272,17 @@ class Ledger:
       return {"live": False}
     return (self.samples if row.run.role == Role.SAMPLER else self.trains).status(rid, time.monotonic())
 
-  def list_checkpoints(self, run: str | None = None) -> list[dict]:
+  def list_checkpoints(self, run: str | None = None) -> list[Checkpoint]:
     items = (c for u, c in self.checkpoints.items() if run is None or parse_uri(u)[0] == run)
-    return sorted(items, key=lambda c: c["time"], reverse=run is None)
+    return sorted(items, key=lambda c: c.time, reverse=run is None)
 
-  def get_checkpoint(self, uri: str) -> dict | None:
+  def get_checkpoint(self, uri: str) -> Checkpoint | None:
     parse_uri(uri)
-    return dict(c) if (c := self.checkpoints.get(uri)) else None
+    return self.checkpoints.get(uri)
 
   def checkpoint_version(self, uri: str) -> str:
-    if ver := (self.get_checkpoint(uri) or {}).get("version"):
-      return ver
+    if ckpt := self.get_checkpoint(uri):
+      return ckpt.version
     raise ValueError(f"no checkpoint at {uri}")
 
   def set_checkpoint_ttl(self, uri: str, ttl: int | None) -> bool:
@@ -297,7 +290,7 @@ class Ledger:
     if (c := self.checkpoints.get(uri)) is None:
       return False
     with self.db:
-      self.checkpoints[uri] = c | {"expires_at": time.time() + ttl if ttl else None}
+      self.checkpoints[uri] = replace(c, expires_at=time.time() + ttl if ttl else None)
     return True
 
   def delete_checkpoint(self, uri: str) -> bool:
@@ -306,7 +299,7 @@ class Ledger:
       return self.checkpoints.pop(uri, None) is not None
 
   def live_versions(self) -> list[str]:
-    v = {c["version"] for c in self.checkpoints.values() if c.get("version")}
+    v = {c.version for c in self.checkpoints.values() if c.version}
     v.update(r.snapshot for r in self.runs.values() if r.live and r.snapshot)
     v.update(self.trains.versions())
     return sorted({x.partition("@")[0] for x in v})
@@ -324,16 +317,20 @@ class Ledger:
     home = {r: p for r, p in self.plan_state.home.items() if r in jobs}
     return replace(self.plan_state, nodes=self.nodes.active_gpus(), home=home, jobs=jobs, service=self.service)
 
-  def live_nodes(self, details: bool = False) -> dict:
+  def live_nodes(self) -> dict[str, int]:
     self.expire_nodes()
-    return self.nodes.snapshot(details)
+    return {nid: n.status.gpus for nid, n in self.nodes.items()}
+
+  def node_status(self) -> dict[str, NodeStatus]:
+    self.expire_nodes()
+    return {nid: n.status for nid, n in self.nodes.items()}
 
   def expire_node(self, node_id: str, boot_id: str) -> None:
     expired_boots = self.nodes.remove(node_id, boot_id)
     self.record_event(Ev.NODE_LOST, {"node": node_id})
-    for req_id, c in self.trains.held_on((node_id, boot_id)):
-      err = RuntimeError(f"its trainer died, or lost ownership, during {c.op}")
-      self.finish_train(req_id, c.owner, Reply.error(err), dead=True)
+    for req_id, row in self.trains.held_on((node_id, boot_id)):
+      err = RuntimeError(f"its trainer died, or lost ownership, during {row.cmd.op}")
+      self.finish_train(req_id, row.owner, Reply.error(err), dead=True)
     with self.db:
       self.meta["expired_boots"] = expired_boots
     self.reclaim(lambda o: o[1:] == (node_id, boot_id))
@@ -344,10 +341,10 @@ class Ledger:
       self.expire_node(nid, bid)
 
   def reconcile(self) -> list[tuple[Ev, dict]]:
-    old, self.plan_due = self.last_plan, time.monotonic() + TICK_MS / 1000
+    self.plan_due = time.monotonic() + TICK_MS / 1000
+    old = scheduler.to_plan(self.plan_state)
     self.plan_state, changes = scheduler.step(self.state())
     if (plan := scheduler.to_plan(self.plan_state)) != old:
-      self.last_plan = plan
       with self.db:
         self.meta["plan"] = plan
         self.flush()
@@ -365,7 +362,7 @@ class Ledger:
     run_gc = mono >= self.gc_due
     with self.db:
       self.flush()
-      for u in [u for u, c in self.checkpoints.items() if c["expires_at"] is not None and c["expires_at"] <= now]:
+      for u in [u for u, c in self.checkpoints.items() if c.expires_at is not None and c.expires_at <= now]:
         del self.checkpoints[u]
       if run_gc:
         self.gc_due, cut = mono + GC_S, now - SESSION_TTL
@@ -395,7 +392,7 @@ class Ledger:
       tok = (wid, node, boot_id)
       if proc.spec.role == Role.TRAINER:
         runs, heads = tuple(ps.runs(wid)), self.head_train(wid, tok)
-        held = [h[1].run] if (h := self.trains.held_by(tok)) else []
+        held = [h[1].cmd.run] if (h := self.trains.held_by(tok)) else []
         lruns = held or [c.run for c in heads] or [r for r in runs if r in ps.jobs]
         closing, lag = tuple(c.run for c in heads if c.op == Op.OPTIM_STEP), max(map(ps.ready_lag, lruns), default=0.0)
         out.append(Assignment(wid, proc.spec, runs, (), bool(held or heads), closing, lag))
@@ -438,28 +435,29 @@ class Ledger:
     if now >= self.plan_due:
       self.reconcile()
     ps = self.plan_state
-    if (proc := ps.procs.get(wid)) is None or proc.node != node or (cur and cur["draining"]):
+    if (proc := ps.procs.get(wid)) is None or proc.node != node or (cur and cur.status.draining):
       return []
     tok, svc, hold = (wid, node, boot), service or {}, set(holding)
     if proc.spec.role == Role.TRAINER:
       if held := self.trains.held_by(tok):
-        return [] if held[0] in hold else [self.trains.work(held[0], asdict(self.runs[held[1].run].run))]
+        return [] if held[0] in hold else [self.trains.work(held[0], self.runs[held[1].cmd.run].run)]
       while slots > 0 and (heads := self.head_train(wid, tok)):
         rid = rank_runs(heads, ps.ready_lag, svc)[0]
-        (k, c), row = self.trains.head(rid), self.runs[rid]
-        ver = uuid.uuid4().hex if c.op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER) else None
-        if c.op == Op.LOAD_WEIGHTS:
+        (k, item), row = self.trains.head(rid), self.runs[rid]
+        op = item.cmd.op
+        ver = uuid.uuid4().hex if op in (Op.SAVE_WEIGHTS, Op.SAVE_WEIGHTS_FOR_SAMPLER) else None
+        if op == Op.LOAD_WEIGHTS:
           try:
-            ver = self.checkpoint_version(c.uri or "")
+            ver = self.checkpoint_version(item.uri or "")
           except ValueError as err:
             self.finish_train(k, None, Reply.error(err))
             continue
-        snapshot = row.snapshot if row.status == RunStatus.SAVED and c.op != Op.LOAD_WEIGHTS else None
+        snapshot = row.snapshot if row.status == RunStatus.SAVED and op != Op.LOAD_WEIGHTS else None
         row.owner = tok
         with self.db:
           self.trains.claim(k, tok, now, snapshot, ver)
           self.runs.save(rid)
-        return [self.trains.work(k, asdict(row.run))]
+        return [self.trains.work(k, row.run)]
       return []
 
     for c, ver in self.ready_samples(proc.spec) if failed else ():
@@ -480,7 +478,7 @@ class Ledger:
     return out
 
   def finish_train(
-    self, req_id: str, owner, reply: Reply, charge=None, *, mutated=False, saved=None, dead=False
+    self, req_id: str, owner: Owner | None, reply: Reply, charge=None, *, mutated=False, checkpoint=None, dead=False
   ) -> bool:
     if (cmd := self.trains.pop_claimed(req_id, owner)) is None:
       return False
@@ -491,8 +489,8 @@ class Ledger:
       self.trains.write_reply(req_id, reply, REPLY_TTL)
       self.flush()
       if row:
-        if saved and reply.ok:
-          self.checkpoints[saved.uri] = make_checkpoint(saved)
+        if checkpoint and reply.ok:
+          self.checkpoints[checkpoint.uri] = checkpoint
         if deleting:
           self.remove_run(cmd.run, owned_ckpts=True)
         else:
@@ -508,7 +506,7 @@ class Ledger:
     self.notify(req_id)
     return True
 
-  def finish_sample(self, req_id: str, owner, reply: Reply, charge=None) -> bool:
+  def finish_sample(self, req_id: str, owner: Owner | None, reply: Reply, charge=None) -> bool:
     if (cmd := self.samples.complete(req_id, owner, reply, REPLY_TTL)) is None:
       return False
     if row := self.runs.get(cmd.run):
@@ -517,14 +515,24 @@ class Ledger:
     return True
 
   def finish(
-    self, node: str, boot: str, wid: str, rid: str, rep: Reply, ch: Charge | None = None, effect: Effect = Effect()
-  ):
+    self,
+    node: str,
+    boot: str,
+    wid: str,
+    rid: str,
+    rep: Reply,
+    ch: Charge | None = None,
+    *,
+    mutated: bool = False,
+    checkpoint: Checkpoint | None = None,
+    dead: bool = False,
+  ) -> bool:
     self.fence(node, boot)
     tok = (wid, node, boot)
     if self.is_sampler(rid.partition("/")[0], rid):
       ok = self.finish_sample(rid, tok, rep, ch)
     else:
-      ok = self.finish_train(rid, tok, rep, ch, mutated=effect.mutated, saved=effect.saved, dead=effect.dead)
+      ok = self.finish_train(rid, tok, rep, ch, mutated=mutated, checkpoint=checkpoint, dead=dead)
     if ok:
       self.notify_work()
     return ok

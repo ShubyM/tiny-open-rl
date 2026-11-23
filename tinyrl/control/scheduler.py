@@ -9,7 +9,7 @@ import msgspec
 
 from tinyrl.control.fairness import update_lag
 from tinyrl.helpers import getenv
-from tinyrl.types import MAX_LORAS, MAX_SEQS, Ev, Role
+from tinyrl.types import MAX_LORAS, MAX_SEQS, Ev, Owner, Role
 from tinyrl.types import WorkerSpec as Spec
 
 REBALANCE_MS = getenv("REBALANCE_MS", 20_000)
@@ -27,7 +27,7 @@ class Job:
   spec: Spec
   train_run: str | None = None
   account: str = ""
-  owner: tuple[str, str, str] | None = None  # (proc, node, boot_id) holding its weights
+  owner: Owner | None = None  # process holding this run's live weights
   backlog: int = 0
 
 

@@ -363,7 +363,7 @@ class TestModel(unittest.TestCase):
       self.assertNotEqual(first.version, second.version)
       reply, _ = loaded.execute(
         Cmd(run, "1-0", Op.LOAD_WEIGHTS, json.dumps({"uri": uri, "optimizer": True}).encode()),
-        run={"base": "tiny", "rank": 4, "lora": LORA},
+        run=Run(run, "tiny", 4, lora=LORA),
         version=first.version,
       )
       self.assertTrue(reply.ok, reply.body)
@@ -597,7 +597,7 @@ class TestDistributedTrainer(unittest.IsolatedAsyncioTestCase):
               single.execute(cmd) if run == r1 else await asyncio.wait_for(multi.call("execute", cmd), 90)
             )
             self.assertEqual(reply.ok, i != 1, reply.body)
-            if checkpoint := effects.saved:
+            if checkpoint := effects.checkpoint:
               saved_versions.append(checkpoint.version)
         expected, actual = (store.get(v)[0] for v in saved_versions)
         self.assertEqual(expected.keys(), actual.keys(), f"rank {rank}")

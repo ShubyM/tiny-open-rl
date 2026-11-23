@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 
 from tinyrl.helpers import getenv
-from tinyrl.types import Cmd, Reply
+from tinyrl.types import Cmd, Owner, Reply
 
 SAMPLE_QUEUE_BYTES = getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20)
 SAMPLE_REPLY_BYTES = getenv("SAMPLE_REPLY_BYTES", 256 * 2**20)
@@ -24,7 +24,7 @@ class QueueFullError(RuntimeError):
 @dataclass
 class Entry:
   cmd: Cmd
-  owner: tuple[str, str, str] | None = None
+  owner: Owner | None = None
   since: float = 0.0
 
 
@@ -41,7 +41,7 @@ class SampleQueue:
   def backlog(self, run_id: str) -> int:
     return len(self.queues.get(run_id, ()))
 
-  def held(self, owner: tuple[str, str, str]) -> list[Cmd]:
+  def held(self, owner: Owner) -> list[Cmd]:
     return [e.cmd for e in self.by_id.values() if e.owner == owner]
 
   def drop(self, run_id: str) -> list[str]:
@@ -77,10 +77,10 @@ class SampleQueue:
     gen = (e.cmd for e in self.queues.get(run_id, {}).values() if e.owner is None)
     return gen if limit is None else itertools.islice(gen, limit)
 
-  def claim(self, cmd: Cmd, owner: tuple[str, str, str], now: float) -> None:
+  def claim(self, cmd: Cmd, owner: Owner, now: float) -> None:
     self.by_id[cmd.request_id].owner, self.by_id[cmd.request_id].since = owner, now
 
-  def complete(self, req_id: str, owner: tuple[str, str, str] | None, reply: Reply, ttl: float) -> Cmd | None:
+  def complete(self, req_id: str, owner: Owner | None, reply: Reply, ttl: float) -> Cmd | None:
     if (entry := self.by_id.get(req_id)) is None or entry.owner != owner:
       return None
     del self.by_id[req_id]

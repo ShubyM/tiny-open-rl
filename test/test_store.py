@@ -10,7 +10,7 @@ import torch
 
 from test.helpers import BusTest, new_id
 from tinyrl.storage.store import SHARD_BYTES, Store
-from tinyrl.types import Effect, FencedError, NodeStatus, Op, Reply, Run, Saved
+from tinyrl.types import Checkpoint, FencedError, NodeStatus, Op, Reply, Run
 
 
 class TestStore(unittest.TestCase):
@@ -218,29 +218,17 @@ class TestStore(unittest.TestCase):
 class TestRegistry(BusTest):
   async def test_preexisting_checkpoint_indexes_support_reads_and_expiry(self):
     # Populate the persisted checkpoint table directly, without using the writer under test.
-    def record(cid, kind):
-      return {
-        "checkpoint_id": cid,
-        "checkpoint_type": kind,
-        "time": 1,
-        "tinker_path": f"tinker://r/{cid}",
-        "size_bytes": 1,
-        "expires_at": None,
-        "owned": False,
-        "version": cid.split("/")[1],
-      }
-
-    saved, parked = record("weights/saved", "training"), record("parked/host", "parked")
-    uri = saved["tinker_path"]
+    saved = Checkpoint("tinker://r/weights/saved", "saved", 1, time=1.0)
+    other = Checkpoint("tinker://r/weights/keep", "keep", 1, time=1.0)
     with self.bus.db:
-      for row in [saved, parked]:
-        self.bus.checkpoints[row["tinker_path"]] = row
-    self.assertEqual(self.bus.checkpoint_version(uri), "saved")
-    self.assertEqual(self.bus.checkpoint_version(parked["tinker_path"]), "host")
-    self.assertTrue(self.bus.set_checkpoint_ttl(uri, -1))
+      for row in (saved, other):
+        self.bus.checkpoints[row.uri] = row
+    self.assertEqual(self.bus.checkpoint_version(saved.uri), "saved")
+    self.assertEqual(self.bus.checkpoint_version(other.uri), "keep")
+    self.assertTrue(self.bus.set_checkpoint_ttl(saved.uri, -1))
     self.bus.maintain()
-    self.assertIsNone(self.bus.get_checkpoint(uri))
-    self.assertEqual(self.bus.get_checkpoint(parked["tinker_path"]), parked)
+    self.assertIsNone(self.bus.get_checkpoint(saved.uri))
+    self.assertEqual(self.bus.get_checkpoint(other.uri), other)
 
   async def test_deletion_wins_over_concurrent_ttl_updates(self):
     run = new_id()
@@ -273,7 +261,7 @@ class TestRegistry(BusTest):
         [a1], _ = await self.bus.heartbeat("n1", b1, NodeStatus(1))
         [w1] = self.bus.take("n1", b1, a1.worker)
         abandoned = w1.version
-        self.bus.nodes["n1"]["until"] = 0.0
+        self.bus.nodes["n1"].until = 0.0
         self.bus.maintain()
 
         self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
@@ -283,12 +271,12 @@ class TestRegistry(BusTest):
         winner = new.put({"w": torch.ones(2)}, version=version)
         sweep(new, grace=0)  # protected even before the reply publishes it
         reply = Reply(True, "application/json", b"{}")
-        self.bus.finish("n2", b2, a2.worker, w2.cmd.request_id, reply, effect=Effect(saved=Saved(uri, winner, 8)))
+        self.bus.finish("n2", b2, a2.worker, w2.cmd.request_id, reply, checkpoint=Checkpoint(uri, winner, 8, 1.0))
         new.upload_pending_saves()
         late = old.put({"w": torch.zeros(2)}, version=abandoned)
         old.upload_pending_saves()
         with self.assertRaises(FencedError):
-          self.bus.finish("n1", b1, a1.worker, w1.cmd.request_id, reply, effect=Effect(saved=Saved(uri, late, 8)))
+          self.bus.finish("n1", b1, a1.worker, w1.cmd.request_id, reply, checkpoint=Checkpoint(uri, late, 8, 1.0))
         reader = Store(root, cache=tempfile.mkdtemp())
         published = self.bus.checkpoint_version(uri)
         self.assertEqual(published, winner)

@@ -1,6 +1,6 @@
 from test.helpers import BusTest
 from tinyrl.control.ledger import Ledger
-from tinyrl.types import Effect, NodeStatus, Op, Reply, Role, Run
+from tinyrl.types import NodeStatus, Op, Reply, Role, Run
 
 OK = Reply(True, "application/json", b"{}")
 
@@ -14,13 +14,13 @@ class TestPopulatedUpgrade(BusTest):
     [w1] = self.bus.take("n1", "b1", a1.worker)
     self.assertEqual(w1.cmd.request_id, first)
 
-    self.bus.nodes["n1"]["until"] = 0.0
+    self.bus.nodes["n1"].until = 0.0
     [a2], _ = await self.bus.heartbeat("n2", "b2", NodeStatus(1))
     self.assertFalse((await self.bus.wait_for_reply(first, 0)).ok)
     self.assertEqual(self.bus.get_run("t")["failed"], 1)
     [w2] = self.bus.take("n2", "b2", a2.worker)
     self.assertEqual((w2.cmd.request_id, w2.cmd.body), (second, b"\xff"))
-    self.bus.finish("n2", "b2", a2.worker, w2.cmd.request_id, OK, effect=Effect(mutated=True))
+    self.bus.finish("n2", "b2", a2.worker, w2.cmd.request_id, OK, mutated=True)
     self.assertEqual(await self.bus.wait_for_reply(second, 0), OK)
 
   async def test_sampler_recovers_abandoned_claim_alongside_fresh_entries(self):
@@ -31,7 +31,7 @@ class TestPopulatedUpgrade(BusTest):
     self.assertEqual(w1.cmd.request_id, first)
 
     second = self.bus.submit_command("s", Op.SAMPLE, b"{}")
-    self.bus.nodes["n1"]["until"] = 0.0
+    self.bus.nodes["n1"].until = 0.0
     [a2], _ = await self.bus.heartbeat("n2", "b2", NodeStatus(1))
     claimed = self.bus.take("n2", "b2", a2.worker, slots=4)
     self.assertEqual([w.cmd.request_id for w in claimed], [first, second])
@@ -48,7 +48,7 @@ class TestPopulatedUpgrade(BusTest):
     req = self.bus.submit_command("t", Op.OPTIM_STEP, b"{}", seq_id=7)
     [a1], _ = await self.bus.heartbeat("n1", "b1", NodeStatus(1))
     [w] = self.bus.take("n1", "b1", a1.worker)
-    self.bus.finish("n1", "b1", a1.worker, w.cmd.request_id, OK, effect=Effect(mutated=True))
+    self.bus.finish("n1", "b1", a1.worker, w.cmd.request_id, OK, mutated=True)
     await self.bus.aclose()
 
     self.bus = Ledger(self.db_path)

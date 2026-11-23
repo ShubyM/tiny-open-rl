@@ -10,7 +10,7 @@ from tinyrl.control.accounting import Charge
 from tinyrl.control.ledger import Ledger
 from tinyrl.control.node_daemon import ControlClient
 from tinyrl.control.samples import QueueFullError, RequestGoneError
-from tinyrl.types import Effect, Ev, FencedError, NodeStatus, Op, Reply, Role, Run, RunStatus, Saved
+from tinyrl.types import Checkpoint, Ev, FencedError, NodeStatus, Op, Reply, Role, Run, RunStatus
 
 
 def ok(**body) -> Reply:
@@ -42,11 +42,11 @@ class TestLedger(BusTest):
     self.assertIsNone(await self.bus.wait_for_reply(request_id, 0))
 
     charge = Charge(started_ms=int(cmd.entry_id.split("-")[0]) + 12, busy_ms=50, gpu_ms=100.5)
-    self.assertTrue(self.bus.finish("n1", "b1", wid, request_id, ok(type="optim_step"), charge, Effect(mutated=True)))
+    self.assertTrue(self.bus.finish("n1", "b1", wid, request_id, ok(type="optim_step"), charge, mutated=True))
     self.assertEqual(await self.bus.wait_for_reply(request_id, 0), ok(type="optim_step"))
 
     # Repeated finish is idempotent and does not double-charge.
-    self.assertFalse(self.bus.finish("n1", "b1", wid, request_id, ok(type="optim_step"), charge, Effect(mutated=True)))
+    self.assertFalse(self.bus.finish("n1", "b1", wid, request_id, ok(type="optim_step"), charge, mutated=True))
 
     run = self.bus.get_run(run_id)
     self.assertEqual(
@@ -137,7 +137,7 @@ class TestLedger(BusTest):
     self.assertEqual(queue["queued"], 2)
     self.assertEqual([c["request_id"] for c in queue["in_flight"]], [request_ids[0]])
 
-    self.assertTrue(self.bus.finish("n1", "b1", wid, w1.cmd.request_id, ok(), effect=Effect(mutated=True)))
+    self.assertTrue(self.bus.finish("n1", "b1", wid, w1.cmd.request_id, ok(), mutated=True))
     [w2] = self.bus.take("n1", "b1", wid)
     self.assertEqual(w2.cmd.request_id, request_ids[1])
 
@@ -174,14 +174,14 @@ class TestLedger(BusTest):
     self.assertNotIn(run_id, st.home)
     self.assertFalse(st.busy(wid))
     self.assertFalse((await self.bus.wait_for_reply(req, 0)).ok)
-    self.assertFalse(self.bus.finish("n1", "b1", wid, req, ok(), effect=Effect(mutated=True)))
+    self.assertFalse(self.bus.finish("n1", "b1", wid, req, ok(), mutated=True))
 
   async def test_sample_finish_ignores_trainer_checkpoint_effects(self):
     sid = self.new_run(role=Role.SAMPLER)
     req = self.bus.submit_command(sid, Op.SAMPLE, b"{}")
     wid, _ = await self.take_one()
-    saved = Saved(f"tinker://{sid}/weights/bad", "v1", 1)
-    self.bus.finish("n1", "b1", wid, req, ok(), effect=Effect(saved=saved))
+    saved = Checkpoint(f"tinker://{sid}/weights/bad", "v1", 1, 1.0)
+    self.bus.finish("n1", "b1", wid, req, ok(), checkpoint=saved)
     self.assertFalse(self.bus.db.conn.in_transaction)
     self.assertIsNone(self.bus.get_checkpoint(saved.uri))
 
@@ -190,7 +190,7 @@ class TestLedger(BusTest):
     first = self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
     w1, _ = await self.take_one("n1", "b1", 1)
 
-    self.bus.nodes["n1"]["until"] = 0.0
+    self.bus.nodes["n1"].until = 0.0
     self.bus.maintain()
     failed = await self.bus.wait_for_reply(first, 0)
     self.assertFalse(failed.ok)
@@ -201,20 +201,20 @@ class TestLedger(BusTest):
     w2, item2 = await self.take_one("n2", "b2", 1)
     self.assertEqual(item2.cmd.request_id, second)
     uri = f"tinker://{run}/weights/step"
-    self.bus.finish("n2", "b2", w2, second, ok(), effect=Effect(saved=Saved(uri, "new", 20)))
+    self.bus.finish("n2", "b2", w2, second, ok(), checkpoint=Checkpoint(uri, "new", 20, 1.0))
 
-    stale = Saved(uri, "old", 10, ttl=60)
+    stale = Checkpoint(uri, "old", 10, 1.0, expires_at=61.0)
     with self.assertRaises(FencedError):
-      self.bus.finish("n1", "b1", w1, first, ok(), effect=Effect(saved=stale))
+      self.bus.finish("n1", "b1", w1, first, ok(), checkpoint=stale)
     self.assertEqual(await self.bus.wait_for_reply(first, 0), failed)
     self.assertEqual(self.bus.checkpoint_version(uri), "new")
-    self.assertIsNone(self.bus.get_checkpoint(uri)["expires_at"])
+    self.assertIsNone(self.bus.get_checkpoint(uri).expires_at)
 
   async def test_detach_saves_parked_snapshot_and_mutating_step_clears_it(self):
     run_id = self.new_run()
     req1 = self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
     w1, _ = await self.take_one("n1", "b1", 1)
-    self.bus.finish("n1", "b1", w1, req1, ok(), effect=Effect(mutated=True))
+    self.bus.finish("n1", "b1", w1, req1, ok(), mutated=True)
 
     plan, _ = await self.bus.heartbeat("n1", "b1", NodeStatus(1, draining=True, live_workers=(w1,)))
     self.assertEqual(plan, [])
@@ -231,13 +231,13 @@ class TestLedger(BusTest):
     req2 = self.bus.submit_command(run_id, Op.SAVE_WEIGHTS, b"{}")
     w2, ro = await self.take_one("n2", "b2", 1)
     self.assertEqual(ro.snapshot, snap_ver)
-    self.bus.finish("n2", "b2", w2, req2, ok(), effect=Effect(mutated=False))
+    self.bus.finish("n2", "b2", w2, req2, ok(), mutated=False)
     self.assertIn(snap_ver, self.bus.live_versions())
 
     req3 = self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
     [mut] = self.bus.take("n2", "b2", w2)
     self.assertEqual(mut.snapshot, snap_ver)
-    self.bus.finish("n2", "b2", w2, req3, ok(), effect=Effect(mutated=True))
+    self.bus.finish("n2", "b2", w2, req3, ok(), mutated=True)
     self.assertIsNone(self.bus.get_run(run_id).get("snapshot"))
     self.assertNotIn(snap_ver, self.bus.live_versions())
 
@@ -282,7 +282,7 @@ class TestLedger(BusTest):
     self.assertEqual([w.cmd.request_id for w in t1], requests)
     plan2, _ = await self.bus.heartbeat("n2", "b2", NodeStatus(1))
     self.assertEqual([w for a in plan2 for w in self.bus.take("n2", "b2", a.worker, slots=4)], [])
-    self.bus.nodes["n1"]["until"] = 0.0
+    self.bus.nodes["n1"].until = 0.0
     [a2], _ = await self.bus.heartbeat("n2", "b2", NodeStatus(1))
     t2 = self.bus.take("n2", "b2", a2.worker, slots=4)
     self.assertEqual([w.cmd.request_id for w in t2], requests)
@@ -290,7 +290,7 @@ class TestLedger(BusTest):
   async def test_a_dead_node_daemon_stops_counting(self):
     await self.bus.heartbeat("node-a", "ba", NodeStatus(2))
     await self.bus.heartbeat("node-b", "bb", NodeStatus(8))
-    self.bus.nodes["node-b"]["until"] = 0.0
+    self.bus.nodes["node-b"].until = 0.0
     self.assertEqual(self.bus.live_nodes(), {"node-a": 2})
 
   async def test_sessions(self):
@@ -325,7 +325,7 @@ class TestLedger(BusTest):
     keep, drop = self.new_run(), self.new_run()
     r1 = self.bus.submit_command(keep, Op.OPTIM_STEP, b"{}")
     wid, _ = await self.take_one("n1", "b1", 1)
-    self.bus.finish("n1", "b1", wid, r1, ok(), effect=Effect(mutated=True))
+    self.bus.finish("n1", "b1", wid, r1, ok(), mutated=True)
     self.assertEqual(self.bus.get_run(keep)["status"], RunStatus.LIVE)
     self.bus.submit_command(drop, Op.FORWARD_BACKWARD, b"{}")
     [taken] = self.bus.take("n1", "b1", wid)
@@ -428,7 +428,7 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
         [a], _ = await client.heartbeat("node-a", "boot-a", NodeStatus(1))
         [w] = await client.take("node-a", "boot-a", a.worker)
         self.assertEqual(w.cmd.body, b"\x00\xff")
-        ckpt = Saved("tinker://tr-1/weights/v1", "ver1", 99)
+        ckpt = Checkpoint("tinker://tr-1/weights/v1", "ver1", 99, 1.0)
 
         await runner.cleanup()
         await bus.aclose()
@@ -436,7 +436,7 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
         runner, _ = await serve_control(bus, host="127.0.0.1", port=port)
 
         self.assertTrue(
-          await client.finish("node-a", "boot-a", a.worker, req, ok(done=1), None, Effect(mutated=True, saved=ckpt))
+          await client.finish("node-a", "boot-a", a.worker, req, ok(done=1), None, mutated=True, checkpoint=ckpt)
         )
         self.assertEqual(await bus.wait_for_reply(req, 0), ok(done=1))
         self.assertEqual(bus.get_session("s1")["metadata"], {"sdk": "0.39"})

@@ -1172,7 +1172,7 @@ class TestMultiNodeExecution(BusTest):
     st = self.bus.state()
     active_node = st.procs[st.procs_of(sid)[0]].node
     req = self.bus.submit_command(sid, Op.SAMPLE, payload, cost=50)
-    self.bus.nodes[active_node]["until"] = 0.0
+    self.bus.nodes[active_node].until = 0.0
     self.assertTrue((await self.bus.wait_for_reply(req, 5)).ok)
     self.assertEqual((self.bus.get_run(sid))["tokens"], (total_cmds + 1) * 50)
     self.assertGreater(self.bus.service["team-s"], svc_before)

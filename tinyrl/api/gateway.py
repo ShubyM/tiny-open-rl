@@ -25,7 +25,7 @@ from tinyrl.control import estimator
 from tinyrl.control.ledger import COUNTERS, TICK_MS, Ledger
 from tinyrl.control.samples import QueueFullError, RequestGoneError
 from tinyrl.helpers import getenv
-from tinyrl.types import FencedError, Op, Role, Run, parse_uri
+from tinyrl.types import Checkpoint, FencedError, Op, Role, Run, parse_uri
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply; the SDK gives up after 45s
 CKPT_TTL = getenv("CKPT_TTL", 0)  # default TTL for unowned saves (>= 3600s; 0 keeps until deleted)
@@ -107,9 +107,18 @@ def iso(t: float | None) -> str | None:
   return datetime.datetime.fromtimestamp(t, datetime.UTC).isoformat() if t else None
 
 
-def public(c: dict) -> dict:
-  keep = {k: c[k] for k in ("checkpoint_id", "checkpoint_type", "tinker_path", "size_bytes")}
-  return keep | {"time": iso(c["time"]), "expires_at": iso(c["expires_at"])}
+def public(c: Checkpoint) -> dict:
+  cid = parse_uri(c.uri)[1]
+  raw = cid.split("/", 1)[0]
+  kind = {"weights": "training", "sampler_weights": "sampler"}.get(raw, raw)
+  return {
+    "checkpoint_id": cid,
+    "checkpoint_type": kind,
+    "tinker_path": c.uri,
+    "size_bytes": c.size,
+    "time": iso(c.time),
+    "expires_at": iso(c.expires_at),
+  }
 
 
 def checkpoint_uri(run: str, kind: str, name: str) -> str:
@@ -185,7 +194,8 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
     if train.get("base"):
       base, lora = train["base"], train["rank"] > 0
     elif mp:
-      meta = (ledger.get_checkpoint(mp) or {}).get("meta", {})
+      ckpt = ledger.get_checkpoint(mp)
+      meta = ckpt.meta if ckpt else {}
       base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
     if not base:
       raise ValueError("could not resolve base_model" if mp else "base_model required when model_path is None")
@@ -203,11 +213,14 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
 
   @api.get("/api/v1/scheduling")
   async def scheduling():
-    nodes, state = ledger.live_nodes(details=True), dataclasses.asdict(ledger.state())
+    nodes, state = ledger.node_status(), dataclasses.asdict(ledger.state())
     for proc, placed in state["procs"].items():
-      info = nodes.get(placed["node"], {})
-      placed |= {dst: info[src][proc] for src, dst in (("pids", "pid"), ("on", "gpus")) if proc in info.get(src, {})}
-    return {"nodes": {n: v["gpus"] for n, v in nodes.items()}, "state": state}
+      if status := nodes.get(placed["node"]):
+        if proc in status.pids:
+          placed["pid"] = status.pids[proc]
+        if gpus := status.on.get(proc):
+          placed["gpus"] = list(gpus)
+    return {"nodes": {n: s.gpus for n, s in nodes.items()}, "state": state}
 
   api.get("/api/v1/healthz")(lambda: {"status": "ok"})
   api.post("/api/v1/telemetry")(lambda: {"status": "accepted"})
@@ -292,7 +305,8 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
 
   @api.post("/api/v1/weights_info")
   async def weights_info(req: WeightsInfoRequest):
-    meta = (ledger.get_checkpoint(req.tinker_path) or {}).get("meta", {})
+    ckpt = ledger.get_checkpoint(req.tinker_path)
+    meta = ckpt.meta if ckpt else {}
     if "base" not in meta:
       raise HTTPException(404, f"no checkpoint {req.tinker_path} that names its base model")
     rank = int(meta.get("rank") or 0)
@@ -398,7 +412,7 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
 
   @api.get("/metrics")
   async def metrics():
-    nodes, state, lines = ledger.live_nodes(details=True), ledger.state(), []
+    nodes, state, lines = ledger.node_status(), ledger.state(), []
     for run in state.jobs:
       if ps := state.procs_of(run):
         info = ledger.get_run(run)
@@ -406,7 +420,7 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
           lbl, v = (f"{k[:-3]}_seconds", info[k] / 1000) if k.endswith("_ms") else (k, info[k])
           lines.append(f'tinyrl_{lbl}_total{{worker="{ps[0]}",run="{run}"}} {v}')
     lines += [f'tinyrl_account_service_total{{account="{a}"}} {float(v)}' for a, v in sorted(ledger.service.items())]
-    lines += [f'tinyrl_node_loop_lag_seconds{{node="{n}"}} {b.get("lag", 0.0)}' for n, b in nodes.items()]
+    lines += [f'tinyrl_node_loop_lag_seconds{{node="{n}"}} {s.lag}' for n, s in nodes.items()]
     return PlainTextResponse("\n".join(lines) + "\n")
 
   return api

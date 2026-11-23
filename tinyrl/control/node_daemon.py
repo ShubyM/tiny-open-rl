@@ -20,7 +20,7 @@ from tinyrl.control.process import Process
 from tinyrl.helpers import DEBUG, LEASE_MS, SWEEP_S, getenv
 from tinyrl.storage.store import Store
 from tinyrl.trace import span
-from tinyrl.types import MAX_SEQS, Assignment, Effect, FencedError, NodeStatus, Reply, Role, Work, WorkerSpec
+from tinyrl.types import MAX_SEQS, Assignment, FencedError, NodeStatus, Reply, Role, Work, WorkerSpec
 from tinyrl.workers.sampler import Sampler
 
 GPUS, DRAIN_S, TICK, SWEEP_GRACE_S = getenv("GPUS", 1), getenv("DRAIN_S", 20.0), getenv("TICK", 0.25), 600
@@ -154,7 +154,7 @@ class WorkerHandle:
           if load is not None:
             charge.started_ms, charge.busy_ms = load[0].started_ms, charge.busy_ms + load[0].busy_ms
             charge.gpu_ms += load[0].gpu_ms / load[1]
-          eff = Effect()
+          done = {}
         else:
           async with self.lock:
             rep, eff = await self.wave.run(
@@ -164,15 +164,16 @@ class WorkerHandle:
             self.dirty.add(cmd.run) if eff.mutated else (self.dirty.discard(cmd.run) if not eff.loaded else None)
             (self.open_grad.add if eff.open_grad else self.open_grad.discard)(cmd.run)
             self.idle_since = time.monotonic()
+            done = {"mutated": eff.mutated, "checkpoint": eff.checkpoint}
             if DEBUG:
               print(f"{self.id} {cmd.request_id} {cmd.op:24s} {charge.busy_ms:9d} ms")
         self.bill(cmd.run, charge)
-        return rep, charge, eff
+        return rep, charge, done
     except asyncio.CancelledError:
       raise
     except Exception as exc:
       self.broken = True
-      return Reply.error(exc), None, Effect(dead=True)
+      return Reply.error(exc), None, {"dead": True}
 
 
 class NodeDaemon:
@@ -238,8 +239,8 @@ class NodeDaemon:
 
   async def run_work(self, w: WorkerHandle, work: Work, gpus: tuple[int, ...], folder: str | None) -> None:
     try:
-      rep, ch, eff = await w.execute(work, gpus, self.store, folder)
-      await self.call("finish", w.id, work.cmd.request_id, rep, ch, eff, retry=True)
+      rep, ch, done = await w.execute(work, gpus, self.store, folder)
+      await self.call("finish", w.id, work.cmd.request_id, rep, ch, retry=True, **done)
     except FencedError:
       self.fenced = True
     finally:

@@ -3,22 +3,19 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from tinyrl.control.db import DB, Table
 from tinyrl.control.samples import flight_status
-from tinyrl.types import Cmd, Op, Reply, Work
+from tinyrl.types import Cmd, Owner, Reply, Run, Work
 
 
 @dataclass
 class CmdRow:
-  run: str
-  eid: str
-  op: Op
-  cost: int
+  cmd: Cmd
   seq: int
   uri: str | None = None
-  owner: tuple[str, str, str] | None = None
+  owner: Owner | None = None
   snapshot: str | None = None
   version: str | None = None
 
@@ -30,10 +27,10 @@ class TrainQueue:
     self.replies, self.seen = Table(db, "replies"), Table(db, "seen")
     self.queues: dict[str, dict[str, None]] = {rid: {} for rid in live_runs}
     self.since: dict[str, float] = {}
-    for req_id, c in sorted(self.cmds.items(), key=lambda kv: kv[1].seq):
-      if c.run in self.queues:
-        self.queues[c.run][req_id] = None
-        if c.owner:
+    for req_id, row in sorted(self.cmds.items(), key=lambda kv: kv[1].seq):
+      if row.cmd.run in self.queues:
+        self.queues[row.cmd.run][req_id] = None
+        if row.owner:
           self.since[req_id] = now
 
   def open(self, run_id: str) -> None:
@@ -43,13 +40,13 @@ class TrainQueue:
     return len(self.queues.get(run_id, ()))
 
   def max_seq(self) -> int:
-    return max((c.seq for c in self.cmds.values()), default=0)
+    return max((row.seq for row in self.cmds.values()), default=0)
 
-  def owners(self) -> list[tuple[str, str, str]]:
-    return [c.owner for c in self.cmds.values() if c.owner]
+  def owners(self) -> list[Owner]:
+    return [row.owner for row in self.cmds.values() if row.owner]
 
   def versions(self) -> set[str]:
-    return {x for c in self.cmds.values() for x in (c.version, c.snapshot) if x}
+    return {x for row in self.cmds.values() for x in (row.version, row.snapshot) if x}
 
   def seen_id(self, run_id: str, seq_id: int) -> str | None:
     return hit[0] if (hit := self.seen.get(f"{run_id}:{seq_id}")) and hit[1] > time.time() else None
@@ -57,7 +54,7 @@ class TrainQueue:
   def submit(self, cmd: Cmd, seq: int, seq_id: int | None, session_ttl: float, uri: str | None = None) -> None:
     with self.db:
       self.db.put_blob(f"c:{cmd.request_id}", cmd.body)
-      self.cmds[cmd.request_id] = CmdRow(cmd.run, cmd.entry_id, cmd.op, cmd.cost, seq, uri)
+      self.cmds[cmd.request_id] = CmdRow(replace(cmd, body=b""), seq, uri)
       if seq_id is not None:
         self.seen[f"{cmd.run}:{seq_id}"] = [cmd.request_id, time.time() + session_ttl]
     self.queues.setdefault(cmd.run, {})[cmd.request_id] = None
@@ -71,38 +68,37 @@ class TrainQueue:
     return None
 
   def cmd(self, req_id: str, *, full: bool = False) -> Cmd:
-    c, body = self.cmds[req_id], (self.db.get_blob(f"c:{req_id}") or b"") if full else b""
-    return Cmd(c.run, c.eid, c.op, body, c.cost)
+    base = self.cmds[req_id].cmd
+    return replace(base, body=self.db.get_blob(f"c:{req_id}") or b"") if full else base
 
-  def work(self, req_id: str, run: dict) -> Work:
-    c = self.cmds[req_id]
-    return Work(self.cmd(req_id, full=True), run, c.snapshot, c.version)
+  def work(self, req_id: str, run: Run) -> Work:
+    row = self.cmds[req_id]
+    return Work(self.cmd(req_id, full=True), run, row.snapshot, row.version)
 
   def head(self, run_id: str) -> tuple[str, CmdRow] | None:
-    if (k := next(iter(self.queues.get(run_id, ())), None)) and not (c := self.cmds[k]).owner:
-      return k, c
+    if (k := next(iter(self.queues.get(run_id, ())), None)) and not (row := self.cmds[k]).owner:
+      return k, row
     return None
 
-  def held_by(self, owner: tuple[str, str, str]) -> tuple[str, CmdRow] | None:
-    return next(((k, c) for k, c in self.cmds.items() if c.owner == owner), None)
+  def held_by(self, owner: Owner) -> tuple[str, CmdRow] | None:
+    return next(((k, row) for k, row in self.cmds.items() if row.owner == owner), None)
 
   def held_on(self, node_boot: tuple[str, str]) -> list[tuple[str, CmdRow]]:
-    return [(k, c) for k, c in self.cmds.items() if c.owner and c.owner[1:] == node_boot]
+    return [(k, row) for k, row in self.cmds.items() if row.owner and row.owner[1:] == node_boot]
 
-  def in_flight(self, run_id: str) -> list[tuple[str, tuple[str, str, str]]]:
+  def in_flight(self, run_id: str) -> list[tuple[str, Owner]]:
     return [(k, o) for k in self.queues.get(run_id, ()) if (o := self.cmds[k].owner)]
 
-  def claim(self, req_id: str, owner: tuple[str, str, str], now: float, snapshot: str | None, ver: str | None) -> None:
-    c = self.cmds[req_id]
-    c.owner, c.snapshot, c.version, self.since[req_id] = owner, snapshot, ver, now
+  def claim(self, req_id: str, owner: Owner, now: float, snapshot: str | None, ver: str | None) -> None:
+    row = self.cmds[req_id]
+    row.owner, row.snapshot, row.version, self.since[req_id] = owner, snapshot, ver, now
     self.cmds.save(req_id)
 
-  def pop_claimed(self, req_id: str, owner: tuple[str, str, str] | None) -> Cmd | None:
-    if (c := self.cmds.get(req_id)) is None or c.owner != owner or req_id not in self.queues.get(c.run, ()):
+  def pop_claimed(self, req_id: str, owner: Owner | None) -> Cmd | None:
+    if (row := self.cmds.get(req_id)) is None or row.owner != owner or req_id not in self.queues.get(row.cmd.run, ()):
       return None
-    cmd = self.cmd(req_id)
-    del self.queues[cmd.run][req_id]
-    return cmd
+    del self.queues[row.cmd.run][req_id]
+    return row.cmd
 
   def remove(self, req_id: str) -> None:
     self.since.pop(req_id, None)

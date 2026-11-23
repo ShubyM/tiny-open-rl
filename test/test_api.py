@@ -179,7 +179,7 @@ class TestAPI(BusTest):
       if self.bus.get_checkpoint("tinker://r/weights/soon") is None:
         break
       await asyncio.sleep(0.05)
-    self.assertEqual([c["checkpoint_id"] for c in self.bus.checkpoints.values()], ["weights/later"])
+    self.assertEqual([c.uri for c in self.bus.checkpoints.values()], ["tinker://r/weights/later"])
 
   async def test_errors(self):
     run_id = await self.create_model()

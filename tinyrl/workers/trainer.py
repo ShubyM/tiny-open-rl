@@ -9,6 +9,7 @@ import contextlib
 import json
 import os
 import sys
+import time
 
 import torch
 import torch.distributed as dist
@@ -16,7 +17,7 @@ import torch.distributed as dist
 from tinyrl.api import wire
 from tinyrl.storage.store import Store, nbytes
 from tinyrl.trace import span
-from tinyrl.types import Cmd, Effect, Op, Reply, Saved
+from tinyrl.types import Checkpoint, Cmd, Effect, Op, Reply, Run
 from tinyrl.workers.model import GradientRecoveryError, Model
 
 RECOVERABLE_ERRORS = (ValueError, KeyError, GradientRecoveryError)
@@ -51,23 +52,23 @@ class Trainer:
         os._exit(1)
       raise
 
-  def save(self, run: str, uri: str, sampler: bool = False, ttl_seconds=None, owned=False, version=None) -> Saved:
+  def save(self, run: str, uri: str, sampler: bool = False, ttl_seconds=None, owned=False, version=None) -> Checkpoint:
     tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
-    ver, size = self.store.put(tensors, meta, version=version), sum(map(nbytes, tensors.values()))
+    ver, size, now = self.store.put(tensors, meta, version=version), sum(map(nbytes, tensors.values())), time.time()
     info = {k: meta[k] for k in ("base", "rank", "lora") if k in meta}
     if info.get("rank"):
       t = meta.get("targets", ())
       info["flags"] = {"train_unembed": "lm_head" in t, "train_mlp": "gate_proj" in t, "train_attn": "q_proj" in t}
-    return Saved(uri, ver, size, ttl_seconds, bool(owned), info)
+    return Checkpoint(uri, ver, size, now, now + ttl_seconds if ttl_seconds else None, bool(owned), info)
 
   def load_run(self, run: str, version: str | None, optimizer: bool, gradients: bool) -> None:
     self.call_model("restore_run", run, *self.store.get(version), optimizer, gradients)
 
   @span("trainer.execute")
   def execute(
-    self, cmd: Cmd, run: dict | None = None, snapshot: str | None = None, version: str | None = None
+    self, cmd: Cmd, run: Run | None = None, snapshot: str | None = None, version: str | None = None
   ) -> tuple[Reply, Effect]:
-    reply, saved, created, revision = None, None, False, None
+    reply, checkpoint, created, revision = None, None, False, None
     try:
       if cmd.op != Op.CREATE_MODEL and cmd.run not in self.model.params:
         if cmd.op == Op.DELETE_MODEL:
@@ -77,7 +78,7 @@ class Trainer:
           raise KeyError(f"model {cmd.run} lost its unsaved steps when its trainer stopped; call load_state")
         if run is None:
           raise KeyError(f"no training run {cmd.run}")
-        self.call_model("create_run", cmd.run, run["base"], run["rank"], run.get("lora", {}))
+        self.call_model("create_run", cmd.run, run.base, run.rank, run.lora)
         created = True
         if snapshot and cmd.op != Op.LOAD_WEIGHTS:
           self.load_run(cmd.run, snapshot, optimizer=True, gradients=True)
@@ -102,7 +103,9 @@ class Trainer:
             reply = ok({"type": cmd.op, "metrics": self.call_model("optim_step", cmd.run, args["adam_params"])})
           case Op.SAVE_WEIGHTS | Op.SAVE_WEIGHTS_FOR_SAMPLER:
             sampler = cmd.op == Op.SAVE_WEIGHTS_FOR_SAMPLER
-            saved = self.save(cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False), version)
+            checkpoint = self.save(
+              cmd.run, args["uri"], sampler, args.get("ttl_seconds"), args.get("owned", False), version
+            )
           case Op.LOAD_WEIGHTS:
             self.load_run(cmd.run, version, optimizer=args["optimizer"], gradients=False)
           case Op.DELETE_MODEL:
@@ -120,7 +123,7 @@ class Trainer:
       reply = Reply.error(e)
     loaded = cmd.run in self.model.params
     mutated = loaded and revision is not None and self.model.state_revision != revision
-    return reply, Effect(loaded, mutated, loaded and cmd.op == Op.FORWARD_BACKWARD and reply.ok, saved)
+    return reply, Effect(loaded, mutated, loaded and cmd.op == Op.FORWARD_BACKWARD and reply.ok, checkpoint)
 
   def save_run(self, run: str, version: str) -> str | None:
     if run in self.model.params:

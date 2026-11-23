@@ -204,7 +204,7 @@ class Stress(BusTest):
     self.loops.pop(name).cancel()
     await node.close()
     if n := self.bus.nodes.get(name):
-      self.bus.expire_node(name, n["boot_id"])
+      self.bus.expire_node(name, n.boot_id)
     await node.control.aclose()
 
   async def cut_node(self, name: str) -> None:

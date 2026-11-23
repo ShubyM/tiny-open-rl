@@ -260,9 +260,9 @@ class TestNodeDaemon(BusTest):
       pb = self.bus.plan_state.home[b]
       self.assertEqual(holder.resident, (0,))
       self.assertNotIn(pb, node.workers)  # Rule R1: never enters GPU 0 until holder finishes parking
-      before = self.bus.nodes[node.id]["until"]
+      before = self.bus.nodes[node.id].until
       await node.step_once(wait_ms=0)
-      self.assertGreater(self.bus.nodes[node.id]["until"], before)
+      self.assertGreater(self.bus.nodes[node.id].until, before)
     finally:
       with contextlib.suppress(ProcessLookupError):
         os.killpg(pid, signal.SIGCONT)
