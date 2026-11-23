@@ -10,7 +10,7 @@ from tinyrl.control.accounting import Charge
 from tinyrl.control.ledger import Ledger
 from tinyrl.control.node_daemon import ControlClient
 from tinyrl.control.samples import QueueFullError, RequestGoneError
-from tinyrl.types import Checkpoint, Ev, FencedError, NodeStatus, Op, Reply, Role, Run, RunStatus
+from tinyrl.types import Checkpoint, Ev, FencedError, LocalWorker, NodeStatus, Op, Reply, Role, Run, RunStatus
 
 
 def ok(**body) -> Reply:
@@ -23,12 +23,11 @@ class TestLedger(BusTest):
     self.bus.create_run(Run(id=run_id, base="base", rank=8, session=session, role=role, account=account))
     return run_id
 
-  async def take_one(self, node: str = "n1", boot: str = "b1", gpus: int = 1, **opts):
-    plan, _ = await self.bus.heartbeat(node, boot, NodeStatus(gpus))
-    for a in plan:
-      if items := self.bus.take(node, boot, a.worker, **opts):
-        return a.worker, items[0]
-    raise AssertionError("expected ready work")
+  async def take_one(self, node: str = "n1", boot: str = "b1", gpus: int = 1):
+    plan = await self.bus.take(node, boot, NodeStatus(gpus))
+    [grant] = [g for g in plan.grants if g.work]
+    [work] = grant.work
+    return grant.worker, work
 
   async def test_a_command_goes_through_take_and_finish_and_its_reply_comes_back(self):
     run_id = self.new_run(account="alice")
@@ -106,7 +105,7 @@ class TestLedger(BusTest):
     self.bus.delete_run(run_id)
     self.assertIsNone(self.bus.submit_command(run_id, Op.OPTIM_STEP, b""))
     self.assertEqual(self.bus.queued_and_in_flight(run_id), {"live": False})
-    self.assertNotIn(run_id, self.bus.trains.queues)
+    self.assertEqual(list(self.bus.trains.rows(run_id)), [])
 
   async def test_delete_removes_owned_checkpoints_and_keeps_saved_weights(self):
     run = self.new_run()
@@ -117,7 +116,7 @@ class TestLedger(BusTest):
     wid, _ = await self.take_one()
     self.bus.finish("n1", "b1", wid, request, ok())
     self.assertEqual(await self.bus.wait_for_reply(request, 5), ok())
-    self.assertNotIn(run, self.bus.trains.queues)
+    self.assertEqual(list(self.bus.trains.rows(run)), [])
     self.assertIsNone(self.bus.get_run(run).get("snapshot"))
     self.assertIsNone(self.bus.get_run(run).get("owner"))
     self.assertNotIn(run, self.bus.state().jobs)
@@ -130,29 +129,31 @@ class TestLedger(BusTest):
     self.assertEqual(self.bus.queued_and_in_flight(run_id), {"live": True, "queued": 3, "in_flight": []})
 
     wid, w1 = await self.take_one()
-    [w1_retry] = self.bus.take("n1", "b1", wid)
+    _, w1_retry = await self.take_one()
     self.assertEqual(w1, w1_retry)
-    self.assertEqual(self.bus.take("n1", "b1", wid, holding=(w1.cmd.request_id,)), [])
+    running = NodeStatus(1, workers={wid: LocalWorker(current=(0,), holding=(w1.cmd.request_id,))})
+    held = await self.bus.take("n1", "b1", running)
+    self.assertFalse(any(g.work for g in held.grants))
     queue = self.bus.queued_and_in_flight(run_id)
     self.assertEqual(queue["queued"], 2)
     self.assertEqual([c["request_id"] for c in queue["in_flight"]], [request_ids[0]])
 
     self.assertTrue(self.bus.finish("n1", "b1", wid, w1.cmd.request_id, ok(), mutated=True))
-    [w2] = self.bus.take("n1", "b1", wid)
+    _, w2 = await self.take_one()
     self.assertEqual(w2.cmd.request_id, request_ids[1])
 
-  async def test_the_planner_runs_on_heartbeat_only_when_its_inputs_changed(self):
+  async def test_take_recomputes_placement_only_when_its_inputs_changed(self):
     with (
       mock.patch("tinyrl.control.ledger.TICK_MS", 10**9),
       mock.patch.object(self.bus, "reconcile", wraps=self.bus.reconcile) as plan,
     ):
       run_id = self.new_run()
-      await self.bus.heartbeat("n1", "b1", NodeStatus(1))
+      await self.bus.take("n1", "b1", NodeStatus(1))
       self.bus.submit_command(run_id, Op.OPTIM_STEP, b"")
-      await self.bus.heartbeat("n1", "b1", NodeStatus(1))
+      await self.bus.take("n1", "b1", NodeStatus(1))
       self.assertEqual(plan.call_count, 1)
       self.new_run()
-      await self.bus.heartbeat("n1", "b1", NodeStatus(1))
+      await self.bus.take("n1", "b1", NodeStatus(1))
       self.assertEqual(plan.call_count, 2)
 
   async def test_expired_dedupe_keys_are_swept_less_often_than_the_tick(self):
@@ -216,8 +217,8 @@ class TestLedger(BusTest):
     w1, _ = await self.take_one("n1", "b1", 1)
     self.bus.finish("n1", "b1", w1, req1, ok(), mutated=True)
 
-    plan, _ = await self.bus.heartbeat("n1", "b1", NodeStatus(1, draining=True, live_workers=(w1,)))
-    self.assertEqual(plan, [])
+    plan = await self.bus.take("n1", "b1", NodeStatus(1, draining=True, workers={w1: LocalWorker()}))
+    self.assertFalse(plan.grants)
     snap_ver = "a" * 32
     self.assertTrue(self.bus.detach("n1", "b1", w1, run_id, snapshot=snap_ver))
     info = self.bus.get_run(run_id)
@@ -235,7 +236,7 @@ class TestLedger(BusTest):
     self.assertIn(snap_ver, self.bus.live_versions())
 
     req3 = self.bus.submit_command(run_id, Op.OPTIM_STEP, b"{}")
-    [mut] = self.bus.take("n2", "b2", w2)
+    _, mut = await self.take_one("n2", "b2")
     self.assertEqual(mut.snapshot, snap_ver)
     self.bus.finish("n2", "b2", w2, req3, ok(), mutated=True)
     self.assertIsNone(self.bus.get_run(run_id).get("snapshot"))
@@ -277,19 +278,19 @@ class TestLedger(BusTest):
   async def test_a_sample_in_flight_is_reclaimed_only_from_a_dead_node(self):
     session = self.new_run(role=Role.SAMPLER)
     requests = [self.bus.submit_command(session, Op.SAMPLE, b"{}") for _ in range(2)]
-    [a1], _ = await self.bus.heartbeat("n1", "b1", NodeStatus(1))
-    t1 = self.bus.take("n1", "b1", a1.worker, slots=4)
+    [a1] = (await self.bus.take("n1", "b1", NodeStatus(1))).grants
+    t1 = a1.work
     self.assertEqual([w.cmd.request_id for w in t1], requests)
-    plan2, _ = await self.bus.heartbeat("n2", "b2", NodeStatus(1))
-    self.assertEqual([w for a in plan2 for w in self.bus.take("n2", "b2", a.worker, slots=4)], [])
+    plan = await self.bus.take("n2", "b2", NodeStatus(1))
+    self.assertFalse(any(g.work for g in plan.grants))
     self.bus.nodes["n1"].until = 0.0
-    [a2], _ = await self.bus.heartbeat("n2", "b2", NodeStatus(1))
-    t2 = self.bus.take("n2", "b2", a2.worker, slots=4)
+    [a2] = (await self.bus.take("n2", "b2", NodeStatus(1))).grants
+    t2 = a2.work
     self.assertEqual([w.cmd.request_id for w in t2], requests)
 
   async def test_a_dead_node_daemon_stops_counting(self):
-    await self.bus.heartbeat("node-a", "ba", NodeStatus(2))
-    await self.bus.heartbeat("node-b", "bb", NodeStatus(8))
+    await self.bus.take("node-a", "ba", NodeStatus(2))
+    await self.bus.take("node-b", "bb", NodeStatus(8))
     self.bus.nodes["node-b"].until = 0.0
     self.assertEqual(self.bus.live_nodes(), {"node-a": 2})
 
@@ -307,7 +308,8 @@ class TestLedger(BusTest):
     self.bus.end_session("s")
     self.assertEqual(self.bus.queued_and_in_flight(run_id)["queued"], 1)
     self.assertTrue(self.bus.sessions["s"]["active"])
-    self.bus.trains.queues[run_id].clear()
+    with self.bus.db:
+      self.bus.trains.drop(run_id)
     self.bus.end_session("s")
     self.assertEqual(self.bus.queued_and_in_flight(run_id)["queued"], 1)
     self.bus.delete_run(run_id)
@@ -328,13 +330,15 @@ class TestLedger(BusTest):
     self.bus.finish("n1", "b1", wid, r1, ok(), mutated=True)
     self.assertEqual(self.bus.get_run(keep)["status"], RunStatus.LIVE)
     self.bus.submit_command(drop, Op.FORWARD_BACKWARD, b"{}")
-    [taken] = self.bus.take("n1", "b1", wid)
+    resident = LocalWorker(current=(0,), loaded={keep: False})
+    plan = await self.bus.take("n1", "b1", NodeStatus(1, workers={wid: resident}))
+    [taken] = next(g.work for g in plan.grants if g.worker == wid)
     self.assertEqual(taken.cmd.run, drop)
     self.bus.delete_run(drop)
     self.assertEqual(self.bus.get_run(keep)["status"], RunStatus.LIVE)
     self.assertEqual(self.bus.get_run(keep)["owner"], [wid, "n1", "b1"])
 
-  async def test_failed_stage_version_fails_all_samples_without_off_gpu_admission(self):
+  async def test_unstaged_samples_wait_while_base_samples_can_run(self):
     base_sid = self.new_run(role=Role.SAMPLER)
     ckpt_uri = "tinker://tr/sampler_weights/s1"
     self.seed_checkpoint(ckpt_uri, 1, version="badver")
@@ -343,14 +347,15 @@ class TestLedger(BusTest):
     base_req = self.bus.submit_command(base_sid, Op.SAMPLE, b"{}")
     r1 = self.bus.submit_command(lora_sid, Op.SAMPLE, b"{}")
     r2 = self.bus.submit_command(lora_sid, Op.SAMPLE, b"{}")
-    [a], _ = await self.bus.heartbeat("n1", "b1", NodeStatus(1))
-    self.assertEqual(self.bus.take("n1", "b1", a.worker, slots=0, failed={"badver": "boom"}), [])
-    for r in (r1, r2):
-      rep = await self.bus.wait_for_reply(r, 0)
-      self.assertFalse(rep.ok)
-      self.assertIn("boom", rep.body.decode())
-    self.assertIsNone(await self.bus.wait_for_reply(base_req, 0))
-    self.assertEqual(self.bus.queued_and_in_flight(base_sid)["queued"], 1)
+    plan = await self.bus.take("n1", "b1", NodeStatus(1))
+    self.assertIn("badver", plan.stage)
+    [g] = [g for g in plan.grants if g.work]
+    self.assertEqual([w.cmd.request_id for w in g.work], [base_req])
+    self.bus.finish("n1", "b1", g.worker, base_req, ok())
+    for req in (r1, r2):
+      self.assertIsNone(await self.bus.wait_for_reply(req, 0))
+    plan = await self.bus.take("n1", "b1", NodeStatus(1, staged=("badver",)))
+    self.assertEqual([w.cmd.request_id for g in plan.grants for w in g.work], [r1, r2])
 
   async def test_sampler_billing_persists_across_maintain_and_reopen(self):
     self.bus.maintain()  # seed meta["service"]
@@ -378,8 +383,8 @@ class TestLedger(BusTest):
   async def test_sample_reply_lru_evicts_read_replies_before_unread(self):
     sid = self.new_run(role=Role.SAMPLER)
     reqs = [self.bus.submit_command(sid, Op.SAMPLE, b"{}") for i in range(3)]
-    [a], _ = await self.bus.heartbeat("n1", "b1", NodeStatus(1))
-    self.bus.take("n1", "b1", a.worker, slots=3)
+    [a] = (await self.bus.take("n1", "b1", NodeStatus(1))).grants
+    self.assertEqual([w.cmd.request_id for w in a.work], reqs)
     big = Reply(True, "application/json", b"x" * 60)
     with mock.patch("tinyrl.control.samples.SAMPLE_REPLY_BYTES", 120):
       self.bus.finish("n1", "b1", a.worker, reqs[0], big)
@@ -400,8 +405,8 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
       for name in ("a", "b"):
         bus.create_run(Run(name, f"base-{name}", 0))
         bus.submit_command(name, Op.OPTIM_STEP, b"")
-      plan, _ = await bus.heartbeat("n1", "b1", NodeStatus(2))
-      self.assertEqual(sum(len(bus.take("n1", "b1", a.worker)) for a in plan), 2)
+      plan = await bus.take("n1", "b1", NodeStatus(2))
+      self.assertEqual(sum(len(g.work) for g in plan.grants), 2)
       await bus.aclose()
       with mock.patch("tinyrl.control.nodes.LEASE_MS", 0):
         bus = Ledger(f"{tmp}/tinyrl.db")
@@ -411,7 +416,7 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
       # Reaped boot_id stays fenced even across another controller restart.
       bus = Ledger(f"{tmp}/tinyrl.db")
       with self.assertRaises(FencedError):
-        await bus.heartbeat("n1", "b1", NodeStatus(2))
+        await bus.take("n1", "b1", NodeStatus(2))
       await bus.aclose()
 
   async def test_rpc_client_survives_control_server_restart_and_preserves_durable_state(self):
@@ -425,8 +430,9 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
         bus.heartbeat_session("s1", {"sdk": "0.39"})
         bus.create_run(Run("tr-1", "base", 4, session="s1", account="alice"))
         req = bus.submit_command("tr-1", Op.SAVE_WEIGHTS, b"\x00\xff", cost=5)
-        [a], _ = await client.heartbeat("node-a", "boot-a", NodeStatus(1))
-        [w] = await client.take("node-a", "boot-a", a.worker)
+        [a] = (await client.take("node-a", "boot-a", NodeStatus(1))).grants
+        [w] = a.work
+        self.assertEqual(a.gpus, (0,))
         self.assertEqual(w.cmd.body, b"\x00\xff")
         ckpt = Checkpoint("tinker://tr-1/weights/v1", "ver1", 99, 1.0)
 
@@ -435,6 +441,11 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
         bus = Ledger(db_path)
         runner, _ = await serve_control(bus, host="127.0.0.1", port=port)
 
+        replay = await client.take("node-a", "boot-a", NodeStatus(1))
+        self.assertEqual(replay.grants, [a])
+        running = LocalWorker(current=a.gpus, holding=(req,))
+        observed = await client.take("node-a", "boot-a", NodeStatus(1, workers={a.worker: running}))
+        self.assertFalse(any(g.work for g in observed.grants))
         self.assertTrue(
           await client.finish("node-a", "boot-a", a.worker, req, ok(done=1), None, mutated=True, checkpoint=ckpt)
         )

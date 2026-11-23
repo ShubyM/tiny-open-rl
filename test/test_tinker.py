@@ -10,7 +10,8 @@ import unittest
 import urllib.request
 
 from test.helpers import tiny
-from tinyrl.control.ledger import Ledger as Bus
+from tinyrl.control.ledger import Ledger
+from tinyrl.types import Checkpoint
 
 EXAMPLE = pathlib.Path(__file__).parent.parent / "examples" / "tinker_sdk.py"
 
@@ -64,15 +65,16 @@ class TestTinkerSDK(unittest.TestCase):
 
       model_id = out.stdout.split("model ")[1].split()[0]
 
-      async def published() -> dict:
-        db = Bus(env["TINYRL_DB"])
+      async def published() -> Checkpoint | None:
+        db = Ledger(env["TINYRL_DB"])
         try:
           return db.get_checkpoint(f"tinker://{model_id}/sampler_weights/final")
         finally:
           await db.aclose()
 
       record = asyncio.run(published())
-      version = record["version"].partition("@")[0]
+      self.assertIsNotNone(record)
+      version = record.version.partition("@")[0]
       final = pathlib.Path(tmp, "ckpt", "objects", version)
       for _ in range(300):
         if (final / "manifest.json").exists():

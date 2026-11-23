@@ -67,15 +67,15 @@ def rank_runs(heads: list[Cmd], ready_lag, service: dict[str, float]) -> list[st
   return [c.run for c in sorted(ready.values(), key=key)]
 
 
-def admit_samples(heads, queued, account, ready_lag, service, ver_of, active_acct, active_vers, slots, max_loras):
-  """Fill up to `slots` for the leading account (draining first if another account leads), capped by `max_loras`."""
+def admit_samples(heads, queued, account, ready_lag, service, ver_of, slots, max_loras, active=()):
+  """Fill one wave for the leading account, rotating among runs with compatible model versions."""
   if slots <= 0 or not heads:
     return []
   ranked = rank_runs(heads, ready_lag, service)
   target = account(ranked[0])
-  if active_acct and target != active_acct:
+  if active and account(active[0].cmd.run) != target:
     return []
-  vers, runs = {v for v in active_vers if v is not None}, deque()
+  vers, runs = {w.version for w in active if w.version}, deque()
   for r in ranked:
     if account(r) == target and ((v := ver_of(r)) is None or v in vers or len(vers) < max_loras):
       if v is not None:
@@ -112,7 +112,7 @@ def plan_gpus(workers: dict[str, Worker], total: int, now: float, occupied: set[
     if w.exclusive or (protected and (w.hold_until > now or w.demand == Demand.FINISH_STEP)):
       keep[name] = w.current
 
-  taken = set().union(*keep.values())
+  taken = set(occupied).union(*keep.values())
   exclusive_gpus = {g for name, block in keep.items() if workers[name].exclusive for g in block}
   reserved, waiting = set(), False
 

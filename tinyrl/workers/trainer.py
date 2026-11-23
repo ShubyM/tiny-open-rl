@@ -55,10 +55,7 @@ class Trainer:
   def save(self, run: str, uri: str, sampler: bool = False, ttl_seconds=None, owned=False, version=None) -> Checkpoint:
     tensors, meta = self.call_model("sampler_weights" if sampler else "training_state", run)
     ver, size, now = self.store.put(tensors, meta, version=version), sum(map(nbytes, tensors.values())), time.time()
-    info = {k: meta[k] for k in ("base", "rank", "lora") if k in meta}
-    if info.get("rank"):
-      t = meta.get("targets", ())
-      info["flags"] = {"train_unembed": "lm_head" in t, "train_mlp": "gate_proj" in t, "train_attn": "q_proj" in t}
+    info = Checkpoint.model_info(meta)
     return Checkpoint(uri, ver, size, now, now + ttl_seconds if ttl_seconds else None, bool(owned), info)
 
   def load_run(self, run: str, version: str | None, optimizer: bool, gradients: bool) -> None:
@@ -87,12 +84,8 @@ class Trainer:
       revision = self.model.state_revision  # restoring the parked state itself leaves its snapshot valid
       if cmd.op == Op.FORWARD_BACKWARD:
         req = wire.parse(cmd.body)
-        stab = None
-        if req.loss_fn == "stable_reinforce":
-          reqs = {sid.rpartition(":")[0] for sid in wire.referenced_sequences(req)}
-          stab = {k: v for rid in reqs if rid for k, v in self.store.get_stability(rid).items()}
         fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
-        logprobs, metrics = self.call_model("forward_backward", *fb, stab)
+        logprobs, metrics = self.call_model("forward_backward", *fb, cmd.stability)
         reply = Reply(True, wire.PROTO, wire.output(logprobs, metrics))
       else:
         args = json.loads(cmd.body)

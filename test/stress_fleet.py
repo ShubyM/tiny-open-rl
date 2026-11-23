@@ -422,7 +422,7 @@ class Stress(BusTest):
     self.started = started
     self.abandoned, self.finished = [], []
     patches = [
-      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 100),
+      mock.patch("tinyrl.control.grants.QUANTUM_MS", 100),
       mock.patch("tinyrl.control.scheduler.REBALANCE_MS", 1000),
     ]
     if CHAOS:  # so that a node cut off from the controller is given up on in seconds
@@ -470,7 +470,7 @@ class Stress(BusTest):
         f"did not settle after deleting every run: procs {sorted(self.bus.plan_state.procs)} workers {workers}"
       )
     left = {
-      "queues": sorted([*self.bus.trains.queues, *self.bus.samples.queues]),
+      "queues": sorted([*self.bus.trains.cmds, *self.bus.samples.queues]),
       "writing": sorted(self.bus.trains.versions()),
       "owners": [r for r in trainers if (row := self.bus.runs.get(r)) and row.owner],
       "on GPUs": {n.id: dict(n.occ.on) for n in self.nodes.values() if n.occ.on},

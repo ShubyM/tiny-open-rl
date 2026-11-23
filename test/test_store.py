@@ -40,6 +40,8 @@ class TestStore(unittest.TestCase):
     saved = saver.put({"w": torch.ones(4)}, {"lora": True, "config": {"r": 4}})
     saver.upload_pending_saves()  # what start() does in the background
 
+    self.assertEqual(loader.read_meta(saved), {"lora": True, "config": {"r": 4}})
+    self.assertFalse(os.path.exists(f"{loader.cache}/{saved}"))
     folder, version = loader.local_folder(saved)
     self.assertEqual(sorted(os.listdir(folder)), ["adapter_config.json", "adapter_model.safetensors"])
     self.assertTrue(torch.equal(loader.get(saved)[0]["w"], torch.ones(4)))
@@ -176,6 +178,7 @@ class TestStore(unittest.TestCase):
     root = f"memory://tinyrl-test/{uuid.uuid4()}"
     saver, loader = Store(root, cache=tempfile.mkdtemp()), Store(root, cache=tempfile.mkdtemp())
     saver.start()
+    saver.peer = f"127.0.0.1:{saver.server.server_port}"  # Both test nodes share this host.
     saver.stopping.set()  # no uploads, so the copy can only come from the saver
     saver.uploader.join()
     meta, w = {"lora": False, "config": {"model_type": "x"}}, torch.randn(64, 64).to(torch.bfloat16)
@@ -236,8 +239,8 @@ class TestRegistry(BusTest):
     uri = f"tinker://{run}/sampler_weights/session"
     self.seed_checkpoint(uri, 1, ttl=60, owned=True)
     self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
-    [a], _ = await self.bus.heartbeat("n1", "b1", NodeStatus(1))
-    [w] = self.bus.take("n1", "b1", a.worker)
+    [a] = (await self.bus.take("n1", "b1", NodeStatus(1))).grants
+    [w] = a.work
     for _ in range(20):
       self.bus.set_checkpoint_ttl(uri, 600)
     self.bus.finish("n1", "b1", a.worker, w.cmd.request_id, Reply(True, "application/json", b"{}"))
@@ -258,15 +261,15 @@ class TestRegistry(BusTest):
         uri = f"tinker://{run}/weights/final"
         self.bus.create_run(Run(run, "base", 4))
         self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        [a1], _ = await self.bus.heartbeat("n1", b1, NodeStatus(1))
-        [w1] = self.bus.take("n1", b1, a1.worker)
+        [a1] = (await self.bus.take("n1", b1, NodeStatus(1))).grants
+        [w1] = a1.work
         abandoned = w1.version
         self.bus.nodes["n1"].until = 0.0
         self.bus.maintain()
 
         self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        [a2], _ = await self.bus.heartbeat("n2", b2, NodeStatus(1))
-        [w2] = self.bus.take("n2", b2, a2.worker)
+        [a2] = (await self.bus.take("n2", b2, NodeStatus(1))).grants
+        [w2] = a2.work
         version = w2.version
         winner = new.put({"w": torch.ones(2)}, version=version)
         sweep(new, grace=0)  # protected even before the reply publishes it

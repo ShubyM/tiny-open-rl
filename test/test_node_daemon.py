@@ -131,21 +131,31 @@ class TestNodeDaemon(BusTest):
         release.set()
       await self.reply(slow, node)
 
-  async def test_a_checkpoint_whose_node_left_before_it_uploaded_fails_fast(self):
+  async def test_a_failed_stage_retries_when_the_checkpoint_arrives(self):
     with tempfile.TemporaryDirectory() as folder:
       writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
       writer.peer = "127.0.0.1:9"  # a node that no longer answers
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       uri = "tinker://training/sampler_weights/lost"
-      version = writer.put({}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
+      version = writer.put({}, {"base": "tiny", "lora": True, "config": {}})
       self.seed_checkpoint(uri, 0, version=version)
       self.bus.create_run(Run("lost", "tiny", 4, role=Role.SAMPLER, model_path=uri))
       request = self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
+      failed, read = threading.Event(), node.store.local_folder
+
+      def stage(ver):
+        try:
+          return read(ver)
+        except ValueError:
+          failed.set()
+          raise
+
+      node.store.local_folder = stage
       await node.bind("sampler", "lost")
-      waiting = self.background(self.bus.wait_for_reply(request, 10))
-      await self.until(waiting.done, node)
-      self.assertFalse(waiting.result().ok)
-      self.assertIn("has not landed, and 127.0.0.1:9 failed to copy", waiting.result().body.decode())
+      await self.until(failed.is_set, node)
+      self.assertIsNone(await self.bus.wait_for_reply(request, 0))
+      await asyncio.to_thread(writer.upload_pending_saves)
+      await self.reply(request, node)
 
   async def test_trainer_leaves_next_command_unclaimed_during_execution(self):
     node, a, b = self.node(), new_id(), new_id()
@@ -352,7 +362,7 @@ class TestNodeDaemon(BusTest):
     self.assertLessEqual(len(parks), 3)
 
   async def test_a_swap_waits_for_an_open_training_step_to_finish(self):
-    self.enterContext(patch("tinyrl.control.node_daemon.QUANTUM_MS", 40))
+    self.enterContext(patch("tinyrl.control.grants.QUANTUM_MS", 40))
     node = self.node(gpus=1)
     a, b = new_id(), new_id()
     self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
@@ -432,15 +442,15 @@ class TestNodeDaemon(BusTest):
     req = self.bus.submit_command(b, Op.CREATE_MODEL, json.dumps({"base_model": "b", "rank": 4, "lora": LORA}).encode())
     try:
       await self.until(parking.is_set, node)
-      snap = self.background(holder.detach_run(a))
+      snap = self.background(node.detach_run(holder, a, drop=True))
       for _ in range(5):
         await asyncio.sleep(0)
       self.assertFalse(snap.done())
       self.assertEqual(overlap, [])
     finally:
       release.set()
-    saved = await snap
-    self.assertIsNotNone(saved)
+    await snap
+    self.assertIsNotNone(self.bus.get_run(a)["snapshot"])
     self.assertEqual(overlap, [])
     await self.reply(req, node)
 

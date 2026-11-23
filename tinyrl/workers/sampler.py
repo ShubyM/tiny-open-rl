@@ -1,4 +1,4 @@
-"""The node's sampling driver. It loads staged checkpoints into an engine; the node owns storage, queues and GPU turns.
+"""The sampling driver loads staged checkpoints into the engine and executes the samples in a grant.
 
 ENGINE names the engine's class, vLLM (tinyrl/workers/vllm.py) unless set. Engines own loaded checkpoint names and make load_checkpoint idempotent.
 """
@@ -78,17 +78,16 @@ class Sampler:
     async with self.loading:
       await self.running.load_checkpoint(checkpoint[1], checkpoint[0])
 
-  async def execute(self, cmd: Cmd, name: str | None = None, store=None) -> Reply:
+  async def execute(self, cmd: Cmd, name: str | None = None) -> Reply:
     try:
       job = json.loads(cmd.body)
       out = await self.running.sample(job, name)
 
-      def encode_all() -> bytes:
-        if store is not None and job.get("record_stability_info"):
-          store.put_stability(cmd.request_id, encode_stability(cmd.request_id, out))
-        return encode(job, out)
+      def encode_reply() -> Reply:
+        stability = encode_stability(cmd.request_id, out) if job.get("record_stability_info") else None
+        return Reply(True, wire.PROTO, encode(job, out), stability)
 
-      return Reply(True, wire.PROTO, await asyncio.to_thread(encode_all))
+      return await asyncio.to_thread(encode_reply)
     except Exception as e:
       return Reply.error(e)
 

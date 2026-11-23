@@ -24,8 +24,9 @@ from tinyrl.api import wire
 from tinyrl.control import estimator
 from tinyrl.control.ledger import COUNTERS, TICK_MS, Ledger
 from tinyrl.control.samples import QueueFullError, RequestGoneError
+from tinyrl.control.upgrade import checkpoint_meta
 from tinyrl.helpers import getenv
-from tinyrl.types import Checkpoint, FencedError, Op, Role, Run, parse_uri
+from tinyrl.types import RPC_TYPES, Checkpoint, FencedError, Op, Role, Run, parse_uri
 
 WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply; the SDK gives up after 45s
 CKPT_TTL = getenv("CKPT_TTL", 0)  # default TTL for unowned saves (>= 3600s; 0 keeps until deleted)
@@ -152,10 +153,7 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
       await ledger.aclose()
 
   api = FastAPI(title="tiny-open-rl", lifespan=lifespan if control else None)
-  rpc = {
-    name: (fn := getattr(ledger, name), inspect.signature(fn), typing.get_type_hints(fn))
-    for name in ("heartbeat", "take", "finish", "detach")
-  }
+  rpc = {name: (fn := getattr(ledger, name), inspect.signature(fn), typing.get_type_hints(fn)) for name in RPC_TYPES}
   for exc, code in ERRORS.items():
     api.add_exception_handler(exc, lambda _, err, c=code: JSONResponse({"error": f"{type(err).__name__}: {err}"}, c))
 
@@ -179,10 +177,10 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
     return record
 
   def submit(
-    run: str, op: Op, body: bytes | dict, seq_id: int | None = None, cost: int = 1, uri: str | None = None
+    run: str, op: Op, body: bytes | dict, seq_id: int | None = None, cost: int = 1, uri=None, stability_refs=None
   ) -> dict[str, str]:
     raw = json.dumps(body).encode() if isinstance(body, dict) else body
-    if (request_id := ledger.submit_command(run, op, raw, seq_id, cost, uri)) is None:
+    if (request_id := ledger.submit_command(run, op, raw, seq_id, cost, uri, stability_refs)) is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
 
@@ -194,8 +192,7 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
     if train.get("base"):
       base, lora = train["base"], train["rank"] > 0
     elif mp:
-      ckpt = ledger.get_checkpoint(mp)
-      meta = ckpt.meta if ckpt else {}
+      meta = await checkpoint_meta(ledger.get_checkpoint(mp))
       base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
     if not base:
       raise ValueError("could not resolve base_model" if mp else "base_model required when model_path is None")
@@ -215,11 +212,11 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
   async def scheduling():
     nodes, state = ledger.node_status(), dataclasses.asdict(ledger.state())
     for proc, placed in state["procs"].items():
-      if status := nodes.get(placed["node"]):
-        if proc in status.pids:
-          placed["pid"] = status.pids[proc]
-        if gpus := status.on.get(proc):
-          placed["gpus"] = list(gpus)
+      if (status := nodes.get(placed["node"])) and (worker := status.workers.get(proc)):
+        if worker.pid is not None:
+          placed["pid"] = worker.pid
+        if worker.current:
+          placed["gpus"] = list(worker.current)
     return {"nodes": {n: s.gpus for n, s in nodes.items()}, "state": state}
 
   api.get("/api/v1/healthz")(lambda: {"status": "ok"})
@@ -273,7 +270,10 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
   @api.post("/api/v1/forward_backward")
   async def forward_backward(request: Request):
     parsed = wire.parse(body := await request.body())
-    return submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed))
+    refs = wire.referenced_sequences(parsed) if parsed.loss_fn == "stable_reinforce" else None
+    return submit(
+      parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed), stability_refs=refs
+    )
 
   @api.post("/api/v1/optim_step")
   async def optim_step(req: OptimStepRequest):
@@ -305,8 +305,7 @@ def app(ledger: Ledger | None = None, *, control: bool = False) -> FastAPI:
 
   @api.post("/api/v1/weights_info")
   async def weights_info(req: WeightsInfoRequest):
-    ckpt = ledger.get_checkpoint(req.tinker_path)
-    meta = ckpt.meta if ckpt else {}
+    meta = await checkpoint_meta(ledger.get_checkpoint(req.tinker_path))
     if "base" not in meta:
       raise HTTPException(404, f"no checkpoint {req.tinker_path} that names its base model")
     rank = int(meta.get("rank") or 0)

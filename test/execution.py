@@ -40,6 +40,8 @@ class InlineProcess:
 class TestNode(NodeDaemon):
   def __init__(self, control, store=None, gpus=8, node="test-node", model=tiny, engine=FakeEngine, gpu_mib=0):
     super().__init__(control, gpus=gpus, node=node, gpu_mib=gpu_mib, store=store)
+    if self.store.server:  # Test nodes share a host and use separate caches.
+      self.store.peer = f"127.0.0.1:{self.store.server.server_port}"
     self.default_model, self.engine_type = model, engine
     self.processes, self.samplers = {}, {}
 

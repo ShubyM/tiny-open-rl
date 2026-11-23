@@ -18,7 +18,8 @@ from test.test_trainer import LORA, counting
 from tinyrl.api.proto import tinker_public_pb2 as pb
 from tinyrl.control import scheduler
 from tinyrl.control.fairness import Demand, Worker, admit_samples, plan_gpus, rank_runs, update_lag, waterfill
-from tinyrl.control.node_daemon import QUANTUM_MS, NodeDaemon, WorkerHandle
+from tinyrl.control.grants import QUANTUM_MS
+from tinyrl.control.node_daemon import NodeDaemon, WorkerHandle
 from tinyrl.control.scheduler import (
   REBALANCE_MS,
   Job,
@@ -585,24 +586,14 @@ class TestLocalQuantum(unittest.TestCase):
       service[run] += 3 if run == "saving" else 1
     self.assertEqual(service, {"saving": 9, "training": 9})
 
-  def test_admit_samples_never_exceeds_free_slots(self):
+  def test_sampler_wave_obeys_account_and_version_limits_and_rotates_within_them(self):
     queues = {
-      "b1": [Cmd("b1", f"1-{i}", Op.SAMPLE, b"{}") for i in range(2)],
-      "b2": [Cmd("b2", f"2-{i}", Op.SAMPLE, b"{}") for i in range(2)],
+      run: [Cmd(run, f"{i}-{j}", Op.SAMPLE, b"{}") for j in range(3)] for i, run in enumerate(("a1", "a2", "a3", "b1"))
     }
     heads = [q[0] for q in queues.values()]
-    admitted = admit_samples(
-      heads, lambda r, n: queues[r][:n], lambda r: "B", lambda r: 0.0, {}, lambda r: None, "B", (), 2, 16
-    )
-    self.assertEqual(len(admitted), 2)
-    self.assertEqual({c.run for c in admitted}, {"b1", "b2"})
-    # When another account leads, stop admitting so the in-flight wave drains cleanly.
-    self.assertEqual(
-      admit_samples(
-        heads, lambda r, n: queues[r][:n], lambda r: "B", lambda r: 0.0, {}, lambda r: None, "A", (), 2, 16
-      ),
-      [],
-    )
+    versions = {"a1": "v1", "a2": "v1", "a3": "v2", "b1": "v1"}
+    admitted = admit_samples(heads, lambda r, n: queues[r][:n], lambda r: r[0], lambda r: 0, {}, versions.get, 4, 1)
+    self.assertEqual([c.run for c in admitted], ["a1", "a2", "a1", "a2"])
 
   def test_local_guard_enforces_gpu_exclusivity_under_concurrent_handoffs(self):
     async def run():
@@ -961,7 +952,7 @@ class TestMultiNodeExecution(BusTest):
     from tinyrl.control.db import Table
     from tinyrl.types import NodeStatus
 
-    await self.bus.heartbeat("n", "bn", NodeStatus(1))
+    await self.bus.take("n", "bn", NodeStatus(1))
     self.bus.create_run(Run("r", "tiny", 4, lora=LORA, account="acct"))
     writes, orig_set = 0, Table.__setitem__
 
@@ -979,7 +970,7 @@ class TestMultiNodeExecution(BusTest):
       self.bus.create_run(Run("r2", "tiny", 4, lora=LORA, account="acct"))
       self.bus.maintain()  # a run joined the process
       self.bus.nodes.pop("n", None)
-      await self.bus.heartbeat("m", "bm", NodeStatus(1))  # the process moved to m
+      await self.bus.take("m", "bm", NodeStatus(1))  # the process moved to m
     self.assertEqual(writes, 4)
 
   async def test_new_node_rebalances_mid_accumulation_with_exact_model_parameters(self):
@@ -1030,8 +1021,8 @@ class TestMultiNodeExecution(BusTest):
         return await super().sample(job, name)
 
     with (
-      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
-      mock.patch("tinyrl.control.node_daemon.MAX_SEQS", 2),
+      mock.patch("tinyrl.control.grants.QUANTUM_MS", 15),
+      mock.patch("tinyrl.types.MAX_SEQS", 2),
     ):
       await self.add_node("shared", gpus=1, engine=BusySampler)
       self.start_scheduler()
@@ -1146,7 +1137,7 @@ class TestMultiNodeExecution(BusTest):
     self.bus.create_run(Run(sid, "tiny", 4, role=Role.SAMPLER, account="team-s"))
     total_cmds = 12
     payload = json.dumps(JOB).encode()
-    with mock.patch("tinyrl.control.node_daemon.MAX_SEQS", 2), mock.patch("tinyrl.control.scheduler.MAX_SEQS", 4):
+    with mock.patch("tinyrl.types.MAX_SEQS", 2), mock.patch("tinyrl.control.scheduler.MAX_SEQS", 4):
       reqs = [await self.submit(sid, Op.SAMPLE, payload, cost=50) for _ in range(total_cmds)]
 
       async def scaled_out() -> bool:
@@ -1221,11 +1212,11 @@ class TestMultiNodeExecution(BusTest):
     pa = self.bus.state().home[a]
     w_a = self.nodes[0].workers[pa]
     # Push `a` past its minimum quantum (into OVERTIME) without touching `b` yet.
-    self.assertGreaterEqual(w_a.hold_until, before + QUANTUM_MS / 1000)
-    w_a.hold_until = expired = time.monotonic() - 1.0
+    self.assertGreaterEqual(w_a.resumed_at, before)
+    w_a.resumed_at = expired = time.monotonic() - QUANTUM_MS / 1000 - 1.0
     # Running alone after the deadline keeps the original turn.
     await self.run_cmd(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
-    self.assertEqual(w_a.hold_until, expired)
+    self.assertEqual(w_a.resumed_at, expired)
     # Late-joiner `b` arrives while `a` is busy in OVERTIME -> preempts without waiting a full 2s quantum.
     await self.create(b, account="bob")
     t0 = time.monotonic()

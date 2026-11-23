@@ -31,5 +31,5 @@ class Wave:
       return await call
     finally:
       end, final_ms = self._change_active(-1)
-      charge.busy_ms = (end - start) // 1_000_000
-      charge.gpu_ms = final_ms - initial_ms
+      charge.busy_ms += (end - start) // 1_000_000
+      charge.gpu_ms += final_ms - initial_ms

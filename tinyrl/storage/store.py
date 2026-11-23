@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import fsspec
-import msgspec
 
 if TYPE_CHECKING:
   import torch
@@ -42,7 +41,6 @@ MAX_SHARDS = 16
 STREAM_CHUNK = 256 * 1024 * 1024
 # trim_cache() keeps CKPT_CACHE under this, oldest first. 0 is half its disk
 CACHE_BYTES = getenv("CKPT_CACHE_BYTES", 0)
-STABILITY_TTL = getenv("STABILITY_TTL", 24 * 3600)
 
 
 def object_id(name: str) -> bool:
@@ -83,8 +81,12 @@ def as_bytes(t: torch.Tensor) -> torch.Tensor:
 
 def header(path: str | Path) -> dict:
   with open(path, "rb") as f:
-    n = int.from_bytes(f.read(8), "little")
-    return json.loads(json.loads(f.read(n)).get("__metadata__", {}).get("meta", "{}"))
+    return read_header(f)
+
+
+def read_header(f) -> dict:
+  n = int.from_bytes(f.read(8), "little")
+  return json.loads(json.loads(f.read(n)).get("__metadata__", {}).get("meta", "{}"))
 
 
 def parallel(fn, *xs):
@@ -308,32 +310,22 @@ class Store:
     folder, _ = self.local_folder(version)
     return sorted(Path(folder).glob("*.safetensors"))
 
+  def read_meta(self, reference: str) -> dict:
+    version = reference.partition("@")[0]
+    prefix = f"{self.base}/objects/{version}"
+    if self.remote and object_id(version) and self.fs.exists(f"{prefix}/manifest.json"):
+      names = json.loads(self.fs.cat_file(f"{prefix}/manifest.json"))
+      first = sorted(n for n in names if n.endswith(".safetensors"))[0]
+      with self.fs.open(f"{prefix}/{first}", "rb", block_size=8192) as f:
+        return read_header(f)
+    return header(self.weight_files(reference)[0])
+
   @span("store.get")
   def get(self, version: str) -> tuple[dict[str, torch.Tensor], dict]:
     from safetensors.torch import load_file
 
     paths = self.weight_files(version)
     return {k: v for shard in parallel(load_file, paths) for k, v in shard.items()}, header(paths[0])
-
-  def stability_path(self, request_id: str) -> tuple[str, Path]:
-    key = hashlib.sha256(request_id.encode()).hexdigest()[:32]
-    return key, Path(self.cache if self.remote else self.base, "stability", key)
-
-  def put_stability(self, request_id: str, blobs: dict[str, bytes]) -> None:
-    key, path = self.stability_path(request_id)
-    data = msgspec.msgpack.encode(blobs)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    (tmp := path.parent / f"{key}.{uuid.uuid4().hex[:8]}.tmp").write_bytes(data)
-    tmp.replace(path)
-    if self.remote:
-      self.fs.pipe_file(f"{self.base}/stability/{key}", data)
-
-  def get_stability(self, request_id: str) -> dict[str, bytes]:
-    key, path = self.stability_path(request_id)
-    if path.is_file():
-      return msgspec.msgpack.decode(path.read_bytes())
-    raw = self.fs.cat_file(r) if self.remote and self.fs.exists(r := f"{self.base}/stability/{key}") else None
-    return msgspec.msgpack.decode(raw) if raw else {}
 
   def versions(self) -> set[str]:
     found = {os.path.basename(p).removesuffix(".writing") for p in self.fs.glob(f"{self.base}/objects/*")}
@@ -356,22 +348,10 @@ class Store:
             shutil.rmtree(Path(self.cache, version + suffix), ignore_errors=True)
         else:
           shutil.rmtree(path + ".writing", ignore_errors=True)
-    if self.remote:
-      cutoff = time.time() - STABILITY_TTL
-      for p in self.fs.glob(f"{self.base}/stability/*"):
-        with contextlib.suppress(Exception):
-          if float(self.fs.modified(p).timestamp()) <= cutoff:
-            self.fs.rm(p)
     self.trim_cache()
 
   def trim_cache(self) -> None:
-    """Prune expired stability blobs and remove oldest uploaded checkpoints in CKPT_CACHE until under CKPT_CACHE_BYTES."""
-    if os.path.isdir(stab := os.path.join(self.cache if self.remote else self.base, "stability")):
-      cutoff = time.time() - STABILITY_TTL
-      for e in os.scandir(stab):
-        with contextlib.suppress(FileNotFoundError):
-          if e.stat().st_mtime <= cutoff:
-            Path(e.path).unlink(missing_ok=True)
+    """Remove oldest uploaded checkpoints in CKPT_CACHE until under CKPT_CACHE_BYTES."""
     if not os.path.isdir(self.cache):
       return
     limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2

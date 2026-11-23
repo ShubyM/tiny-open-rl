@@ -290,8 +290,8 @@ class TestSampler(BusTest):
 
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
     with (
-      mock.patch("tinyrl.control.node_daemon.QUANTUM_MS", 15),
-      mock.patch("tinyrl.control.node_daemon.MAX_SEQS", 1),
+      mock.patch("tinyrl.control.grants.QUANTUM_MS", 15),
+      mock.patch("tinyrl.types.MAX_SEQS", 1),
     ):
       first = self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode(), cost=10)
       self.pump(node, sched=True)
@@ -308,25 +308,22 @@ class TestSampler(BusTest):
     self.assertEqual(order[0], [11])
     self.assertLess(order.index([22]), order.index([55]))
 
-  async def test_invalid_backlog_does_not_starve_a_ready_sibling(self):
+  async def test_missing_checkpoint_is_rejected_before_healthy_sibling_uses_gpu(self):
     self.bus.create_run(Run("broken", "base", 4, role=Role.SAMPLER, model_path="tinker://x/sampler_weights/gone"))
     self.bus.create_run(Run("ready", "base", 4, role=Role.SAMPLER))
     requests = [self.bus.submit_command("broken", Op.SAMPLE, json.dumps(JOB).encode()) for _ in range(32)]
     ready = self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
-    bus, queued = self.bus, []
+    self.assertEqual(self.bus.queued_and_in_flight("broken"), {"live": True, "queued": 0, "in_flight": []})
+    for request in requests:
+      reply = await self.bus.wait_for_reply(request, 0)
+      self.assertFalse(reply.ok)
+      self.assertIn("no checkpoint at", json.loads(reply.body)["error"])
+    self.assertEqual(self.bus.get_run("broken")["failed"], len(requests))
 
-    class Ready(FakeEngine):
-      async def sample(self, job, name):
-        queued.append((bus.queued_and_in_flight("broken"))["queued"])
-        return await super().sample(job, name)
-
-    node = self.node(gpus=1, engine=Ready)
+    node = self.node(gpus=1)
     await node.bind("sampler", "broken", "ready")
     self.pump(node)
     self.assertTrue((await self.bus.wait_for_reply(ready, 5)).ok)
-    self.assertGreater(queued[0], 0, "ready work waited for the whole invalid backlog")
-    self.assertFalse((await self.bus.wait_for_reply(requests[-1], 5)).ok)
-    self.assertEqual((self.bus.get_run("broken"))["failed"], len(requests))
 
   async def test_high_priority_sampler_account_runs_before_overserved_sibling(self):
     self.bus.create_run(Run("high", "base", 4, role=Role.SAMPLER, account="alice"))

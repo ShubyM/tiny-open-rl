@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import itertools
 import time
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 
+from tinyrl.control.db import DB
 from tinyrl.helpers import getenv
-from tinyrl.types import Cmd, Owner, Reply
+from tinyrl.types import Cmd, Owner, Reply, Work
 
 SAMPLE_QUEUE_BYTES = getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20)
 SAMPLE_REPLY_BYTES = getenv("SAMPLE_REPLY_BYTES", 256 * 2**20)
+STABILITY_TTL, STABILITY_BYTES = getenv("STABILITY_TTL", 24 * 3600), getenv("STABILITY_BYTES", 512 * 2**20)
 
 
 class RequestGoneError(LookupError):
@@ -24,8 +27,14 @@ class QueueFullError(RuntimeError):
 @dataclass
 class Entry:
   cmd: Cmd
+  version: str | None = None
   owner: Owner | None = None
+  block: tuple[int, ...] = ()
   since: float = 0.0
+  attempt: int = 0
+
+  def work(self) -> Work:
+    return Work(self.cmd, version=self.version, attempt=self.attempt)
 
 
 def flight_status(total: int, active: list[tuple[str, str, float]], now: float) -> dict:
@@ -34,18 +43,26 @@ def flight_status(total: int, active: list[tuple[str, str, float]], now: float) 
 
 
 class SampleQueue:
-  def __init__(self):
-    self.queues, self.by_id, self.replies, self.seen = {}, {}, {}, {}
+  def __init__(self, db: DB):
+    self.db = db
+    self.queues, self.replies, self.seen = {}, {}, {}
+    self.by_id: OrderedDict[str, Entry] = OrderedDict()
     self.queued_bytes = self.reply_bytes = 0
 
   def backlog(self, run_id: str) -> int:
-    return len(self.queues.get(run_id, ()))
+    return sum(len(group) for group in self.queues.get(run_id, {}).values())
 
-  def held(self, owner: Owner) -> list[Cmd]:
-    return [e.cmd for e in self.by_id.values() if e.owner == owner]
+  def held(self, owner: Owner) -> list[Work]:
+    return [e.work() for e in self.by_id.values() if e.owner == owner]
+
+  def claimed_blocks(self):
+    return ((e.owner, e.cmd.run, e.block) for e in self.by_id.values() if e.owner)
+
+  def versions(self):
+    return {e.version for e in self.by_id.values() if e.version}
 
   def drop(self, run_id: str) -> list[str]:
-    entries = list(self.queues.pop(run_id, {}).values())
+    entries = [e for group in self.queues.pop(run_id, {}).values() for e in group.values()]
     self.queued_bytes -= sum(len(e.cmd.body) for e in entries)
     for e in entries:
       self.by_id.pop(e.cmd.request_id, None)
@@ -55,10 +72,11 @@ class SampleQueue:
   def seen_id(self, run_id: str, seq_id: int) -> str | None:
     return hit[0] if (hit := self.seen.get((run_id, seq_id))) and hit[1] > time.time() else None
 
-  def submit(self, cmd: Cmd, seq_id: int | None, session_ttl: float) -> None:
+  def submit(self, cmd: Cmd, seq_id: int | None, session_ttl: float, version: str | None = None) -> None:
     if self.queued_bytes + len(cmd.body) > SAMPLE_QUEUE_BYTES:
       raise QueueFullError("sampling queue memory limit reached")
-    self.queues.setdefault(cmd.run, {})[cmd.entry_id] = self.by_id[cmd.request_id] = Entry(cmd)
+    group = self.queues.setdefault(cmd.run, {}).setdefault(version, {})
+    group[cmd.entry_id] = self.by_id[cmd.request_id] = Entry(cmd, version)
     self.queued_bytes += len(cmd.body)
     if seq_id is not None:
       self.seen[cmd.run, seq_id] = (cmd.request_id, time.time() + session_ttl)
@@ -73,18 +91,34 @@ class SampleQueue:
       raise RequestGoneError(f"sampling request not found: {req_id}")
     return None
 
-  def queued(self, run_id: str, limit: int | None = None):
-    gen = (e.cmd for e in self.queues.get(run_id, {}).values() if e.owner is None)
-    return gen if limit is None else itertools.islice(gen, limit)
+  def queued(self, run: str, limit: int, version: str | None = None):
+    group = self.queues.get(run, {}).get(version, {})
+    return itertools.islice((e.cmd for e in group.values() if e.owner is None), limit)
 
-  def claim(self, cmd: Cmd, owner: Owner, now: float) -> None:
-    self.by_id[cmd.request_id].owner, self.by_id[cmd.request_id].since = owner, now
+  def heads(self, run: str):
+    for version in self.queues.get(run, ()):
+      if cmd := next(self.queued(run, 1, version), None):
+        yield cmd, version
 
-  def complete(self, req_id: str, owner: Owner | None, reply: Reply, ttl: float) -> Cmd | None:
-    if (entry := self.by_id.get(req_id)) is None or entry.owner != owner:
+  def claim(self, cmd: Cmd, owner: Owner, now: float, block: tuple[int, ...] = ()) -> Work:
+    # Iterating claimed entries must replay the same order as admission, including interleaved runs.
+    entry = self.by_id[cmd.request_id]
+    entry.owner, entry.since, entry.block = owner, now, block
+    self.by_id.move_to_end(cmd.request_id)
+    return entry.work()
+
+  def complete(self, req_id: str, owner: Owner | None, reply: Reply, ttl: float, attempt: int = 0) -> Cmd | None:
+    if (entry := self.by_id.get(req_id)) is None or (entry.owner, entry.attempt) != (owner, attempt):
       return None
+    if reply.ok and reply.stability:
+      with self.db:
+        self.db.record_stability(reply.stability, time.time() + STABILITY_TTL, STABILITY_BYTES)
+      reply = replace(reply, stability=None)
     del self.by_id[req_id]
-    self.queues.get(entry.cmd.run, {}).pop(entry.cmd.entry_id, None)
+    groups = self.queues[entry.cmd.run]
+    del groups[entry.version][entry.cmd.entry_id]
+    if not groups[entry.version]:
+      del groups[entry.version]
     self.queued_bytes, self.reply_bytes = self.queued_bytes - len(entry.cmd.body), self.reply_bytes + len(reply.body)
     self.replies[req_id] = (reply, time.time() + ttl, False)
     while self.reply_bytes > SAMPLE_REPLY_BYTES and len(self.replies) > 1:
@@ -97,14 +131,17 @@ class SampleQueue:
 
   def reclaim(self, pred) -> None:
     for e in self.by_id.values():
-      if e.owner and pred(e.owner):
-        e.owner, e.since = None, 0.0
+      if e.owner and pred(e):
+        e.attempt += 1
+        e.owner, e.since, e.block = None, 0.0, ()
 
-  def status(self, run_id: str, now: float) -> dict:
-    q = self.queues.get(run_id, {})
-    return flight_status(len(q), [(e.cmd.request_id, e.owner[0], e.since) for e in q.values() if e.owner], now)
+  def status(self, run_id: str) -> dict:
+    entries = (e for group in self.queues.get(run_id, {}).values() for e in group.values())
+    active = [(e.cmd.request_id, e.owner[0], e.since) for e in entries if e.owner]
+    return flight_status(self.backlog(run_id), active, time.monotonic())
 
   def gc(self, now: float) -> None:
+    self.db.conn.execute("DELETE FROM stability WHERE expires<=?", (now,))
     for k in [k for k, (_, exp, _) in self.replies.items() if exp <= now]:
       self.reply_bytes -= len(self.replies.pop(k)[0].body)
     self.seen = {k: v for k, v in self.seen.items() if v[1] > now}

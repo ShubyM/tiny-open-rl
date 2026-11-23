@@ -93,7 +93,7 @@ class TestLease(BusTest):
 
     async def reported():
       node = self.bus.node_status().get(first_node)
-      return node.pids.get(proc_name) if node else None
+      return w.pid if node and (w := node.workers.get(proc_name)) else None
 
     await self.until(reported)
     model_pid = await reported()
@@ -119,7 +119,7 @@ class TestLease(BusTest):
 
     async def first_reaped():
       node = self.bus.node_status().get(first_node)
-      return node is not None and not node.pids and not node.on
+      return node is not None and not node.workers
 
     await self.until(first_reaped)
     self.assertEqual(await self.bus.wait_for_reply(request, 0), expected)

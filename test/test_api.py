@@ -413,7 +413,7 @@ class TestAPI(BusTest):
     )
     samp_id = saved.json()["sampling_session_id"]
 
-    await self.bus.heartbeat("node-1", "b1", NodeStatus(8))
+    await self.bus.take("node-1", "b1", NodeStatus(8))
     self.start_maintenance()
     worker = self.worker(run_id)
     data = await self.scheduling_until(lambda d: d["state"]["procs"].get(worker, {}).get("node"))
@@ -459,7 +459,7 @@ class TestAPI(BusTest):
     self.assertEqual(await self.sampler_runs(), [sid])
     sampler = self.worker(sid)
 
-    await self.bus.heartbeat("n8", "b8", NodeStatus(8))
+    await self.bus.take("n8", "b8", NodeStatus(8))
     self.start_maintenance()
     await self.scheduling_until(lambda d: d["state"]["procs"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
@@ -556,9 +556,9 @@ class TestAPI(BusTest):
   async def test_stable_reinforce_records_stability_info_and_trains_end_to_end(self):
     run_id, prompt = await self.create_model(), [1, 2, 3, 4]
     seq_ids, resp = await self._sample_for_stable_reinforce(run_id, prompt)
-    # Client did not ask for topk_sample_logprobs, so wire reply stays lean while Store persists stability info.
+    # Client did not ask for topk_sample_logprobs, so only the training input carries the recorded top-k values.
     self.assertFalse(resp.sequences[0].HasField("topk_sampled_logprobs"))
-    self.assertIn(seq_ids[0], self.store.get_stability(seq_ids[0].rpartition(":")[0]))
+    self.assertIn(seq_ids[0], self.bus.db.read_stability({seq_ids[0]}, time.time()))
 
     # Valid provenance -> succeeds and runs optim_step.
     fb = await self.post(
@@ -598,19 +598,24 @@ class TestAPI(BusTest):
     )
     id0, id1 = fb0.json()["request_id"], fb1.json()["request_id"]
 
-    # Claim fb0 and drop the reply; fb1 remains queued. Reopen SQLite and verify both recover and train from Store.
-    plan, _ = await self.bus.heartbeat(self.node.id, self.node.boot_id, NodeStatus(self.node.gpus))
-    a = next(x for x in plan if run_id in x.runs)
-    [first] = self.bus.take(self.node.id, self.node.boot_id, a.worker)
+    # Leave the first command claimed and the second queued when the controller restarts.
+    report = NodeStatus(
+      self.node.gpus, workers={wid: w.observe(time.monotonic()) for wid, w in self.node.workers.items()}
+    )
+    plan = await self.bus.take(self.node.id, self.node.boot_id, report)
+    [first] = [w for g in plan.grants for w in g.work if w.cmd.run == run_id]
     self.assertEqual(first.cmd.request_id, id0)
 
     await self.bus.aclose()
     self.bus = bus.Ledger(self.db_path)
     self.node.control = self.bus
+    with self.bus.db:
+      self.bus.samples.gc(float("inf"))
+    self.assertFalse(self.bus.db.read_stability(set(seq_ids), time.time()))
 
-    # Reconnecting from the same node redelivers fb0 verbatim, and draining runs both fb0 and fb1 from Store.
-    await self.bus.heartbeat(self.node.id, self.node.boot_id, NodeStatus(self.node.gpus))
-    [redelivered] = self.bus.take(self.node.id, self.node.boot_id, a.worker)
+    # The queued commands retain their own inputs across a restart and sample expiry.
+    plan = await self.bus.take(self.node.id, self.node.boot_id, report)
+    [redelivered] = [w for g in plan.grants for w in g.work if w.cmd.run == run_id]
     self.assertEqual(redelivered, first)
     await self.node.drain(run_id)
     for req_id in (id0, id1):

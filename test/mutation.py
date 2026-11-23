@@ -26,14 +26,20 @@ RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery
 # (source, function, original expression, faulty replacement, tests that should detect it)
 CASES = [
   (FAIRNESS, "rank_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
-  (FAIRNESS, "admit_samples", "while len(out) < slots and runs:", "while len(out) < 1 and runs:", BILLING),
+  (
+    FAIRNESS,
+    "admit_samples",
+    "while len(out) < slots and runs:",
+    "while len(out) < 1 and runs:",
+    ORDER + ".test_sampler_wave_obeys_account_and_version_limits_and_rotates_within_them",
+  ),
   (FAIRNESS, "rank_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
   (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
   (LEDGER, "bill", "if charge and charge.gpu_ms", "if reply.ok and charge and charge.gpu_ms", BILLING),
   (NODES, "fence", "if boot_id in self.expired_boots", "if False", CLAIM),
-  (SAMPLES, "complete", "entry.owner != owner", "False", DEDUP),
+  (SAMPLES, "complete", "(entry.owner, entry.attempt) != (owner, attempt)", "entry.attempt != attempt", DEDUP),
   (LEDGER, "finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
 ]
 
@@ -77,7 +83,7 @@ def measure():
     if baseline.returncode:
       raise SystemExit(f"Clean baseline failed:\n{baseline.stderr}")
     for path, function, old, new, test in CASES:
-      source = (ROOT / path).read_text()
+      source = (folder / path).read_text()
       (folder / path).write_text(mutate(source, function, old, new))
       result = run_tests(folder, [test])
       (folder / path).write_text(source)

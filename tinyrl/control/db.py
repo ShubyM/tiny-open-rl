@@ -7,8 +7,14 @@ import sqlite3
 
 import msgspec
 
+from tinyrl.control.upgrade import schema_version, upgrade
+
 PRAGMAS = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA auto_vacuum=INCREMENTAL"
-DDL = "CREATE TABLE IF NOT EXISTS kv (ns TEXT, k TEXT, v BLOB, PRIMARY KEY (ns, k))"
+DDL = """
+CREATE TABLE IF NOT EXISTS kv (ns TEXT, k TEXT, v BLOB, PRIMARY KEY (ns, k));
+CREATE TABLE IF NOT EXISTS stability (sequence TEXT PRIMARY KEY, blob BLOB NOT NULL, expires REAL NOT NULL, start_byte INTEGER UNIQUE NOT NULL);
+CREATE INDEX IF NOT EXISTS stability_expiry ON stability (expires);
+"""
 
 
 class DB:
@@ -16,7 +22,13 @@ class DB:
     if path != ":memory:":
       os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     self.conn, self.tables = sqlite3.connect(path, isolation_level="IMMEDIATE"), []
-    self.conn.executescript(f"{PRAGMAS}; {DDL}")
+    try:
+      schema_version(self.conn)  # Reject a newer file before touching its schema or journal mode.
+      self.conn.executescript(f"{PRAGMAS}; BEGIN IMMEDIATE; {DDL}")
+      upgrade(self.conn)
+    except BaseException:
+      self.conn.close()
+      raise
 
   def __enter__(self):
     return self.conn.__enter__()
@@ -24,6 +36,9 @@ class DB:
   def __exit__(self, exc_type, exc, tb):
     try:
       return self.conn.__exit__(exc_type, exc, tb)
+    except BaseException as commit_error:
+      exc_type = type(commit_error)
+      raise
     finally:
       if exc_type is not None:
         for tab in self.tables:
@@ -31,13 +46,28 @@ class DB:
 
   def get_blob(self, key: str) -> bytes | None:
     row = self.conn.execute("SELECT v FROM kv WHERE ns='blobs' AND k=?", (key,)).fetchone()
-    return bytes(row[0]) if row else None
+    return bytes(row[0]) if row and row[0] is not None else None
 
   def put_blob(self, key: str, body: bytes) -> None:
     self.conn.execute("INSERT OR REPLACE INTO kv VALUES ('blobs', ?, ?)", (key, body))
 
   def del_blob(self, key: str) -> None:
     self.conn.execute("DELETE FROM kv WHERE ns='blobs' AND k=?", (key,))
+
+  def record_stability(self, blobs: dict[str, bytes], expires: float, budget: int) -> None:
+    # Monotone byte offsets let SQLite evict the oldest records by index without scanning their payloads.
+    last = self.conn.execute(
+      "SELECT start_byte + max(1,length(blob)) FROM stability ORDER BY start_byte DESC LIMIT 1"
+    ).fetchone()
+    start = end = last[0] if last else 0
+    for sid, raw in blobs.items():
+      start, end = end, end + max(1, len(raw))
+      self.conn.execute("INSERT INTO stability VALUES (?, ?, ?, ?)", (sid, raw, expires, start))
+    self.conn.execute("DELETE FROM stability WHERE start_byte < ?", (min(start, end - budget),))
+
+  def read_stability(self, sequences: set[str], now: float) -> dict[str, bytes]:
+    read = "SELECT blob FROM stability WHERE sequence=? AND expires>?"
+    return {sid: row[0] for sid in sequences if (row := self.conn.execute(read, (sid, now)).fetchone())}
 
   def vacuum(self) -> None:
     self.conn.execute("PRAGMA incremental_vacuum(256)")

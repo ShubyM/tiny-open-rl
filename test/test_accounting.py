@@ -12,6 +12,7 @@ from tinyrl.types import Effect, Op, Reply, Role, Run
 
 class TestAccounting(BusTest):
   async def setup_node(self, role, **accounts):
+    self.receipts = self.enterContext(patch.object(self.bus, "bill", wraps=self.bus.bill))
     folder = tempfile.TemporaryDirectory()
     self.addCleanup(folder.cleanup)
     store = Store(root=folder.name)
@@ -25,6 +26,9 @@ class TestAccounting(BusTest):
       await asyncio.gather(*ts)
     spec = self.bus.plan_state.procs["worker"].spec
     return node, spec
+
+  def gpu_ms(self, run):
+    return sum(c.args[3].gpu_ms for c in self.receipts.call_args_list if c.args[1].run == run and c.args[3])
 
   async def step_turn(self, node: TestNode):
     await node.tick()
@@ -50,7 +54,7 @@ class TestAccounting(BusTest):
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=[0, 0, 10_000_000, 30_000_000]):
       await self.step_turn(node)
     w = node.workers["worker"]
-    self.assertEqual(w.run_service, {"short": 10, "long": 50})
+    self.assertEqual({r: self.gpu_ms(r) for r in ("short", "long")}, {"short": 10, "long": 50})
     self.assertEqual(w.gpu_ms, 60)
     self.assertEqual(self.bus.service, {"alice": 60})
     short, long = self.bus.get_run("short"), self.bus.get_run("long")
@@ -99,9 +103,8 @@ class TestAccounting(BusTest):
         await self.step_turn(node)
     self.assertEqual(model.load.await_count, 2)
     self.assertEqual(model.execute.await_count, 5)
-    w = node.workers["worker"]
-    self.assertAlmostEqual(w.run_service["a1"], 80 / 3)
-    self.assertAlmostEqual(w.run_service["a2"], 40 / 3)
+    self.assertAlmostEqual(self.gpu_ms("a1"), 80 / 3)
+    self.assertAlmostEqual(self.gpu_ms("a2"), 40 / 3)
     self.assertAlmostEqual(self.bus.service["alice"], 40)
     self.assertEqual((self.bus.get_run("a1"))["failed"], 2)
 
@@ -123,7 +126,7 @@ class TestAccounting(BusTest):
     model = SimpleNamespace(execute=sample, resume=AsyncMock(), park=AsyncMock(), close=AsyncMock(), proc=None)
     node.workers["worker"] = WorkerHandle("worker", spec, model, resident=(0, 1), bound=(0, 1))
     with (
-      patch("tinyrl.control.node_daemon.MAX_SEQS", 2),
+      patch("tinyrl.types.MAX_SEQS", 2),
       patch("tinyrl.control.accounting.monotonic_ns", lambda: now),
     ):
       for _ in range(6):
@@ -131,8 +134,7 @@ class TestAccounting(BusTest):
         await self.step_turn(node)
 
     self.assertEqual(self.bus.service, {"alice": 72, "bob": 72})
-    w = node.workers["worker"]
-    self.assertEqual(w.run_service, {"a1": 24, "a2": 24, "a3": 24, "b": 72})
+    self.assertEqual({r: self.gpu_ms(r) for r in accounts}, {"a1": 24, "a2": 24, "a3": 24, "b": 72})
 
   async def test_backlogged_training_runs_of_one_account_alternate_equal_cost_steps(self):
     node, spec = await self.setup_node(Role.TRAINER, first="account", second="account")
@@ -175,7 +177,7 @@ class TestAccounting(BusTest):
     self.bus.submit_command("run", Op.OPTIM_STEP, b"{}")
     with patch("tinyrl.control.accounting.monotonic_ns", side_effect=[0, 250_000]):
       await self.step_turn(node)
-    self.assertEqual(w.run_service, {"run": 0.5})
+    self.assertEqual(self.gpu_ms("run"), 0.5)
     self.assertEqual(w.gpu_ms, 0.5)
     self.assertEqual(self.bus.service, {"run-account": 0.5})
     run = self.bus.get_run("run")
