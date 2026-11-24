@@ -136,7 +136,9 @@ class NodeDaemon:
     self.workers: dict[str, WorkerHandle] = {}
     self.active: dict[str, tuple[Task, asyncio.Task]] = {}
     self.done_buf: dict[str, Done] = {}
+    self.sent_done: set[str] = set()
     self.staged: dict[str, str] = {}
+    self.stage_dirty = False
     self.staging: dict[str, asyncio.Task] = {}
 
     self.changed = asyncio.Event()
@@ -209,6 +211,7 @@ class NodeDaemon:
       return cached
     folder, _ = await asyncio.to_thread(self.store.local_folder, version)
     self.staged[version] = folder
+    self.stage_dirty = True
     return folder
 
   async def execute_task(self, task: Task) -> Done:
@@ -297,8 +300,10 @@ class NodeDaemon:
     self.done_buf[task.id] = await self.execute_task(task)
 
   async def prefetch_version(self, version: str) -> None:
-    with contextlib.suppress(Exception):
+    try:
       await self.stage_version(version)
+    except Exception:
+      self.stage_dirty = True
 
   async def run_sweep(self, keep: set[str]) -> None:
     try:
@@ -323,10 +328,19 @@ class NodeDaemon:
       if not os.path.isdir(folder):
         del self.staged[version]
         lost_stage = True
+        self.stage_dirty = True
 
     want_sweep = not self.draining and self.sweep_task is None and time.time() - self.swept > SWEEP_S
     if want_sweep:
       self.swept = time.time()
+
+    if hello:
+      self.sent_done.clear()
+    done = tuple(d for tid, d in self.done_buf.items() if tid not in self.sent_done)
+    self.sent_done.update(d.id for d in done)
+
+    staged = tuple(self.staged) if (hello or self.stage_dirty) else None
+    self.stage_dirty = False
 
     return NodeMsg(
       kind="hello" if hello else "events",
@@ -338,10 +352,10 @@ class NodeDaemon:
       lag=self.lag,
       want_sweep=want_sweep,
       workers=tuple(w.info() for w in self.workers.values()) if hello else (),
-      staged=tuple(self.staged),
+      staged=staged,
       exited=exited,
       active=tuple(self.active) if (hello or self.draining or lost_stage) else (),
-      done=tuple(self.done_buf.values()),
+      done=done,
     )
 
   def apply(self, msg: ControlMsg) -> None:
@@ -350,11 +364,13 @@ class NodeDaemon:
       raise FencedError("controller reset node incarnation")
     for task_id in msg.ack:
       self.done_buf.pop(task_id, None)
+      self.sent_done.discard(task_id)
     for task_id in msg.cancel:
       running = self.active.pop(task_id, None)
       if running and running[0].kind == TaskKind.SAMPLE:
         running[1].cancel()
       self.done_buf.pop(task_id, None)
+      self.sent_done.discard(task_id)
     for version in msg.stage:
       if version not in self.staged and version not in self.staging:
         self.start_background(self.staging, version, self.prefetch_version(version))
@@ -409,7 +425,8 @@ class NodeDaemon:
           self.lag = max(0.0, time.monotonic() - sent_at)
           sent_at = 0.0
         self.apply(decode_msg(frame.data, type=ControlMsg))
-        self.notify()
+        if self.draining:
+          self.notify()
 
     async def writer() -> None:
       nonlocal sent_at, deadline
@@ -481,6 +498,7 @@ class NodeDaemon:
     self.active.clear()
     self.staging.clear()
     self.done_buf.clear()
+    self.sent_done.clear()
     self.sweep_task = None
 
     for task in tasks:

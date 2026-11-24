@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from tinyrl import types
 from tinyrl.control import policy
 from tinyrl.control.fleet import LiveWorker, NodeState, new_task_id
-from tinyrl.types import Cmd, Ev, Op, Reply, Role, RunStatus, Task, TaskKind, WorkerSpec, entry_sort_key
+from tinyrl.types import Ev, Op, Reply, Role, RunStatus, Task, TaskKind, WorkerSpec
 
 
 @dataclass
@@ -33,12 +33,17 @@ def train_head(ctrl, run_id: str):
   return head if head.owner is None else None
 
 
-def ready_samples(ctrl, spec: WorkerSpec, staged: set[str]) -> list:
-  out = []
-  for state in ctrl.runs.values():
-    if state.live and state.run.role == Role.SAMPLER and state.run.spec == spec:
-      out.extend(it for it in state.queue.values() if it.owner is None and (it.version is None or it.version in staged))
-  return out
+def sample_heads(ctrl, spec: WorkerSpec, staged: set[str]) -> dict[str, object]:
+  """Earliest unclaimed, staged sample item per live sampler run matching `spec`."""
+  heads: dict[str, object] = {}
+  for run_id, state in ctrl.runs.items():
+    if not (state.live and state.run.role == Role.SAMPLER and state.run.spec == spec and state.queue):
+      continue
+    for item in state.queue.values():
+      if item.owner is None and (item.version is None or item.version in staged):
+        heads[run_id] = item
+        break
+  return heads
 
 
 def settle_trivial_heads(ctrl) -> None:
@@ -258,7 +263,7 @@ def plan_node(
       occupied.update(worker.gpus)
       fixed[wid] = worker.gpus
       if worker.spec.role == Role.SAMPLER and len(active) < types.MAX_SEQS:
-        ready_by_worker[wid] = {it.cmd.run for it in ready_samples(ctrl, worker.spec, node.staged)}
+        ready_by_worker[wid] = set(sample_heads(ctrl, worker.spec, node.staged))
       continue
 
     if worker.spec.role == Role.TRAINER:
@@ -275,7 +280,7 @@ def plan_node(
       )
       ready_runs, gang = set(heads), worker.spec.gpus > 1
     else:
-      ready_runs = {it.cmd.run for it in ready_samples(ctrl, worker.spec, node.staged)}
+      ready_runs = set(sample_heads(ctrl, worker.spec, node.staged))
       demand, gang = (policy.Demand.READY if ready_runs else policy.Demand.IDLE), False
 
     ready_by_worker[wid] = ready_runs
@@ -360,12 +365,9 @@ def grant_worker(
   active_vers = {task.version for task in active if task.version is not None}
   eligible = node.staged if len(active_vers) < lora_cap else (node.staged & active_vers)
 
-  heads: list[Cmd] = []
-  ver_by_run: dict[str, str | None] = {}
-  for item in sorted(ready_samples(ctrl, worker.spec, eligible), key=lambda it: entry_sort_key(it.cmd.entry_id)):
-    if item.cmd.run not in ver_by_run:
-      heads.append(item.cmd)
-      ver_by_run[item.cmd.run] = item.version
+  first_by_run = sample_heads(ctrl, worker.spec, eligible)
+  heads = [item.cmd for item in first_by_run.values()]
+  ver_by_run = {run_id: item.version for run_id, item in first_by_run.items()}
 
   def queued(run_id: str, limit: int):
     target_ver = ver_by_run[run_id]
