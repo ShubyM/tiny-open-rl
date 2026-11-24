@@ -1,124 +1,92 @@
 import unittest
-from dataclasses import replace
 
-from tinyrl.control.grants import QUANTUM_MS, plan_node, projected_lag
-from tinyrl.control.scheduler import Job, State
-from tinyrl.types import MAX_SEQS, Assignment, LocalWorker, NodeStatus, Op, Role, Run, WorkerSpec
+from tinyrl.control.accounting import Charge
+from tinyrl.control.controller import Controller
+from tinyrl.control.policy import QUANTUM_MS, Demand, Worker, plan_gpus, projected_lag
+from tinyrl.types import MAX_SEQS, Done, Effect, NodeMsg, Op, Reply, Role, Run, TaskKind, WorkerSpec
 
 
 class TestFleetGrants(unittest.TestCase):
   def test_one_sample_wave_reserves_the_same_gpu_time_as_one_trainer_turn(self):
-    trainer = WorkerSpec(Role.TRAINER)
-    sampler = WorkerSpec(Role.SAMPLER)
-    state = State(nodes={"east": 1, "west": 1}, jobs={"a": Job(sampler, backlog=512), "b": Job(trainer, backlog=1)})
-    wave = {("sampler", "east", "1"): ("a", (0,))}
-    east = projected_lag(state, wave)
+    runs = [("a", WorkerSpec(Role.SAMPLER), 512), ("b", WorkerSpec(Role.TRAINER), 1)]
+    nodes = {"east": 1, "west": 1}
+    east = projected_lag({}, {}, {}, {}, runs, nodes, [("a", 1)])
     self.assertEqual((east("a"), east("b")), (-QUANTUM_MS / 2, QUANTUM_MS / 2))
-    both = projected_lag(state, wave | {("trainer", "west", "1"): ("b", (0,))})
+    both = projected_lag({}, {}, {}, {}, runs, nodes, [("a", 1), ("b", 1)])
     self.assertEqual((both("a"), both("b")), (0, 0))
-    self.assertEqual(projected_lag(state, {})("a"), 0)
-    self.assertEqual((state.service, state.lag, state.seen), ({}, {}, {}))
+    self.assertEqual(projected_lag({}, {}, {}, {}, runs, nodes, [])("a"), 0)
 
-  def test_pending_work_reserves_its_exact_block_even_under_exclusive_contention(self):
-    spec = WorkerSpec(Role.SAMPLER)
-    assignments = [Assignment("w", spec), Assignment("x", WorkerSpec(exclusive=True), ready=True, lag=10000)]
-    observed = {"w": LocalWorker(current=(1,), holding=("request",))}
-    blocks, _, _ = plan_node(assignments, observed, 2)
-    self.assertEqual(blocks, {"w": (1,), "x": (0,)})
-    observed["closing"] = LocalWorker(current=(0,), busy=True)
-    blocks, _, _ = plan_node(assignments, observed, 2)
-    self.assertEqual(blocks, {"w": (1,)})
-
-  def test_parked_wide_trainer_rebinds_only_with_an_alternative_block(self):
-    assignments = [
-      Assignment("exclusive", WorkerSpec(exclusive=True)),
-      Assignment("wide", WorkerSpec(gpus=2), ready=True),
-    ]
-    observed = {"exclusive": LocalWorker(current=(0,)), "wide": LocalWorker(bound=(0, 1))}
-    self.assertEqual(plan_node(assignments, observed, 2)[2], set())
-    self.assertEqual(plan_node(assignments, observed, 4)[2], {"wide"})
+  def test_occupied_gpus_prevent_exclusive_overlap(self):
+    cands = {"x": Worker(exclusive=True, lag=10_000)}
+    self.assertEqual(plan_gpus(cands, 2, 0.0, locked={1})[0], {"x": (0,)})
+    self.assertEqual(plan_gpus(cands, 2, 0.0, locked={0, 1})[0], {})
 
   def test_only_ready_work_protects_a_residents_quantum(self):
-    a = Assignment("resident", WorkerSpec(Role.SAMPLER), ready=True)
-    b = Assignment("waiting", WorkerSpec(), ready=True, lag=10.0)
-    local = {"resident": LocalWorker(current=(0,), resident_s=QUANTUM_MS / 1000 - 0.25)}
-    self.assertEqual(plan_node([a, b], local, 1)[:2], ({"resident": (0,)}, 0.25))
-    self.assertEqual(plan_node([replace(a, ready=False), b], local, 1)[:2], ({"waiting": (0,)}, None))
+    res = Worker(current=(0,), hold_until=0.25)
+    wait = Worker(lag=10.0)
+    self.assertEqual(plan_gpus({"resident": res, "waiting": wait}, 1, 0.0), ({"resident": (0,)}, 0.25))
+    idle = Worker(demand=Demand.IDLE, current=(0,), hold_until=0.25)
+    self.assertEqual(plan_gpus({"resident": idle, "waiting": wait}, 1, 0.0), ({"waiting": (0,)}, None))
 
 
-class TestNodePull(unittest.IsolatedAsyncioTestCase):
+class TestNodeGrants(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
-    from tinyrl.control.ledger import Ledger
-
-    self.ledger = Ledger(":memory:")
-    self.addAsyncCleanup(self.ledger.aclose)
+    self.ctrl = Controller(":memory:")
+    self.addAsyncCleanup(self.ctrl.aclose)
 
   async def test_second_node_sees_the_first_sample_wave_before_any_finish(self):
-    status = NodeStatus(1)
-    for node in ("east", "west"):
-      await self.ledger.take(node, "boot", status)
     for run, backlog in (("a", MAX_SEQS * 2), ("b", MAX_SEQS)):
-      self.ledger.create_run(Run(run, "base", 8, role=Role.SAMPLER))
+      self.ctrl.create_run(Run(run, "base", 8, role=Role.SAMPLER))
       for _ in range(backlog):
-        self.ledger.submit_command(run, Op.SAMPLE, b"{}")
-    east = await self.ledger.take("east", "boot", status)
-    west = await self.ledger.take("west", "boot", status)
-    for plan, run in ((east, "a"), (west, "b")):
-      [grant] = [g for g in plan.grants if g.work]
-      self.assertEqual(grant.gpus, (0,))
-      self.assertEqual([w.cmd.run for w in grant.work], [run] * MAX_SEQS)
-    replay = await self.ledger.take("east", "boot", status)
-    [retried] = [g for g in replay.grants if g.work]
-    [original] = [g for g in east.grants if g.work]
-    self.assertEqual((retried.worker, retried.gpus, retried.work), (original.worker, original.gpus, original.work))
+        self.ctrl.submit_command(run, Op.SAMPLE, b"{}")
+    east = [t for t in self.ctrl.handle(NodeMsg("hello", "east", "boot", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
+    west = [t for t in self.ctrl.handle(NodeMsg("hello", "west", "boot", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
+    for wave, run in ((east, "a"), (west, "b")):
+      self.assertEqual(wave[0].gpus, (0,))
+      self.assertEqual([t.cmd.run for t in wave], [run] * MAX_SEQS)
+    replay = [t for t in self.ctrl.handle(NodeMsg("hello", "east", "boot", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
+    self.assertEqual(replay, east)
 
   async def test_cold_start_while_peers_are_idle_does_not_delay_the_next_burst(self):
-    from tinyrl.control.accounting import Charge
-    from tinyrl.types import Reply
-
     for run in ("cold", "warm"):
-      self.ledger.create_run(Run(run, "base", 8, account="team"))
-    status = NodeStatus(1)
+      self.ctrl.create_run(Run(run, "base", 8, account="team"))
+    self.ctrl.handle(NodeMsg("hello", "node", "boot", gpus=1))
     ok = Reply(True, "application/json", b"{}")
 
-    async def serve(ms):
-      plan = await self.ledger.take("node", "boot", status)
-      [grant] = [g for g in plan.grants if g.work]
-      [work] = grant.work
-      self.assertTrue(self.ledger.finish("node", "boot", grant.worker, work.cmd.request_id, ok, Charge(gpu_ms=ms)))
-      return work.cmd.run
+    def serve(ms):
+      [t] = [t for t in self.ctrl.nodes["node"].tasks.values() if t.kind == TaskKind.TRAIN]
+      self.ctrl.handle(
+        NodeMsg("events", "node", "boot", done=(Done(t.id, True, ok, Charge(gpu_ms=ms), Effect(True, True)),))
+      )
+      return t.cmd.run
 
-    self.ledger.submit_command("cold", Op.CREATE_MODEL, b"{}")
-    await serve(60_000)
+    self.ctrl.submit_command("cold", Op.CREATE_MODEL, b"{}")
+    serve(60_000)
     for run in ("cold", "warm"):
       for _ in range(5):
-        self.ledger.submit_command(run, Op.OPTIM_STEP, b"{}")
-    self.assertEqual([await serve(1) for _ in range(4)], ["cold", "warm", "cold", "warm"])
-    self.assertEqual(self.ledger.service["team"], 60_004)
+        self.ctrl.submit_command(run, Op.OPTIM_STEP, b"{}")
+    self.assertEqual([serve(1) for _ in range(4)], ["cold", "warm", "cold", "warm"])
+    self.assertEqual(self.ctrl.service["team"], 60_004)
 
   async def test_two_gpu_node_reconsiders_account_priority_after_its_first_grant(self):
-    self.ledger.create_run(Run("first", "model1", 0, account="B"))
-    self.ledger.create_run(Run("second", "model2", 0, account="A"))
-    self.ledger.create_run(Run("third", "model3", 0, account="A"))
+    self.ctrl.create_run(Run("first", "model1", 0, account="B"))
+    self.ctrl.create_run(Run("second", "model2", 0, account="A"))
+    self.ctrl.create_run(Run("third", "model3", 0, account="A"))
     for run in ("first", "second", "third"):
-      self.ledger.submit_command(run, Op.CREATE_MODEL, b"{}")
-    plan = await self.ledger.take("node", "boot", NodeStatus(2))
-    grants = [g for g in plan.grants if g.work]
-    self.assertEqual({g.gpus for g in grants}, {(0,), (1,)})
-    self.assertEqual({self.ledger.plan_state.account(w.cmd.run) for g in grants for w in g.work}, {"A", "B"})
+      self.ctrl.submit_command(run, Op.CREATE_MODEL, b"{}")
+    tasks = [t for t in self.ctrl.handle(NodeMsg("hello", "node", "boot", gpus=2)).tasks if t.kind == TaskKind.TRAIN]
+    self.assertEqual({t.gpus for t in tasks}, {(0,), (1,)})
+    self.assertEqual({self.ctrl.account(t.cmd.run) for t in tasks}, {"A", "B"})
 
   async def test_busy_sampler_tops_up_for_its_account_and_drains_for_a_waiting_trainer(self):
-    self.ledger.create_run(Run("rollout", "base", 8, account="A", role=Role.SAMPLER))
-    first = self.ledger.submit_command("rollout", Op.SAMPLE, b"{}")
-    [sampler] = (await self.ledger.take("node", "boot", NodeStatus(1))).grants
-    second = self.ledger.submit_command("rollout", Op.SAMPLE, b"{}")
-    observed = LocalWorker(current=sampler.gpus, holding=(first,))
-    status = NodeStatus(1, workers={sampler.worker: observed})
-    [topup] = (await self.ledger.take("node", "boot", status)).grants
-    self.assertEqual([w.cmd.request_id for w in topup.work], [second])
-    self.ledger.create_run(Run("train", "base", 8, account="B"))
-    self.ledger.submit_command("train", Op.OPTIM_STEP, b"{}")
-    self.ledger.submit_command("rollout", Op.SAMPLE, b"{}")
-    status = replace(status, workers={sampler.worker: replace(observed, holding=(first, second))})
-    plan = await self.ledger.take("node", "boot", status)
-    self.assertFalse(any(g.work for g in plan.grants))
+    self.ctrl.create_run(Run("rollout", "base", 8, account="A", role=Role.SAMPLER))
+    first = self.ctrl.submit_command("rollout", Op.SAMPLE, b"{}")
+    [t1] = [t for t in self.ctrl.handle(NodeMsg("hello", "node", "boot", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
+    self.assertEqual(t1.cmd.request_id, first)
+    second = self.ctrl.submit_command("rollout", Op.SAMPLE, b"{}")
+    [t2] = self.ctrl.nodes["node"].drain_push().tasks
+    self.assertEqual(t2.cmd.request_id, second)
+    self.ctrl.create_run(Run("train", "base", 8, account="B"))
+    self.ctrl.submit_command("train", Op.OPTIM_STEP, b"{}")
+    self.ctrl.submit_command("rollout", Op.SAMPLE, b"{}")
+    self.assertEqual(self.ctrl.nodes["node"].drain_push().tasks, ())

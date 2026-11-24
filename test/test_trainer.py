@@ -462,8 +462,8 @@ class TestTrainer(BusTest):
   async def test_a_full_fine_tune_process_closes_with_its_run(self):
     run = new_id()
     self.bus.create_run(Run(run, "tiny", 0))
-    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
     await self.node.bind(run, run)
+    await self.submit(run, (Op.CREATE_MODEL, {"base_model": "tiny", "rank": 0, "lora": {}}), (Op.DELETE_MODEL, {}))
     await self.until(lambda: run in self.node.processes and run not in self.node.workers and not self.node.busy())
     child = self.node.processes[run]
     self.assertTrue(child.closed)
@@ -496,7 +496,9 @@ class TestTrainer(BusTest):
         [request] = await self.submit(r, (Op.OPTIM_STEP, {"adam_params": {"learning_rate": 1e-2}}))
         await self.node.drain(r)
         self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
-      self.assertTrue(same(self.model(f"ctrl-{rank}").params[ctrl], self.model(f"p-{rank}").params[run]))
+      self.assertTrue(
+        same(self.model(self.bus.workers_of(ctrl)[0]).params[ctrl], self.model(self.bus.workers_of(run)[0]).params[run])
+      )
       self.assertIsNone((self.bus.get_run(run)).get("snapshot"))
       self.assertNotIn(
         parked.partition("@")[0], self.bus.live_versions()
@@ -514,7 +516,7 @@ class TestTrainer(BusTest):
     expected = {k: p.detach().clone() for k, p in self.model("p").params[run].items()}
     step = (Op.OPTIM_STEP, {"adam_params": {}})
     for command in ((Op.FORWARD_BACKWARD, partial_backward_failure(run)), step):
-      await self.drain_and_evict("p")
+      await self.drain_and_evict(self.bus.workers_of(run)[0])
       parked = (self.bus.get_run(run))["snapshot"]
       [request] = await self.submit(run, command)
       await self.node.drain(run)
@@ -527,11 +529,11 @@ class TestTrainer(BusTest):
       self.assertIsNone(info.get("snapshot"))
       self.assertNotIn(parked.partition("@")[0], self.bus.live_versions())
 
-    await self.drain_and_evict("p")
+    await self.drain_and_evict(self.bus.workers_of(run)[0])
     [request] = await self.submit(run, step)
     await self.node.drain(run)
     self.assertTrue((await self.bus.wait_for_reply(request, 1)).ok)
-    torch.testing.assert_close(self.model("p").params[run], expected, atol=0, rtol=0)
+    torch.testing.assert_close(self.model(self.bus.workers_of(run)[0]).params[run], expected, atol=0, rtol=0)
 
   async def test_a_run_whose_process_died_unsaved_fails_until_it_loads_a_checkpoint(self):
     run, uri = new_id(), "tinker://saved/weights/step-1"

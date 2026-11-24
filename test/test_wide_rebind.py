@@ -9,7 +9,7 @@ import torch
 from test.execution import TestNode
 from test.helpers import BusTest, new_id
 from test.test_api import proto_body
-from tinyrl.control.fairness import Worker, plan_gpus
+from tinyrl.control.policy import Worker, plan_gpus
 from tinyrl.storage.store import Store
 from tinyrl.types import Op, Run
 
@@ -101,10 +101,11 @@ class TestWideRebind(BusTest):
               await asyncio.sleep(0.005)
           self.assertTrue(reply.ok, reply.body)
         self.assertTrue(child.closed)
+        [rebound] = self.bus.workers_of(run)
         self.assertEqual(
-          {k: h.resident for k, h in node.workers.items() if h.resident}, {"wide": (2, 3), "exclusive": (0,)}
+          {k: h.resident for k, h in node.workers.items() if h.resident}, {rebound: (2, 3), "exclusive": (0,)}
         )
-        actual, _ = node.workers["wide"].model.trainer.model.training_state(run)
+        actual, _ = node.workers[rebound].model.trainer.model.training_state(run)
         self.assertEqual(actual.keys(), expected.keys())
         for key in expected:
           torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)

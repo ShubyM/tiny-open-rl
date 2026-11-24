@@ -49,22 +49,30 @@ if (
 
 
 class CuttableBus:
-  """Wraps a Ledger/ControlClient so chaos can sever a node from the control plane immediately."""
+  """Wraps a ControlClient so chaos can sever a node's WebSocket immediately."""
 
   def __init__(self, inner):
-    self.inner = inner
-    self.cut = False
+    self.inner, self.cut, self.ws = inner, False, None
 
-  def __getattr__(self, name):
-    if self.cut:
+  def connect(self):
+    import contextlib
 
-      async def fail(*args, **kwargs):
-        raise ConnectionError(f"control plane is unreachable ({name})")
+    @contextlib.asynccontextmanager
+    async def ctx():
+      if self.cut:
+        raise ConnectionError("control plane is unreachable")
+      async with self.inner.connect() as ws:
+        self.ws = ws
+        try:
+          yield ws
+        finally:
+          self.ws = None
 
-      return fail
-    return getattr(self.inner, name)
+    return ctx()
 
   async def aclose(self) -> None:
+    if self.ws and not self.ws.closed:
+      await self.ws.close()
     await self.inner.aclose()
 
 
@@ -184,14 +192,10 @@ class Stress(BusTest):
     delay = lambda: self.rng.uniform(0.004, 0.02)  # noqa: E731
     node = StressNode(CuttableBus(ControlClient(self.url)), store, gpus, name, self.violations, self.errors, delay)
     self.nodes[name] = node
-    await node.tick()
-
-    async def loop():
-      while True:
-        await node.tick()
+    self.loops[name] = asyncio.create_task(node.serve())
+    async with asyncio.timeout(10):
+      while name not in self.bus.nodes:
         await asyncio.sleep(0.01)
-
-    self.loops[name] = asyncio.create_task(loop())
     return node
 
   async def remove_node(self, name: str, graceful: bool) -> None:
@@ -235,7 +239,7 @@ class Stress(BusTest):
       if action in ("cancel", "crash"):
         node = self.nodes[self.rng.choice(nodes)]
         if action == "cancel":
-          live = [(wid, rid, tk) for wid, w in node.workers.items() for rid, tk in w.running.items() if not tk.done()]
+          live = [(t.worker, t.cmd.request_id, tk) for t, tk in node.active.values() if t.cmd and not tk.done()]
           if not live:
             continue
           wid, rid, tk = self.rng.choice(live)
@@ -422,11 +426,11 @@ class Stress(BusTest):
     self.started = started
     self.abandoned, self.finished = [], []
     patches = [
-      mock.patch("tinyrl.control.grants.QUANTUM_MS", 100),
-      mock.patch("tinyrl.control.scheduler.REBALANCE_MS", 1000),
+      mock.patch("tinyrl.control.policy.QUANTUM_MS", 100),
+      mock.patch("tinyrl.control.policy.REBALANCE_MS", 1000),
     ]
     if CHAOS:  # so that a node cut off from the controller is given up on in seconds
-      patches += [mock.patch(f"tinyrl.control.{m}.LEASE_MS", 3000) for m in ("nodes", "node_daemon")]
+      patches += [mock.patch(f"tinyrl.control.{m}.LEASE_MS", 3000) for m in ("controller", "node_daemon")]
     for p in patches:
       p.start()
       self.addCleanup(p.stop)
@@ -462,16 +466,19 @@ class Stress(BusTest):
       self.bus.delete_run(session)
     try:
       async with asyncio.timeout(30):
-        while self.bus.plan_state.procs or any(n.workers or n.busy() for n in self.nodes.values()):
+        while any(n.workers or n.tasks for n in self.bus.nodes.values()) or any(
+          n.workers or n.busy() for n in self.nodes.values()
+        ):
           await asyncio.sleep(0.05)
     except TimeoutError:
       workers = {n.id: sorted(n.workers) for n in self.nodes.values()}
-      self.problems.append(
-        f"did not settle after deleting every run: procs {sorted(self.bus.plan_state.procs)} workers {workers}"
-      )
+      ctrl_w = {nid: sorted(n.workers) for nid, n in self.bus.nodes.items() if n.workers}
+      self.problems.append(f"did not settle after deleting every run: ctrl {ctrl_w} workers {workers}")
     left = {
-      "queues": sorted([*self.bus.trains.cmds, *self.bus.samples.queues]),
-      "writing": sorted(self.bus.trains.versions()),
+      "queues": sorted([cid for rs in self.bus.runs.values() for cid in rs.queue]),
+      "writing": sorted(
+        ver for n in self.bus.nodes.values() for t in n.tasks.values() for ver in (t.version, t.snapshot) if ver
+      ),
       "owners": [r for r in trainers if (row := self.bus.runs.get(r)) and row.owner],
       "on GPUs": {n.id: dict(n.occ.on) for n in self.nodes.values() if n.occ.on},
     }

@@ -16,9 +16,9 @@ from test.execution import TestNode
 from test.helpers import BusTest, tiny
 from tinyrl.api import gateway, wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
-from tinyrl.control import ledger as bus
+from tinyrl.control import controller as bus
 from tinyrl.storage.store import Store
-from tinyrl.types import NodeStatus
+from tinyrl.types import NodeMsg
 
 PROTO = {"content-type": wire.PROTO}
 
@@ -179,7 +179,7 @@ class TestAPI(BusTest):
       if self.bus.get_checkpoint("tinker://r/weights/soon") is None:
         break
       await asyncio.sleep(0.05)
-    self.assertEqual([c.uri for c in self.bus.checkpoints.values()], ["tinker://r/weights/later"])
+    self.assertEqual([c.uri for c in self.bus.list_checkpoints()], ["tinker://r/weights/later"])
 
   async def test_errors(self):
     run_id = await self.create_model()
@@ -218,8 +218,8 @@ class TestAPI(BusTest):
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
     self.assertEqual((self.bus.get_run(full))["rank"], 0)
-    state = self.bus.state()
-    self.assertEqual(state.runs(self.worker(full)), [full])
+    wid = self.worker(full)
+    self.assertEqual([r for r, rs in self.bus.runs.items() if rs.live and rs.owner and rs.owner[0] == wid], [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -244,21 +244,21 @@ class TestAPI(BusTest):
 
     stale = time.time() - bus.SESSION_GRACE - 1
     with self.bus.db:
-      self.bus.sessions[session_id]["seen"] = stale
-      self.bus.sessions.save(session_id)
+      self.bus.db.execute("UPDATE sessions SET seen=? WHERE id=?", (stale, session_id))
     await self.post("session_heartbeat", json={"session_id": session_id})  # a heartbeat in time keeps it
     await asyncio.sleep(0.3)
     self.assertTrue((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
 
     with self.bus.db:
-      self.bus.sessions[session_id]["seen"] = stale  # longer ago than the grace
-      self.bus.sessions.save(session_id)
+      self.bus.db.execute("UPDATE sessions SET seen=? WHERE id=?", (stale, session_id))  # longer ago than the grace
     await self.scheduling_until(lambda d: samp_id not in d["state"]["jobs"])
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     self.assertFalse((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
     cutoff = time.time() - bus.SESSION_GRACE
-    self.assertEqual([s for s, v in self.bus.sessions.items() if v["active"] and v["seen"] <= cutoff], [])
+    self.assertEqual(
+      self.bus.db.execute("SELECT id FROM sessions WHERE active=1 AND seen<=?", (cutoff,)).fetchall(), []
+    )
 
   async def test_a_finished_session_loses_its_runs_without_waiting_for_its_heartbeats_to_stop(self):
     session_id = (await self.post("create_session")).json()["session_id"]
@@ -273,7 +273,9 @@ class TestAPI(BusTest):
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     cutoff = time.time() - bus.SESSION_GRACE
-    self.assertEqual([s for s, v in self.bus.sessions.items() if v["active"] and v["seen"] <= cutoff], [])
+    self.assertEqual(
+      self.bus.db.execute("SELECT id FROM sessions WHERE active=1 AND seen<=?", (cutoff,)).fetchall(), []
+    )
 
   async def test_a_checkpoint_saved_without_a_ttl_gets_the_deployment_default_unless_its_run_owns_it(self):
     run_id = await self.create_model()
@@ -413,7 +415,7 @@ class TestAPI(BusTest):
     )
     samp_id = saved.json()["sampling_session_id"]
 
-    await self.bus.take("node-1", "b1", NodeStatus(8))
+    self.bus.handle(NodeMsg("hello", "node-1", "b1", gpus=8))
     self.start_maintenance()
     worker = self.worker(run_id)
     data = await self.scheduling_until(lambda d: d["state"]["procs"].get(worker, {}).get("node"))
@@ -459,7 +461,7 @@ class TestAPI(BusTest):
     self.assertEqual(await self.sampler_runs(), [sid])
     sampler = self.worker(sid)
 
-    await self.bus.take("n8", "b8", NodeStatus(8))
+    self.bus.handle(NodeMsg("hello", "n8", "b8", gpus=8))
     self.start_maintenance()
     await self.scheduling_until(lambda d: d["state"]["procs"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
@@ -476,7 +478,7 @@ class TestAPI(BusTest):
 
     session = await self.post("create_sampling_session", json={"base_model": "tiny"})
     sid = session.json()["sampling_session_id"]
-    with patch("tinyrl.control.samples.SAMPLE_QUEUE_BYTES", 8):
+    with patch("tinyrl.control.controller.SAMPLE_QUEUE_BYTES", 8):
       res = await self.post(
         "asample",
         json={
@@ -599,23 +601,28 @@ class TestAPI(BusTest):
     id0, id1 = fb0.json()["request_id"], fb1.json()["request_id"]
 
     # Leave the first command claimed and the second queued when the controller restarts.
-    report = NodeStatus(
-      self.node.gpus, workers={wid: w.observe(time.monotonic()) for wid, w in self.node.workers.items()}
+    hello = NodeMsg(
+      "hello",
+      self.node.id,
+      self.node.boot_id,
+      gpus=self.node.gpus,
+      workers=tuple(w.info() for w in self.node.workers.values()),
     )
-    plan = await self.bus.take(self.node.id, self.node.boot_id, report)
-    [first] = [w for g in plan.grants for w in g.work if w.cmd.run == run_id]
+    [first] = [t for t in self.bus.handle(hello).tasks if t.cmd and t.cmd.run == run_id]
     self.assertEqual(first.cmd.request_id, id0)
 
     await self.bus.aclose()
-    self.bus = bus.Ledger(self.db_path)
+    self.bus = bus.Controller(self.db_path)
     self.node.control = self.bus
+    self.node.connected = False
     with self.bus.db:
-      self.bus.samples.gc(float("inf"))
+      self.bus.db.execute("DELETE FROM stability WHERE expires<=?", (float("inf"),))
     self.assertFalse(self.bus.db.read_stability(set(seq_ids), time.time()))
+    # Store sweep still preserves stability blobs pinned by queued/claimed commands!
+    self.store.sweep(self.store.versions() - set(self.bus.live_versions()), 0)
 
-    # The queued commands retain their own inputs across a restart and sample expiry.
-    plan = await self.bus.take(self.node.id, self.node.boot_id, report)
-    [redelivered] = [w for g in plan.grants for w in g.work if w.cmd.run == run_id]
+    # The queued commands retain their own inputs across a restart, sample expiry, and store GC sweep.
+    [redelivered] = [t for t in self.bus.handle(hello).tasks if t.cmd and t.cmd.run == run_id]
     self.assertEqual(redelivered, first)
     await self.node.drain(run_id)
     for req_id in (id0, id1):

@@ -92,7 +92,7 @@ class TestLease(BusTest):
     self.assertEqual((self.bus.get_run(run))["owner"], old_owner)
 
     async def reported():
-      node = self.bus.node_status().get(first_node)
+      node = self.bus.nodes.get(first_node)
       return w.pid if node and (w := node.workers.get(proc_name)) else None
 
     await self.until(reported)
@@ -118,7 +118,8 @@ class TestLease(BusTest):
         os.killpg(model_pid, signal.SIGCONT)
 
     async def first_reaped():
-      node = self.bus.node_status().get(first_node)
+      self.bus.expire_nodes()
+      node = self.bus.nodes.get(first_node)
       return node is not None and not node.workers
 
     await self.until(first_reaped)

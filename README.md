@@ -22,7 +22,7 @@ sampler_path = trainer.save_weights_for_sampler("step-100").result().path
 ```sh
 pip install -e .
 python -m tinyrl.api.gateway &        # Tinker HTTP API and controller (:8000)
-python -m tinyrl.control.node_daemon  # runs assigned work on local GPUs
+python -m tinyrl.control.node_daemon  # runs assigned tasks on local GPUs
 ```
 
 Run one `gateway` (persisting durable state in `TINYRL_DB`) and one `node_daemon` per GPU machine (set `CONTROL_URL`, `GPUS`).
@@ -34,48 +34,41 @@ Run one `gateway` (persisting durable state in `TINYRL_DB`) and one `node_daemon
 
 ```mermaid
 flowchart TD
-  G["Gateway + Ledger"] <-->|SQLite WAL| D[("Durable State")]
-  N["Node daemon"] <-->|"take / finish / detach"| G
+  G["Gateway + Controller"] <-->|SQLite WAL| D[("Relational State")]
+  N["Node daemon"] <-->|"/internal/ws (msgpack)"| G
   N -->|Unix IPC| T["Trainer ranks"]
   N -->|Engine calls| V["vLLM"]
-  T & V <-->|Checkpoints| C[("Store")]
+  T & V <-->|"Checkpoints + stability blobs"| C[("Store")]
 ```
 
-Each GPU node calls `take` with its capacity, resident workers, active requests, and staged checkpoints. The controller chooses a worker, a GPU block, and the exact training command or sample batch. Outstanding work counts toward an account’s share on the next node’s pull. The daemon stages, parks, and resumes its workers to carry out the grant, then calls `finish` with the result and measured GPU time. When a training run moves, `detach` publishes its snapshot before the source worker releases it.
+Each GPU node holds one full-duplex msgpack WebSocket (`/internal/ws`) to the controller. Treating GPU VRAM across the fleet as a directly paged cache of training runs and sampler engines, the controller pushes explicit tasks (`train`, `sample`, `park`, `save`, `drop`, `stop`) plus off-GPU prefetch/sweep directives directly against live reported workers—with no persisted cluster plan or virtual process layer. Outstanding GPU grants reserve one quantum in EEVDF projected lag before the next grant is chosen, and two-phase `save` commits a detached snapshot before releasing a source worker.
 
-Drain the old daemons before upgrading the gateway and daemons together. On the first startup, the gateway migrates existing SQLite run, command, and checkpoint records in one transaction.
-
-- **Durable training, RAM sampling:** Training runs follow an explicit `fresh -> live <-> saved -> lost -> deleted` lifecycle in SQLite WAL ([ledger.py](tinyrl/control/ledger.py), [db.py](tinyrl/control/db.py)). High-QPS sampling queues and bounded LRU replies live in RAM ([samples.py](tinyrl/control/samples.py)) with `429` backpressure and `410` on evicted promises so the SDK retries transparently.
-- **Fleet scheduling.** Placement groups compatible LoRA runs, sizes sampler pools, and rebalances workers. On each pull, the controller chooses GPU blocks using reported occupancy and accounts for both measured GPU time and outstanding work. [Placement](tinyrl/control/scheduler.py) · [GPU grants](tinyrl/control/grants.py)
-- **Trainers, samplers, and store:** Trainers run as isolated synchronous PyTorch/PEFT processes (FSDP via `torchrun` across multiple GPUs) with bf16 forward, fp32 master weights + AdamW state, `cispo`/`dro`/`gspo`/`stable_reinforce` losses, and pinned host-memory parking. Samplers drive isolated vLLM processes (with optional CRIU snapshots). [store.py](tinyrl/storage/store.py) handles immutable `safetensors` checkpoints across local cache, peer HTTP, and async bucket uploads. SQLite records top-k inputs from the accepted sample and pins them when a `stable_reinforce` command is queued.
+- **Durable training, RAM sampling:** Training runs follow an explicit `fresh -> live <-> saved -> lost -> deleted` lifecycle in relational SQLite WAL ([controller.py](tinyrl/control/controller.py), [sql.py](tinyrl/control/sql.py)). Sampling queues and bounded LRU replies live in RAM with `429` backpressure, `410` on evicted promises, submission-time version pinning, and attempt-fenced failover.
+- **Pure EEVDF fleet paging:** [policy.py](tinyrl/control/policy.py) handles weighted waterfilling, account EEVDF lag and in-flight quantum lookahead, rotating sample wave admission, non-overlapping multi-GPU block planning, LoRA sharing/splitting/merging, elastic sampler scaling, and cross-node rebalance with zero I/O.
+- **Trainers, samplers, and store:** Trainers run as isolated synchronous PyTorch/PEFT processes (FSDP via `torchrun` across multiple GPUs) with bf16 forward, fp32 master weights + AdamW state, `cispo`/`dro`/`gspo`/`stable_reinforce` losses, and pinned host-memory parking. Samplers drive isolated vLLM processes (with optional CRIU snapshots). [store.py](tinyrl/storage/store.py) stores immutable `safetensors` checkpoints and `stable_reinforce` top-k blobs across local cache, peer HTTP, and async bucket uploads, with SQLite recording only byte-range metadata.
 
 ## Code layout
 
-`tinyrl/` is kept small (`python sz.py` counts token-bearing lines). Start with [ledger.py](tinyrl/control/ledger.py) and [node_daemon.py](tinyrl/control/node_daemon.py).
+`tinyrl/` is kept small (`python sz.py` counts token-bearing lines). Start with [controller.py](tinyrl/control/controller.py), [policy.py](tinyrl/control/policy.py), and [node_daemon.py](tinyrl/control/node_daemon.py).
 
 | File | Responsibility |
 |---|---|
-| [tinyrl/control/ledger.py](tinyrl/control/ledger.py) | Sessions, runs, checkpoints, placement loop, and `take`/`finish`/`detach` |
-| [tinyrl/control/trains.py](tinyrl/control/trains.py) | Durable SQLite FIFO training queues, replies, and `seq_id` deduplication |
-| [tinyrl/control/samples.py](tinyrl/control/samples.py) | In-memory sampling queues and bounded LRU reply cache (`429`/`410`) |
-| [tinyrl/control/nodes.py](tinyrl/control/nodes.py) | Live-node registry, lease expiry, and durable `boot_id` fencing |
-| [tinyrl/control/db.py](tinyrl/control/db.py) | SQLite WAL store, rollback-safe write-through tables, and request/reply blobs |
-| [tinyrl/control/scheduler.py](tinyrl/control/scheduler.py) | Pure cluster placement (`run -> proc -> node`) and account lag updates |
-| [tinyrl/control/fairness.py](tinyrl/control/fairness.py) | Account waterfilling, run/sample selection, and GPU block planning |
-| [tinyrl/control/grants.py](tinyrl/control/grants.py) | GPU turn selection and fair-share adjustments for outstanding grants |
+| [tinyrl/control/controller.py](tinyrl/control/controller.py) | Sessions, runs, unified queues, checkpoints, live node table, and direct fleet pager |
+| [tinyrl/control/policy.py](tinyrl/control/policy.py) | Pure waterfilling, EEVDF + projected lag, sample admission, GPU blocks, and placement |
+| [tinyrl/control/sql.py](tinyrl/control/sql.py) | Relational SQLite WAL schema, `boot_id` fence ring, stability slice index, and GC |
+| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | Stateless task executor, `/internal/ws` WebSocket client, staging, sweep, and drain |
 | [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | Monotonic GPU-time accounting across overlapping calls |
-| [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | Local worker reconciliation, GPU handoff, off-GPU staging, drain, and RPC client |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | Private Unix IPC and owned process-group supervision |
 | [tinyrl/control/estimator.py](tinyrl/control/estimator.py) | Framework-free model memory and GPU-width estimation |
-| [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, `/internal/{method}` RPC, checkpoints, and `/metrics` |
+| [tinyrl/api/gateway.py](tinyrl/api/gateway.py) | Tinker HTTP routes, `/internal/ws` channel, checkpoints, and `/metrics` |
 | [tinyrl/api/wire.py](tinyrl/api/wire.py) | Tinker protobufs, numpy encoding, and stability packing |
-| [tinyrl/types.py](tinyrl/types.py) | Domain types, node observations, and GPU grants |
-| [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | Synchronous trainer command loop and checkpoint metadata |
+| [tinyrl/types.py](tinyrl/types.py) | Domain types and binary msgpack node protocol frames |
+| [tinyrl/workers/trainer.py](tinyrl/workers/trainer.py) | Synchronous trainer command loop, stability fetch, and checkpoint metadata |
 | [tinyrl/workers/model.py](tinyrl/workers/model.py) | PyTorch/PEFT training, RL losses, token batching, and host parking |
-| [tinyrl/workers/sampler.py](tinyrl/workers/sampler.py) | Engine calls and encoding sample replies with optional top-k data |
+| [tinyrl/workers/sampler.py](tinyrl/workers/sampler.py) | Coalesced checkpoint loading, sample encoding, and Store-backed stability blobs |
 | [tinyrl/workers/vllm.py](tinyrl/workers/vllm.py) | vLLM engine lifecycle, checkpoint loading, and sleep/wake |
 | [tinyrl/workers/snapshot.py](tinyrl/workers/snapshot.py) | CRIU snapshots and restores for vLLM |
-| [tinyrl/storage/store.py](tinyrl/storage/store.py) | Safetensors I/O, local cache, peer reads, and async uploads |
+| [tinyrl/storage/store.py](tinyrl/storage/store.py) | Safetensors + blob I/O, local cache, peer reads, async uploads, and sweep |
 | [tinyrl/storage/models.py](tinyrl/storage/models.py) | Base-model fetching and local caching |
 | [tinyrl/trace.py](tinyrl/trace.py) | NVTX ranges for Nsight Systems |
 
@@ -91,7 +84,7 @@ Drain the old daemons before upgrading the gateway and daemons together. On the 
 ## Test
 
 ```sh
-python -m unittest discover -s test -t .                            # isolated SQLite Ledger per test
+python -m unittest discover -s test -t .                            # isolated SQLite Controller per test
 TINKER_PYTHON=$(which python) python -m unittest test.test_tinker  # end-to-end via examples/tinker_sdk.py
 python -m test.mutation                                             # control-plane mutation tests
 SEED=3 CHAOS=1 python -m test.stress_fleet                          # randomized chaos & fleet stress test

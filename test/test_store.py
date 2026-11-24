@@ -10,7 +10,7 @@ import torch
 
 from test.helpers import BusTest, new_id
 from tinyrl.storage.store import SHARD_BYTES, Store
-from tinyrl.types import Checkpoint, FencedError, NodeStatus, Op, Reply, Run
+from tinyrl.types import Checkpoint, Done, Effect, NodeMsg, Op, Reply, Run, TaskKind
 
 
 class TestStore(unittest.TestCase):
@@ -225,7 +225,7 @@ class TestRegistry(BusTest):
     other = Checkpoint("tinker://r/weights/keep", "keep", 1, time=1.0)
     with self.bus.db:
       for row in (saved, other):
-        self.bus.checkpoints[row.uri] = row
+        self.bus.put_checkpoint(row)
     self.assertEqual(self.bus.checkpoint_version(saved.uri), "saved")
     self.assertEqual(self.bus.checkpoint_version(other.uri), "keep")
     self.assertTrue(self.bus.set_checkpoint_ttl(saved.uri, -1))
@@ -239,11 +239,10 @@ class TestRegistry(BusTest):
     uri = f"tinker://{run}/sampler_weights/session"
     self.seed_checkpoint(uri, 1, ttl=60, owned=True)
     self.bus.submit_command(run, Op.DELETE_MODEL, b"{}")
-    [a] = (await self.bus.take("n1", "b1", NodeStatus(1))).grants
-    [w] = a.work
+    [t] = [x for x in self.bus.handle(NodeMsg("hello", "n1", "b1", gpus=1)).tasks if x.kind == TaskKind.TRAIN]
     for _ in range(20):
       self.bus.set_checkpoint_ttl(uri, 600)
-    self.bus.finish("n1", "b1", a.worker, w.cmd.request_id, Reply(True, "application/json", b"{}"))
+    self.bus.handle(NodeMsg("events", "n1", "b1", done=(Done(t.id, True, Reply(True, "application/json", b"{}")),)))
     self.assertFalse(self.bus.set_checkpoint_ttl(uri, 600))
     self.assertIsNone(self.bus.get_checkpoint(uri))
 
@@ -261,25 +260,25 @@ class TestRegistry(BusTest):
         uri = f"tinker://{run}/weights/final"
         self.bus.create_run(Run(run, "base", 4))
         self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        [a1] = (await self.bus.take("n1", b1, NodeStatus(1))).grants
-        [w1] = a1.work
-        abandoned = w1.version
+        [t1] = [x for x in self.bus.handle(NodeMsg("hello", "n1", b1, gpus=1)).tasks if x.kind == TaskKind.TRAIN]
+        abandoned = t1.version
         self.bus.nodes["n1"].until = 0.0
         self.bus.maintain()
 
         self.bus.submit_command(run, Op.SAVE_WEIGHTS, b"{}")
-        [a2] = (await self.bus.take("n2", b2, NodeStatus(1))).grants
-        [w2] = a2.work
-        version = w2.version
+        [t2] = [x for x in self.bus.handle(NodeMsg("hello", "n2", b2, gpus=1)).tasks if x.kind == TaskKind.TRAIN]
+        version = t2.version
         winner = new.put({"w": torch.ones(2)}, version=version)
         sweep(new, grace=0)  # protected even before the reply publishes it
         reply = Reply(True, "application/json", b"{}")
-        self.bus.finish("n2", b2, a2.worker, w2.cmd.request_id, reply, checkpoint=Checkpoint(uri, winner, 8, 1.0))
+        eff_win = Effect(loaded=True, checkpoint=Checkpoint(uri, winner, 8, 1.0))
+        self.bus.handle(NodeMsg("events", "n2", b2, done=(Done(t2.id, True, reply, effect=eff_win),)))
         new.upload_pending_saves()
         late = old.put({"w": torch.zeros(2)}, version=abandoned)
         old.upload_pending_saves()
-        with self.assertRaises(FencedError):
-          self.bus.finish("n1", b1, a1.worker, w1.cmd.request_id, reply, checkpoint=Checkpoint(uri, late, 8, 1.0))
+        eff_late = Effect(loaded=True, checkpoint=Checkpoint(uri, late, 8, 1.0))
+        res = self.bus.handle(NodeMsg("events", "n1", b1, done=(Done(t1.id, True, reply, effect=eff_late),)))
+        self.assertTrue(res.reset)
         reader = Store(root, cache=tempfile.mkdtemp())
         published = self.bus.checkpoint_version(uri)
         self.assertEqual(published, winner)

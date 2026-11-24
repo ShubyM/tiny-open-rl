@@ -11,11 +11,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEDULER = "tinyrl/control/scheduler.py"
-LEDGER = "tinyrl/control/ledger.py"
-NODES = "tinyrl/control/nodes.py"
-SAMPLES = "tinyrl/control/samples.py"
-FAIRNESS = "tinyrl/control/fairness.py"
+CONTROLLER = "tinyrl/control/controller.py"
+POLICY = "tinyrl/control/policy.py"
 ACCOUNTING = "tinyrl/control/accounting.py"
 ORDER = "test.test_scheduler.TestLocalQuantum"
 BILLING = "test.test_accounting.TestAccounting"
@@ -25,22 +22,22 @@ RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery
 
 # (source, function, original expression, faulty replacement, tests that should detect it)
 CASES = [
-  (FAIRNESS, "rank_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
+  (POLICY, "rank_runs", "-lag_of(c.run)", "lag_of(c.run)", ORDER),
   (
-    FAIRNESS,
+    POLICY,
     "admit_samples",
     "while len(out) < slots and runs:",
     "while len(out) < 1 and runs:",
     ORDER + ".test_sampler_wave_obeys_account_and_version_limits_and_rotates_within_them",
   ),
-  (FAIRNESS, "rank_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
-  (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
+  (POLICY, "rank_runs", "entry_sort_key(c.entry_id)", "c.entry_id", ORDER),
+  (POLICY, "ready_lag", "service.get(acct, 0.0)", "seen.get(acct, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (LEDGER, "bill", "if charge and charge.gpu_ms", "if reply.ok and charge and charge.gpu_ms", BILLING),
-  (NODES, "fence", "if boot_id in self.expired_boots", "if False", CLAIM),
-  (SAMPLES, "complete", "(entry.owner, entry.attempt) != (owner, attempt)", "entry.attempt != attempt", DEDUP),
-  (LEDGER, "finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
+  (CONTROLLER, "_bill", "if charge.gpu_ms", "if reply.ok and charge.gpu_ms", BILLING),
+  (CONTROLLER, "handle", "if self.db.is_fenced(msg.boot_id):", "if False:", CLAIM),
+  (CONTROLLER, "_finish_sample", "(it.owner, it.attempt) != (owner, attempt)", "it.attempt != attempt", DEDUP),
+  (CONTROLLER, "_finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
 ]
 
 

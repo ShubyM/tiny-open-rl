@@ -3,7 +3,7 @@
 import asyncio
 
 from test.helpers import FakeEngine, tiny
-from tinyrl.control import scheduler
+from tinyrl.control.controller import LiveWorker
 from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.types import Role
 from tinyrl.workers.model import Model
@@ -57,35 +57,43 @@ class TestNode(NodeDaemon):
     return sampler
 
   async def tick(self):
-    return await self.step_once(wait_ms=0)
+    return await self.step_once()
 
   def tasks(self) -> list[asyncio.Task]:
-    return [t for w in self.workers.values() for t in (*w.running.values(), w.op_task) if t]
+    return [
+      *(tk for _, tk in self.active.values()),
+      *self.staging.values(),
+      *((self.sweep_task,) if self.sweep_task else ()),
+    ]
 
   async def bind(self, proc: str, *runs: str):
-    """Pin `proc` hosting `runs` onto this node in the controller's plan and announce this node."""
-    state = self.control.state()
+    """Ensure this node is registered and optionally pin `proc` hosting `runs` onto it."""
+    if self.id not in self.control.nodes:
+      await self.tick()
+    ns = self.control.nodes[self.id]
     for r in runs:
-      spec = state.jobs[r].spec
+      rs = self.control.runs[r]
+      spec = rs.run.spec
       if spec.role == Role.SAMPLER:
-        for old in [n for n, p in list(state.procs.items()) if n != proc and p.spec == spec]:
-          state.procs.pop(old, None)
-      state.procs[proc] = scheduler.Proc(spec, self.id)
-      if spec.role == Role.TRAINER:
-        state.home[r] = proc
-    self.control.plan_state, self.control.plan_due = state, 0.0
+        for wid in [k for k, w in list(ns.workers.items()) if k != proc and w.spec == spec]:
+          ns.workers.pop(wid, None)
+      ns.workers.setdefault(proc, LiveWorker(proc, spec))
+      if spec.role == Role.TRAINER and rs.owner is None:
+        rs.owner = (proc, self.id, self.boot_id)
+    self.control.schedule()
     await self.tick()
     return self.workers.get(proc)
 
   def drop_local(self, proc: str):
-    if p := self.control.plan_state.procs.get(proc):
-      p.node, self.control.plan_due = None, 0.0
+    if (ns := self.control.nodes.get(self.id)) and (w := ns.workers.get(proc)):
+      w.stopping = True
+    self.control.schedule()
     self.notify()
 
   async def worker_for(self, run: str) -> str | None:
     await self.tick()
-    ps = self.control.state().procs_of(run)
-    return ps[0] if ps else None
+    ws = self.control.workers_of(run)
+    return ws[0] if ws else None
 
   async def drain(self, run: str):
     async with asyncio.timeout(15):
@@ -95,8 +103,8 @@ class TestNode(NodeDaemon):
         if not q.get("queued") and not q.get("in_flight") and not self.busy():
           break
         await asyncio.sleep(0.002)
-    ps = self.control.state().procs_of(run)
-    return self.workers.get(ps[0]) if ps else None
+    ws = self.control.workers_of(run)
+    return self.workers.get(ws[0]) if ws else None
 
   async def aclose(self):
     await self.close()

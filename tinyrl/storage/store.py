@@ -234,8 +234,7 @@ class Store:
       lambda i, name, shard: self.write_safetensors(i, f"{folder}/{name}", shard, meta), range(n), weights, shards
     )
 
-  @span("store.put")
-  def put(self, tensors: dict[str, torch.Tensor], meta: dict | None = None, *, version: str | None = None) -> str:
+  def _publish(self, version: str | None, write) -> str:
     version = version or uuid.uuid4().hex
     if not object_id(version):
       raise ValueError(f"invalid checkpoint version {version!r}")
@@ -244,14 +243,27 @@ class Store:
     folder = parent / f"{version}.writing"
     folder.mkdir()
     try:
-      with self.lock:
-        self.write_checkpoint_files(str(folder), tensors, meta or {})
+      write(folder)
       if self.remote:
         (parent / f"{version}.upload").touch()  # present before rename so trim_cache never drops an unuploaded save
       folder.rename(parent / version)
     finally:
       shutil.rmtree(folder, ignore_errors=True)
     return f"{version}@{self.peer}" if self.remote and self.peer else version
+
+  @span("store.put")
+  def put(self, tensors: dict[str, torch.Tensor], meta: dict | None = None, *, version: str | None = None) -> str:
+    def write(folder: Path) -> None:
+      with self.lock:
+        self.write_checkpoint_files(str(folder), tensors, meta or {})
+
+    return self._publish(version, write)
+
+  def put_blob(self, data: bytes, *, version: str | None = None) -> str:
+    return self._publish(version, lambda folder: (folder / "blob.bin").write_bytes(data))
+
+  def get_blob(self, reference: str) -> bytes:
+    return Path(self.local_folder(reference)[0], "blob.bin").read_bytes()
 
   def upload_pending_saves(self) -> None:
     """An independent, retryable upload per immutable version. Publish its manifest after its files."""

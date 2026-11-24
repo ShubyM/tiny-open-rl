@@ -1,5 +1,5 @@
 from test.helpers import BusTest
-from tinyrl.types import Ev, Run
+from tinyrl.types import Ev, NodeMsg, Op, Run
 
 
 class TestEvents(BusTest):
@@ -12,14 +12,14 @@ class TestEvents(BusTest):
     self.assertLessEqual(events[0].t, events[1].t)
     self.assertEqual([e.id for e in self.bus.read_events(first)], [second])
 
-  async def test_the_scheduler_assigns_new_runs_and_the_log_has_the_process_membership(self):
+  async def test_compatible_lora_runs_share_a_worker_while_full_finetune_gets_its_own(self):
+    self.bus.handle(NodeMsg("hello", "n", "b", gpus=1))
     for run in ("a", "b"):
       self.bus.create_run(Run(run, "tiny", 4))
+      self.bus.submit_command(run, Op.CREATE_MODEL, b"{}")
     self.bus.create_run(Run("f", "tiny", 0))
-    self.bus.maintain()
-    state = self.bus.state()
-    home = state.home
-    self.assertEqual(home["a"], home["b"])
-    self.assertNotEqual(home["a"], home["f"])
-    self.assertEqual(state.runs(home["a"]), ["a", "b"])
-    self.assertEqual(state.runs(home["f"]), ["f"])
+    self.bus.submit_command("f", Op.CREATE_MODEL, b"{}")
+    ws = self.bus.nodes["n"].workers
+    self.assertEqual(len(ws), 2)
+    self.assertEqual(self.bus.runs["a"].owner[0], [w.id for w in ws.values() if w.spec.lora][0])
+    self.assertNotEqual([w.id for w in ws.values() if w.spec.lora], [w.id for w in ws.values() if not w.spec.lora])

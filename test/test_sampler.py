@@ -290,7 +290,7 @@ class TestSampler(BusTest):
 
     node = self.node(Store(tempfile.mkdtemp()), gpus=1, engine=Recording)
     with (
-      mock.patch("tinyrl.control.grants.QUANTUM_MS", 15),
+      mock.patch("tinyrl.control.policy.QUANTUM_MS", 15),
       mock.patch("tinyrl.types.MAX_SEQS", 1),
     ):
       first = self.bus.submit_command("busy", Op.SAMPLE, json.dumps(JOB | {"prompt": [11]}).encode(), cost=10)
@@ -335,11 +335,10 @@ class TestSampler(BusTest):
         order.append(job["prompt"][0])
         return await super().sample(job, name)
 
-    node = self.node(gpus=1, engine=OrderEngine)
-    await node.bind("sampler", "high", "low")
+    self.bus.service["bob"] = 1000.0
     req_low = self.bus.submit_command("low", Op.SAMPLE, json.dumps(JOB | {"prompt": [1]}).encode())
     req_high = self.bus.submit_command("high", Op.SAMPLE, json.dumps(JOB | {"prompt": [2]}).encode())
-    self.bus.service["bob"] = 1000.0
+    node = self.node(gpus=1, engine=OrderEngine)
     self.pump(node)
     self.assertTrue((await self.bus.wait_for_reply(req_high, 5)).ok)
     self.assertTrue((await self.bus.wait_for_reply(req_low, 5)).ok)

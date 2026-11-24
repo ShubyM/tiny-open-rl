@@ -10,7 +10,7 @@ import unittest
 import urllib.request
 
 from test.helpers import tiny
-from tinyrl.control.ledger import Ledger
+from tinyrl.control.controller import Controller
 from tinyrl.types import Checkpoint
 
 EXAMPLE = pathlib.Path(__file__).parent.parent / "examples" / "tinker_sdk.py"
@@ -66,7 +66,7 @@ class TestTinkerSDK(unittest.TestCase):
       model_id = out.stdout.split("model ")[1].split()[0]
 
       async def published() -> Checkpoint | None:
-        db = Ledger(env["TINYRL_DB"])
+        db = Controller(env["TINYRL_DB"])
         try:
           return db.get_checkpoint(f"tinker://{model_id}/sampler_weights/final")
         finally:

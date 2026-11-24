@@ -61,6 +61,12 @@ class Trainer:
   def load_run(self, run: str, version: str | None, optimizer: bool, gradients: bool) -> None:
     self.call_model("restore_run", run, *self.store.get(version), optimizer, gradients)
 
+  def read_stability(self, slices: dict | None) -> dict[str, bytes] | None:
+    if not slices:
+      return None
+    blobs = {ref: self.store.get_blob(ref) for ref in {r for r, _, _ in slices.values()}}
+    return {sid: blobs[ref][off : off + ln] for sid, (ref, off, ln) in slices.items()}
+
   @span("trainer.execute")
   def execute(
     self, cmd: Cmd, run: Run | None = None, snapshot: str | None = None, version: str | None = None
@@ -85,7 +91,7 @@ class Trainer:
       if cmd.op == Op.FORWARD_BACKWARD:
         req = wire.parse(cmd.body)
         fb = (cmd.run, wire.datums(req), req.loss_fn or "cross_entropy", wire.loss_config(req), req.forward_only)
-        logprobs, metrics = self.call_model("forward_backward", *fb, cmd.stability)
+        logprobs, metrics = self.call_model("forward_backward", *fb, self.read_stability(cmd.stability))
         reply = Reply(True, wire.PROTO, wire.output(logprobs, metrics))
       else:
         args = json.loads(cmd.body)

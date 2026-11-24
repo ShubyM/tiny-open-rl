@@ -76,7 +76,8 @@ class TestNodeDaemon(BusTest):
       self.assertTrue(os.path.isdir(f"{folder}/cache") and os.path.isdir(f"{folder}/local"))
 
   async def test_a_backlogged_run_yields_to_a_ready_sibling(self):
-    node, a, b = self.node(), new_id(), new_id()
+    node, a, b = self.node(gpus=1), new_id(), new_id()
+    await node.tick()
     creates = {}
     for run in (a, b):
       self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
@@ -87,12 +88,13 @@ class TestNodeDaemon(BusTest):
       self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
     await node.bind("worker", a, b)
     await self.reply(creates[b], node)
-    child = node.processes["worker"]
+    [wid] = self.bus.workers_of(a)
+    child = node.processes[wid]
     self.assertLessEqual((self.bus.get_run(a))["steps"], 4)
     self.assertGreater((self.bus.queued_and_in_flight(a))["queued"], 0)
     await node.drain(a)
     self.assertEqual((self.bus.get_run(a))["steps"], 12)
-    self.assertIs(node.processes["worker"], child)
+    self.assertIs(node.processes[wid], child)
 
   async def test_a_slow_checkpoint_read_does_not_block_ready_work_or_gpu_handoff(self):
     with tempfile.TemporaryDirectory() as folder:
@@ -115,13 +117,13 @@ class TestNodeDaemon(BusTest):
       try:
         ready = self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(ready, node)
-        resident = self.bus.plan_state.procs_of("slow")[0]
+        resident = self.bus.workers_of("slow")[0]
         await self.until(started.is_set, node)
         # Another base-model sampler takes the GPU from `resident` while `slow` is still downloading off-GPU.
         self.bus.create_run(Run("other", "other-base", 4, role=Role.SAMPLER))
         request = self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(request, node)
-        contender = self.bus.plan_state.procs_of("other")[0]
+        contender = self.bus.workers_of("other")[0]
         self.assertEqual(node.workers[resident].resident, ())
         self.assertEqual(node.workers[contender].resident, (0,))
         self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
@@ -258,7 +260,7 @@ class TestNodeDaemon(BusTest):
       a, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
     )
     await self.reply(req_a, node)
-    pa = self.bus.plan_state.home[a]
+    pa = self.bus.workers_of(a)[0]
     holder = node.workers[pa]
     pid = holder.model.proc.pid
     os.killpg(pid, signal.SIGSTOP)
@@ -266,10 +268,9 @@ class TestNodeDaemon(BusTest):
       request = self.bus.submit_command(
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
       )
-      await self.until(lambda: node.workers[pa].op_task is not None, node)
-      pb = self.bus.plan_state.home[b]
+      await self.until(lambda: any(t.worker == pa and t.kind == "park" for t, _ in node.active.values()), node)
       self.assertEqual(holder.resident, (0,))
-      self.assertNotIn(pb, node.workers)  # Rule R1: never enters GPU 0 until holder finishes parking
+      self.assertEqual(list(node.workers), [pa])  # Rule R1: never enters GPU 0 until holder finishes parking
       before = self.bus.nodes[node.id].until
       await node.step_once(wait_ms=0)
       self.assertGreater(self.bus.nodes[node.id].until, before)
@@ -287,7 +288,7 @@ class TestNodeDaemon(BusTest):
     run = new_id()
     self.bus.create_run(Run(run, base, 4, lora=LORA))
     await self.create(run, base, node)
-    proc = self.bus.plan_state.home[run]
+    proc = self.bus.workers_of(run)[0]
     first = node.workers[proc].model.proc.pid
     # When GPU 0 is occupied, the parked 1-GPU trainer hops to GPU 1 without restarting its subprocess.
     handle = node.workers[proc]
@@ -303,7 +304,8 @@ class TestNodeDaemon(BusTest):
     os.killpg(first, signal.SIGKILL)
     await self.until(lambda: proc not in node.workers, node)
     await self.create(run, base, node)
-    self.assertNotEqual(node.workers[proc].model.proc.pid, first)
+    [new_proc] = self.bus.workers_of(run)
+    self.assertNotEqual(node.workers[new_proc].model.proc.pid, first)
 
   async def test_the_node_uploads_what_its_model_saved(self):
     with tempfile.TemporaryDirectory() as folder:
@@ -362,7 +364,7 @@ class TestNodeDaemon(BusTest):
     self.assertLessEqual(len(parks), 3)
 
   async def test_a_swap_waits_for_an_open_training_step_to_finish(self):
-    self.enterContext(patch("tinyrl.control.grants.QUANTUM_MS", 40))
+    self.enterContext(patch("tinyrl.control.policy.QUANTUM_MS", 40))
     node = self.node(gpus=1)
     a, b = new_id(), new_id()
     self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
@@ -442,15 +444,20 @@ class TestNodeDaemon(BusTest):
     req = self.bus.submit_command(b, Op.CREATE_MODEL, json.dumps({"base_model": "b", "rank": 4, "lora": LORA}).encode())
     try:
       await self.until(parking.is_set, node)
-      snap = self.background(node.detach_run(holder, a, drop=True))
+      import uuid as _uuid
+
+      from tinyrl.types import Task, TaskKind
+
+      save_t = Task(_uuid.uuid4().hex[:12], TaskKind.SAVE, "holder", holder.spec, run_id=a, version=_uuid.uuid4().hex)
+      snap = self.background(node._exec(save_t))
       for _ in range(5):
         await asyncio.sleep(0)
       self.assertFalse(snap.done())
       self.assertEqual(overlap, [])
     finally:
       release.set()
-    await snap
-    self.assertIsNotNone(self.bus.get_run(a)["snapshot"])
+    done = await snap
+    self.assertIsNotNone(done.saved)
     self.assertEqual(overlap, [])
     await self.reply(req, node)
 

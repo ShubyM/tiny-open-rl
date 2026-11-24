@@ -7,7 +7,7 @@ import uuid
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from tinyrl.control.ledger import Ledger
+from tinyrl.control.controller import Controller
 from tinyrl.types import Checkpoint
 
 
@@ -29,7 +29,7 @@ def new_id() -> str:
   return str(uuid.uuid4())
 
 
-async def serve_control(ledger: Ledger, host: str = "127.0.0.1", port: int = 0):
+async def serve_control(ledger: Controller, host: str = "127.0.0.1", port: int = 0):
   """Run the FastAPI gateway (including `/internal/{method}`) on a TCP port for tests."""
   import socket
 
@@ -62,14 +62,13 @@ class BusTest(unittest.IsolatedAsyncioTestCase):
   def seed_checkpoint(self, uri, size, *, ttl=None, owned=False, version=None, meta=None):
     now = time.time()
     exp = now + ttl if ttl else None
-    with self.bus.db:
-      self.bus.checkpoints[uri] = Checkpoint(uri, version or uuid.uuid4().hex, size, now, exp, bool(owned), meta or {})
+    self.bus.put_checkpoint(Checkpoint(uri, version or uuid.uuid4().hex, size, now, exp, bool(owned), meta or {}))
 
   async def asyncSetUp(self):
     self.renewal_tasks = []
     self._db_dir = tempfile.TemporaryDirectory()
     self.db_path = f"{self._db_dir.name}/tinyrl.db"
-    self.bus = Ledger(self.db_path)
+    self.bus = Controller(self.db_path)
 
   def start_maintenance(self, period: float = 0.02) -> asyncio.Task:
     async def loop():
@@ -82,8 +81,8 @@ class BusTest(unittest.IsolatedAsyncioTestCase):
     return task
 
   def worker(self, run: str) -> str:
-    self.bus.reconcile()
-    return self.bus.state().procs_of(run)[0]
+    self.bus.schedule()
+    return self.bus.workers_of(run)[0]
 
   async def asyncTearDown(self):
     for task in self.renewal_tasks:

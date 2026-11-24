@@ -14,6 +14,7 @@ import sys
 import traceback
 
 import aiohttp
+import msgspec
 
 from tinyrl.control.process import launch, reap, target_pid
 from tinyrl.helpers import getenv
@@ -48,7 +49,7 @@ def unix_client(sock: str) -> aiohttp.ClientSession:
 
 
 def parse(body: bytes) -> Out:
-  choices = sorted(json.loads(body)["choices"], key=lambda c: c["index"])
+  choices = sorted(msgspec.json.decode(body)["choices"], key=lambda c: c["index"])
   seqs = [
     Seq(
       c["token_ids"],
