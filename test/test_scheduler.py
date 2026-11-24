@@ -603,8 +603,14 @@ class TestLocalQuantum(unittest.TestCase):
     }
     heads = [q[0] for q in queues.values()]
     versions = {"a1": "v1", "a2": "v1", "a3": "v2", "b1": "v1"}
+    # max_loras=1 skips a3 (v2), splits 4 slots fairly 2/2 across accounts a and b, and rotates a1/a2 inside a.
     admitted = admit_samples(heads, lambda r, n: queues[r][:n], lambda r: r[0], lambda r: 0, {}, versions.get, 4, 1)
-    self.assertEqual([c.run for c in admitted], ["a1", "a2", "a1", "a2"])
+    self.assertEqual([c.run for c in admitted], ["a1", "a2", "b1", "b1"])
+    # Existing in-flight slots for account a tilt new slots toward account b until balanced.
+    topped = admit_samples(
+      heads, lambda r, n: queues[r][:n], lambda r: r[0], lambda r: 0, {}, versions.get, 3, 2, {"a": 2}
+    )
+    self.assertEqual([c.run for c in topped], ["a1", "b1", "b1"])
 
   def test_local_guard_enforces_gpu_exclusivity_under_concurrent_handoffs(self):
     async def run():

@@ -35,11 +35,13 @@ class TestNodeGrants(unittest.IsolatedAsyncioTestCase):
     self.addAsyncCleanup(self.ctrl.aclose)
 
   async def test_second_node_sees_the_first_sample_wave_before_any_finish(self):
-    for run, backlog in (("a", MAX_SEQS * 2), ("b", MAX_SEQS)):
-      self.ctrl.create_run(Run(run, "base", 8, role=Role.SAMPLER))
-      for _ in range(backlog):
-        self.ctrl.submit_command(run, Op.SAMPLE, b"{}")
+    self.ctrl.create_run(Run("a", "base", 8, role=Role.SAMPLER))
+    for _ in range(MAX_SEQS * 2):
+      self.ctrl.submit_command("a", Op.SAMPLE, b"{}")
     east = [t for t in self.ctrl.handle(NodeMsg("hello", "east", "boot", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
+    self.ctrl.create_run(Run("b", "base", 8, role=Role.SAMPLER))
+    for _ in range(MAX_SEQS):
+      self.ctrl.submit_command("b", Op.SAMPLE, b"{}")
     west = [t for t in self.ctrl.handle(NodeMsg("hello", "west", "boot", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
     for wave, run in ((east, "a"), (west, "b")):
       self.assertEqual(wave[0].gpus, (0,))

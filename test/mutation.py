@@ -27,8 +27,8 @@ CASES = [
   (
     POLICY,
     "admit_samples",
-    "while len(admitted) < slots and run_queues:",
-    "while len(admitted) < 1 and run_queues:",
+    "for _ in range(slots):",
+    "for _ in range(1):",
     ORDER + ".test_sampler_wave_obeys_account_and_version_limits_and_rotates_within_them",
   ),
   (POLICY, "rank_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),

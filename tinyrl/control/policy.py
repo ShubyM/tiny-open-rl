@@ -139,7 +139,7 @@ def projected_lag(
   weights: dict[str, float],
   runs: list[tuple[str, WorkerSpec, int]],
   nodes: dict[str, int],
-  holds: list[tuple[str, int]],
+  holds: list[tuple[str, float]],
 ) -> Callable[[str], float]:
   if not holds:
     return lambda acct: ready_lag(lag, seen, service, acct)
@@ -170,36 +170,44 @@ def admit_samples(
   version_of: Callable[[str], str | None],
   slots: int,
   max_loras: int,
-  active_account: str | None = None,
+  in_flight: dict[str, int] | None = None,
   active_versions: Iterable[str | None] = (),
 ) -> list[Cmd]:
+  """Continuously fill free sampler slots up to `max_loras`, equalizing in-flight slots across accounts."""
   if slots <= 0 or not heads:
     return []
-  ranked = rank_runs(heads, lag_of, service)
-  target_account = account(ranked[0])
-  if active_account is not None and active_account != target_account:
-    return []
-
   loaded_versions = {ver for ver in active_versions if ver is not None}
-  run_queues: deque[deque[Cmd]] = deque()
-  for run in ranked:
-    if account(run) != target_account:
-      continue
+  runs_by_acct: dict[str, list[deque[Cmd]]] = {}
+  for run in rank_runs(heads, lag_of, service):
     ver = version_of(run)
     if ver is not None and ver not in loaded_versions and len(loaded_versions) >= max_loras:
       continue
+    pending = deque(queued(run, slots))
+    if not pending:
+      continue
     if ver is not None:
       loaded_versions.add(ver)
-    pending = deque(queued(run, slots))
-    if pending:
-      run_queues.append(pending)
+    runs_by_acct.setdefault(account(run), []).append(pending)
+
+  available = {acct: sum(len(q) for q in qs) for acct, qs in runs_by_acct.items()}
+  allocated = dict.fromkeys(runs_by_acct, 0)
+  rank_index = {acct: i for i, acct in enumerate(runs_by_acct)}
+  active_counts = in_flight or {}
+  for _ in range(slots):
+    eligible = [acct for acct in runs_by_acct if allocated[acct] < available[acct]]
+    if not eligible:
+      break
+    chosen = min(eligible, key=lambda acct: (active_counts.get(acct, 0) + allocated[acct], rank_index[acct]))
+    allocated[chosen] += 1
 
   admitted: list[Cmd] = []
-  while len(admitted) < slots and run_queues:
-    queue = run_queues.popleft()
-    admitted.append(queue.popleft())
-    if queue:
-      run_queues.append(queue)
+  for acct, queues in runs_by_acct.items():
+    ring = deque(queues)
+    for _ in range(allocated[acct]):
+      queue = ring.popleft()
+      admitted.append(queue.popleft())
+      if queue:
+        ring.append(queue)
   return admitted
 
 

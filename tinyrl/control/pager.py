@@ -33,17 +33,28 @@ def train_head(ctrl, run_id: str):
   return head if head.owner is None else None
 
 
-def sample_heads(ctrl, spec: WorkerSpec, staged: set[str]) -> dict[str, object]:
+def sample_heads(ctrl, spec: WorkerSpec, staged: set[str], allow_base: bool = True) -> dict[str, object]:
   """Earliest unclaimed, staged sample item per live sampler run matching `spec`."""
   heads: dict[str, object] = {}
   for run_id, state in ctrl.runs.items():
     if not (state.live and state.run.role == Role.SAMPLER and state.run.spec == spec and state.queue):
       continue
     for item in state.queue.values():
-      if item.owner is None and (item.version is None or item.version in staged):
+      if item.owner is None and ((allow_base and item.version is None) or item.version in staged):
         heads[run_id] = item
         break
   return heads
+
+
+def eligible_stage(worker: LiveWorker, active: list[Task], staged: set[str]) -> tuple[set[str], bool]:
+  """Staged checkpoint versions (and whether base-model samples fit) alongside `active` sampler tasks."""
+  if worker.spec.lora:
+    active_vers = {t.version for t in active if t.version is not None}
+    return (staged if len(active_vers) < types.MAX_LORAS else (staged & active_vers)), True
+  if not active:
+    return staged, True
+  ver = active[0].version
+  return ({ver} & staged if ver is not None else set()), ver is None
 
 
 def settle_trivial_heads(ctrl) -> None:
@@ -263,7 +274,8 @@ def plan_node(
       occupied.update(worker.gpus)
       fixed[wid] = worker.gpus
       if worker.spec.role == Role.SAMPLER and len(active) < types.MAX_SEQS:
-        ready_by_worker[wid] = set(sample_heads(ctrl, worker.spec, node.staged))
+        eligible, allow_base = eligible_stage(worker, [t for t in active if t.kind == TaskKind.SAMPLE], node.staged)
+        ready_by_worker[wid] = set(sample_heads(ctrl, worker.spec, eligible, allow_base))
       continue
 
     if worker.spec.role == Role.TRAINER:
@@ -322,16 +334,16 @@ def plan_node(
 
 def grant_worker(
   ctrl,
+  view: FleetView,
   node: NodeState,
   worker: LiveWorker,
   block: tuple[int, ...],
-  runs,
   fair: dict[str, float],
   lag_of_run: Callable[[str], float],
   now: float,
 ) -> bool:
   if worker.spec.role == Role.TRAINER:
-    heads = [h.cmd for r in runs if (h := train_head(ctrl, r)) is not None]
+    heads = [h.cmd for r in view.trainer_runs.get((node.id, worker.id), ()) if (h := train_head(ctrl, r)) is not None]
     if not heads:
       return False
     run_id = policy.rank_runs(heads, lag_of_run, fair)[0]
@@ -363,9 +375,9 @@ def grant_worker(
   active = [task for task in node.worker_tasks(worker.id) if task.kind == TaskKind.SAMPLE]
   lora_cap = types.MAX_LORAS if worker.spec.lora else 1
   active_vers = {task.version for task in active if task.version is not None}
-  eligible = node.staged if len(active_vers) < lora_cap else (node.staged & active_vers)
+  eligible, allow_base = eligible_stage(worker, active, node.staged)
 
-  first_by_run = sample_heads(ctrl, worker.spec, eligible)
+  first_by_run = sample_heads(ctrl, worker.spec, eligible, allow_base)
   heads = [item.cmd for item in first_by_run.values()]
   ver_by_run = {run_id: item.version for run_id, item in first_by_run.items()}
 
@@ -375,7 +387,12 @@ def grant_worker(
       (it.cmd for it in ctrl.runs[run_id].queue.values() if not it.owner and it.version == target_ver), limit
     )
 
-  active_acct = ctrl.account(active[0].cmd.run) if active else None
+  in_flight: dict[str, int] = {}
+  for live_node in view.nodes.values():
+    for task in live_node.tasks.values():
+      if task.kind == TaskKind.SAMPLE and task.spec == worker.spec and task.cmd:
+        acct = ctrl.account(task.cmd.run)
+        in_flight[acct] = in_flight.get(acct, 0) + 1
   batch = policy.admit_samples(
     heads,
     queued,
@@ -385,7 +402,7 @@ def grant_worker(
     ver_by_run.get,
     types.MAX_SEQS - len(active),
     lora_cap,
-    active_acct,
+    in_flight,
     active_vers,
   )
   for cmd in batch:
@@ -408,20 +425,34 @@ def grant_worker(
   return bool(batch)
 
 
+def worker_holds(ctrl, node: NodeState, wid: str) -> list[tuple[str, float]]:
+  """Proportional GPU hold per account for one active worker."""
+  tasks = [t for t in node.worker_tasks(wid) if t.kind in (TaskKind.TRAIN, TaskKind.SAMPLE) and t.cmd]
+  if not tasks:
+    return []
+  width = len(tasks[0].gpus) or tasks[0].spec.gpus
+  counts: dict[str, int] = {}
+  for task in tasks:
+    acct = ctrl.account(task.cmd.run)
+    counts[acct] = counts.get(acct, 0) + 1
+  return [(acct, width * count / len(tasks)) for acct, count in counts.items()]
+
+
 def dispatch_and_park(ctrl, view: FleetView, now: float, deadlines: list[float]) -> None:
   fair = {rid: state.fair_ms or 0.0 for rid, state in ctrl.runs.items() if state.live and state.queue}
   demand_runs = ctrl.demand_runs()
-  holds: dict[tuple[str, str], tuple[str, int]] = {}
+  holds: dict[tuple[str, str], list[tuple[str, float]]] = {}
   for nid, node in view.nodes.items():
-    for task in node.tasks.values():
-      if task.kind in (TaskKind.TRAIN, TaskKind.SAMPLE) and task.cmd:
-        holds.setdefault((nid, task.worker), (ctrl.account(task.cmd.run), len(task.gpus) or task.spec.gpus))
+    for wid in node.workers:
+      if shares := worker_holds(ctrl, node, wid):
+        holds[nid, wid] = shares
 
   keeps: dict[str, dict[str, tuple[int, ...]]] = {}
   wakes: dict[str, float | None] = {}
   while True:
+    flat_holds = [share for shares in holds.values() for share in shares]
     lag_of_acct = policy.projected_lag(
-      ctrl.lag, ctrl.seen, ctrl.service, ctrl.weights, demand_runs, view.capacity, list(holds.values())
+      ctrl.lag, ctrl.seen, ctrl.service, ctrl.weights, demand_runs, view.capacity, flat_holds
     )
 
     def lag_of_run(run_id: str, fn=lag_of_acct) -> float:
@@ -435,10 +466,8 @@ def dispatch_and_park(ctrl, view: FleetView, now: float, deadlines: list[float])
     candidates.sort(key=lambda entry: entry[0], reverse=True)
     granted = False
     for _, node, worker, block in candidates:
-      if grant_worker(
-        ctrl, node, worker, block, view.trainer_runs.get((node.id, worker.id), ()), fair, lag_of_run, now
-      ):
-        holds.setdefault((node.id, worker.id), (ctrl.account(node.new_tasks[-1].cmd.run), len(block)))
+      if grant_worker(ctrl, view, node, worker, block, fair, lag_of_run, now):
+        holds[node.id, worker.id] = worker_holds(ctrl, node, worker.id)
         granted = True
         break
     if not granted:
