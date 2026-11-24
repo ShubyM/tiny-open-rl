@@ -958,7 +958,7 @@ class TestMultiNodeExecution(BusTest):
       flushes += 1
       orig()
 
-    with mock.patch.object(self.bus, "_flush_sql", count):
+    with mock.patch.object(self.bus, "flush_sql", count):
       self.bus.maintain()
       self.bus.maintain()
       self.assertEqual(flushes, 0)

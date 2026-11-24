@@ -9,7 +9,7 @@ import numpy as np
 from tinyrl.api import wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
 from tinyrl.control.controller import Controller
-from tinyrl.control.sql import DB
+from tinyrl.control.db import DB
 from tinyrl.storage.store import Store
 from tinyrl.types import NodeMsg, Op, Role, Run, TaskKind
 from tinyrl.workers.sampler import Out, Sampler, Seq

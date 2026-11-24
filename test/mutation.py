@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER = "tinyrl/control/controller.py"
+LEDGER = "tinyrl/control/ledger.py"
 POLICY = "tinyrl/control/policy.py"
 ACCOUNTING = "tinyrl/control/accounting.py"
 ORDER = "test.test_scheduler.TestLocalQuantum"
@@ -34,10 +35,10 @@ CASES = [
   (POLICY, "ready_lag", "service.get(acct, 0.0)", "seen.get(acct, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (CONTROLLER, "apply_charge", "if charge.gpu_ms:", "if reply.ok and charge.gpu_ms:", BILLING),
+  (LEDGER, "apply_charge", "if charge.gpu_ms:", "if reply.ok and charge.gpu_ms:", BILLING),
   (CONTROLLER, "handle", "if self.db.is_fenced(msg.boot_id):", "if False:", CLAIM),
-  (CONTROLLER, "finish_sample", "item.owner != owner or item.attempt != attempt", "item.attempt != attempt", DEDUP),
-  (CONTROLLER, "finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
+  (LEDGER, "finish_sample", "item.owner != owner or item.attempt != attempt", "item.attempt != attempt", DEDUP),
+  (LEDGER, "finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
 ]
 
 

@@ -299,7 +299,8 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
       exclusive = str(meta.get("openrl.exclusive")).lower() == "true"
       account = str(meta.get("openrl.account") or "")
       ctrl.create_run(Run(run_id, base_model, rank, session, None, lora, exclusive, gpus=gpus, account=account))
-    return submit(run_id, Op.CREATE_MODEL, {"base_model": base_model, "rank": rank, "lora": lora}, model_seq_id)
+    dedup_seq = -1 if (session and model_seq_id is not None) else None
+    return submit(run_id, Op.CREATE_MODEL, {"base_model": base_model, "rank": rank, "lora": lora}, dedup_seq)
 
   @api.post("/api/v1/get_info")
   async def get_info(req: ModelReq):

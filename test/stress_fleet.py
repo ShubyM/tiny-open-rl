@@ -290,7 +290,8 @@ class Stress(BusTest):
   async def dump(self, run: str, request: str) -> None:
     """Where a command that got no reply is stuck."""
     row = self.bus.get_run(run) or {}
-    plan, out = self.bus.meta.get("plan", {}), [f"--- {request} at {time.monotonic() - self.started:.1f}s"]
+    plan = self.bus.snapshot_scheduling()["state"]
+    out = [f"--- {request} at {time.monotonic() - self.started:.1f}s"]
     out.append(f"row {row}")
     out.append(f"queue {self.bus.queued_and_in_flight(run)}")
     out.append(
@@ -304,7 +305,7 @@ class Stress(BusTest):
       out.append(f"{node.id}: gpus={node.gpus} on={on} physical={node.occ.on} draining={node.draining}")
       for proc, h in node.workers.items():
         out.append(
-          f"  {proc} role={h.spec.role.value} gpus={h.spec.gpus} loaded={sorted(h.loaded)} resident={h.resident} running={list(h.running)}"
+          f"  {proc} role={h.spec.role.value} gpus={h.spec.gpus} loaded={sorted(h.loaded)} resident={h.resident}"
         )
     print("\n".join(out), file=sys.stderr)
 
