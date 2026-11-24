@@ -183,7 +183,7 @@ class TestLedger(BusTest):
     t = self.take_one()
     self.bus.delete_run(run_id)
     self.assertFalse((await self.bus.wait_for_reply(req, 0)).ok)
-    self.assertFalse(self.bus._finish_train(req, (t.worker, "n1", "b1"), ok(), mutated=True))
+    self.assertFalse(self.bus.finish_train(req, (t.worker, "n1", "b1"), ok(), mutated=True))
 
   async def test_sample_finish_ignores_trainer_checkpoint_effects(self):
     sid = self.new_run(role=Role.SAMPLER)
@@ -256,12 +256,10 @@ class TestLedger(BusTest):
     req = self.bus.submit_command(sid, Op.SAMPLE, b"{}", cost=100)
     t = self.take_one("n1", "b1", 1)
     self.assertFalse(
-      self.bus._finish_sample(req, ("other", "n1", "b1"), ok(replica=-1), Charge(busy_ms=99, gpu_ms=99), t.attempt)
+      self.bus.finish_sample(req, ("other", "n1", "b1"), ok(replica=-1), Charge(busy_ms=99, gpu_ms=99), t.attempt)
     )
     results = [
-      self.bus._finish_sample(
-        req, (t.worker, "n1", "b1"), ok(replica=i), Charge(busy_ms=40, gpu_ms=40.5 + i), t.attempt
-      )
+      self.bus.finish_sample(req, (t.worker, "n1", "b1"), ok(replica=i), Charge(busy_ms=40, gpu_ms=40.5 + i), t.attempt)
       for i in range(5)
     ]
     self.assertEqual(sum(results), 1)
@@ -273,7 +271,7 @@ class TestLedger(BusTest):
 
     self.bus.sample_replies.pop(req, None)
     self.assertFalse(
-      self.bus._finish_sample(req, (t.worker, "n1", "b1"), ok(late=True), Charge(busy_ms=100, gpu_ms=100), t.attempt)
+      self.bus.finish_sample(req, (t.worker, "n1", "b1"), ok(late=True), Charge(busy_ms=100, gpu_ms=100), t.attempt)
     )
     with self.assertRaises(RequestGoneError):
       await self.bus.wait_for_reply(req, 0)

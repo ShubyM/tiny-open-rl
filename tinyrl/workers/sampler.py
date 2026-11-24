@@ -49,14 +49,23 @@ def encode(job: dict, out: Out) -> bytes:
   return wire.sample_output(seqs, plp, topk(rows, job["topk_prompt"]) if job["topk_prompt"] else None)
 
 
+@dataclass
+class SharedLoad:
+  task: asyncio.Task
+  cost: Charge
+  waiters: int = 0
+
+
 def pack_stability_blob(request_id: str, out: Out, store) -> dict[str, StabSlice]:
-  k = max((len(r) for s in out.seqs for r in s.top if r), default=1)
-  chunks = [wire.pack_stability(*topk(s.top, k)) for s in out.seqs]
-  ref, at, out_map = store.put_blob(b"".join(chunks)), 0, {}
-  for i, ch in enumerate(chunks):
-    out_map[f"{request_id}:{i}"] = (ref, at, len(ch))
-    at += len(ch)
-  return out_map
+  k = max((len(row) for seq in out.seqs for row in seq.top if row), default=1)
+  chunks = [wire.pack_stability(*topk(seq.top, k)) for seq in out.seqs]
+  ref = store.put_blob(b"".join(chunks))
+  slices: dict[str, StabSlice] = {}
+  offset = 0
+  for index, chunk in enumerate(chunks):
+    slices[f"{request_id}:{index}"] = (ref, offset, len(chunk))
+    offset += len(chunk)
+  return slices
 
 
 class Sampler:
@@ -64,8 +73,12 @@ class Sampler:
     self.env = dict(os.environ if env is None else env)
     module, name = self.env.get("ENGINE", "tinyrl.workers.vllm:VLLM").split(":")
     self.engine_type = engine or getattr(importlib.import_module(module), name)
-    self.base, self.lora, self.store = base, lora, store
-    self.running, self.loading, self.loads = None, asyncio.Lock(), {}
+    self.base = base
+    self.lora = lora
+    self.store = store
+    self.running = None
+    self.loading = asyncio.Lock()
+    self.loads: dict[tuple[str, str], SharedLoad] = {}
 
   @property
   def proc(self):
@@ -77,46 +90,58 @@ class Sampler:
         self.running = await self.engine_type.start(self.base, self.lora, self.env)
 
   async def load(self, checkpoint: tuple[str, str]) -> None:
+    path, name = checkpoint
     await self.start()
     async with self.loading:
-      await self.running.load_checkpoint(checkpoint[1], checkpoint[0])
+      await self.running.load_checkpoint(name, path)
 
-  async def load_shared(self, ckpt: tuple[str, str], wave: Wave, charge: Charge) -> None:
-    if (entry := self.loads.get(ckpt)) is None:
+  async def load_shared(self, checkpoint: tuple[str, str], wave: Wave, charge: Charge) -> None:
+    entry = self.loads.get(checkpoint)
+    if entry is None:
       cost = Charge()
-      self.loads[ckpt] = entry = [asyncio.create_task(wave.run(self.load(ckpt), cost)), cost, 0]
-    entry[2] += 1
+      task = asyncio.create_task(wave.run(self.load(checkpoint), cost))
+      entry = SharedLoad(task=task, cost=cost)
+      self.loads[checkpoint] = entry
+    entry.waiters += 1
     try:
-      await entry[0]
+      await entry.task
     finally:
-      if self.loads.get(ckpt) is entry:
-        del self.loads[ckpt]
-      charge.started_ms, charge.busy_ms = entry[1].started_ms, charge.busy_ms + entry[1].busy_ms
-      charge.gpu_ms += entry[1].gpu_ms / entry[2]
+      if self.loads.get(checkpoint) is entry:
+        del self.loads[checkpoint]
+      charge.started_ms = entry.cost.started_ms
+      charge.busy_ms += entry.cost.busy_ms
+      charge.gpu_ms += entry.cost.gpu_ms / entry.waiters
 
   async def execute(
-    self, cmd: Cmd, ckpt: tuple[str, str] | None = None, *, wave: Wave | None = None, charge: Charge | None = None
+    self,
+    cmd: Cmd,
+    checkpoint: tuple[str, str] | None = None,
+    *,
+    wave: Wave | None = None,
+    charge: Charge | None = None,
   ) -> Reply:
     try:
-      if ckpt is not None:
-        await (self.load_shared(ckpt, wave, charge) if wave and charge else self.load(ckpt))
-      else:
+      if checkpoint is None:
         await self.start()
+      elif wave and charge:
+        await self.load_shared(checkpoint, wave, charge)
+      else:
+        await self.load(checkpoint)
+
       job = json.loads(cmd.body)
-      call = self.running.sample(job, ckpt[1] if ckpt else None)
-      out = await (wave.run(call, charge) if wave and charge else call)
+      ckpt_name = checkpoint[1] if checkpoint else None
+      call = self.running.sample(job, ckpt_name)
+      out = await wave.run(call, charge) if wave and charge else await call
 
-      def pack() -> Reply:
-        stab = (
-          pack_stability_blob(cmd.request_id, out, self.store)
-          if job.get("record_stability_info") and self.store
-          else None
-        )
-        return Reply(True, wire.PROTO, encode(job, out), stab)
+      def encode_reply() -> Reply:
+        stability = None
+        if job.get("record_stability_info") and self.store:
+          stability = pack_stability_blob(cmd.request_id, out, self.store)
+        return Reply(True, wire.PROTO, encode(job, out), stability)
 
-      return await asyncio.to_thread(pack)
-    except Exception as e:
-      return Reply.error(e)
+      return await asyncio.to_thread(encode_reply)
+    except Exception as exc:
+      return Reply.error(exc)
 
   async def resume(self, gpus: tuple[int, ...]) -> None:
     if self.running is None:

@@ -51,8 +51,8 @@ class TestSampleProvenance(unittest.IsolatedAsyncioTestCase):
     ctrl.expire_node("a", "b1")
     [t2] = [t for t in ctrl.handle(NodeMsg("hello", "b", "b2", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
     winner = await worker.execute(t2.cmd)
-    self.assertTrue(ctrl._finish_sample(rid, (t2.worker, "b", "b2"), winner, None, t2.attempt))
-    self.assertFalse(ctrl._finish_sample(rid, (t1.worker, "a", "b1"), early, None, t1.attempt))
+    self.assertTrue(ctrl.finish_sample(rid, (t2.worker, "b", "b2"), winner, None, t2.attempt))
+    self.assertFalse(ctrl.finish_sample(rid, (t1.worker, "a", "b1"), early, None, t1.attempt))
 
     reply = await ctrl.wait_for_reply(rid, 0)
     self.assertIsNone(reply.stability)

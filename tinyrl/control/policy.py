@@ -1,8 +1,9 @@
-"""Pure fleet pager & EEVDF GPU scheduler: zero I/O, zero locks, zero virtual `Proc` layer."""
+"""Pure fleet pager and EEVDF GPU scheduler: zero I/O, zero locks, zero virtual `Proc` layer."""
 
 from __future__ import annotations
 
 from collections import Counter, deque
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -10,10 +11,17 @@ from tinyrl import types
 from tinyrl.helpers import getenv
 from tinyrl.types import Cmd, Role, WorkerSpec, entry_sort_key
 
-QUANTUM_MS, MAX_QUANTUM_MS = getenv("QUANTUM_MS", 2000), getenv("MAX_QUANTUM_MS", 15000)
-CYCLE_GRACE_S, REBALANCE_MS = getenv("CYCLE_GRACE_MS", 100) / 1000, getenv("REBALANCE_MS", 20_000)
+QUANTUM_MS = getenv("QUANTUM_MS", 2000)
+MAX_QUANTUM_MS = getenv("MAX_QUANTUM_MS", 15000)
+CYCLE_GRACE_S = getenv("CYCLE_GRACE_MS", 100) / 1000
+REBALANCE_MS = getenv("REBALANCE_MS", 20_000)
 SWITCH_BUDGET = max(0.01, float(getenv("SWITCH_BUDGET", 0.1)))
-Demand = StrEnum("Demand", "IDLE READY FINISH_STEP")  # FINISH_STEP holds GPUs across forward_backward -> optim_step
+
+
+class Demand(StrEnum):
+  IDLE = "idle"
+  READY = "ready"
+  FINISH_STEP = "finish_step"  # holds GPUs across forward_backward -> optim_step
 
 
 @dataclass(frozen=True)
@@ -39,162 +47,263 @@ class Placed:
   runs: int = 0
 
 
+@dataclass(frozen=True)
+class NodeStats:
+  used: int
+  exclusive: int
+  spare: int
+  load: float
+  min_lag: float
+
+
 def quantum_s(switch_s: float) -> float:
-  return min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, switch_s / SWITCH_BUDGET if switch_s else 0.0))
+  amortized = switch_s / SWITCH_BUDGET if switch_s else 0.0
+  return min(MAX_QUANTUM_MS / 1000, max(QUANTUM_MS / 1000, amortized))
 
 
 def waterfill(capacity: float, demand: dict[str, float], weights: dict[str, float] | None = None) -> dict[str, float]:
   """Weighted progressive max-min fair rates `r*[a] <= demand[a]` summing to `min(capacity, sum(demand))`."""
-  rates, pending = {}, {a: float(d) for a, d in demand.items() if d > 0}
-  weight = {a: max(1e-9, float((weights or {}).get(a, 1.0))) for a in pending}
+  rates: dict[str, float] = {}
+  pending = {acct: float(d) for acct, d in demand.items() if d > 0}
+  weight = {acct: max(1e-9, float((weights or {}).get(acct, 1.0))) for acct in pending}
   while pending:
-    total_w = sum(weight[a] for a in pending)
-    level = min(pending[a] / weight[a] for a in pending)
-    if level * total_w >= capacity - 1e-9:
-      return rates | {a: capacity * weight[a] / total_w for a in pending}
-    for a in [a for a in pending if pending[a] / weight[a] <= level + 1e-9]:
-      rates[a] = pending.pop(a)
-      capacity -= rates[a]
+    total_weight = sum(weight[acct] for acct in pending)
+    level = min(pending[acct] / weight[acct] for acct in pending)
+    if level * total_weight >= capacity - 1e-9:
+      for acct in pending:
+        rates[acct] = capacity * weight[acct] / total_weight
+      return rates
+    saturated = [acct for acct in pending if pending[acct] / weight[acct] <= level + 1e-9]
+    for acct in saturated:
+      rates[acct] = pending.pop(acct)
+      capacity -= rates[acct]
   return rates
 
 
-def update_lag(lag: dict, seen: dict, service: dict, cap: float, demand: dict, weights: dict | None = None):
+def update_lag(
+  lag: dict[str, float],
+  seen: dict[str, float],
+  service: dict[str, float],
+  capacity: float,
+  demand: dict[str, float],
+  weights: dict[str, float] | None = None,
+) -> tuple[dict[str, float], dict[str, float]]:
   """Advance each account's EEVDF lag from monotonic `service - seen` GPU-ms deltas."""
-  lag, accts = dict(lag), lag.keys() | service.keys() | demand.keys()
-  used = {a: max(0.0, service.get(a, 0.0) - seen.get(a, 0.0)) for a in accts}
-  seen = seen | {a: max(seen.get(a, 0.0), v) for a, v in service.items()}
-  rates = waterfill(max(cap, 1.0), {a: max(demand.get(a, 0), float(used[a] > 0)) for a in accts}, weights)
-  if (work := sum(used.values())) > 0 and (total_rate := sum(rates.values())) > 0:
-    for a, rate in rates.items():
-      lag[a] = lag.get(a, 0.0) + work * (rate / total_rate) - used[a]
-    weight = {a: max(1e-9, float((weights or {}).get(a, 1.0))) for a in accts}
-    active_w = sum(weight[a] for a in rates)
-    for a in lag.keys() - rates.keys():
-      lag[a] = min(0.0, lag[a] + work * weight[a] / (active_w + weight[a]))
-  return {a: v for a, v in lag.items() if a in rates or v < -1e-9}, seen
+  next_lag = dict(lag)
+  accounts = next_lag.keys() | service.keys() | demand.keys()
+  used = {acct: max(0.0, service.get(acct, 0.0) - seen.get(acct, 0.0)) for acct in accounts}
+  next_seen = seen | {acct: max(seen.get(acct, 0.0), total) for acct, total in service.items()}
+
+  active_demand = {acct: max(demand.get(acct, 0.0), float(used[acct] > 0)) for acct in accounts}
+  rates = waterfill(max(capacity, 1.0), active_demand, weights)
+  total_work = sum(used.values())
+  total_rate = sum(rates.values())
+  if total_work > 0 and total_rate > 0:
+    for acct, rate in rates.items():
+      next_lag[acct] = next_lag.get(acct, 0.0) + total_work * (rate / total_rate) - used[acct]
+    weight = {acct: max(1e-9, float((weights or {}).get(acct, 1.0))) for acct in accounts}
+    active_weight = sum(weight[acct] for acct in rates)
+    for acct in next_lag.keys() - rates.keys():
+      repay = total_work * weight[acct] / (active_weight + weight[acct])
+      next_lag[acct] = min(0.0, next_lag[acct] + repay)
+
+  live_lag = {acct: val for acct, val in next_lag.items() if acct in rates or val < -1e-9}
+  return live_lag, next_seen
 
 
 def account_demand(runs: list[tuple[str, WorkerSpec, int]], nodes: dict[str, int]) -> dict[str, float]:
-  biggest, cap, want = max(nodes.values(), default=0), sum(nodes.values()), {}
+  biggest_node = max(nodes.values(), default=0)
+  total_gpus = sum(nodes.values())
+  want: dict[str, float] = {}
   for acct, spec, backlog in runs:
-    if backlog > 0 and spec.gpus <= biggest:
-      reps = min(cap // spec.gpus, max(1, (backlog + types.MAX_SEQS - 1) // types.MAX_SEQS)) if spec.elastic else 1
-      want[acct] = want.get(acct, 0.0) + reps * spec.gpus
+    if backlog <= 0 or spec.gpus > biggest_node:
+      continue
+    if spec.elastic:
+      needed = max(1, (backlog + types.MAX_SEQS - 1) // types.MAX_SEQS)
+      replicas = min(total_gpus // spec.gpus, needed)
+    else:
+      replicas = 1
+    want[acct] = want.get(acct, 0.0) + replicas * spec.gpus
   return want
 
 
-def ready_lag(lag: dict, seen: dict, service: dict, acct: str) -> float:
-  return lag.get(acct, 0.0) - max(0.0, service.get(acct, 0.0) - seen.get(acct, 0.0))
+def ready_lag(lag: dict[str, float], seen: dict[str, float], service: dict[str, float], acct: str) -> float:
+  unbilled = max(0.0, service.get(acct, 0.0) - seen.get(acct, 0.0))
+  return lag.get(acct, 0.0) - unbilled
 
 
-def projected_lag(lag, seen, service, weights, runs, nodes, holds: list[tuple[str, int]]):
+def projected_lag(
+  lag: dict[str, float],
+  seen: dict[str, float],
+  service: dict[str, float],
+  weights: dict[str, float],
+  runs: list[tuple[str, WorkerSpec, int]],
+  nodes: dict[str, int],
+  holds: list[tuple[str, int]],
+) -> Callable[[str], float]:
   if not holds:
     return lambda acct: ready_lag(lag, seen, service, acct)
-  proj_svc = Counter(service)
+  projected_service = Counter(service)
   for acct, width in holds:
-    proj_svc[acct] += width * QUANTUM_MS
-  proj, _ = update_lag(lag, seen, proj_svc, float(sum(nodes.values())), account_demand(runs, nodes), weights)
-  return lambda acct: proj.get(acct, 0.0)
+    projected_service[acct] += width * QUANTUM_MS
+  capacity = float(sum(nodes.values()))
+  projected, _ = update_lag(lag, seen, projected_service, capacity, account_demand(runs, nodes), weights)
+  return lambda acct: projected.get(acct, 0.0)
 
 
-def rank_runs(heads: list[Cmd], lag_of, service: dict[str, float]) -> list[str]:
-  ready = {cmd.run: cmd for cmd in reversed(heads)}
-  floor = min((service[r] for r in ready if r in service), default=0.0)
-  return [
-    c.run
-    for c in sorted(
-      ready.values(), key=lambda c: (round(-lag_of(c.run), 3), service.get(c.run, floor), entry_sort_key(c.entry_id))
-    )
-  ]
+def rank_runs(heads: list[Cmd], lag_of: Callable[[str], float], service: dict[str, float]) -> list[str]:
+  earliest = {cmd.run: cmd for cmd in reversed(heads)}
+  floor = min((service[run] for run in earliest if run in service), default=0.0)
+  ordered = sorted(
+    earliest.values(),
+    key=lambda cmd: (round(-lag_of(cmd.run), 3), service.get(cmd.run, floor), entry_sort_key(cmd.entry_id)),
+  )
+  return [cmd.run for cmd in ordered]
 
 
-def admit_samples(heads, queued, account, lag_of, service, ver_of, slots, max_loras, active_acct=None, active_vers=()):
+def admit_samples(
+  heads: list[Cmd],
+  queued: Callable[[str, int], Iterable[Cmd]],
+  account: Callable[[str], str],
+  lag_of: Callable[[str], float],
+  service: dict[str, float],
+  version_of: Callable[[str], str | None],
+  slots: int,
+  max_loras: int,
+  active_account: str | None = None,
+  active_versions: Iterable[str | None] = (),
+) -> list[Cmd]:
   if slots <= 0 or not heads:
     return []
-  target = account((ranked := rank_runs(heads, lag_of, service))[0])
-  if active_acct is not None and active_acct != target:
+  ranked = rank_runs(heads, lag_of, service)
+  target_account = account(ranked[0])
+  if active_account is not None and active_account != target_account:
     return []
-  vers, runs, out = {v for v in active_vers if v is not None}, deque(), []
-  for r in ranked:
-    if account(r) == target and ((v := ver_of(r)) is None or v in vers or len(vers) < max_loras):
-      vers.update((v,) if v is not None else ())
-      if q := deque(queued(r, slots)):
-        runs.append(q)
-  while len(out) < slots and runs:
-    out.append((q := runs.popleft()).popleft())
-    if q:
-      runs.append(q)
-  return out
+
+  loaded_versions = {ver for ver in active_versions if ver is not None}
+  run_queues: deque[deque[Cmd]] = deque()
+  for run in ranked:
+    if account(run) != target_account:
+      continue
+    ver = version_of(run)
+    if ver is not None and ver not in loaded_versions and len(loaded_versions) >= max_loras:
+      continue
+    if ver is not None:
+      loaded_versions.add(ver)
+    pending = deque(queued(run, slots))
+    if pending:
+      run_queues.append(pending)
+
+  admitted: list[Cmd] = []
+  while len(admitted) < slots and run_queues:
+    queue = run_queues.popleft()
+    admitted.append(queue.popleft())
+    if queue:
+      run_queues.append(queue)
+  return admitted
 
 
 def blocks(total: int, width: int) -> list[tuple[int, ...]]:
-  step = width if width > 0 and total % width == 0 else 1
-  return [tuple(range(i, i + width)) for i in range(0, total - width + 1, step)] if 1 <= width <= total else []
+  if not 1 <= width <= total:
+    return []
+  step = width if total % width == 0 else 1
+  return [tuple(range(start, start + width)) for start in range(0, total - width + 1, step)]
 
 
 def plan_gpus(
-  workers: dict[str, Worker], total: int, now: float, occ: set[int] = frozenset(), locked: set[int] = frozenset()
-):
+  workers: dict[str, Worker],
+  total: int,
+  now: float,
+  occupied: set[int] = frozenset(),
+  locked: set[int] = frozenset(),
+) -> tuple[dict[str, tuple[int, ...]], float | None]:
   """Select non-overlapping GPU blocks on one node and the next contested quantum deadline."""
-  held = occ | locked | {g for w in workers.values() for g in w.current}
-  pinned = {g for w in workers.values() if w.gang for g in w.bound}
-  excl_wait = any(w.exclusive and w.demand != Demand.IDLE and not w.current for w in workers.values())
-  keep, deadlines, reserved, waiting = {}, [], set(), False
-  for name, w in workers.items():
-    prot = bool(w.current) and w.demand != Demand.IDLE and not excl_wait
-    deadlines.extend((w.hold_until,) if prot and w.hold_until > now else ())
-    if w.current and (w.exclusive or (prot and (w.hold_until > now or w.demand == Demand.FINISH_STEP))):
-      keep[name] = w.current
+  held = occupied | locked | {gpu for w in workers.values() for gpu in w.current}
+  gang_pinned = {gpu for w in workers.values() if w.gang for gpu in w.bound}
+  exclusive_waiting = any(w.exclusive and w.demand != Demand.IDLE and not w.current for w in workers.values())
+
+  keep: dict[str, tuple[int, ...]] = {}
+  deadlines: list[float] = []
+  for name, worker in workers.items():
+    protected = bool(worker.current) and worker.demand != Demand.IDLE and not exclusive_waiting
+    if protected and worker.hold_until > now:
+      deadlines.append(worker.hold_until)
+    must_keep = worker.exclusive or (protected and (worker.hold_until > now or worker.demand == Demand.FINISH_STEP))
+    if worker.current and must_keep:
+      keep[name] = worker.current
+
   taken = set(locked).union(*keep.values())
-  excl_gpus = {g for n, b in keep.items() if workers[n].exclusive for g in b}
+  exclusive_gpus = {gpu for name, block in keep.items() if workers[name].exclusive for gpu in block}
+  reserved: set[int] = set()
+  waiting = False
 
-  def prio(n):
-    return (
-      workers[n].exclusive,
-      round(workers[n].lag, 3),
-      round(-workers[n].gpu_ms, 3),
-      bool(workers[n].current),
-      n,
-    )  # noqa: E731
-
-  for name in sorted(
-    (n for n, w in workers.items() if n not in keep and w.demand != Demand.IDLE), key=prio, reverse=True
-  ):
+  def priority(name: str) -> tuple:
     w = workers[name]
-    opts = [w.bound] if w.bound else blocks(total, w.gpus)
-    if free := [b for b in opts if taken.isdisjoint(b) and (b == w.current or reserved.isdisjoint(b))]:
-      avoid = pinned if w.exclusive else set()
-      keep[name] = blk = min(free, key=lambda b: (b != w.current, not avoid.isdisjoint(b), not held.isdisjoint(b)))
-      taken.update(blk)
-      excl_gpus.update(blk if w.exclusive else ())
+    return (w.exclusive, round(w.lag, 3), round(-w.gpu_ms, 3), bool(w.current), name)
+
+  contenders = [name for name, w in workers.items() if name not in keep and w.demand != Demand.IDLE]
+  for name in sorted(contenders, key=priority, reverse=True):
+    worker = workers[name]
+    options = [worker.bound] if worker.bound else blocks(total, worker.gpus)
+    free = [
+      block for block in options if taken.isdisjoint(block) and (block == worker.current or reserved.isdisjoint(block))
+    ]
+    if free:
+      avoid = gang_pinned if worker.exclusive else set()
+      chosen = min(free, key=lambda b: (b != worker.current, not avoid.isdisjoint(b), not held.isdisjoint(b)))
+      keep[name] = chosen
+      taken.update(chosen)
+      if worker.exclusive:
+        exclusive_gpus.update(chosen)
     else:
       waiting = True
-      reserved.update(next((b for b in opts if excl_gpus.isdisjoint(b)), ()))
-  keep.update((n, w.current) for n, w in workers.items() if w.current and taken.isdisjoint(w.current))
-  return keep, min(deadlines, default=None) if waiting else None
+      for block in options:
+        if exclusive_gpus.isdisjoint(block):
+          reserved.update(block)
+          break
+
+  for name, worker in workers.items():
+    if worker.current and taken.isdisjoint(worker.current):
+      keep[name] = worker.current
+
+  next_deadline = min(deadlines, default=None) if waiting else None
+  return keep, next_deadline
 
 
 def sampler_replicas(spec: WorkerSpec, backlogs: list[int]) -> int:
-  ready, cap = [b for b in backlogs if b > 0], (types.MAX_LORAS if spec.lora else 1)
-  return (
-    1 if spec.exclusive else max(1, (sum(ready) + types.MAX_SEQS - 1) // types.MAX_SEQS, (len(ready) + cap - 1) // cap)
-  )
+  if spec.exclusive:
+    return 1
+  ready = [count for count in backlogs if count > 0]
+  lora_cap = types.MAX_LORAS if spec.lora else 1
+  by_seqs = (sum(ready) + types.MAX_SEQS - 1) // types.MAX_SEQS
+  by_loras = (len(ready) + lora_cap - 1) // lora_cap
+  return max(1, by_seqs, by_loras)
 
 
-def node_stats(node: str, total: int, placed: list[Placed], skip: str = "") -> tuple[int, int, int, float, float]:
-  on = [p for p in placed if p.node == node and p.worker != skip]
-  used, excl = sum(p.spec.gpus for p in on), sum(p.spec.gpus for p in on if p.spec.exclusive)
-  busy = sum(p.spec.gpus for p in on if not p.spec.exclusive and p.busy)
-  floor = min((p.lag for p in on if not p.spec.exclusive and p.busy), default=float("inf"))
-  return used, excl, total - excl - busy, busy / max(1, total - excl), floor
+def node_stats(node: str, total: int, placed: list[Placed], skip: str = "") -> NodeStats:
+  on_node = [p for p in placed if p.node == node and p.worker != skip]
+  used = sum(p.spec.gpus for p in on_node)
+  exclusive = sum(p.spec.gpus for p in on_node if p.spec.exclusive)
+  shared_busy = sum(p.spec.gpus for p in on_node if not p.spec.exclusive and p.busy)
+  shared_capacity = total - exclusive
+  load = shared_busy / max(1, shared_capacity)
+  min_lag = min((p.lag for p in on_node if not p.spec.exclusive and p.busy), default=float("inf"))
+  return NodeStats(used=used, exclusive=exclusive, spare=shared_capacity - shared_busy, load=load, min_lag=min_lag)
 
 
 def can_host(
-  node: str, nodes: dict[str, int], placed: list[Placed], spec: WorkerSpec, skip="", only_spare=False
+  node: str,
+  nodes: dict[str, int],
+  placed: list[Placed],
+  spec: WorkerSpec,
+  skip: str = "",
+  only_spare: bool = False,
 ) -> bool:
-  return (
-    node in nodes and node_stats(node, nodes[node], placed, skip)[0 if only_spare else 1] + spec.gpus <= nodes[node]
-  )
+  if node not in nodes:
+    return False
+  stats = node_stats(node, nodes[node], placed, skip=skip)
+  committed = stats.used if only_spare else stats.exclusive
+  return committed + spec.gpus <= nodes[node]
 
 
 def choose_node(
@@ -202,31 +311,44 @@ def choose_node(
   nodes: dict[str, int],
   placed: list[Placed],
   *,
-  near=frozenset(),
-  owed_gpus=None,
-  only_spare=False,
-  prefer_cool=False,
-):
-  paired = spec.gpus * (2 if spec.role == Role.TRAINER and not spec.lora else 1)
+  near: set[str] | frozenset[str] = frozenset(),
+  owed_gpus: dict[str, int] | None = None,
+  only_spare: bool = False,
+  prefer_cool: bool = False,
+) -> str | None:
+  paired_width = spec.gpus * (2 if spec.role == Role.TRAINER and not spec.lora else 1)
 
-  def rank(n: str) -> tuple:
-    used, _, _, load, floor = node_stats(n, nodes[n], placed)
-    cool = (round(load, 6), round(floor, 3)) if prefer_cool else ()
-    return nodes[n] - used - (owed_gpus or {}).get(n, 0) < paired, n not in near, *cool, used / nodes[n], n
+  def rank(node: str) -> tuple:
+    stats = node_stats(node, nodes[node], placed)
+    free_after_owed = nodes[node] - stats.used - (owed_gpus or {}).get(node, 0)
+    cool_key = (round(stats.load, 6), round(stats.min_lag, 3)) if prefer_cool else ()
+    return (free_after_owed < paired_width, node not in near, *cool_key, stats.used / nodes[node], node)
 
-  return min(
-    (n for n in sorted(nodes) if can_host(n, nodes, placed, spec, only_spare=only_spare)), key=rank, default=None
-  )
+  eligible = [node for node in sorted(nodes) if can_host(node, nodes, placed, spec, only_spare=only_spare)]
+  return min(eligible, key=rank, default=None)
 
 
-def rebalance_target(p: Placed, nodes: dict[str, int], placed: list[Placed]) -> str | None:
-  if p.spec.exclusive or not p.busy or p.node not in nodes or node_stats(p.node, nodes[p.node], placed)[2] >= 0:
+def rebalance_target(target: Placed, nodes: dict[str, int], placed: list[Placed]) -> str | None:
+  if target.spec.exclusive or not target.busy or target.node not in nodes:
     return None
-  fit = {
-    n: node_stats(n, nodes[n], placed) for n in sorted(nodes) if n != p.node and can_host(n, nodes, placed, p.spec)
+  if node_stats(target.node, nodes[target.node], placed).spare >= 0:
+    return None
+
+  candidates = {
+    node: node_stats(node, nodes[node], placed)
+    for node in sorted(nodes)
+    if node != target.node and can_host(node, nodes, placed, target.spec)
   }
-  if spare := [n for n, st in fit.items() if st[2] >= p.spec.gpus]:
-    return min(spare, key=lambda n: (fit[n][0] / nodes[n], n))
-  _, _, _, lw, fw = node_stats(p.node, nodes[p.node], placed, skip=p.worker)
-  opts = [(round(st[3], 6), round(st[4], 3), n) for n, st in fit.items() if p.lag - st[4] >= REBALANCE_MS - 1e-9]
-  return min((o for o in opts if o[:2] < (round(lw, 6), round(fw, 3))), default=(0, 0, None))[2]
+  with_spare = [node for node, stats in candidates.items() if stats.spare >= target.spec.gpus]
+  if with_spare:
+    return min(with_spare, key=lambda node: (candidates[node].used / nodes[node], node))
+
+  without = node_stats(target.node, nodes[target.node], placed, skip=target.worker)
+  current_heat = (round(without.load, 6), round(without.min_lag, 3))
+  cooler = [
+    (round(stats.load, 6), round(stats.min_lag, 3), node)
+    for node, stats in candidates.items()
+    if target.lag - stats.min_lag >= REBALANCE_MS - 1e-9
+    and (round(stats.load, 6), round(stats.min_lag, 3)) < current_heat
+  ]
+  return min(cooler)[2] if cooler else None

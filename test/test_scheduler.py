@@ -884,7 +884,7 @@ class TestMultiNodeFairness(unittest.TestCase):
     self.assertEqual(sampler_replicas(spec, [0, 0]), 1)
     self.assertEqual(sampler_replicas(WorkerSpec(Role.SAMPLER, "b", True, True, "t"), [99 * MAX_SEQS]), 1)
     placed = [Placed("a", "w1", WorkerSpec(Role.TRAINER, "x", False, True), True)]
-    self.assertEqual(node_stats("a", 2, placed)[2], 1)
+    self.assertEqual(node_stats("a", 2, placed).spare, 1)
     self.assertFalse(can_host("missing", {"a": 2}, placed, spec))
     self.assertEqual(choose_node(spec, {"a": 2}, placed), "a")
 
@@ -951,7 +951,7 @@ class TestMultiNodeExecution(BusTest):
   async def test_idle_maintain_writes_zero_sql_and_accounts_flush_only_when_dirty(self):
     self.bus.handle(NodeMsg("hello", "n", "bn", gpus=1, workers=(WorkerInfo("w", WorkerSpec(Role.TRAINER, "tiny")),)))
     self.bus.maintain()
-    flushes, orig = 0, self.bus._flush_sql
+    flushes, orig = 0, self.bus.flush_sql
 
     def count():
       nonlocal flushes

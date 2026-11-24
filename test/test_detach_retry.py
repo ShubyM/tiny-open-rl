@@ -51,7 +51,7 @@ class TestDetachRetry(unittest.IsolatedAsyncioTestCase):
 
   async def test_detach_keeps_source_until_controller_acknowledges_snapshot(self):
     self.model.call.return_value = "snap-b"
-    self.ctrl._detach_one(self.ctrl.nodes["n"], self.ctrl.nodes["n"].workers["w"], "b", 0.0)
+    self.ctrl.detach_run(self.ctrl.nodes["n"], self.ctrl.nodes["n"].workers["w"], "b", 0.0)
     cmsg = self.ctrl.nodes["n"].drain_push()
     self.assertEqual([t.kind for t in cmsg.tasks], [TaskKind.SAVE])
     self.node.apply(cmsg)

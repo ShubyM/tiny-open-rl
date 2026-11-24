@@ -234,7 +234,7 @@ class Store:
       lambda i, name, shard: self.write_safetensors(i, f"{folder}/{name}", shard, meta), range(n), weights, shards
     )
 
-  def _publish(self, version: str | None, write) -> str:
+  def publish(self, version: str | None, write) -> str:
     version = version or uuid.uuid4().hex
     if not object_id(version):
       raise ValueError(f"invalid checkpoint version {version!r}")
@@ -257,10 +257,10 @@ class Store:
       with self.lock:
         self.write_checkpoint_files(str(folder), tensors, meta or {})
 
-    return self._publish(version, write)
+    return self.publish(version, write)
 
   def put_blob(self, data: bytes, *, version: str | None = None) -> str:
-    return self._publish(version, lambda folder: (folder / "blob.bin").write_bytes(data))
+    return self.publish(version, lambda folder: (folder / "blob.bin").write_bytes(data))
 
   def get_blob(self, reference: str) -> bytes:
     return Path(self.local_folder(reference)[0], "blob.bin").read_bytes()

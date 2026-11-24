@@ -37,7 +37,7 @@ class TestSampleFailover(unittest.IsolatedAsyncioTestCase):
     ctrl.handle(NodeMsg("events", "east", "east", done=(Done(running.id, True, ok),)))
     self.assertEqual(await ctrl.wait_for_reply(running.cmd.request_id, 0), ok)
     self.assertFalse(
-      ctrl._finish_sample(unseen.cmd.request_id, (unseen.worker, "east", "east"), ok, None, unseen.attempt)
+      ctrl.finish_sample(unseen.cmd.request_id, (unseen.worker, "east", "east"), ok, None, unseen.attempt)
     )
 
     # Return to the original boot and worker; every earlier attempt stays fenced.
@@ -52,12 +52,12 @@ class TestSampleFailover(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(current.version, version)
     self.assertLess(unseen.attempt, west_claim.attempt)
     self.assertLess(west_claim.attempt, current.attempt)
-    self.assertFalse(ctrl._finish_sample(unseen.cmd.request_id, (current.worker, "east", "east"), ok, None, 0))
+    self.assertFalse(ctrl.finish_sample(unseen.cmd.request_id, (current.worker, "east", "east"), ok, None, 0))
     self.assertFalse(
-      ctrl._finish_sample(unseen.cmd.request_id, (west_claim.worker, "west", "west"), ok, None, west_claim.attempt)
+      ctrl.finish_sample(unseen.cmd.request_id, (west_claim.worker, "west", "west"), ok, None, west_claim.attempt)
     )
     self.assertTrue(
-      ctrl._finish_sample(unseen.cmd.request_id, (current.worker, "east", "east"), ok, None, current.attempt)
+      ctrl.finish_sample(unseen.cmd.request_id, (current.worker, "east", "east"), ok, None, current.attempt)
     )
     self.assertEqual(await ctrl.wait_for_reply(unseen.cmd.request_id, 0), ok)
 

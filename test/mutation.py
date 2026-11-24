@@ -22,22 +22,22 @@ RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery
 
 # (source, function, original expression, faulty replacement, tests that should detect it)
 CASES = [
-  (POLICY, "rank_runs", "-lag_of(c.run)", "lag_of(c.run)", ORDER),
+  (POLICY, "rank_runs", "-lag_of(cmd.run)", "lag_of(cmd.run)", ORDER),
   (
     POLICY,
     "admit_samples",
-    "while len(out) < slots and runs:",
-    "while len(out) < 1 and runs:",
+    "while len(admitted) < slots and run_queues:",
+    "while len(admitted) < 1 and run_queues:",
     ORDER + ".test_sampler_wave_obeys_account_and_version_limits_and_rotates_within_them",
   ),
-  (POLICY, "rank_runs", "entry_sort_key(c.entry_id)", "c.entry_id", ORDER),
+  (POLICY, "rank_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
   (POLICY, "ready_lag", "service.get(acct, 0.0)", "seen.get(acct, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (CONTROLLER, "_bill", "if charge.gpu_ms", "if reply.ok and charge.gpu_ms", BILLING),
+  (CONTROLLER, "apply_charge", "if charge.gpu_ms:", "if reply.ok and charge.gpu_ms:", BILLING),
   (CONTROLLER, "handle", "if self.db.is_fenced(msg.boot_id):", "if False:", CLAIM),
-  (CONTROLLER, "_finish_sample", "(it.owner, it.attempt) != (owner, attempt)", "it.attempt != attempt", DEDUP),
-  (CONTROLLER, "_finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
+  (CONTROLLER, "finish_sample", "item.owner != owner or item.attempt != attempt", "item.attempt != attempt", DEDUP),
+  (CONTROLLER, "finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
 ]
 
 

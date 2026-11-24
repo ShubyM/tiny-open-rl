@@ -14,7 +14,7 @@ from tinyrl.workers.sampler import Sampler
 
 class TestAccounting(BusTest):
   async def setup_node(self, role, **accounts):
-    self.receipts = self.enterContext(patch.object(self.bus, "_bill", wraps=self.bus._bill))
+    self.receipts = self.enterContext(patch.object(self.bus, "apply_charge", wraps=self.bus.apply_charge))
     folder = tempfile.TemporaryDirectory()
     self.addCleanup(folder.cleanup)
     store = Store(root=folder.name)

@@ -449,7 +449,7 @@ class TestNodeDaemon(BusTest):
       from tinyrl.types import Task, TaskKind
 
       save_t = Task(_uuid.uuid4().hex[:12], TaskKind.SAVE, "holder", holder.spec, run_id=a, version=_uuid.uuid4().hex)
-      snap = self.background(node._exec(save_t))
+      snap = self.background(node.execute_task(save_t))
       for _ in range(5):
         await asyncio.sleep(0)
       self.assertFalse(snap.done())

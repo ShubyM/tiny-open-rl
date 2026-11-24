@@ -119,8 +119,12 @@ class Checkpoint:
   def model_info(meta: dict) -> dict:
     info = {k: meta[k] for k in ("base", "rank", "lora") if k in meta}
     if info.get("rank"):
-      t = meta.get("targets", ())
-      info["flags"] = {"train_unembed": "lm_head" in t, "train_mlp": "gate_proj" in t, "train_attn": "q_proj" in t}
+      targets = meta.get("targets", ())
+      info["flags"] = {
+        "train_unembed": "lm_head" in targets,
+        "train_mlp": "gate_proj" in targets,
+        "train_attn": "q_proj" in targets,
+      }
     return info
 
 
@@ -211,7 +215,10 @@ def entry_sort_key(entry_id: str) -> tuple[int, int]:
 
 
 def parse_uri(uri: str) -> tuple[str, str]:
-  run, sep, cid = uri.removeprefix("tinker://").partition("/") if uri.startswith("tinker://") else ("", "", "")
-  if not sep or "" in (parts := f"{run}/{cid}".split("/")) or ".." in parts:
+  if not uri.startswith("tinker://"):
     raise ValueError(f"bad checkpoint URI {uri}")
-  return run, cid
+  run, sep, checkpoint_id = uri.removeprefix("tinker://").partition("/")
+  parts = f"{run}/{checkpoint_id}".split("/")
+  if not sep or "" in parts or ".." in parts:
+    raise ValueError(f"bad checkpoint URI {uri}")
+  return run, checkpoint_id
