@@ -205,7 +205,7 @@ class ControlMsg:
   tasks: tuple[Task, ...] = ()
   cancel: tuple[str, ...] = ()
   stage: tuple[str, ...] = ()
-  sweep: tuple[str, ...] = ()
+  sweep: tuple[str, ...] | None = None
   reset: bool = False
 
 

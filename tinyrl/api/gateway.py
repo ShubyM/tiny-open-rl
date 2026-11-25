@@ -135,35 +135,57 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
       lambda _, err, code=status_code: JSONResponse({"error": f"{type(err).__name__}: {err}"}, code),
     )
 
+  live_ws: dict[str, tuple[WebSocket, asyncio.Task | None]] = {}
+
+  async def close_socket(old: WebSocket) -> None:
+    with contextlib.suppress(BaseException):
+      await old.close()
+
   @api.websocket("/internal/ws")
   async def node_ws(ws: WebSocket) -> None:
     await ws.accept()
     bound_node: tuple[str, str] | None = None
     pusher: asyncio.Task | None = None
+    send_lock = asyncio.Lock()
 
     async def push_loop(node_id: str, boot_id: str) -> None:
       while (node := ctrl.nodes.get(node_id)) is not None and node.boot_id == boot_id:
         await node.push_ev.wait()
-        node = ctrl.nodes.get(node_id)
-        if node is None or node.boot_id != boot_id:
-          return
-        out = node.drain_push()
-        if any((out.tasks, out.cancel, out.stage, out.sweep, out.ack)):
-          await ws.send_bytes(msgspec.msgpack.encode(out))
+        async with send_lock:
+          if live_ws.get(node_id, (None, None))[0] is not ws:
+            return
+          node = ctrl.nodes.get(node_id)
+          if node is None or node.boot_id != boot_id:
+            return
+          out = node.drain_push()
+          if out.tasks or out.cancel or out.stage or out.sweep is not None or out.ack:
+            await ws.send_bytes(msgspec.msgpack.encode(out))
 
     try:
       while True:
         msg = msgspec.msgpack.decode(await ws.receive_bytes(), type=NodeMsg)
-        reply = ctrl.handle(msg)
-        await ws.send_bytes(msgspec.msgpack.encode(reply))
-        if reply.reset:
-          await ws.close()
-          return
-        if bound_node != (msg.node, msg.boot_id):
-          if pusher is not None:
-            pusher.cancel()
-          bound_node = (msg.node, msg.boot_id)
-          pusher = asyncio.create_task(push_loop(*bound_node))
+        async with send_lock:
+          if bound_node is not None and live_ws.get(bound_node[0], (None, None))[0] is not ws:
+            await ws.close()
+            return
+          reply = ctrl.handle(msg)
+          if not reply.reset:
+            old_ws, old_pusher = live_ws.get(msg.node, (None, None))
+            if old_ws is not None and old_ws is not ws:
+              if old_pusher is not None:
+                old_pusher.cancel()
+              asyncio.create_task(close_socket(old_ws))
+            live_ws[msg.node] = (ws, pusher if bound_node == (msg.node, msg.boot_id) else None)
+          await ws.send_bytes(msgspec.msgpack.encode(reply))
+          if reply.reset:
+            await ws.close()
+            return
+          if bound_node != (msg.node, msg.boot_id):
+            if pusher is not None:
+              pusher.cancel()
+            bound_node = (msg.node, msg.boot_id)
+            pusher = asyncio.create_task(push_loop(*bound_node))
+            live_ws[msg.node] = (ws, pusher)
     except (WebSocketDisconnect, RuntimeError):
       pass
     finally:
@@ -171,12 +193,11 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
         pusher.cancel()
         with contextlib.suppress(BaseException):
           await pusher
+      if bound_node is not None and live_ws.get(bound_node[0], (None, None))[0] is ws:
+        live_ws.pop(bound_node[0], None)
 
   def require_run(run_id: str | None) -> dict:
-    if not run_id:
-      raise HTTPException(404, f"no model {run_id}")
-    record = ctrl.get_run(run_id)
-    if record is None:
+    if not run_id or (record := ctrl.get_run(run_id)) is None:
       raise HTTPException(404, f"no model {run_id}")
     return record
 
@@ -277,6 +298,8 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
     model_seq_id: int | None = Body(None),
   ):
     session = session_id or ""
+    if "/" in session:
+      raise ValueError("session_id must not contain '/'")
     lora = lora_config or {}
     session_meta = (ctrl.get_session(session) or {}).get("metadata", {})
     meta = session_meta | (user_metadata or {})
@@ -343,6 +366,9 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
       existing = ctrl.seen_request(req.model_id, req.seq_id)
       if existing:
         return {"request_id": existing, "model_id": req.model_id}
+      state = ctrl.runs.get(req.model_id)
+      if state is None or not state.live:
+        raise HTTPException(404, f"no model {req.model_id}")
       ctrl.create_run(sampler)
       args |= {"sampling_session_id": sampler.id, "owned": True}
     return submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
@@ -505,4 +531,6 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
 
 
 if __name__ == "__main__":
-  uvicorn.run(app(control=True), host="0.0.0.0", port=getenv("PORT", 8000))
+  uvicorn.run(
+    app(control=True), host="0.0.0.0", port=getenv("PORT", 8000), ws_max_size=getenv("WS_MAX_BYTES", 64 * 2**20)
+  )

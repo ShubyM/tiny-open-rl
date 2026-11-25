@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from tinyrl.control.controller import Controller
 from tinyrl.control.node_daemon import NodeDaemon, WorkerHandle
-from tinyrl.types import Run, RunStatus, TaskKind, WorkerSpec
+from tinyrl.types import Done, Effect, NodeMsg, Op, Reply, Run, RunStatus, TaskKind, WorkerSpec
 
 
 class TestDetachRetry(unittest.IsolatedAsyncioTestCase):
@@ -76,3 +76,16 @@ class TestDetachRetry(unittest.IsolatedAsyncioTestCase):
     self.assertIsNone(self.ctrl.get_run("a").get("snapshot"))
     self.assertIsNone(self.ctrl.get_run("b").get("snapshot"))
     self.model.close.assert_awaited_once()
+
+  async def test_scale_out_detach_respects_failed_saves_backoff(self):
+    ok = Reply(True, "application/json", b"{}")
+    self.ctrl.submit_command("a", Op.OPTIM_STEP, b"{}")
+    [t] = self.ctrl.nodes["n"].drain_push().tasks
+    self.ctrl.submit_command("a", Op.OPTIM_STEP, b"{}")
+    self.ctrl.submit_command("b", Op.OPTIM_STEP, b"{}")
+    self.ctrl.handle(NodeMsg("hello", "n2", "b2", gpus=1))
+    self.ctrl.handle(NodeMsg("events", "n", self.node.boot_id, done=(Done(t.id, True, ok, effect=Effect(True, True)),)))
+    save_tasks = [x for x in self.ctrl.nodes["n"].tasks.values() if x.kind == TaskKind.SAVE]
+    self.assertEqual([x.run_id for x in save_tasks], ["b"])
+    cmsg = self.ctrl.handle(NodeMsg("events", "n", self.node.boot_id, done=(Done(save_tasks[0].id, ok=False),)))
+    self.assertEqual([x for x in cmsg.tasks if x.kind == TaskKind.SAVE and x.run_id == "b"], [])

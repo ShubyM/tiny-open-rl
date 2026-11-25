@@ -177,38 +177,36 @@ def admit_samples(
   if slots <= 0 or not heads:
     return []
   loaded_versions = {ver for ver in active_versions if ver is not None}
-  runs_by_acct: dict[str, list[deque[Cmd]]] = {}
+  runs_by_acct: dict[str, deque[tuple[str | None, deque[Cmd]]]] = {}
   for run in rank_runs(heads, lag_of, service):
-    ver = version_of(run)
-    if ver is not None and ver not in loaded_versions and len(loaded_versions) >= max_loras:
-      continue
     pending = deque(queued(run, slots))
     if not pending:
       continue
-    if ver is not None:
-      loaded_versions.add(ver)
-    runs_by_acct.setdefault(account(run), []).append(pending)
+    runs_by_acct.setdefault(account(run), deque()).append((version_of(run), pending))
 
-  available = {acct: sum(len(q) for q in qs) for acct, qs in runs_by_acct.items()}
+  def can_use(ver: str | None) -> bool:
+    return ver is None or ver in loaded_versions or len(loaded_versions) < max_loras
+
   allocated = dict.fromkeys(runs_by_acct, 0)
   rank_index = {acct: i for i, acct in enumerate(runs_by_acct)}
   active_counts = in_flight or {}
+  admitted_by_acct: dict[str, list[Cmd]] = {acct: [] for acct in runs_by_acct}
   for _ in range(slots):
-    eligible = [acct for acct in runs_by_acct if allocated[acct] < available[acct]]
+    eligible = [acct for acct, ring in runs_by_acct.items() if any(can_use(ver) for ver, _ in ring)]
     if not eligible:
       break
     chosen = min(eligible, key=lambda acct: (active_counts.get(acct, 0) + allocated[acct], rank_index[acct]))
+    ring = runs_by_acct[chosen]
+    while not can_use(ring[0][0]):
+      ring.rotate(-1)
+    ver, queue = ring.popleft()
+    if ver is not None:
+      loaded_versions.add(ver)
+    admitted_by_acct[chosen].append(queue.popleft())
     allocated[chosen] += 1
-
-  admitted: list[Cmd] = []
-  for acct, queues in runs_by_acct.items():
-    ring = deque(queues)
-    for _ in range(allocated[acct]):
-      queue = ring.popleft()
-      admitted.append(queue.popleft())
-      if queue:
-        ring.append(queue)
-  return admitted
+    if queue:
+      ring.append((ver, queue))
+  return [cmd for cmds in admitted_by_acct.values() for cmd in cmds]
 
 
 def blocks(total: int, width: int) -> list[tuple[int, ...]]:

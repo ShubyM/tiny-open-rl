@@ -259,30 +259,39 @@ class Store:
 
     return self.publish(version, write)
 
-  def put_blob(self, data: bytes, *, version: str | None = None) -> str:
-    return self.publish(version, lambda folder: (folder / "blob.bin").write_bytes(data))
+  def put_blob(self, data: bytes, *, version: str | None = None, durable: bool = False) -> str:
+    ref = self.publish(version, lambda folder: (folder / "blob.bin").write_bytes(data))
+    if durable and self.remote:
+      self.upload_version(ref.partition("@")[0])
+    return ref
 
   def get_blob(self, reference: str) -> bytes:
     return Path(self.local_folder(reference)[0], "blob.bin").read_bytes()
+
+  def upload_version(self, version: str) -> None:
+    if not self.remote:
+      return
+    with self.uploading:
+      job = Path(self.cache, f"{version}.upload")
+      folder = Path(self.cache, version)
+      if not job.exists() or not folder.is_dir():
+        return
+      dest = f"{self.base}/objects/{version}"
+      names = sorted(os.listdir(folder))
+      parallel(self.fs.put_file, [str(folder / n) for n in names], [f"{dest}/{n}" for n in names])
+      self.fs.pipe_file(f"{dest}/manifest.json", json.dumps(names).encode())
+      job.unlink(missing_ok=True)
 
   def upload_pending_saves(self) -> None:
     """An independent, retryable upload per immutable version. Publish its manifest after its files."""
     if not self.remote:
       return
-    with self.uploading:
-      for job in Path(self.cache).glob("*.upload"):
-        version = job.stem
-        folder = Path(self.cache, version)
-        if not folder.is_dir():
-          continue
-        dest = f"{self.base}/objects/{version}"
-        try:
-          names = sorted(os.listdir(folder))
-          parallel(self.fs.put_file, [str(folder / n) for n in names], [f"{dest}/{n}" for n in names])
-          self.fs.pipe_file(f"{dest}/manifest.json", json.dumps(names).encode())
-          job.unlink()
-        except Exception as exc:
-          print(f"upload failed for {version}, trying again: {exc!r}", file=sys.stderr, flush=True)
+    for job in list(Path(self.cache).glob("*.upload")):
+      version = job.stem
+      try:
+        self.upload_version(version)
+      except Exception as exc:
+        print(f"upload failed for {version}, trying again: {exc!r}", file=sys.stderr, flush=True)
 
   def local_folder(self, reference: str) -> tuple[str, str]:
     """Resolve exactly the published version through shared disk, the local cache, a peer, or the bucket."""

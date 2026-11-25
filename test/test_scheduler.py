@@ -611,6 +611,20 @@ class TestLocalQuantum(unittest.TestCase):
       heads, lambda r, n: queues[r][:n], lambda r: r[0], lambda r: 0, {}, versions.get, 3, 2, {"a": 2}
     )
     self.assertEqual([c.run for c in topped], ["a1", "b1", "b1"])
+    # High in-flight account must not consume the only max_loras slot ahead of a 0-in-flight account.
+    ver_diff = {"a1": "v1", "b1": "v2"}
+    fair = admit_samples(
+      [queues["a1"][0], queues["b1"][0]],
+      lambda r, n: queues[r][:n],
+      lambda r: r[0],
+      lambda r: 10.0 if r == "a1" else 0.0,
+      {},
+      ver_diff.get,
+      1,
+      1,
+      {"a": 100, "b": 0},
+    )
+    self.assertEqual([c.run for c in fair], ["b1"])
 
   def test_local_guard_enforces_gpu_exclusivity_under_concurrent_handoffs(self):
     async def run():

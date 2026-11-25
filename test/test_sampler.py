@@ -12,9 +12,10 @@ from test.helpers import BusTest, FakeEngine, tiny
 from tinyrl.api import wire
 from tinyrl.api.gateway import app
 from tinyrl.api.proto import tinker_public_pb2 as pb
+from tinyrl.control.accounting import Charge, Wave
 from tinyrl.storage.store import Store
-from tinyrl.types import Op, Role, Run
-from tinyrl.workers.sampler import Out, Seq, encode
+from tinyrl.types import Cmd, Op, Role, Run
+from tinyrl.workers.sampler import Out, Sampler, Seq, encode
 
 JOB = {
   "prompt": [1, 2, 3],
@@ -343,6 +344,42 @@ class TestSampler(BusTest):
     self.assertTrue((await self.bus.wait_for_reply(req_high, 5)).ok)
     self.assertTrue((await self.bus.wait_for_reply(req_low, 5)).ok)
     self.assertEqual(order, [2, 1])
+
+  async def test_load_shared_cancellation_does_not_cancel_sibling_waiter(self):
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class SlowEngine:
+      load_cancelled = False
+
+      async def load_checkpoint(self, name, path):
+        started.set()
+        try:
+          await release.wait()
+        except asyncio.CancelledError:
+          self.load_cancelled = True
+          raise
+
+      async def sample(self, job, name):
+        return Out([Seq([7], [-0.5], [{7: -0.5}], True)], [])
+
+    sampler = Sampler("base", True, engine=SlowEngine)
+    sampler.running = SlowEngine()
+    wave, body = Wave(1), json.dumps(JOB).encode()
+    t1 = asyncio.create_task(
+      sampler.execute(Cmd("r1", "1-1", Op.SAMPLE, body), ("/tmp/c", "v1"), wave=wave, charge=Charge())
+    )
+    t2 = asyncio.create_task(
+      sampler.execute(Cmd("r1", "1-2", Op.SAMPLE, body), ("/tmp/c", "v1"), wave=wave, charge=Charge())
+    )
+    await started.wait()
+    await asyncio.sleep(0)
+    t1.cancel()
+    with self.assertRaises(asyncio.CancelledError):
+      await t1
+    self.assertFalse(sampler.running.load_cancelled)
+    release.set()
+    self.assertTrue((await asyncio.wait_for(t2, 2.0)).ok)
+    self.assertEqual((wave.active, sampler.loads), (0, {}))
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 # tinyrl on Kubernetes
 
-**Current implementation.** One gateway hosts the SQLite ledger and the fleet scheduler. Each GPU node reports its capacity,
-worker residency, active requests, and staged checkpoints when it pulls work. The controller chooses the worker, physical
-GPU block, and requests to execute. The node daemon owns local process lifetime, stages weights, parks and resumes
-workers, and reports measured GPU time. Portable checkpoints, single-node FSDP, host parking, and node-loss recovery
-are implemented. [Controller](../tinyrl/control/ledger.py) · [Node daemon](../tinyrl/control/node_daemon.py)
+**Current implementation.** One gateway hosts the SQLite ledger and the fleet pager over a full-duplex `/internal/ws` WebSocket.
+Each GPU node reports its capacity, worker residency, active requests, and staged checkpoints, and receives pushed tasks directly
+from the controller. The controller chooses the worker, physical GPU block, and requests to execute. The node daemon owns local
+process lifetime, stages weights, parks and resumes workers, and reports measured GPU time. Portable checkpoints, single-node FSDP,
+host parking, and node-loss recovery are implemented. [Controller](../tinyrl/control/controller.py) · [Node daemon](../tinyrl/control/node_daemon.py)
 
 **Historical design.** The Redis key layouts and implementation sketches below describe an earlier proposal. The current controller can move checkpointed runs between healthy nodes and the Store can fetch weights from a peer. Adaptive sharding, a `/dev/shm` storage tier, and Spot notification handling are proposed extensions.
 Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.

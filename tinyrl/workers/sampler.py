@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import json
 import os
@@ -54,12 +55,13 @@ class SharedLoad:
   task: asyncio.Task
   cost: Charge
   waiters: int = 0
+  active: int = 0
 
 
 def pack_stability_blob(request_id: str, out: Out, store) -> dict[str, StabSlice]:
   k = max((len(row) for seq in out.seqs for row in seq.top if row), default=1)
   chunks = [wire.pack_stability(*topk(seq.top, k)) for seq in out.seqs]
-  ref = store.put_blob(b"".join(chunks))
+  ref = store.put_blob(b"".join(chunks), durable=True)
   slices: dict[str, StabSlice] = {}
   offset = 0
   for index, chunk in enumerate(chunks):
@@ -97,20 +99,34 @@ class Sampler:
 
   async def load_shared(self, checkpoint: tuple[str, str], wave: Wave, charge: Charge) -> None:
     entry = self.loads.get(checkpoint)
-    if entry is None:
+    if entry is None or entry.task.done():
       cost = Charge()
       task = asyncio.create_task(wave.run(self.load(checkpoint), cost))
       entry = SharedLoad(task=task, cost=cost)
       self.loads[checkpoint] = entry
     entry.waiters += 1
+    entry.active += 1
+    cancelled = False
     try:
-      await entry.task
+      await asyncio.shield(entry.task)
+    except asyncio.CancelledError:
+      cancelled = True
+      entry.waiters -= 1
+      if entry.active == 1:
+        if self.loads.get(checkpoint) is entry:
+          del self.loads[checkpoint]
+        entry.task.cancel()
+        with contextlib.suppress(BaseException):
+          await entry.task
+      raise
     finally:
-      if self.loads.get(checkpoint) is entry:
+      entry.active -= 1
+      if (entry.active == 0 or entry.task.done()) and self.loads.get(checkpoint) is entry:
         del self.loads[checkpoint]
-      charge.started_ms = entry.cost.started_ms
-      charge.busy_ms += entry.cost.busy_ms
-      charge.gpu_ms += entry.cost.gpu_ms / entry.waiters
+      if not cancelled:
+        charge.started_ms = entry.cost.started_ms
+        charge.busy_ms += entry.cost.busy_ms
+        charge.gpu_ms += entry.cost.gpu_ms / max(1, entry.waiters)
 
   async def execute(
     self,

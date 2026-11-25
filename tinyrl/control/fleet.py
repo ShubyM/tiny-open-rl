@@ -69,6 +69,7 @@ class NodeState:
 
   def cancel_task(self, task_id: str) -> None:
     self.tasks.pop(task_id, None)
+    self.new_tasks = [task for task in self.new_tasks if task.id != task_id]
     self.cancelled.append(task_id)
 
   def wake(self) -> None:
@@ -78,7 +79,7 @@ class NodeState:
   def drain_push(
     self,
     ack: tuple[str, ...] = (),
-    sweep: tuple[str, ...] = (),
+    sweep: tuple[str, ...] | None = None,
     *,
     hello: bool = False,
     active_ids: set[str] = frozenset(),
@@ -96,7 +97,10 @@ class NodeState:
     self.cancelled.clear()
     self.push_ev.clear()
     if hello:
-      return replace(msg, tasks=tuple(t for t in self.tasks.values() if t.id not in active_ids))
+      stale_active = tuple(sorted(tid for tid in active_ids if tid not in self.tasks and tid not in ack))
+      cancel = tuple(dict.fromkeys((*msg.cancel, *stale_active)))
+      tasks = tuple(t for t in self.tasks.values() if t.id not in active_ids)
+      return replace(msg, tasks=tasks, cancel=cancel)
     return msg
 
 
@@ -159,6 +163,8 @@ class Fleet:
         if not node.worker_tasks(info.worker):
           worker.gpus = info.gpus
           worker.loaded = dict(info.loaded)
+        elif info.loaded:
+          worker.loaded = {**info.loaded, **worker.loaded}
       else:
         node.workers[info.worker] = LiveWorker(
           info.worker, info.spec, info.gpus, info.bound, dict(info.loaded), info.pid, started=True

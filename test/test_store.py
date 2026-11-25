@@ -54,6 +54,14 @@ class TestStore(unittest.TestCase):
     with self.assertRaises(ValueError):
       loader.get("tinker://run-1/weights/missing")
 
+  def test_durable_put_blob_survives_writer_cache_loss(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      writer = Store(f"file://{tmp}/bucket", cache=f"{tmp}/writer")
+      reader = Store(f"file://{tmp}/bucket", cache=f"{tmp}/reader")
+      writer.peer = "127.0.0.1:9"
+      ref = writer.put_blob(b"stability-bytes", durable=True)
+      self.assertEqual(reader.get_blob(ref), b"stability-bytes")
+
   def test_roundtrips_contiguous_and_non_contiguous_tensors(self):
     store = Store(root=tempfile.mkdtemp())
     base = torch.arange(16, dtype=torch.float32).reshape(4, 4)

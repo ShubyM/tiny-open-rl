@@ -26,6 +26,8 @@ GPUS = getenv("GPUS", 1)
 DRAIN_S = getenv("DRAIN_S", 20.0)
 TICK = getenv("TICK", 0.25)
 SWEEP_GRACE_S = 600
+DONE_FRAME_BYTES = getenv("DONE_FRAME_BYTES", 8 * 2**20)
+CLOSE_RETRIES = 5
 
 encode_msg = msgspec.msgpack.encode
 decode_msg = msgspec.msgpack.decode
@@ -106,14 +108,17 @@ class WorkerHandle:
       return time.monotonic() - started
 
   async def close(self) -> None:
-    while True:
-      try:
-        await self.model.close()
-        self.resident = ()
-        return
-      except Exception as exc:
-        print(f"{self.id} could not close, retrying: {exc!r}", file=sys.stderr, flush=True)
-        await asyncio.sleep(min(0.05, TICK))
+    try:
+      for attempt in range(CLOSE_RETRIES):
+        try:
+          await self.model.close()
+          return
+        except Exception as exc:
+          print(f"{self.id} could not close ({attempt + 1}/{CLOSE_RETRIES}): {exc!r}", file=sys.stderr, flush=True)
+          if attempt + 1 < CLOSE_RETRIES:
+            await asyncio.sleep(min(0.05, TICK))
+    finally:
+      self.resident = ()
 
 
 class NodeDaemon:
@@ -140,6 +145,7 @@ class NodeDaemon:
     self.staged: dict[str, str] = {}
     self.stage_dirty = False
     self.staging: dict[str, asyncio.Task] = {}
+    self.stage_failures: dict[str, int] = {}
 
     self.changed = asyncio.Event()
     self.draining = False
@@ -217,13 +223,13 @@ class NodeDaemon:
   async def execute_task(self, task: Task) -> Done:
     kind = task.kind
     worker = self.workers.get(task.worker)
-    if worker is None and kind in (TaskKind.TRAIN, TaskKind.SAMPLE):
-      worker = self.spawn(task.worker, task.spec, task.gpus)
-      self.workers[task.worker] = worker
-    if worker is None:
-      return Done(task.id, dead=True)
-
     try:
+      if worker is None and kind in (TaskKind.TRAIN, TaskKind.SAMPLE):
+        worker = self.spawn(task.worker, task.spec, task.gpus)
+        self.workers[task.worker] = worker
+      if worker is None:
+        return Done(task.id, dead=True)
+
       with span(f"node.{kind}"):
         if kind == TaskKind.PARK:
           return Done(task.id, duration_s=await worker.park(), pid=worker.pid())
@@ -257,7 +263,12 @@ class NodeDaemon:
         if kind == TaskKind.SAMPLE:
           checkpoint = None
           if task.version:
-            folder = await self.stage_version(task.version)
+            try:
+              folder = await self.stage_version(task.version)
+            except Exception:
+              self.staged.pop(task.version, None)
+              self.stage_dirty = True
+              return Done(task.id, ok=False, reply=None, dead=False, pid=worker.pid())
             checkpoint = (folder, task.version.partition("@")[0])
           reply = await worker.model.execute(cmd, checkpoint, wave=worker.wave, charge=charge)
           if not reply.ok and worker.exited():
@@ -277,11 +288,12 @@ class NodeDaemon:
             task.id, ok=True, reply=reply, charge=charge, effect=effect, duration_s=resume_s, pid=worker.pid()
           )
     except asyncio.CancelledError:
-      if kind in (TaskKind.TRAIN, TaskKind.PARK, TaskKind.SAVE, TaskKind.STOP):
+      if worker is not None and kind in (TaskKind.TRAIN, TaskKind.PARK, TaskKind.SAVE, TaskKind.STOP):
         await asyncio.shield(self.drop_worker(task.worker, worker))
       raise
     except Exception as exc:
-      await self.drop_worker(task.worker, worker)
+      if worker is not None:
+        await self.drop_worker(task.worker, worker)
       err_reply = Reply.error(exc) if task.cmd else None
       return Done(task.id, ok=False, reply=err_reply, dead=True)
 
@@ -302,7 +314,10 @@ class NodeDaemon:
   async def prefetch_version(self, version: str) -> None:
     try:
       await self.stage_version(version)
+      self.stage_failures.pop(version, None)
     except Exception:
+      fails = self.stage_failures[version] = self.stage_failures.get(version, 0) + 1
+      await asyncio.sleep(min(10.0, 0.05 * (2 ** min(fails - 1, 8))))
       self.stage_dirty = True
 
   async def run_sweep(self, keep: set[str]) -> None:
@@ -336,26 +351,35 @@ class NodeDaemon:
 
     if hello:
       self.sent_done.clear()
-    done = tuple(d for tid, d in self.done_buf.items() if tid not in self.sent_done)
+    done_items, frame_bytes = [], 0
+    for tid, item in self.done_buf.items():
+      if tid in self.sent_done:
+        continue
+      size = (len(item.reply.body) if item.reply else 0) + 512
+      if done_items and frame_bytes + size > DONE_FRAME_BYTES:
+        self.notify()
+        break
+      done_items.append(item)
+      frame_bytes += size
+    done = tuple(done_items)
     self.sent_done.update(d.id for d in done)
 
     staged = tuple(self.staged) if (hello or self.stage_dirty) else None
     self.stage_dirty = False
-
     return NodeMsg(
-      kind="hello" if hello else "events",
-      node=self.id,
-      boot_id=self.boot_id,
-      gpus=self.gpus,
-      gpu_mib=self.gpu_mib,
-      draining=self.draining,
-      lag=self.lag,
-      want_sweep=want_sweep,
-      workers=tuple(w.info() for w in self.workers.values()) if hello else (),
-      staged=staged,
-      exited=exited,
-      active=tuple(self.active) if (hello or self.draining or lost_stage) else (),
-      done=done,
+      "hello" if hello else "events",
+      self.id,
+      self.boot_id,
+      self.gpus,
+      self.gpu_mib,
+      self.draining,
+      self.lag,
+      want_sweep,
+      tuple(w.info() for w in self.workers.values()) if hello else (),
+      staged,
+      exited,
+      tuple(self.active) if (hello or self.draining or lost_stage) else (),
+      done,
     )
 
   def apply(self, msg: ControlMsg) -> None:
@@ -365,8 +389,9 @@ class NodeDaemon:
     for task_id in msg.ack:
       self.done_buf.pop(task_id, None)
       self.sent_done.discard(task_id)
+    cancelled = set(msg.cancel)
     for task_id in msg.cancel:
-      running = self.active.pop(task_id, None)
+      running = self.active.get(task_id)
       if running and running[0].kind == TaskKind.SAMPLE:
         running[1].cancel()
       self.done_buf.pop(task_id, None)
@@ -374,10 +399,10 @@ class NodeDaemon:
     for version in msg.stage:
       if version not in self.staged and version not in self.staging:
         self.start_background(self.staging, version, self.prefetch_version(version))
-    if msg.sweep and self.sweep_task is None:
+    if msg.sweep is not None and self.sweep_task is None:
       self.sweep_task = asyncio.create_task(self.run_sweep(set(msg.sweep)))
     for task in msg.tasks:
-      if task.id not in self.active and task.id not in self.done_buf:
+      if task.id not in cancelled and task.id not in self.active and task.id not in self.done_buf:
         self.start_background(self.active, task.id, self.record_done(task), wrap=lambda bg, t=task: (t, bg))
 
   async def step_once(self, wait_ms: int = 0) -> bool:
@@ -412,6 +437,7 @@ class NodeDaemon:
     close_types = (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR)
     sent_at = time.monotonic()
     self.connected = True
+    self.changed.clear()
     await ws.send_bytes(encode_msg(await self.build_msg(hello=True)))
 
     async def reader() -> None:
@@ -431,7 +457,6 @@ class NodeDaemon:
     async def writer() -> None:
       nonlocal sent_at, deadline
       while not ws.closed:
-        self.changed.clear()
         deadline = self.drain_deadline(deadline)
         if not self.is_drained(deadline):
           wait_s = heartbeat_s if deadline is None else min(heartbeat_s, deadline - time.monotonic())
@@ -440,11 +465,18 @@ class NodeDaemon:
         if self.is_drained(deadline):
           await ws.close()
           return
+        self.changed.clear()
         msg = await self.build_msg(hello=False)
         sent_at = time.monotonic()
         await ws.send_bytes(encode_msg(msg))
 
-    tasks = {asyncio.create_task(reader()), asyncio.create_task(writer())}
+    async def lease_watch() -> None:
+      while not self.lease_expired():
+        remaining = LEASE_MS / 1000 - (time.monotonic() - self.last_ok)
+        await asyncio.sleep(heartbeat_s if self.draining else min(heartbeat_s, max(0.02, remaining)))
+      raise FencedError("controller lease expired")
+
+    tasks = {asyncio.create_task(reader()), asyncio.create_task(writer()), asyncio.create_task(lease_watch())}
     try:
       done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
@@ -497,6 +529,7 @@ class NodeDaemon:
       tasks.append(self.sweep_task)
     self.active.clear()
     self.staging.clear()
+    self.stage_failures.clear()
     self.done_buf.clear()
     self.sent_done.clear()
     self.sweep_task = None

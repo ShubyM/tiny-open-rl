@@ -268,20 +268,26 @@ class Ledger:
     aborted_trains: list[tuple[Owner, str]] = []
     state = self.runs.get(run_id)
     if state is not None:
+      deleted_reply = Reply.error(RuntimeError(f"run {run_id} was deleted"))
+      queued_trains: list[str] = []
       for cmd_id, item in list(state.queue.items()):
         if state.run.role == Role.SAMPLER:
           self.samples.release(len(item.cmd.body))
           if item.owner and item.task_id:
             cancelled_samples.append((item.owner, item.task_id))
         elif item.owner:
-          self.finish_train(cmd_id, item.owner, Reply.error(RuntimeError(f"run {run_id} was deleted")))
+          self.finish_train(cmd_id, item.owner, deleted_reply)
           if item.task_id:
             aborted_trains.append((item.owner, item.task_id))
+        else:
+          queued_trains.append(cmd_id)
       self.samples.drop_run(run_id)
       now, dropped = time.time(), list(state.queue)
       with self.db:
+        for cmd_id in queued_trains:
+          self.db.save_reply(cmd_id, deleted_reply, now + REPLY_TTL)
         self.db.save_run(replace(state, status=RunStatus.DELETED, owner=None, snapshot=None, deleted_at=now))
-        self.db.delete_run_commands(run_id)
+        self.db.remove_command(None, run_id, deleting=True)
       state.status, state.owner, state.snapshot, state.deleted_at = RunStatus.DELETED, None, None, now
       state.queue.clear()
       for cmd_id in dropped:
@@ -407,6 +413,23 @@ class Ledger:
     ]
     return {"live": True, "queued": len(state.queue) - len(in_flight), "in_flight": in_flight}
 
+  def train_head(self, run_id: str) -> QueueItem | None:
+    state = self.runs.get(run_id)
+    if state is None or not state.live or state.run.role != Role.TRAINER or not state.queue:
+      return None
+    head = next(iter(state.queue.values()))
+    return head if head.owner is None else None
+
+  def sample_heads(self, spec: WorkerSpec, staged: set[str], allow_base: bool = True) -> dict[str, QueueItem]:
+    heads: dict[str, QueueItem] = {}
+    for run_id, state in self.runs.items():
+      if state.live and state.run.role == Role.SAMPLER and state.run.spec == spec and state.queue:
+        for item in state.queue.values():
+          if item.owner is None and ((allow_base and item.version is None) or item.version in staged):
+            heads[run_id] = item
+            break
+    return heads
+
   def hydrate_cmd(self, req_id: str) -> Cmd:
     body, stability = self.db.load_command_payload(req_id)
     return replace(self.runs[req_id.partition("/")[0]].queue[req_id].cmd, body=body, stability=stability)
@@ -430,7 +453,16 @@ class Ledger:
     return fair_ms
 
   def finish_train(
-    self, req_id: str, owner: Owner | None, reply: Reply, charge=None, *, mutated=False, checkpoint=None, dead=False
+    self,
+    req_id: str,
+    owner: Owner | None,
+    reply: Reply,
+    charge=None,
+    *,
+    mutated=False,
+    checkpoint=None,
+    dead=False,
+    loaded=True,
   ) -> bool:
     state = self.runs.get(req_id.partition("/")[0])
     item = state.queue.get(req_id) if state else None
@@ -443,12 +475,7 @@ class Ledger:
     peer_updates: list[RunState] = []
 
     if deleting:
-      next_state.status, next_state.owner, next_state.snapshot, next_state.deleted_at = (
-        RunStatus.DELETED,
-        None,
-        None,
-        now,
-      )
+      next_state = replace(next_state, status=RunStatus.DELETED, owner=None, snapshot=None, deleted_at=now)
     else:
       if mutated:
         next_state.snapshot, next_state.status = None, RunStatus.LIVE
@@ -461,12 +488,21 @@ class Ledger:
           for p in self.runs.values()
           if p.run.id != cmd.run and p.owner == owner
         ]
-      elif dead or next_state.status in (RunStatus.FRESH, RunStatus.LOST):
+      elif (
+        dead
+        or next_state.status in (RunStatus.FRESH, RunStatus.LOST)
+        or (not loaded and next_state.status == RunStatus.SAVED)
+      ):
         next_state.owner = None
 
     with self.db:
       self.db.remove_command(req_id, cmd.run, deleting=deleting)
       self.db.save_reply(req_id, reply, now + REPLY_TTL)
+      if deleting:
+        deleted_reply = Reply.error(RuntimeError(f"run {cmd.run} was deleted"))
+        for cid in state.queue:
+          if cid != req_id:
+            self.db.save_reply(cid, deleted_reply, now + REPLY_TTL)
       self.flush_sql(service)
       if checkpoint and reply.ok:
         self.db.save_checkpoint(checkpoint)

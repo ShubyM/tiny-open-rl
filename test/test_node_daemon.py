@@ -6,18 +6,19 @@ import signal
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import torch
 
 from test.execution import TestNode
-from test.helpers import BusTest, new_id, tiny
+from test.helpers import BusTest, new_id, serve_control, tiny
 from test.test_api import proto_body
 from test.test_process import require_unix
 from test.test_sampler import JOB
-from tinyrl.control.node_daemon import NodeDaemon, WorkerHandle
+from tinyrl.control.node_daemon import ControlClient, NodeDaemon, WorkerHandle
 from tinyrl.storage.store import Store
-from tinyrl.types import Op, Role, Run, WorkerSpec
+from tinyrl.types import Checkpoint, Done, NodeMsg, Op, Reply, Role, Run, TaskKind, WorkerInfo, WorkerSpec
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -496,6 +497,76 @@ class TestNodeDaemon(BusTest):
     self.assertEqual(seen_env["full"], "1")
     self.assertEqual(seen_resume, [("lora", (0,)), ("full", ())])
     self.assertEqual(node.workers["full"].bound, (1,))
+
+  async def test_oversized_done_buffer_chunks_across_ws_frames(self):
+    runner, url = await serve_control(self.bus, host="127.0.0.1", port=0)
+    with tempfile.TemporaryDirectory() as tmp:
+      daemon = NodeDaemon(ControlClient(url), gpus=1, node="n1", gpu_mib=0, store=Store(root=tmp))
+      try:
+        self.bus.create_run(Run("s1", "base", 4, role=Role.SAMPLER))
+        reqs = [self.bus.submit_command("s1", Op.SAMPLE, b"{}") for _ in range(4)]
+        cmsg = self.bus.handle(NodeMsg("hello", "n1", daemon.boot_id, gpus=1))
+        big = b"x" * (5 * 2**20)
+        for task in cmsg.tasks:
+          daemon.done_buf[task.id] = Done(task.id, True, Reply(True, "application/octet-stream", big))
+        async with daemon.control.connect() as ws:
+          serve_task = asyncio.create_task(daemon.serve_socket(ws, 0.05, None))
+          try:
+            async with asyncio.timeout(5):
+              while daemon.done_buf:
+                await asyncio.sleep(0.02)
+          finally:
+            serve_task.cancel()
+            with contextlib.suppress(BaseException):
+              await serve_task
+        for req in reqs:
+          self.assertEqual(len((await self.bus.wait_for_reply(req, 0)).body), len(big))
+      finally:
+        await daemon.close()
+        await runner.cleanup()
+
+  async def test_spawn_failure_emits_terminal_done(self):
+    daemon = self.node(real=True)
+    daemon.spawn = Mock(side_effect=OSError("cannot allocate tempdir"))
+    self.bus.create_run(Run("r1", "base", 4))
+    req = self.bus.submit_command("r1", Op.CREATE_MODEL, b"{}")
+    await daemon.step_once()
+    await asyncio.sleep(0.02)
+    await daemon.step_once()
+    reply = await self.bus.wait_for_reply(req, 0)
+    self.assertFalse(reply.ok)
+    self.assertIn("cannot allocate tempdir", reply.body.decode())
+    self.assertEqual(self.bus.queued_and_in_flight("r1")["in_flight"], [])
+
+  async def test_stage_version_error_reclaims_sample_without_killing_worker(self):
+    daemon = self.node(real=True)
+    model = SimpleNamespace(execute=AsyncMock(), close=AsyncMock(), resume=AsyncMock(), proc=None)
+    spec = WorkerSpec(Role.SAMPLER, "base", lora=True)
+    daemon.workers["w1"] = WorkerHandle("w1", spec, model, resident=(0,))
+    daemon.stage_version = AsyncMock(side_effect=ValueError("cache evicted"))
+    self.bus.put_checkpoint(Checkpoint("tinker://tr/sampler_weights/s0", "v1", 10, 1.0))
+    self.bus.create_run(Run("samp-1", "base", 4, role=Role.SAMPLER, model_path="tinker://tr/sampler_weights/s0"))
+    req = self.bus.submit_command("samp-1", Op.SAMPLE, b"{}")
+    cmsg = self.bus.handle(
+      NodeMsg("hello", "node", daemon.boot_id, gpus=1, workers=(WorkerInfo("w1", spec, (0,)),), staged=("v1",))
+    )
+    [sample_task] = [t for t in cmsg.tasks if t.kind == TaskKind.SAMPLE]
+    done = await daemon.execute_task(sample_task)
+    self.assertEqual((done.ok, done.dead, done.reply), (False, False, None))
+    self.assertIn("w1", daemon.workers)
+    model.close.assert_not_awaited()
+    self.bus.handle(NodeMsg("events", "node", daemon.boot_id, staged=(), done=(done,)))
+    self.assertIn("w1", self.bus.nodes["node"].workers)
+    self.assertEqual(self.bus.queued_and_in_flight("samp-1"), {"live": True, "queued": 1, "in_flight": []})
+    self.assertIsNone(await self.bus.wait_for_reply(req, 0))
+
+  async def test_worker_handle_close_bounds_retries_and_clears_resident(self):
+    model = SimpleNamespace(close=AsyncMock(side_effect=RuntimeError("stuck")))
+    handle = WorkerHandle("w1", WorkerSpec(), model, resident=(0,))
+    with patch("tinyrl.control.node_daemon.TICK", 0.001):
+      await asyncio.wait_for(handle.close(), 1.0)
+    self.assertEqual(handle.resident, ())
+    self.assertEqual(model.close.await_count, 5)
 
 
 if __name__ == "__main__":
