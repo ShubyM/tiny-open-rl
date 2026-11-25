@@ -6,9 +6,9 @@ These specifications model and exhaustively verify the `tinyrl` control plane ac
 
 | Module | Truth / Hint | Code mapping |
 | --- | --- | --- |
-| `PagedFleet.tla` | Ground truth: `on` (node GPU table), `run` (`owner`, `epoch`, `pos`, `snap`), `lease`. Pure hints: `procs`, `home`. | `tinyrl/bus.py`, `tinyrl/control/node_daemon.py` |
-| `ConvPaged.tla` | Finite termination rank proving deadlock-free convergence to any well-formed `(procs, home)` once crashes/plan edits stop. | `NodeDaemon.tick`, `Lifetime.run` |
-| `Lag.tla` | EEVDF `lag` updated from monotone `service - seen` deltas (`gpu_ms`) with minimum-quantum switch amortization `c / eps`. | `fairness.py` (`waterfill`, `update_lag`, `plan_gpus`), `scheduler.py` (`rebalance_target`), `node_daemon.py` (`sync_gpus`) |
+| `PagedFleet.tla` | Ground truth: `on` (node GPU table), `run` (`owner`, `status`, `snap`), `nodes[node].until` + `reaped`. Pure hints: `procs`, `home`. | `ledger.py`, `trains.py`, `samples.py`, `nodes.py`, `node_daemon.py` |
+| `ConvPaged.tla` | Finite termination rank proving deadlock-free convergence to any well-formed `(procs, home)` once crashes/plan edits stop. | `NodeDaemon.step_once`, `NodeDaemon.reconcile`, `WorkerHandle` |
+| `Lag.tla` | EEVDF `lag` updated from monotone `service - seen` deltas (`gpu_ms`) with minimum-quantum switch amortization `c / eps`. | `fairness.py` (`waterfill`, `update_lag`, `plan_gpus`), `scheduler.py` (`rebalance_target`), `node_daemon.py` (`WorkerHandle.ensure_gpu`) |
 
 ## Verified Properties and Rule Necessity
 
@@ -17,11 +17,11 @@ Every safety and accounting rule has a boolean flag in the model; flipping any s
 | Flag | Rule | Property violated when `FALSE` |
 | --- | --- | --- |
 | `ClearAfterExit` | Release `node.on[life]` only after `park()` or child exit | `GpuExclusive` |
-| `OwnerFencesWrite` | `commit_reply` and `detach_run` require exact `owner == token` | `MemoryMatchesPos` |
-| `ExactSnapOnly` | `detach_run` records `snap` iff `run.pos == pos`; mutation clears superseded `snap` | `MemoryMatchesPos` |
-| `ReapChecksLease` | `reap_run` clears `owner` only inside `WATCH run, lease` when the lease key is gone | `LiveOwnerKept` |
-| `SerializeRunOps` | Ownership checks and state mutations run in one Redis `WATCH`/`MULTI` transaction | `MemoryMatchesPos` |
-| `SampleSetNX` | Stateless sampler replicas publish `f:<req>` and bill `service` once (`xlen == 0`) | `SampleChargedOnce` |
+| `OwnerFencesWrite` | `finish_train` and `detach` require exact `owner == (worker, node, boot_id)` | `MemoryMatchesPos` |
+| `ExactSnapOnly` | `detach` records `snap` iff clean snapshot saved; mutation clears superseded `snap` | `MemoryMatchesPos` |
+| `ReapChecksLease` | `reap_node` clears `owner` only after lease expiry and records durable `reaped_boots` | `LiveOwnerKept` |
+| `SerializeRunOps` | Ownership checks and state mutations run atomically in `Ledger` inside one SQLite `IMMEDIATE` transaction | `MemoryMatchesPos` |
+| `SampleSetNX` | Stateless sampler replicas complete and bill a sample once (`SampleQueue.complete` checks `entry.owner == owner`) | `SampleChargedOnce` |
 | `UseDelta` | Planner advances `lag` from `service[a] - seen[a]` (never overwriting `service`) | `ExactAccounting` |
 | `KeepNegLag` | Sleeping preserves negative debt (decaying only as active peers receive work) and zeros positive idle credit | `NoFlickerGain` |
 | `AmortizeCost` | Preemption requires `ran >= holder.cost` and `lag[waiter] - lag[holder] >= switch_cost` | `GoodputBounded` |

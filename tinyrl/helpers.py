@@ -29,3 +29,4 @@ def atomic_dir(folder: str, fill) -> str:
 
 
 DEBUG = getenv("DEBUG")
+LEASE_MS, SWEEP_S = getenv("LEASE_MS", 10000), getenv("SWEEP_S", 60.0)

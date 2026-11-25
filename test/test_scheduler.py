@@ -16,76 +16,190 @@ from test.test_api import proto_body
 from test.test_sampler import JOB
 from test.test_trainer import LORA, counting
 from tinyrl.api.proto import tinker_public_pb2 as pb
-from tinyrl.bus import QUANTUM_MS, Cmd, Ev, Op, Role, Run
-from tinyrl.control import scheduler
-from tinyrl.control.fairness import Demand, Worker, admit_samples, plan_gpus, rank_runs, update_lag, waterfill
+from tinyrl.control import policy
 from tinyrl.control.node_daemon import NodeDaemon, WorkerHandle
-from tinyrl.control.scheduler import (
+from tinyrl.control.policy import (
   REBALANCE_MS,
-  Job,
-  Proc,
-  Spec,
-  State,
-  from_plan,
-  step,
-  to_plan,
+  Demand,
+  Placed,
+  Worker,
+  account_demand,
+  admit_samples,
+  can_host,
+  choose_node,
+  node_stats,
+  plan_gpus,
+  rank_runs,
+  ready_lag,
+  rebalance_target,
+  sampler_replicas,
+  update_lag,
+  waterfill,
 )
 from tinyrl.storage.store import Store
-from tinyrl.types import MAX_SEQS
+from tinyrl.types import (
+  MAX_SEQS,
+  Cmd,
+  Done,
+  Effect,
+  NodeMsg,
+  Op,
+  Reply,
+  Role,
+  Run,
+  TaskKind,
+  WorkerInfo,
+  WorkerSpec,
+)
 from tinyrl.workers.model import Model
 
 GIB = 2**30
 
 
-class Cluster:
-  """Nodes, runs and queues that step the pure L2 cluster planner the way `Bus.reconcile` does."""
+class FleetSim:
+  """Drives the real `Controller.schedule()` loop with instant fake nodes to test fleet paging deterministically."""
 
   def __init__(self):
-    self.nodes, self.runs, self.queues, self.service, self.s = {}, {}, {}, {}, State()
+    from tinyrl.control.controller import Controller
 
-  def settle(self) -> list[tuple[Ev, dict]]:
-    self.s.nodes = {n: (v["gpus"], v["memory"]) for n, v in self.nodes.items()}
-    self.s.jobs, self.s.service = scheduler.jobs(self.runs, self.queues), dict(self.service)
-    self.s, changes = step(self.s)
-    return changes
+    self.ctrl = Controller(":memory:")
+    self.boots: dict[str, str] = {}
+    self.pinned_owners: set[str] = set()
 
-  def node(self, name: str, gpus: int, memory: int = 80 * GIB) -> None:
-    self.nodes[name] = {"gpus": gpus, "memory": memory}
+  def close(self) -> None:
+    self.ctrl.db.close()
+
+  def node(self, name: str, gpus: int) -> None:
+    bid = self.boots.setdefault(name, f"b-{name}")
+    n = self.ctrl.nodes.get(name)
+    if n is not None:
+      n.gpus = gpus
+      self.settle()
+      return
+    self.ctrl.handle(NodeMsg("hello", name, bid, gpus=gpus))
     self.settle()
 
-  def lose(self, node: str) -> None:
-    self.nodes.pop(node, None)
-
-  def run(self, name: str, *, backlog: int = 0, owner: list[str] | None = None, **body) -> str:
-    self.runs[name] = {"record": {"role": "trainer", "base": "a", "rank": 0} | body, "owner": owner}
-    self.queues[name] = backlog
+  def lose(self, name: str) -> None:
+    if bid := self.boots.pop(name, None):
+      self.ctrl.expire_node(name, bid)
     self.settle()
-    return self.s.procs_of(name)[0]
+
+  def run(self, name: str, *, backlog: int = 0, **body) -> str | None:
+    role = Role(body.pop("role", "trainer"))
+    base = body.pop("base", "a")
+    rank = int(body.pop("rank", 0))
+    self.ctrl.create_run(Run(name, base, rank, role=role, **body))
+    self.queue(name, backlog)
+    if role == Role.TRAINER and backlog == 0:
+      # Materialize idle trainer onto a worker by running one instant CREATE_MODEL.
+      self.ctrl.submit_command(name, Op.CREATE_MODEL, b"{}")
+      self._step(run_one_create=name)
+    self.settle()
+    ws = self.workers_of(name)
+    return ws[0] if ws else None
 
   def queue(self, run: str, n: int) -> None:
-    self.queues[run] = n
+    rs = self.ctrl.runs[run]
+    if rs.run.role == Role.TRAINER:
+      with self.ctrl.db:
+        self.ctrl.db.execute("DELETE FROM commands WHERE run_id=?", (run,))
+    rs.queue.clear()
+    op = Op.SAMPLE if rs.run.role == Role.SAMPLER else Op.OPTIM_STEP
+    for _ in range(n):
+      self.ctrl.submit_command(run, op, b"{}")
 
   def serve(self, run: str, gpu_ms: float) -> None:
-    acct = self.s.account(run)
-    self.service[acct] = self.service.get(acct, 0.0) + gpu_ms
+    acct = self.ctrl.account(run)
+    self.ctrl.service[acct] = self.ctrl.service.get(acct, 0.0) + gpu_ms
+    self.ctrl.advance_lag()
 
   def delete(self, run: str) -> None:
-    self.runs.pop(run, None)
-    self.queues.pop(run, None)
+    self.queue(run, 0)
+    self.ctrl.delete_run(run)
+
+  def workers_of(self, run: str) -> list[str]:
+    return self.ctrl.workers_of(run)
+
+  def node_of(self, wid: str) -> str | None:
+    for nid, n in self.ctrl.nodes.items():
+      if wid in n.workers and not n.workers[wid].stopping:
+        return nid
+    return None
+
+  def home(self, run: str) -> str | None:
+    rs = self.ctrl.runs.get(run)
+    if not rs or not rs.live:
+      return None
+    if rs.owner:
+      return rs.owner[0]
+    for _nid, n in sorted(self.ctrl.nodes.items()):
+      for t in n.tasks.values():
+        if t.kind == TaskKind.TRAIN and t.run_id == run:
+          return t.worker
+    return None
+
+  def _step(self, run_one_create: str | None = None) -> None:
+    for _ in range(12):
+      for n in self.ctrl.nodes.values():
+        for w in n.workers.values():
+          w.hold_until = w.idle_until = 0.0
+      self.ctrl.lag_due = 0.0
+      self.ctrl.schedule()
+      progressed = False
+      for nid, n in list(self.ctrl.nodes.items()):
+        dones: list[Done] = []
+        for tid, t in list(n.tasks.items()):
+          if t.kind in (TaskKind.SAVE, TaskKind.DROP, TaskKind.STOP, TaskKind.PARK):
+            if t.run_id in self.pinned_owners and t.kind in (TaskKind.SAVE, TaskKind.DROP):
+              continue
+            dones.append(Done(tid, saved=t.kind == TaskKind.SAVE, dead=t.kind == TaskKind.STOP))
+          elif t.kind == TaskKind.TRAIN and t.run_id == run_one_create and t.cmd and t.cmd.op == Op.CREATE_MODEL:
+            dones.append(
+              Done(tid, reply=Reply(True, "application/json", b"{}"), effect=Effect(loaded=True, mutated=True))
+            )
+          elif t.kind == TaskKind.TRAIN and (rs := self.ctrl.runs.get(t.run_id or "")):
+            w = n.workers[t.worker]
+            w.started = True
+            if rs.owner is None:
+              w.loaded[t.run_id] = False
+              rs.owner = (t.worker, nid, n.boot_id)
+              progressed = True
+            elif any(
+              o.live and o.run.role == Role.TRAINER and o.owner is None and o.queue for o in self.ctrl.runs.values()
+            ):
+              progressed = True
+            rs.fair_ms = (rs.fair_ms or 0.0) + 1.0
+            w.gpu_ms += 1.0
+            if it := rs.queue.get(t.cmd.request_id):
+              it.owner = None
+            n.tasks.pop(tid, None)
+            n.new_tasks = [x for x in n.new_tasks if x.id != tid]
+          elif t.kind == TaskKind.SAMPLE:
+            w = n.workers[t.worker]
+            w.started = True
+            if it := self.ctrl.runs[t.cmd.run].queue.get(t.cmd.request_id):
+              it.owner = None
+            n.tasks.pop(tid, None)
+            n.new_tasks = [x for x in n.new_tasks if x.id != tid]
+            progressed = True
+        if dones:
+          self.ctrl.handle(NodeMsg("events", nid, n.boot_id, done=tuple(dones)))
+          progressed = True
+      if not progressed:
+        break
+
+  def settle(self) -> None:
+    self._step()
 
 
 def apply_gpus(
   workers: dict[str, Worker],
   quanta: dict[str, float],
-  state: State,
+  lag_of,
   total: int,
   now: float,
 ) -> tuple[dict[str, tuple[int, ...]], float | None]:
-  """Drive pure `plan_gpus` on `Worker` snapshots, resetting `hold_until` only when a worker's block changes."""
-  ranked = {
-    p: replace(w, lag=max((state.ready_lag(r) for r in state.runs(p) if state.ready(r)), default=-w.gpu_ms))
-    for p, w in workers.items()
-  }
+  ranked = {p: replace(w, lag=lag_of(p) if w.demand != Demand.IDLE else -w.gpu_ms) for p, w in workers.items()}
   keep, wake_at = plan_gpus(ranked, total, now)
   for p, w in list(workers.items()):
     want = keep.get(p, ())
@@ -94,15 +208,18 @@ def apply_gpus(
   return keep, wake_at
 
 
-def check_plan_invariants(test: unittest.TestCase, s: State) -> None:
-  for node, (total, _) in s.nodes.items():
-    test.assertLessEqual(s.excl_used(node), total)
-  for p in s.procs.values():
-    test.assertTrue(p.node is None or (p.node in s.nodes and p.spec.gpus <= s.nodes[p.node][0]))
-  for r, proc in s.home.items():
-    test.assertIn(r, s.jobs)
-    test.assertEqual(s.jobs[r].spec.role, Role.TRAINER)
-    test.assertIn(proc, s.procs)
+def check_fleet_invariants(test: unittest.TestCase, f: FleetSim) -> None:
+  for n in f.ctrl.nodes.values():
+    live = [w for w in n.workers.values() if not w.stopping]
+    test.assertLessEqual(sum(w.spec.gpus for w in live if w.spec.exclusive), n.gpus)
+    for w in live:
+      test.assertLessEqual(w.spec.gpus, n.gpus)
+  for _r, rs in f.ctrl.runs.items():
+    if rs.live and rs.owner:
+      wid, nid, _ = rs.owner
+      test.assertEqual(rs.run.role, Role.TRAINER)
+      test.assertIn(nid, f.ctrl.nodes)
+      test.assertIn(wid, f.ctrl.nodes[nid].workers)
 
 
 def check_gpu_invariants(test: unittest.TestCase, keep: dict, workers: dict[str, Worker], total: int) -> None:
@@ -116,418 +233,339 @@ def check_gpu_invariants(test: unittest.TestCase, keep: dict, workers: dict[str,
 
 
 class TestCluster(unittest.TestCase):
-  def test_runs_are_assigned_and_empty_procs_wait_for_live_owner_detach(self):
-    c = Cluster()
-    c.node("n", 8)
-    a = c.run("a", rank=8)
-    self.assertEqual(c.run("b", rank=8), a)
-    self.assertEqual(c.s.procs[a].node, "n")
-    c.delete("a")
-    self.assertEqual(c.settle(), [])
-    c.run("c")
-    c.runs["c"]["owner"] = [a, "n", "boot1"]
-    c.delete("b")
-    self.assertEqual(c.settle(), [])
-    self.assertIn(a, c.s.procs)
-    c.runs["c"]["owner"] = None
-    self.assertEqual(c.settle(), [(Ev.UNPLACED, {"proc": a, "rule": "place.emptied"})])
-    self.assertNotIn(a, c.s.procs)
+  def make_fleet(self) -> FleetSim:
+    f = FleetSim()
+    self.addCleanup(f.close)
+    return f
 
-  def test_a_new_proc_never_takes_a_name_in_use(self):
-    c = Cluster()
-    c.node("n", 1)
-    c.s.procs["p1"] = Proc(Spec(lora=True), "n")
-    self.assertNotEqual(c.run("f"), "p1")
+  def test_runs_are_assigned_and_empty_workers_stop_after_detach(self):
+    f = self.make_fleet()
+    f.node("n", 8)
+    a = f.run("a", rank=8)
+    self.assertEqual(f.run("b", rank=8), a)
+    self.assertEqual(f.node_of(a), "n")
+    f.delete("a")
+    f.settle()
+    self.assertEqual(f.node_of(a), "n")
+    f.delete("b")
+    f.settle()
+    self.assertIsNone(f.node_of(a))
 
   def test_procs_go_to_the_node_with_the_fewest_procs_per_gpu(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 2)
-    procs = [c.run(name, rank=4, base=name) for name in ("r1", "r2", "r3")]
-    self.assertEqual([c.s.procs[p].node for p in procs], ["a", "b", "b"])
+    f = self.make_fleet()
+    f.node("a", 1)
+    f.node("b", 2)
+    procs = [f.run(name, rank=4, base=name) for name in ("r1", "r2", "r3")]
+    self.assertEqual([f.node_of(p) for p in procs], ["a", "b", "b"])
 
   def test_full_fine_tune_sampler_stays_near_its_training_run(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    a, b = c.run("a"), c.run("b")
-    self.assertEqual([c.s.procs[p].node for p in (a, b)], ["a", "b"])
-    sampler = c.run("sample", role="sampler", train_run="b")
-    self.assertEqual(c.s.procs[sampler].node, "b")
+    f = self.make_fleet()
+    f.node("a", 1)
+    f.node("b", 1)
+    a, b = f.run("a"), f.run("b")
+    self.assertEqual([f.node_of(p) for p in (a, b)], ["a", "b"])
+    sampler = f.run("sample", role="sampler", train_run="b")
+    self.assertEqual(f.node_of(sampler), "b")
 
   def test_full_fine_tune_sampler_goes_elsewhere_when_its_trainers_node_is_full(self):
-    c = Cluster()
-    c.node("a", 2)
-    c.node("b", 8)
-    x, other = c.run("x", exclusive=True), c.run("r", rank=4)
-    self.assertEqual([c.s.procs[p].node for p in (x, other)], ["a", "b"])
-    c.s.procs[other].node = "a"
-    sampler = c.run("sample", role="sampler", train_run="x", exclusive=True)
-    self.assertEqual(c.s.procs[sampler].node, "b")
+    f = self.make_fleet()
+    f.node("a", 2)
+    f.node("b", 8)
+    x = f.run("x", exclusive=True)
+    self.assertEqual(f.node_of(x), "a")
+    y = f.run("y", rank=4, exclusive=True)
+    self.assertEqual(f.node_of(y), "b")
+    # Fill remaining slot on `a` with an exclusive worker so `x`'s exclusive sampler must spill to `b`.
+    f.ctrl.nodes["a"].workers[y] = f.ctrl.nodes["b"].workers.pop(y)
+    f.ctrl.runs["y"].owner = (y, "a", f.boots["a"])
+    sampler = f.run("sample", role="sampler", train_run="x", exclusive=True)
+    self.assertEqual(f.node_of(sampler), "b")
 
   def test_a_full_fine_tunes_trainer_keeps_room_beside_it_for_its_sampler(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 2)
-    c.node("c", 8)
-    t = c.run("t")
-    others = [c.run(f"r{i}", rank=4, base=f"m{i}") for i in range(5)]
-    self.assertEqual([c.s.procs[p].node for p in [t, *others]], ["b", "a", "c", "c", "c", "c"])
-    lora = c.run("q", role="sampler", rank=4, base="m0")
-    sampler = c.run("sample", role="sampler", train_run="t")
-    self.assertEqual([c.s.procs[p].node for p in (lora, sampler)], ["c", "b"])
+    f = self.make_fleet()
+    f.node("a", 1)
+    f.node("b", 2)
+    f.node("c", 8)
+    t = f.run("t")
+    others = [f.run(f"r{i}", rank=4, base=f"m{i}") for i in range(5)]
+    self.assertEqual([f.node_of(p) for p in [t, *others]], ["b", "a", "c", "c", "c", "c"])
+    lora = f.run("q", role="sampler", rank=4, base="m0")
+    sampler = f.run("sample", role="sampler", train_run="t")
+    self.assertEqual([f.node_of(p) for p in (lora, sampler)], ["c", "b"])
 
   def test_a_second_sampler_stays_near_its_trainer_when_other_free_gpus_are_owed(self):
-    c = Cluster()
-    c.node("a", 2)
-    c.node("b", 8)
-    t = c.run("t")
-    others = [c.run(f"r{i}") for i in range(4)]
-    self.assertEqual([c.s.procs[p].node for p in [t, *others]], ["a", "b", "b", "b", "b"])
-    q = c.run("q", role="sampler", train_run="t")
-    g = c.run("g", role="sampler", train_run="t", base="b")
-    self.assertEqual([c.s.procs[p].node for p in (q, g)], ["a", "a"])
+    f = self.make_fleet()
+    f.node("a", 2)
+    f.node("b", 8)
+    t = f.run("t")
+    others = [f.run(f"r{i}") for i in range(4)]
+    self.assertEqual([f.node_of(p) for p in [t, *others]], ["a", "b", "b", "b", "b"])
+    q = f.run("q", role="sampler", train_run="t")
+    g = f.run("g", role="sampler", train_run="t", base="b")
+    self.assertEqual([f.node_of(p) for p in (q, g)], ["a", "a"])
 
-  def test_lost_or_shrunk_node_procs_are_reassigned(self):
-    c = Cluster()
-    c.node("a", 2)
-    p = c.run("r", gpus=2)
-    c.node("b", 2)
-    c.lose("a")
-    changes = c.settle()
-    self.assertEqual(changes[0], (Ev.UNPLACED, {"proc": p, "rule": "place.node_lost"}))
-    self.assertEqual(c.s.procs[p].node, "b")
-    c.nodes["b"]["gpus"] = 1
-    c.settle()
-    self.assertIsNone(c.s.procs[p].node)
-
-  def test_multi_gpu_proc_waits_for_a_node_that_has_enough_gpus(self):
-    c = Cluster()
-    c.node("a", 1)
-    p = c.run("wide", gpus=2)
-    self.assertIsNone(c.s.procs[p].node)
-    c.node("b", 4)
-    self.assertEqual(c.s.procs[p].node, "b")
+  def test_lost_node_and_multi_gpu_waiting(self):
+    f = self.make_fleet()
+    f.node("a", 1)
+    self.assertIsNone(f.run("wide", gpus=2, backlog=1))
+    f.node("b", 4)
+    p = f.home("wide")
+    self.assertIsNotNone(p)
+    self.assertEqual(f.node_of(p), "b")
+    f.node("c", 2)
+    f.ctrl.runs["wide"].status = "saved"  # type: ignore[assignment]
+    f.ctrl.runs["wide"].snapshot = "snap"
+    f.lose("b")
+    p2 = f.home("wide")
+    self.assertIsNotNone(p2)
+    self.assertEqual(f.node_of(p2), "c")
 
   def test_lora_runs_share_when_idle_split_when_busy_and_merge_when_squeezed(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    p1 = c.run("r1", rank=8)
-    self.assertEqual(c.run("r2", rank=8), p1)
-    others = [c.run("r3", rank=8, base="b"), c.run("f"), c.run("x", rank=8, exclusive=True)]
+    f = self.make_fleet()
+    f.node("a", 1)
+    f.node("b", 1)
+    p1 = f.run("r1", rank=8)
+    self.assertEqual(f.run("r2", rank=8), p1)
+    others = [f.run("r3", rank=8, base="b"), f.run("f"), f.run("x", rank=8, exclusive=True)]
     self.assertEqual(len({p1, *others}), 4)
 
-    c = Cluster()
-    c.node("a", 1)
-    p1 = c.run("r1", rank=8, backlog=1)
-    self.assertEqual(c.run("r2", rank=8, backlog=1), p1)
-    c.node("b", 1)
-    p2 = c.s.home["r2"]
+    f = self.make_fleet()
+    f.node("a", 1)
+    p1 = f.run("r1", rank=8, backlog=1)
+    self.assertEqual(f.run("r2", rank=8, backlog=1), p1)
+    f.node("b", 1)
+    p2 = f.home("r2")
     self.assertNotEqual(p1, p2)
-    self.assertEqual({c.s.procs[p1].node, c.s.procs[p2].node}, {"a", "b"})
-    c.run("excl", exclusive=True, backlog=1)
-    c.settle()  # the trainer on the exclusive's node is unplaced and joins the other node
-    c.settle()  # where the two merge
-    self.assertEqual(c.s.home["r1"], c.s.home["r2"])
-    check_plan_invariants(self, c.s)
+    self.assertEqual({f.node_of(p1), f.node_of(p2)}, {"a", "b"})
+    f.run("excl", exclusive=True, backlog=1)
+    f.settle()
+    self.assertEqual(f.home("r1"), f.home("r2"))
+    check_fleet_invariants(self, f)
 
   def test_subscribed_node_with_idle_peers_does_not_split_or_scale_out_thrash(self):
-    c = Cluster()
-    c.node("a", 2)
-    s1 = c.run("s1", role="sampler", base="m1")
-    c.run("s2", role="sampler", base="m2")
-    p1 = c.run("r1", rank=8, backlog=1)
-    self.assertEqual(c.run("r2", rank=8, backlog=1), p1)
-    self.assertEqual(c.s.home["r1"], c.s.home["r2"])
-    c.queue("r1", 0)
-    c.queue("r2", 0)
-    c.queue("s1", 12)
-    c.settle()
-    self.assertEqual((c.s.procs_of("s1"), c.s.made), ([s1], 3))
-    check_plan_invariants(self, c.s)
+    f = self.make_fleet()
+    f.node("a", 2)
+    s1 = f.run("s1", role="sampler", base="m1")
+    f.run("s2", role="sampler", base="m2")
+    p1 = f.run("r1", rank=8, backlog=1)
+    self.assertEqual(f.run("r2", rank=8, backlog=1), p1)
+    self.assertEqual(f.home("r1"), f.home("r2"))
+    f.queue("r1", 0)
+    f.queue("r2", 0)
+    f.queue("s1", 12)
+    f.settle()
+    self.assertEqual(f.workers_of("s1"), [s1])
+    check_fleet_invariants(self, f)
 
   def test_sampling_sessions_share_only_their_kind_and_exclusive_training_run(self):
-    c = Cluster()
-    c.run("X", rank=8, exclusive=True)
-    c.run("Z", rank=8, exclusive=True)
-    a = c.run("a", role="sampler", rank=8, train_run="A")
-    b = c.run("b", role="sampler", rank=8, train_run="B")
-    fft = c.run("f", role="sampler", train_run="A")
-    x = c.run("x", role="sampler", rank=8, train_run="X", exclusive=True)
-    y = c.run("y", role="sampler", rank=8, train_run="X", exclusive=True)
-    z = c.run("z", role="sampler", rank=8, train_run="Z", exclusive=True)
+    f = self.make_fleet()
+    f.node("n", 8)
+    f.run("A", rank=8)
+    f.run("B", rank=8)
+    f.run("X", rank=8, exclusive=True)
+    f.run("Z", rank=8, exclusive=True)
+    a = f.run("a", role="sampler", rank=8, train_run="A")
+    b = f.run("b", role="sampler", rank=8, train_run="B")
+    fft = f.run("f", role="sampler", train_run="A")
+    x = f.run("x", role="sampler", rank=8, train_run="X", exclusive=True)
+    y = f.run("y", role="sampler", rank=8, train_run="X", exclusive=True)
+    z = f.run("z", role="sampler", rank=8, train_run="Z", exclusive=True)
     self.assertEqual(a, b)
     self.assertEqual(x, y)
     self.assertEqual(len({a, b, fft, x, y, z}), 4)
-    self.assertNotEqual(c.s.home["X"], c.s.home["Z"])  # exclusive LoRA runs on one base still get a trainer each
+    self.assertNotEqual(f.home("X"), f.home("Z"))
 
   def test_a_sampling_session_without_an_account_bills_its_training_run(self):
-    c = Cluster()
-    c.run("t", session="s1")
-    c.run("q", role="sampler", train_run="t", session="s2")
-    c.run("base", role="sampler", session="s3")
-    self.assertEqual([c.s.account(r) for r in ("t", "q", "base")], ["s1", "s1", "s3"])
-
-  def test_a_proc_is_owed_what_its_ready_runs_are_owed(self):
-    jobs = {"a": Job(Spec(lora=True), account="A", backlog=1), "b": Job(Spec(lora=True), account="B")}
-    s = State(procs={"p": Proc(Spec(lora=True), "n")}, home={"a": "p", "b": "p"}, jobs=jobs, lag={"A": 5.0, "B": 9.0})
-    self.assertEqual(s.lag_of("p"), 5.0)
+    f = self.make_fleet()
+    f.ctrl.create_run(Run("t", "a", 0, session="s1"))
+    f.ctrl.create_run(Run("q", "a", 0, role=Role.SAMPLER, train_run="t", session="s2"))
+    f.ctrl.create_run(Run("base", "a", 0, role=Role.SAMPLER, session="s3"))
+    self.assertEqual([f.ctrl.account(r) for r in ("t", "q", "base")], ["s1", "s1", "s3"])
 
   def test_demand_is_what_each_account_could_run_now(self):
-    c = Cluster()
-    c.node("a", 2)
-    c.node("b", 2)
-    c.run("idle", rank=4, base="z", account="idle")  # nothing queued: nothing
-    c.run("wide", gpus=4, backlog=1, account="wide")  # wider than any node: nothing
-    c.run("t", rank=4, backlog=9, account="t")  # a trainer is one process however long its queue
-    c.run("x", role="sampler", train_run="t", exclusive=True, backlog=9, account="x")  # so is an exclusive sampler
-    c.run("s", role="sampler", base="m", backlog=3 * MAX_SEQS, account="s")  # a shared sampler: a replica per MAX_SEQS
-    c.run("big", role="sampler", base="n", backlog=99 * MAX_SEQS, account="big")  # up to every GPU there is
-    self.assertEqual(scheduler.demand(c.s, 4.0), {"t": 1, "x": 1, "s": 3, "big": 4})
+    nodes = {"a": 2, "b": 2}
+    runs = [
+      ("idle", WorkerSpec(Role.TRAINER, "z", True), 0),
+      ("wide", WorkerSpec(Role.TRAINER, "a", False, gpus=4), 1),
+      ("t", WorkerSpec(Role.TRAINER, "a", True), 9),
+      ("x", WorkerSpec(Role.SAMPLER, "a", False, True, "t"), 9),
+      ("s", WorkerSpec(Role.SAMPLER, "m", False), 3 * MAX_SEQS),
+      ("big", WorkerSpec(Role.SAMPLER, "n", False), 99 * MAX_SEQS),
+    ]
+    self.assertEqual(account_demand(runs, nodes), {"t": 1, "x": 1, "s": 3, "big": 4})
 
   def test_a_backlogged_shared_sampler_gets_a_replica_per_batch_and_an_exclusive_one_does_not(self):
-    c = Cluster()
+    f = self.make_fleet()
     for node in "abcde":
-      c.node(node, 1)
-    c.run("t")
-    c.run("x", role="sampler", train_run="t", exclusive=True, backlog=3 * MAX_SEQS)
-    c.run("s", role="sampler", backlog=3 * MAX_SEQS)
-    self.assertEqual((len(c.s.procs_of("x")), len(set(c.s.procs_of("s")))), (1, 3))
+      f.node(node, 1)
+    f.run("t")
+    f.run("x", role="sampler", train_run="t", exclusive=True, backlog=3 * MAX_SEQS)
+    f.run("s", role="sampler", backlog=3 * MAX_SEQS)
+    self.assertEqual((len(f.workers_of("x")), len(set(f.workers_of("s")))), (1, 3))
 
   def test_unplaced_sampler_pool_does_not_scale_out_onto_busy_single_gpu_node(self):
-    spec = Spec(Role.SAMPLER, "tiny", lora=True, gpus=1)
-    state = State(
-      nodes={"n1": (1, 0)},
-      jobs={"s1": Job(spec, backlog=4 * MAX_SEQS, account="alice")},
-    )
-    new, _ = step(state)
-    self.assertEqual(len(new.procs), 1)
-    self.assertEqual(next(iter(new.procs.values())).node, "n1")
+    f = self.make_fleet()
+    f.node("n1", 1)
+    f.run("s1", role="sampler", rank=4, backlog=4 * MAX_SEQS, account="alice")
+    self.assertEqual(len(f.workers_of("s1")), 1)
 
-  def test_scale_out_reuses_existing_placed_pool_before_spawning_more(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 2)
-    first = c.run("s", role="sampler")
-    c.s.procs["p9"] = Proc(c.s.procs[first].spec, "b")
-    c.runs["o"], c.queues["o"] = dict(c.runs["s"]), 0
-    c.queue("s", 2 * MAX_SEQS)
-    c.settle()
-    self.assertEqual(c.s.procs_of("s"), [first, "p9"])  # the existing replica on b, not a third process
-    c.queue("s", 3 * MAX_SEQS)
-    c.queue("o", 1)
-    c.settle()
-    self.assertEqual(len(c.s.procs_of("s")), 3)  # a third replica spawns on b's other GPU
-    new_proc = next(p for p in c.s.procs_of("s") if p not in (first, "p9"))
-    self.assertEqual(c.s.procs[new_proc].node, "b")
+  def test_two_busy_sessions_do_not_split_their_lora_sampler_while_fft_scales_out(self):
+    f = self.make_fleet()
+    f.node("a", 1)
+    f.node("b", 1)
+    self.assertEqual(f.run("s1", role="sampler", rank=4), f.run("s2", role="sampler", rank=4))
+    f.queue("s1", 1)
+    f.queue("s2", 1)
+    f.settle()
+    self.assertEqual(len(f.workers_of("s1")), 1)
 
-  def test_two_busy_sessions_do_not_split_their_sampler(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    self.assertEqual(c.run("s1", role="sampler", rank=4), c.run("s2", role="sampler", rank=4))
-    c.queue("s1", 1)
-    c.queue("s2", 1)
-    c.settle()
-    self.assertEqual(c.s.procs_of("s1"), c.s.procs_of("s2"))
-    self.assertEqual(len(c.s.procs_of("s1")), 1)
-
-  def test_two_busy_fft_samplers_scale_out_onto_spare_gpu(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    c.run("f1", role="sampler", rank=0)
-    c.run("f2", role="sampler", rank=0)
-    c.queue("f1", 1)
-    c.queue("f2", 1)
-    c.settle()
-    self.assertEqual(len(c.s.procs_of("f1")), 2)
+    f2 = self.make_fleet()
+    f2.node("a", 1)
+    f2.node("b", 1)
+    f2.run("f1", role="sampler", rank=0, backlog=1)
+    f2.run("f2", role="sampler", rank=0, backlog=1)
+    self.assertEqual(len(f2.workers_of("f1")), 2)
 
   def test_idle_lora_trainers_stay_split_while_their_node_has_room(self):
-    c = Cluster()
-    c.node("a", 2)
-    self.assertNotEqual(c.run("r1", rank=4, backlog=1), c.run("r2", rank=4, backlog=1))
-    c.queue("r1", 0)
-    c.queue("r2", 0)
-    c.settle()
-    self.assertNotEqual(c.s.home["r1"], c.s.home["r2"])
+    f = self.make_fleet()
+    f.node("a", 2)
+    self.assertNotEqual(f.run("r1", rank=4, backlog=1), f.run("r2", rank=4, backlog=1))
+    f.queue("r1", 0)
+    f.queue("r2", 0)
+    f.settle()
+    self.assertNotEqual(f.home("r1"), f.home("r2"))
 
-  def test_a_busy_lora_trainer_moves_to_a_spare_node_rather_than_merging(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    p1, p2 = c.run("r1", rank=4, backlog=1), c.run("r2", rank=4, backlog=1)
-    c.lose("b")
-    c.settle()
-    self.assertEqual((c.s.procs[p1].node, c.s.procs[p2].node), ("a", "a"))
-    c.node("c", 1)
-    self.assertEqual((c.s.home["r1"], c.s.home["r2"]), (p1, p2))
-    self.assertEqual({c.s.procs[p1].node, c.s.procs[p2].node}, {"a", "c"})
-
-  def test_an_idle_proc_stays_on_a_crowded_node(self):
-    c = Cluster()
-    c.node("a", 1)
-    idle = c.run("idle", rank=4, base="x")
+  def test_idle_and_crowded_rebalance_rules(self):
+    f = self.make_fleet()
+    f.node("a", 1)
+    idle = f.run("idle", rank=4, base="x")
     for i in range(2):
-      c.run(f"busy{i}", rank=4, base=f"y{i}", backlog=1)
-    c.node("b", 1)
-    self.assertEqual(c.s.procs[idle].node, "a")
+      f.run(f"busy{i}", rank=4, base=f"y{i}", backlog=1)
+    f.node("b", 1)
+    self.assertEqual(f.node_of(idle), "a")
 
-  def test_a_busy_proc_beside_an_idle_one_is_not_crowded(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.run("idle", rank=4, base="x")
-    busy = c.run("busy", rank=4, base="y", backlog=1)
-    c.node("b", 1)
-    self.assertEqual(c.s.procs[busy].node, "a")
+    f2 = self.make_fleet()
+    f2.node("a", 1)
+    f2.run("idle", rank=4, base="x")
+    busy = f2.run("busy", rank=4, base="y", backlog=1)
+    f2.node("b", 1)
+    self.assertEqual(f2.node_of(busy), "a")
 
-  def test_an_exclusive_proc_holds_its_gpus_whether_or_not_it_is_busy(self):
-    jobs = {"r": Job(Spec(exclusive=True), backlog=1)}
-    s = State(nodes={"n": (2, 0)}, procs={"x": Proc(Spec(exclusive=True), "n")}, home={"r": "x"}, jobs=jobs)
-    self.assertEqual(s.spare("n"), 1)
-
-  def test_crowding_moves_a_shared_proc_and_never_an_exclusive_one(self):
-    c = Cluster()
-    c.node("a", 2)
-    x = c.run("x", exclusive=True, backlog=1)
-    shared = [c.run(f"r{i}", rank=4, base=f"m{i}", backlog=1) for i in range(2)]
-    c.node("b", 1)
-    self.assertEqual(c.s.procs[x].node, "a")
-    self.assertEqual(sorted(c.s.procs[p].node for p in shared), ["a", "b"])
-
-  def test_scale_out_does_not_reuse_a_sampler_that_has_no_node(self):
-    c = Cluster()
-    c.node("a", 1)
-    first = c.run("s", role="sampler")
-    c.s.procs["p9"] = Proc(c.s.procs[first].spec, None)
-    c.runs["o"], c.queues["o"] = dict(c.runs["s"]), 0
-    c.queue("s", 2 * MAX_SEQS)
-    c.settle()
-    self.assertEqual(c.s.procs_of("s"), [first])
+    f3 = self.make_fleet()
+    f3.node("a", 2)
+    x = f3.run("x", exclusive=True, backlog=1)
+    shared = [f3.run(f"r{i}", rank=4, base=f"m{i}", backlog=1) for i in range(2)]
+    f3.node("b", 1)
+    self.assertEqual(f3.node_of(x), "a")
+    self.assertEqual(sorted(f3.node_of(f3.home(f"r{i}")) for i in range(2)), ["a", "b"])
+    self.assertEqual(len(shared), 2)
 
   def test_rotation_weighs_a_mover_against_the_busy_shared_procs_on_the_other_node(self):
-    def target(c_lag: float, n2: int = 1, **extra) -> str | None:
-      specs = {"me": (Spec(lora=True, base="me"), "n1", 1), "b": (Spec(lora=True, base="b"), "n1", 1)}
-      specs |= {"c": (Spec(lora=True, base="c"), "n2", 1)} | extra
-      s = State(nodes={"n1": (1, 0), "n2": (n2, 0)}, lag={"me": 30000.0, "b": 25000.0, "c": c_lag, "x": -50000.0})
-      for name, (spec, node, backlog) in specs.items():
-        s.procs[name], s.home[name], s.jobs[name] = Proc(spec, node), name, Job(spec, account=name, backlog=backlog)
-      return scheduler.rebalance_target(s, "me")
+    def target(c_lag: float, n2: int = 1, extra: list[Placed] = ()) -> str | None:
+      me = Placed("n1", "me", WorkerSpec(Role.TRAINER, "me", True), True, 30000.0)
+      placed = [
+        me,
+        Placed("n1", "b", WorkerSpec(Role.TRAINER, "b", True), True, 25000.0),
+        Placed("n2", "c", WorkerSpec(Role.TRAINER, "c", True), True, c_lag),
+        *extra,
+      ]
+      return rebalance_target(me, {"n1": 1, "n2": n2}, placed)
 
-    self.assertEqual(target(5000.0), "n2")  # owed REBALANCE_MS more than `c`, who is owed less than `b`
-    self.assertIsNone(target(15000.0))  # not owed enough more than `c`
-    self.assertIsNone(target(15000.0, d=(Spec(lora=True, base="d"), "n2", 0)))  # an idle proc there changes nothing
-    self.assertIsNone(target(15000.0, 2, x=(Spec(exclusive=True), "n2", 1)))  # nor does an exclusive one
-
-  def test_a_new_run_joins_the_matching_trainer_with_the_fewest_runs(self):
-    c = Cluster()
-    c.node("a", 2)
-    first = c.run("r1", rank=4)
-    c.s.procs["p9"] = Proc(c.s.procs[first].spec, "a")
-    c.runs["r2"], c.queues["r2"], c.s.home["r2"] = dict(c.runs["r1"]), 0, first
-    c.runs["r3"], c.queues["r3"], c.s.home["r3"] = dict(c.runs["r1"]), 0, "p9"
-    self.assertEqual(c.run("r4", rank=4), "p9")
+    self.assertEqual(target(5000.0), "n2")
+    self.assertIsNone(target(15000.0))
+    self.assertIsNone(target(15000.0, extra=[Placed("n2", "d", WorkerSpec(Role.TRAINER, "d", True), False, 0.0)]))
+    self.assertIsNone(
+      target(15000.0, 2, [Placed("n2", "x", WorkerSpec(Role.TRAINER, "x", False, True), True, -50000.0)])
+    )
 
   def test_only_a_trainer_is_owed_room_for_a_sampler(self):
-    c = Cluster()
-    c.node("a", 2)
-    q = c.run("q", role="sampler")
-    c.node("b", 2)
-    c.run("r1", rank=4, base="m1")
-    self.assertEqual([c.s.procs[p].node for p in (q, c.s.home["r1"])], ["a", "b"])
-    new = c.run("r2", rank=4, base="m2")
-    self.assertEqual(c.s.procs[new].node, "a")
-
-  def test_an_empty_proc_owned_from_a_lost_node_is_collected(self):
-    c = Cluster()
-    c.node("n", 1)
-    c.run("r")
-    c.s.procs["p9"] = Proc(Spec(), None)
-    c.runs["r"]["owner"] = ["p9", "gone-1", "1"]
-    c.settle()
-    self.assertNotIn("p9", c.s.procs)
+    f = self.make_fleet()
+    f.node("a", 2)
+    q = f.run("q", role="sampler")
+    f.node("b", 2)
+    r1 = f.run("r1", rank=4, base="m1")
+    self.assertEqual([f.node_of(q), f.node_of(r1)], ["a", "b"])
+    self.assertEqual(f.node_of(f.run("r2", rank=4, base="m2")), "a")
 
   def test_sampler_settings_follow_the_node(self):
-    self.assertEqual(scheduler.settings(1, 24 * GIB), {})
-    self.assertEqual(scheduler.settings(2, 80 * GIB), {"TINYRL_KV_BYTES": str(24 * GIB)})
+    seen = {}
+    for mib in (24 * 1024, 80 * 1024):
+      d = NodeDaemon(types.SimpleNamespace(), gpus=1, node="n", gpu_mib=mib, store=Store(root=tempfile.mkdtemp()))
+      d.open_sampler = lambda wid, spec, env, m=mib: seen.setdefault(m, env.get("TINYRL_KV_BYTES"))  # type: ignore[assignment]
+      d.spawn("s", WorkerSpec(role=Role.SAMPLER, base="b"), (0,))
+    self.assertIsNone(seen[24 * 1024])
+    self.assertEqual(seen[80 * 1024], str(24 * GIB))
 
   def test_exclusive_evacuates_squeezed_shareable_procs_and_never_overcommits(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    pa = c.run("ra", backlog=1)
-    pb = c.run("rb", backlog=1)
-    self.assertEqual({c.s.procs[pa].node, c.s.procs[pb].node}, {"a", "b"})
-    x = c.run("x", exclusive=True, backlog=1)
-    c.settle()  # the proc that no longer fits beside `x` is unplaced, and placed again on the other node
-    x_node = c.s.procs[x].node
+    f = self.make_fleet()
+    f.node("a", 1)
+    f.node("b", 1)
+    f.run("ra", backlog=1)
+    f.run("rb", backlog=1)
+    self.assertEqual({f.node_of(f.home("ra")), f.node_of(f.home("rb"))}, {"a", "b"})
+    x = f.run("x", exclusive=True, backlog=1)
+    f.settle()
+    x_node = f.node_of(x)
     other = "b" if x_node == "a" else "a"
-    self.assertEqual((c.s.procs[pa].node, c.s.procs[pb].node), (other, other))
-    # Even huge lag never lets a shareable proc move onto `x`'s fully exclusive node.
-    c.s.lag["ra"] = c.s.lag["rb"] = 100 * REBALANCE_MS
-    c.settle()
-    self.assertEqual((c.s.procs[pa].node, c.s.procs[pb].node), (other, other))
-    # A third exclusive waits unplaced when both 1-GPU nodes already hold exclusives.
-    y = c.run("y", exclusive=True)
-    z = c.run("z", exclusive=True)
-    self.assertEqual({c.s.procs[x].node, c.s.procs[y].node}, {"a", "b"})
-    self.assertIsNone(c.s.procs[z].node)
-    check_plan_invariants(self, c.s)
+    self.assertEqual((f.node_of(f.home("ra")), f.node_of(f.home("rb"))), (other, other))
+    f.ctrl.lag["ra"] = f.ctrl.lag["rb"] = 100 * REBALANCE_MS
+    f.settle()
+    self.assertEqual((f.node_of(f.home("ra")), f.node_of(f.home("rb"))), (other, other))
+    y = f.run("y", exclusive=True, backlog=1)
+    z = f.run("z", exclusive=True, backlog=1)
+    self.assertEqual({f.node_of(x), f.node_of(y)}, {"a", "b"})
+    self.assertIsNone(z)
+    check_fleet_invariants(self, f)
 
-  def test_random_clusters_settle_round_trip_and_preserve_invariants(self):
-    for seed in range(100):
-      rng, c = random.Random(seed), Cluster()
-      for _ in range(80):
-        roll, name = rng.random(), f"x{rng.randrange(8)}"
-        if roll < 0.15:
-          c.node(name, rng.choice([1, 2, 4]))
-        elif roll < 0.23:
-          c.lose(name)
-        elif roll < 0.65 and name not in c.runs:
-          role = rng.choice(["trainer", "trainer", "sampler"])
-          excl = rng.random() < 0.15 and role == "trainer"
-          c.run(
-            name,
-            role=role,
-            rank=rng.choice([0, 8]),
-            base=str(rng.randrange(3)),
-            gpus=rng.choice([1, 2]),
-            exclusive=excl,
-            backlog=rng.choice([0, 1, 2, 8]),
-          )
-        elif roll < 0.82 and c.runs:
-          r = rng.choice(list(c.runs))
-          c.queue(r, rng.choice([0, 1, 8]))
-          if rng.random() < 0.5 and r in c.s.jobs:
-            c.serve(r, rng.choice([500.0, 2000.0, 25_000.0]))
-        else:
-          c.delete(name)
-        c.settle()
-        check_plan_invariants(self, c.s)
-        saved = from_plan(to_plan(c.s))  # the plan comes back from the database as it went in
-        saved.nodes, saved.jobs, saved.service = c.s.nodes, c.s.jobs, c.s.service
-        self.assertEqual(saved, c.s)
-        c.settle()
-        check_plan_invariants(self, c.s)
-        again, changes = step(c.s)
-        self.assertEqual(changes, [])
-        self.assertEqual(again, c.s)
+  def test_random_clusters_preserve_invariants(self):
+    for seed in range(40):
+      rng, f = random.Random(seed), FleetSim()
+      try:
+        for _ in range(40):
+          roll, name = rng.random(), f"x{rng.randrange(8)}"
+          if roll < 0.15:
+            f.node(name, rng.choice([1, 2, 4]))
+          elif roll < 0.23:
+            f.lose(name)
+          elif roll < 0.65 and (name not in f.ctrl.runs or not f.ctrl.runs[name].live):
+            role = rng.choice(["trainer", "trainer", "sampler"])
+            excl = rng.random() < 0.15 and role == "trainer"
+            f.run(
+              name,
+              role=role,
+              rank=rng.choice([0, 8]),
+              base=str(rng.randrange(3)),
+              gpus=rng.choice([1, 2]),
+              exclusive=excl,
+              backlog=rng.choice([0, 1, 2, 8]),
+            )
+          elif roll < 0.82:
+            live = [r for r, rs in f.ctrl.runs.items() if rs.live]
+            if live:
+              r = rng.choice(live)
+              f.queue(r, rng.choice([0, 1, 8]))
+              if rng.random() < 0.5:
+                f.serve(r, rng.choice([500.0, 2000.0, 25_000.0]))
+          elif name in f.ctrl.runs and f.ctrl.runs[name].live:
+            f.delete(name)
+          f.settle()
+          check_fleet_invariants(self, f)
+      finally:
+        f.close()
 
 
 class TestLocalQuantum(unittest.TestCase):
   def make_daemon(self, gpus: int) -> NodeDaemon:
     store = Store(tempfile.mkdtemp())
-    node = NodeDaemon(types.SimpleNamespace(r=None), gpus=gpus, node="n", gpu_mib=0, store=store)  # type: ignore[arg-type]
+    node = NodeDaemon(types.SimpleNamespace(), gpus=gpus, node="n", gpu_mib=0, store=store)
     self.addCleanup(store.close)
     return node
 
   def test_ready_runs_share_service_even_when_commands_have_different_costs(self):
     heads = [Cmd(run, "1-0", Op.FORWARD_BACKWARD, b"") for run in ("slow", "fast")]
     service = {"slow": 0.0, "fast": 0.0}
-    state = State()
     for _ in range(11):
-      run = rank_runs(heads, state.ready_lag, service)[0]
+      run = rank_runs(heads, lambda _: 0.0, service)[0]
       service[run] += 10 if run == "slow" else 1
     self.assertEqual(service, {"slow": 10.0, "fast": 10.0})
 
@@ -537,59 +575,42 @@ class TestLocalQuantum(unittest.TestCase):
       Cmd("same_ms_later", "9-10", Op.OPTIM_STEP, b""),
       Cmd("first", "9-2", Op.OPTIM_STEP, b""),
     ]
-    state = State(jobs={cmd.run: Job(Spec(), account="alice") for cmd in heads})
-    self.assertEqual(rank_runs(heads, state.ready_lag, {}), ["first", "same_ms_later", "later"])
-    # Sub-microsecond float drift from split waves must not outrank run service or arrival order.
+    self.assertEqual(rank_runs(heads, lambda _: 0.0, {}), ["first", "same_ms_later", "later"])
     tiny_drift = {"later": 1e-12, "same_ms_later": 0.0, "first": 0.0}
     self.assertEqual(rank_runs(heads, tiny_drift.__getitem__, {})[0], "first")
 
   def test_account_lag_precedes_run_service_and_arrival(self):
-    cluster = Cluster()
-    cluster.run("current", account="alice")
-    cluster.run("save", account="alice")
-    cluster.run("waiting", account="bob")
-    state = cluster.s
-    state.lag = {"alice": 10, "bob": 5}
-    state.seen = {"alice": 100}
-    state.service = {"alice": 110}
+    accts = {"current": "alice", "save": "alice", "waiting": "bob"}
+    lag, seen, svc = {"alice": 10.0, "bob": 5.0}, {"alice": 100.0}, {"alice": 110.0}
     heads = [
       Cmd("current", "1-0", Op.OPTIM_STEP, b""),
       Cmd("save", "2-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""),
       Cmd("waiting", "3-0", Op.OPTIM_STEP, b""),
     ]
-    self.assertEqual(rank_runs(heads, state.ready_lag, {"waiting": 1000})[0], "waiting")
+    self.assertEqual(rank_runs(heads, lambda r: ready_lag(lag, seen, svc, accts[r]), {"waiting": 1000})[0], "waiting")
 
   def test_continuous_sampler_saves_share_a_trainer_with_training_work(self):
-    cluster = Cluster()
-    for run in ("saving", "training"):
-      cluster.run(run, account="alice")
     heads = [Cmd("saving", "1-0", Op.SAVE_WEIGHTS_FOR_SAMPLER, b""), Cmd("training", "2-0", Op.OPTIM_STEP, b"")]
     service = {"saving": 0, "training": 0}
     for _ in range(12):
-      run = rank_runs(heads, cluster.s.ready_lag, service)[0]
+      run = rank_runs(heads, lambda _: 0.0, service)[0]
       service[run] += 3 if run == "saving" else 1
     self.assertEqual(service, {"saving": 9, "training": 9})
 
-  def test_admit_samples_never_exceeds_free_slots(self):
+  def test_sampler_wave_obeys_account_and_version_limits_and_rotates_within_them(self):
     queues = {
-      "b1": [Cmd("b1", f"1-{i}", Op.SAMPLE, b"{}") for i in range(2)],
-      "b2": [Cmd("b2", f"2-{i}", Op.SAMPLE, b"{}") for i in range(2)],
+      run: [Cmd(run, f"{i}-{j}", Op.SAMPLE, b"{}") for j in range(3)] for i, run in enumerate(("a1", "a2", "a3", "b1"))
     }
     heads = [q[0] for q in queues.values()]
-    admitted = admit_samples(
-      heads,
-      lambda r, n: queues[r][:n],
-      lambda r: "B",
-      lambda r: 0.0,
-      {},
-      lambda r: None,
-      {"A": 6},
-      set(),
-      8,
-      16,
+    versions = {"a1": "v1", "a2": "v1", "a3": "v2", "b1": "v1"}
+    # max_loras=1 skips a3 (v2), splits 4 slots fairly 2/2 across accounts a and b, and rotates a1/a2 inside a.
+    admitted = admit_samples(heads, lambda r, n: queues[r][:n], lambda r: r[0], lambda r: 0, {}, versions.get, 4, 1)
+    self.assertEqual([c.run for c in admitted], ["a1", "a2", "b1", "b1"])
+    # Existing in-flight slots for account a tilt new slots toward account b until balanced.
+    topped = admit_samples(
+      heads, lambda r, n: queues[r][:n], lambda r: r[0], lambda r: 0, {}, versions.get, 3, 2, {"a": 2}
     )
-    self.assertEqual(len(admitted), 2)
-    self.assertEqual({c.run for c in admitted}, {"b1", "b2"})
+    self.assertEqual([c.run for c in topped], ["a1", "b1", "b1"])
 
   def test_local_guard_enforces_gpu_exclusivity_under_concurrent_handoffs(self):
     async def run():
@@ -616,31 +637,22 @@ class TestLocalQuantum(unittest.TestCase):
         async def close(self):
           active_gpus.pop(self.wid, None)
 
-      node.open_trainer = lambda wid, width, env: FakeModel(wid)
       rng = random.Random(7)
       specs = [
-        (f"p{i}", Spec(Role.TRAINER, "b", gpus=w), tuple(range(g, g + w)))
+        (f"p{i}", WorkerSpec(Role.TRAINER, "b", gpus=w), tuple(range(g, g + w)))
         for i, (g, w) in enumerate([(0, 2), (2, 2), (0, 1), (1, 1), (2, 1), (3, 1)])
       ]
 
-      async def use(wid, spec, gpus):
-        h = node.workers.setdefault(wid, WorkerHandle(wid, spec, FakeModel(wid)))
-        async with node.gpu_cond:
-          h.active += 1
-        try:
-          await node.claim_gpus(h, gpus)
-          await h.ensure_gpu(gpus)
-          await asyncio.sleep(0)
-        finally:
-          async with node.gpu_cond:
-            h.active -= 1
-            if h.active == 0:
-              h.claimed = ()
-            node.gpu_cond.notify_all()
-
       for _ in range(40):
-        batch = rng.sample(specs, 3)
-        await asyncio.gather(*(use(*item) for item in batch))
+        cands = {}
+        for wid, spec, gpus in rng.sample(specs, 3):
+          h = node.workers.setdefault(wid, WorkerHandle(wid, spec, FakeModel(wid)))
+          cands[wid] = Worker(spec.gpus, False, Demand.READY, h.resident, gpus, spec.gpus > 1)
+        keep, _ = plan_gpus(cands, 4, 1.0)
+        for wid, h in list(node.workers.items()):
+          if h.resident and keep.get(wid) != h.resident:
+            await h.park()
+        await asyncio.gather(*(node.workers[wid].ensure_gpu(gpus) for wid, gpus in keep.items()))
         flat = [g for h in node.workers.values() for g in h.resident]
         self.assertEqual(len(flat), len(set(flat)))
       self.assertEqual(violations, [])
@@ -648,121 +660,94 @@ class TestLocalQuantum(unittest.TestCase):
     asyncio.run(run())
 
   def test_active_quantum_prevents_thrash_and_overtime_hands_off_with_zero_wait(self):
-    c = Cluster()
-    c.node("n", 1)
-    p1 = c.run("a", backlog=1)
-    workers, quanta = {p1: Worker(hold_until=2.0)}, {p1: 2.0}
-
-    # Lone client enters OVERTIME at t=2s: no switch, timer stays disarmed, the deadline never resets.
+    lag, seen, svc = {}, {}, {}
+    workers, quanta = {"a": Worker(hold_until=2.0)}, {"a": 2.0}
     for t in (0.0, 0.5, 1.9, 2.5, 10.0):
-      keep, wake = apply_gpus(workers, quanta, c.s, 1, t)
-      self.assertEqual((keep, wake, workers[p1].hold_until), ({p1: (0,)}, None, 2.0))
-      workers[p1] = replace(workers[p1], gpu_ms=workers[p1].gpu_ms + 500.0)
-      c.serve("a", 500.0)
-      c.settle()
+      keep, wake = apply_gpus(workers, quanta, lambda p, lg=lag, sn=seen: ready_lag(lg, sn, svc, p), 1, t)
+      self.assertEqual((keep, wake, workers["a"].hold_until), ({"a": (0,)}, None, 2.0))
+      workers["a"] = replace(workers["a"], gpu_ms=workers["a"].gpu_ms + 500.0)
+      svc["a"] = svc.get("a", 0.0) + 500.0
+      lag, seen = update_lag(lag, seen, svc, 1.0, {"a": 1.0})
 
-    # Late joiner `p2` arrives at t=10s: `p1` is already in overtime -> `p2` gets GPU immediately, held for its quantum.
-    p2 = c.run("b", backlog=1)
-    workers[p2], quanta[p2] = Worker(hold_until=2.0), 2.0
-    keep, wake = apply_gpus(workers, quanta, c.s, 1, 10.0)
-    self.assertEqual((keep, wake), ({p2: (0,)}, None))
-    # Five rapid command boundaries inside [10.0, 12.0) all keep `p2` and arm the quantum timer for t=12.0.
+    workers["b"], quanta["b"] = Worker(hold_until=2.0), 2.0
+    keep, wake = apply_gpus(workers, quanta, lambda p, lg=lag, sn=seen: ready_lag(lg, sn, svc, p), 1, 10.0)
+    self.assertEqual((keep, wake), ({"b": (0,)}, None))
     for t in (10.1, 10.4, 10.9, 11.5, 11.9):
-      keep, wake = apply_gpus(workers, quanta, c.s, 1, t)
-      self.assertEqual((keep, wake, workers[p2].hold_until), ({p2: (0,)}, 12.0, 12.0))
-    # If `p2` goes idle early (RL ping-pong), `p1` takes GPU immediately; if both idle, last owner stays warm.
-    workers[p2] = replace(workers[p2], demand=Demand.IDLE)
-    keep, wake = apply_gpus(workers, quanta, c.s, 1, 11.95)
-    self.assertEqual((keep, wake), ({p1: (0,)}, None))
-    workers[p1] = replace(workers[p1], demand=Demand.IDLE)
-    keep, wake = apply_gpus(workers, quanta, c.s, 1, 12.1)
-    self.assertEqual((keep, wake), ({p1: (0,)}, None))
+      keep, wake = apply_gpus(workers, quanta, lambda p, lg=lag, sn=seen: ready_lag(lg, sn, svc, p), 1, t)
+      self.assertEqual((keep, wake, workers["b"].hold_until), ({"b": (0,)}, 12.0, 12.0))
+    workers["b"] = replace(workers["b"], demand=Demand.IDLE)
+    keep, wake = apply_gpus(workers, quanta, lambda p, lg=lag, sn=seen: ready_lag(lg, sn, svc, p), 1, 11.95)
+    self.assertEqual((keep, wake), ({"a": (0,)}, None))
+    workers["a"] = replace(workers["a"], demand=Demand.IDLE)
+    keep, wake = apply_gpus(workers, quanta, lambda p, lg=lag, sn=seen: ready_lag(lg, sn, svc, p), 1, 12.1)
+    self.assertEqual((keep, wake), ({"a": (0,)}, None))
 
   def test_asymmetric_switch_cost_and_account_grouping_share_gpu_ms_fairly(self):
-    # Trainer (quantum=1s) vs slow-waking sampler (quantum=6s): trainer stays across overtime to catch up with few swaps.
-    c = Cluster()
-    c.node("n", 1)
-    pt = c.run("train", backlog=1)
-    ps = c.run("samp", role="sampler", backlog=1)
-    quanta = {pt: 1.0, ps: 6.0}
+    lag, seen, svc = {}, {}, {}
+    quanta = {"train": 1.0, "samp": 6.0}
     workers = {p: Worker(hold_until=q) for p, q in quanta.items()}
     switches, last, dt = 0, None, 0.5
     for i in range(240):
-      keep, _ = apply_gpus(workers, quanta, c.s, 1, i * dt)
+      keep, _ = apply_gpus(workers, quanta, lambda p, lg=lag, sn=seen: ready_lag(lg, sn, svc, p), 1, i * dt)
       [h] = keep
       switches += h != last
       last = h
       workers[h] = replace(workers[h], gpu_ms=workers[h].gpu_ms + dt * 1000)
-      c.serve(c.s.runs(h)[0], dt * 1000)
-      c.settle()
-    self.assertAlmostEqual(c.service["train"] / sum(c.service.values()), 0.5, delta=0.05)
-    self.assertLessEqual(switches, 24)  # switches once per ~6s sampler quantum, not every 1s trainer quantum
+      svc[h] = svc.get(h, 0.0) + dt * 1000
+      lag, seen = update_lag(lag, seen, svc, 1.0, {"train": 1.0, "samp": 1.0})
+    self.assertAlmostEqual(svc["train"] / sum(svc.values()), 0.5, delta=0.05)
+    self.assertLessEqual(switches, 24)
 
-    # Account grouping: Alice's trainer + sampler pair splits 50/50 against Bob's solo trainer (25/25/50).
-    c = Cluster()
-    c.node("n", 1)
-    t1 = c.run("t1", session="alice", backlog=1)
-    s1 = c.run("s1", role="sampler", train_run="t1", backlog=1)
-    t2 = c.run("t2", session="bob", backlog=1)
-    quanta = {p: 1.0 if p != s1 else 4.0 for p in (t1, s1, t2)}
+    lag, seen, svc = {}, {}, {}
+    acct = {"t1": "alice", "s1": "alice", "t2": "bob"}
+    quanta = {"t1": 1.0, "s1": 4.0, "t2": 1.0}
     workers = {p: Worker(hold_until=q) for p, q in quanta.items()}
     for i in range(240):
-      keep, _ = apply_gpus(workers, quanta, c.s, 1, i * dt)
+      keep, _ = apply_gpus(workers, quanta, lambda p, lg=lag, sn=seen: ready_lag(lg, sn, svc, acct[p]), 1, i * dt)
       [h] = keep
       workers[h] = replace(workers[h], gpu_ms=workers[h].gpu_ms + dt * 1000)
-      c.serve(c.s.runs(h)[0], dt * 1000)
-      c.settle()
-    self.assertAlmostEqual(c.service["alice"] / (c.service["alice"] + c.service["bob"]), 0.5, delta=0.06)
-    self.assertAlmostEqual(workers[t1].gpu_ms / (workers[t1].gpu_ms + workers[s1].gpu_ms), 0.5, delta=0.08)
+      svc[acct[h]] = svc.get(acct[h], 0.0) + dt * 1000
+      lag, seen = update_lag(lag, seen, svc, 1.0, {"alice": 2.0, "bob": 1.0})
+    self.assertAlmostEqual(svc["alice"] / (svc["alice"] + svc["bob"]), 0.5, delta=0.06)
+    self.assertAlmostEqual(workers["t1"].gpu_ms / (workers["t1"].gpu_ms + workers["s1"].gpu_ms), 0.5, delta=0.08)
 
   def test_gang_hold_prevents_leapfrog_starvation_and_achieves_waterfill_shares(self):
-    c = Cluster()
-    c.node("n", 2)
-    p1 = c.run("a", backlog=1)
-    p2 = c.run("b", backlog=1)
-    p3 = c.run("d", rank=4, backlog=1)
-    gang = c.run("wide", gpus=2, backlog=1)
-    quanta = dict.fromkeys((p1, p2, p3, gang), 2.0)
-    # Stagger `p1` (overtime at t=2) and `p2` (active until t=3) while `gang` has highest lag and `p3` waits.
+    quanta = dict.fromkeys(("a", "b", "d", "wide"), 2.0)
     workers = {
-      p1: Worker(current=(0,), hold_until=2.0),
-      p2: Worker(current=(1,), hold_until=3.0),
-      p3: Worker(hold_until=2.0),
-      gang: Worker(gpus=2, hold_until=2.0),
+      "a": Worker(current=(0,), hold_until=2.0),
+      "b": Worker(current=(1,), hold_until=3.0),
+      "d": Worker(hold_until=2.0),
+      "wide": Worker(gpus=2, hold_until=2.0),
     }
-    c.s.lag = {"wide": 5000.0, "d": 1000.0, "a": 0.0, "b": 0.0}
-    keep, wake = apply_gpus(workers, quanta, c.s, 2, 2.2)
-    # `p3` is blocked from leapfrogging onto GPU 0; overtime `p1` keeps computing without clock reset until `p2` ends at 3.0.
-    self.assertEqual((keep, wake, workers[p1].hold_until), ({p1: (0,), p2: (1,)}, 3.0, 2.0))
-    keep, _ = apply_gpus(workers, quanta, c.s, 2, 3.0)
-    self.assertEqual(keep, {gang: (0, 1)})
+    lag = {"wide": 5000.0, "d": 1000.0, "a": 0.0, "b": 0.0}
+    keep, wake = apply_gpus(workers, quanta, lag.__getitem__, 2, 2.2)
+    self.assertEqual((keep, wake, workers["a"].hold_until), ({"a": (0,), "b": (1,)}, 3.0, 2.0))
+    keep, _ = apply_gpus(workers, quanta, lag.__getitem__, 2, 3.0)
+    self.assertEqual(keep, {"wide": (0, 1)})
 
-    # Steady-state 2 singles + 1 gang on 2 GPUs -> exact 1/3 `gpu_ms` each (waterfill C=2, d=(1,1,2)).
-    c = Cluster()
-    c.node("n", 2)
-    p1, p2, gang = c.run("a", backlog=1), c.run("b", backlog=1), c.run("wide", gpus=2, backlog=1)
-    quanta = dict.fromkeys((p1, p2, gang), 1.0)
-    workers = {p: Worker(gpus=c.s.procs[p].spec.gpus, hold_until=1.0) for p in quanta}
+    lag, seen, svc = {}, {}, {}
+    quanta = dict.fromkeys(("a", "b", "wide"), 1.0)
+    workers = {"a": Worker(hold_until=1.0), "b": Worker(hold_until=1.0), "wide": Worker(gpus=2, hold_until=1.0)}
     both_ticks = gang_ticks = 0
     for i in range(180):
-      keep, _ = apply_gpus(workers, quanta, c.s, 2, i * 0.5)
+      keep, _ = apply_gpus(workers, quanta, lambda p, lg=lag, sn=seen: ready_lag(lg, sn, svc, p), 2, i * 0.5)
       check_gpu_invariants(self, keep, workers, 2)
-      gang_ticks += keep == {gang: (0, 1)}
-      both_ticks += p1 in keep and p2 in keep
+      gang_ticks += keep == {"wide": (0, 1)}
+      both_ticks += "a" in keep and "b" in keep
       for h, gs in keep.items():
         ms = 500.0 * len(gs)
         workers[h] = replace(workers[h], gpu_ms=workers[h].gpu_ms + ms)
-        c.serve(c.s.runs(h)[0], ms)
-      c.settle()
+        svc[h] = svc.get(h, 0.0) + ms
+      lag, seen = update_lag(lag, seen, svc, 2.0, {"a": 1.0, "b": 1.0, "wide": 2.0})
     self.assertGreater(gang_ticks, 25)
     self.assertGreater(both_ticks, 25)
-    total = sum(c.service.values())
-    for acct in ("a", "b", "wide"):
-      self.assertAlmostEqual(c.service[acct] / total, 1 / 3, delta=0.05)
+    total = sum(svc.values())
+    for a in ("a", "b", "wide"):
+      self.assertAlmostEqual(svc[a] / total, 1 / 3, delta=0.05)
 
   def test_random_local_quantum_schedules_never_overlap_or_violate_exclusives(self):
     for seed in range(100):
-      rng, s, now = random.Random(seed), State(), 0.0
+      rng, now = random.Random(seed), 0.0
       total = rng.choice([1, 2, 4])
       workers, quanta = {}, {}
       for i in range(6):
@@ -775,7 +760,7 @@ class TestLocalQuantum(unittest.TestCase):
           demand = Demand.READY if rng.random() < 0.7 else Demand.IDLE
           ms = w.gpu_ms + (rng.uniform(10.0, 500.0) if w.current else 0.0)
           workers[p] = replace(w, demand=demand, gpu_ms=ms)
-        keep, wake = apply_gpus(workers, quanta, s, total, now)
+        keep, wake = apply_gpus(workers, quanta, lambda _: 0.0, total, now)
         check_gpu_invariants(self, keep, workers, total)
         if wake is not None:
           self.assertGreater(wake, now)
@@ -811,86 +796,103 @@ class TestMultiNodeFairness(unittest.TestCase):
     lag, seen = update_lag(lag, seen, {"a": 250.0, "b": 50.0}, 1.0, {"a": 1.0, "b": 1.0})
     self.assertAlmostEqual(lag["a"], -100.0)
     self.assertAlmostEqual(lag["b"], 100.0)
-    # `finish_cmd` deletes `b`'s last queued entry (`demand["b"] == 0`) in the same tx that increments `service["b"]`:
-    # positive catch-up lag is conserved while `deltas["b"] > 0`, and clears only once `b` is truly idle (`deltas == 0`).
     lag, seen = update_lag(lag, seen, {"a": 250.0, "b": 80.0}, 1.0, {"a": 1.0})
     self.assertAlmostEqual(lag["a"], -85.0)
     self.assertAlmostEqual(lag["b"], 85.0)
 
-  def simulate(self, c: Cluster, steps: int, dt: float = 0.5, quantum: float = 1.0) -> int:
-    """Co-simulate per-node `plan_gpus` (L1) and cluster `scheduler.step` (L2)."""
+  def simulate(
+    self,
+    nodes: dict[str, int],
+    placement: dict[str, str],
+    accts: dict[str, str],
+    steps: int,
+    *,
+    weights: dict[str, float] | None = None,
+    dt: float = 0.5,
+    quantum: float = 1.0,
+  ) -> tuple[int, dict[str, float], dict[str, str]]:
+    """Co-simulate per-node `plan_gpus` and cross-node `rebalance_target` + `update_lag`."""
+    placement = dict(placement)
     workers: dict[str, tuple[str, Worker]] = {}
+    lag, seen, svc = {}, {}, {}
+    demand: dict[str, float] = {}
+    for p in placement:
+      demand[accts[p]] = demand.get(accts[p], 0.0) + 1.0
     moves = 0
     for i in range(steps):
       now = i * dt
-      for n in c.nodes:
+      for n, total in nodes.items():
         local = {}
-        for p, pr in c.s.procs_on(n):
-          if c.s.runs(p):
-            w = (
-              workers[p][1]
-              if p in workers and workers[p][0] == n
-              else Worker(gpus=pr.spec.gpus, exclusive=pr.spec.exclusive, hold_until=quantum)
-            )
-            local[p] = replace(w, demand=Demand.READY if c.s.busy(p) else Demand.IDLE)
-        keep, _ = apply_gpus(local, dict.fromkeys(local, quantum), c.s, c.nodes[n]["gpus"], now)
+        for p, pn in placement.items():
+          if pn == n:
+            local[p] = workers[p][1] if p in workers and workers[p][0] == n else Worker(hold_until=quantum)
+        keep, _ = apply_gpus(
+          local, dict.fromkeys(local, quantum), lambda p, lg=lag, sn=seen: ready_lag(lg, sn, svc, accts[p]), total, now
+        )
         for p, w in local.items():
-          if keep.get(p) and w.demand != Demand.IDLE:
+          if keep.get(p):
             ms = dt * 1000.0 * len(keep[p])
             w = replace(w, gpu_ms=w.gpu_ms + ms)
-            c.serve(c.s.runs(p)[0], ms)
+            svc[accts[p]] = svc.get(accts[p], 0.0) + ms
           workers[p] = (n, w)
-      moves += sum(1 for ev, body in c.settle() if ev == Ev.PLACED and body.get("rule") == "place.rebalance")
-    return moves
+      lag, seen = update_lag(lag, seen, svc, float(sum(nodes.values())), demand, weights)
+      placed = [
+        Placed(pn, p, WorkerSpec(Role.TRAINER, p, True), True, ready_lag(lag, seen, svc, accts[p]))
+        for p, pn in sorted(placement.items())
+      ]
+      for pl in sorted(placed, key=lambda x: (-x.lag, x.worker)):
+        if dst := rebalance_target(pl, nodes, placed):
+          placement[pl.worker] = dst
+          moves += 1
+          break
+    return moves, svc, placement
 
   def test_four_on_two_weighted_and_sybil_settle_without_cross_node_thrash(self):
-    # Skewed 3-vs-1 equal accounts: migrates once to 2-vs-2, then zero further migrations forever.
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    procs = [c.run(f"r{i}", rank=4, base=f"m{i}", backlog=1) for i in range(4)]
-    for i, n in enumerate(("a", "a", "a", "b")):
-      c.s.procs[procs[i]].node = n
-    moves = self.simulate(c, 240, dt=0.5, quantum=1.0)
+    moves, svc, place = self.simulate(
+      {"a": 1, "b": 1}, {"r0": "a", "r1": "a", "r2": "a", "r3": "b"}, {f"r{i}": f"r{i}" for i in range(4)}, 240
+    )
     self.assertEqual(moves, 1)
-    self.assertEqual(sorted(sum(p.node == n for p in c.s.procs.values()) for n in ("a", "b")), [2, 2])
-    total = sum(c.service.values())
+    self.assertEqual(sorted(sum(v == n for v in place.values()) for n in ("a", "b")), [2, 2])
+    total = sum(svc.values())
     for i in range(4):
-      self.assertAlmostEqual(c.service[f"r{i}"] / total, 0.25, delta=0.05)
+      self.assertAlmostEqual(svc[f"r{i}"] / total, 0.25, delta=0.05)
 
-    # Weighted 3-on-2 where `{a(w=1), b(w=1)}` on node `a` and `{c(w=2)}` on node `b` already match waterfill: 0 moves.
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    c.s.weights = {"r0": 1.0, "r1": 1.0, "r2": 2.0}
-    p0, p1, p2 = (c.run(f"r{i}", rank=4, base=f"m{i}", backlog=1) for i in range(3))
-    c.s.procs[p0].node, c.s.procs[p1].node, c.s.procs[p2].node = "a", "a", "b"
-    self.assertEqual(self.simulate(c, 200, dt=0.5, quantum=1.0), 0)
+    moves, _, _ = self.simulate(
+      {"a": 1, "b": 1},
+      {"r0": "a", "r1": "a", "r2": "b"},
+      {f"r{i}": f"r{i}" for i in range(3)},
+      200,
+      weights={"r0": 1.0, "r1": 1.0, "r2": 2.0},
+    )
+    self.assertEqual(moves, 0)
 
-    # Sybil: Alice puts 3 busy trainers on node `a` while Bob has 1 on node `b` -> 0 migrations, exact 50/50 split.
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
-    sybils = [c.run(f"s{i}", rank=4, base=f"m{i}", account="alice", backlog=1) for i in range(3)]
-    solo = c.run("b0", rank=4, base="mb", account="bob", backlog=1)
-    for p in sybils:
-      c.s.procs[p].node = "a"
-    c.s.procs[solo].node = "b"
-    self.assertEqual(self.simulate(c, 200, dt=0.5, quantum=1.0), 0)
-    self.assertAlmostEqual(c.service["alice"] / (c.service["alice"] + c.service["bob"]), 0.5, delta=0.02)
+    moves, svc, _ = self.simulate(
+      {"a": 1, "b": 1},
+      {"s0": "a", "s1": "a", "s2": "a", "b0": "b"},
+      {"s0": "alice", "s1": "alice", "s2": "alice", "b0": "bob"},
+      200,
+    )
+    self.assertEqual(moves, 0)
+    self.assertAlmostEqual(svc["alice"] / (svc["alice"] + svc["bob"]), 0.5, delta=0.02)
 
   def test_three_busy_trainers_on_two_nodes_rotate_to_one_third_each(self):
-    c = Cluster()
-    c.node("a", 1)
-    c.node("b", 1)
+    with mock.patch.object(policy, "REBALANCE_MS", 5_000):
+      moves, svc, _ = self.simulate(
+        {"a": 1, "b": 1}, {"r0": "a", "r1": "b", "r2": "a"}, {f"r{i}": f"r{i}" for i in range(3)}, 360
+      )
+    total = sum(svc.values())
     for i in range(3):
-      c.run(f"r{i}", rank=4, base=f"m{i}", backlog=1)
-    with mock.patch.object(scheduler, "REBALANCE_MS", 5_000):
-      moves = self.simulate(c, 360, dt=0.5, quantum=1.0)
-    total = sum(c.service.values())
-    for i in range(3):
-      self.assertAlmostEqual(c.service[f"r{i}"] / total, 1 / 3, delta=0.04)
+      self.assertAlmostEqual(svc[f"r{i}"] / total, 1 / 3, delta=0.04)
     self.assertTrue(4 <= moves <= 30, moves)
+
+  def test_pure_placement_helpers(self):
+    spec = WorkerSpec(Role.SAMPLER, "b", True)
+    self.assertEqual(sampler_replicas(spec, [0, 0]), 1)
+    self.assertEqual(sampler_replicas(WorkerSpec(Role.SAMPLER, "b", True, True, "t"), [99 * MAX_SEQS]), 1)
+    placed = [Placed("a", "w1", WorkerSpec(Role.TRAINER, "x", False, True), True)]
+    self.assertEqual(node_stats("a", 2, placed).spare, 1)
+    self.assertFalse(can_host("missing", {"a": 2}, placed, spec))
+    self.assertEqual(choose_node(spec, {"a": 2}, placed), "a")
 
 
 class TestMultiNodeExecution(BusTest):
@@ -926,7 +928,7 @@ class TestMultiNodeExecution(BusTest):
     self.start_maintenance(0.01)
 
   async def submit(self, run: str, op: Op, body: bytes = b"", cost: int = 100) -> str:
-    req = await self.bus.submit_command(run, op, body, cost=cost)
+    req = self.bus.submit_command(run, op, body, cost=cost)
     assert req is not None
     return req
 
@@ -937,7 +939,7 @@ class TestMultiNodeExecution(BusTest):
 
   async def create(self, run: str, rank: int = 0, lora: dict | None = None, **kw) -> None:
     cfg = {} if lora is None else lora
-    await self.bus.create_run(Run(run, "tiny", rank, lora=cfg, **kw))
+    self.bus.create_run(Run(run, "tiny", rank, lora=cfg, **kw))
     await self.submit(run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": rank, "lora": cfg}).encode())
 
   async def until(self, pred, timeout: float = 10.0) -> None:
@@ -952,30 +954,27 @@ class TestMultiNodeExecution(BusTest):
           return node.processes[proc].trainer.model.params[run]
     raise AssertionError(f"no live owner found for {run}")
 
-  async def test_the_plan_is_written_only_when_it_changes(self):
-    from tinyrl.kv import Table
-    from tinyrl.types import NodeReport
+  async def test_idle_maintain_writes_zero_sql_and_accounts_flush_only_when_dirty(self):
+    self.bus.handle(NodeMsg("hello", "n", "bn", gpus=1, workers=(WorkerInfo("w", WorkerSpec(Role.TRAINER, "tiny")),)))
+    self.bus.maintain()
+    flushes, orig = 0, self.bus.flush_sql
 
-    await self.bus.exchange(NodeReport("n", "bn", 1))
-    await self.bus.create_run(Run("r", "tiny", 4, lora=LORA, account="acct"))
-    writes, orig_set = 0, Table.__setitem__
+    def count():
+      nonlocal flushes
+      flushes += 1
+      orig()
 
-    def count_writes(tbl, k, v):
-      nonlocal writes
-      if tbl is self.bus.meta and k == "plan":
-        writes += 1
-      orig_set(tbl, k, v)
-
-    with mock.patch.object(Table, "__setitem__", count_writes):
-      await self.bus.maintain()  # the run gets a process, and the process a node
-      await self.bus.maintain()  # nothing changed
-      self.bus.service["acct"] = self.bus.service.get("acct", 0.0) + 5.0
-      await self.bus.maintain()  # account service moved
-      await self.bus.create_run(Run("r2", "tiny", 4, lora=LORA, account="acct"))
-      await self.bus.maintain()  # a run joined the process
-      self.bus.nodes.pop("n", None)
-      await self.bus.exchange(NodeReport("m", "bm", 1))  # the process moved to m
-    self.assertEqual(writes, 4)
+    with mock.patch.object(self.bus, "flush_sql", count):
+      self.bus.maintain()
+      self.bus.maintain()
+      self.assertEqual(flushes, 0)
+      self.bus.service["acct"] = 5.0
+      self.bus.maintain()  # records delta
+      self.bus.maintain()  # clears zero-demand entry
+      self.assertEqual(flushes, 2)
+      self.bus.maintain()  # steady-state idle: zero further SQL writes
+      self.bus.maintain()
+      self.assertEqual(flushes, 2)
 
   async def test_new_node_rebalances_mid_accumulation_with_exact_model_parameters(self):
     opt = json.dumps({"adam_params": {"learning_rate": 1e-2}}).encode()
@@ -997,8 +996,8 @@ class TestMultiNodeExecution(BusTest):
       self.assertTrue((await self.bus.wait_for_reply(a, 10)).ok)
       self.assertTrue((await self.bus.wait_for_reply(b, 10)).ok)
 
-    state = self.bus.state()
-    self.assertEqual({state.procs[state.home[r]].node for r in (r1, r2)}, {"node-a", "node-b"})
+    snap = self.bus.snapshot_scheduling()["state"]
+    self.assertEqual({snap["procs"][snap["home"][r]]["node"] for r in (r1, r2)}, {"node-a", "node-b"})
 
     ref = Model(tiny)
     ref.create_run(ctrl, "tiny", 0, {})
@@ -1010,7 +1009,7 @@ class TestMultiNodeExecution(BusTest):
     for r in (r1, r2):
       uri = f"tinker://{r}/weights/after-rebalance"
       await self.run_cmd(r, Op.SAVE_WEIGHTS, json.dumps({"uri": uri}).encode())
-      version = await self.bus.checkpoint_version(uri)
+      version = self.bus.checkpoint_version(uri)
       actual, _ = await asyncio.to_thread(self.nodes[0].store.get, version)
       torch.testing.assert_close(actual, expected)
 
@@ -1025,14 +1024,14 @@ class TestMultiNodeExecution(BusTest):
         return await super().sample(job, name)
 
     with (
-      mock.patch("tinyrl.bus.QUANTUM_MS", 15),
-      mock.patch("tinyrl.bus.MAX_SEQS", 2),
+      mock.patch("tinyrl.control.policy.QUANTUM_MS", 15),
+      mock.patch("tinyrl.types.MAX_SEQS", 2),
     ):
       await self.add_node("shared", gpus=1, engine=BusySampler)
       self.start_scheduler()
       await self.create("train", account="team")
       await self.run_cmd("train", Op.FORWARD_BACKWARD, proto_body("train", 6))
-      await self.bus.create_run(Run("sample", "tiny", 4, role=Role.SAMPLER, account="team"))
+      self.bus.create_run(Run("sample", "tiny", 4, role=Role.SAMPLER, account="team"))
       for _ in range(64):
         await self.submit("sample", Op.SAMPLE, json.dumps(JOB).encode())
       try:
@@ -1042,7 +1041,7 @@ class TestMultiNodeExecution(BusTest):
         release.set()
       for request in requests:
         self.assertTrue((await self.bus.wait_for_reply(request, 5)).ok)
-      self.assertGreater((await self.bus.queued_and_in_flight("sample"))["queued"], 0)
+      self.assertGreater((self.bus.queued_and_in_flight("sample"))["queued"], 0)
 
   async def test_shared_trainer_splits_gpu_time_by_account_not_run_count(self):
     node = await self.add_node("single-gpu")
@@ -1064,12 +1063,12 @@ class TestMultiNodeExecution(BusTest):
 
     self.start_scheduler()
     for run, account in accounts.items():
-      await self.bus.create_run(Run(run, "tiny", 4, lora=LORA, account=account))
+      self.bus.create_run(Run(run, "tiny", 4, lora=LORA, account=account))
       await self.run_cmd(run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode())
     with mock.patch.object(InlineProcess, "call", timed_call):
       for run in accounts:
         for _ in range(100):
-          await self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
+          self.bus.submit_command(run, Op.OPTIM_STEP, b'{"adam_params":{}}')
       async with asyncio.timeout(30):
         while len(completed) < 80:
           await asyncio.sleep(0.005)
@@ -1087,34 +1086,34 @@ class TestMultiNodeExecution(BusTest):
       await self.create(r, rank=4, lora=LORA)
       await self.run_cmd(r, Op.FORWARD_BACKWARD, proto_body(r, 10))
       await self.run_cmd(r, Op.OPTIM_STEP, opt)
-    s0 = self.bus.state()
-    self.assertEqual(s0.home[r1], s0.home[r2])
+    s0 = self.bus.snapshot_scheduling()["state"]
+    self.assertEqual(s0["home"][r1], s0["home"][r2])
 
     await self.add_node("node-b", gpus=1)
     futs = [
       (await self.submit(r, Op.FORWARD_BACKWARD, proto_body(r, 9)), await self.submit(r, Op.OPTIM_STEP, opt))
       for r in (r1, r2)
     ]
-    await self.bus.maintain()
-    s1 = self.bus.state()
-    self.assertNotEqual(s1.home[r1], s1.home[r2])
-    self.assertEqual({s1.procs[s1.home[r]].node for r in (r1, r2)}, {"node-a", "node-b"})
     for a, b in futs:
       self.assertTrue((await self.bus.wait_for_reply(a, 10)).ok)
       self.assertTrue((await self.bus.wait_for_reply(b, 10)).ok)
+    s1 = self.bus.snapshot_scheduling()["state"]
+    self.assertNotEqual(s1["home"][r1], s1["home"][r2])
+    self.assertEqual({s1["procs"][s1["home"][r]]["node"] for r in (r1, r2)}, {"node-a", "node-b"})
 
     excl = new_id()
     await self.create(excl, exclusive=True)
     await self.run_cmd(excl, Op.FORWARD_BACKWARD, proto_body(excl, 6))
 
     async def merged() -> bool:
-      st = self.bus.state()
-      return st.home.get(r1) == st.home.get(r2)
+      # Trigger a command on the evicted run so it page-faults onto the surviving peer trainer.
+      h = self.bus.snapshot_scheduling()["state"]["home"]
+      return h.get(r1) is not None and h.get(r1) == h.get(r2)
 
-    await self.until(merged)
     for r in (r1, r2):
       await self.run_cmd(r, Op.FORWARD_BACKWARD, proto_body(r, 11))
       await self.run_cmd(r, Op.OPTIM_STEP, opt)
+    await self.until(merged)
 
     ref = Model(tiny)
     for r in (r1, r2):
@@ -1138,15 +1137,14 @@ class TestMultiNodeExecution(BusTest):
     self.start_scheduler()
 
     sid = new_id()
-    await self.bus.create_run(Run(sid, "tiny", 4, role=Role.SAMPLER, account="team-s"))
+    self.bus.create_run(Run(sid, "tiny", 4, role=Role.SAMPLER, account="team-s"))
     total_cmds = 12
     payload = json.dumps(JOB).encode()
-    with mock.patch("tinyrl.bus.MAX_SEQS", 2), mock.patch("tinyrl.control.scheduler.MAX_SEQS", 4):
+    with mock.patch("tinyrl.types.MAX_SEQS", 2):
       reqs = [await self.submit(sid, Op.SAMPLE, payload, cost=50) for _ in range(total_cmds)]
 
       async def scaled_out() -> bool:
-        st = self.bus.state()
-        return len(st.procs_of(sid)) >= 2 and len(set(served_by)) >= 2
+        return len(self.bus.workers_of(sid)) >= 2 and len(set(served_by)) >= 2
 
       await self.until(scaled_out)
       for req in reqs:
@@ -1154,22 +1152,21 @@ class TestMultiNodeExecution(BusTest):
         self.assertTrue(reply.ok)
         self.assertEqual(len(pb.SampleResponse.FromString(reply.body).sequences), 1)
 
-    self.assertEqual((await self.bus.get_run(sid))["tokens"], total_cmds * 50)
+    self.assertEqual((self.bus.get_run(sid))["tokens"], total_cmds * 50)
     svc_before = self.bus.service["team-s"]
     self.assertGreaterEqual(svc_before, total_cmds * 20.0)
 
     async def scaled_in() -> bool:
-      return len(self.bus.state().procs_of(sid)) == 1
+      return len(self.bus.workers_of(sid)) == 1
 
     await self.until(scaled_in)
 
-    # Simulate the active sampler's node dying mid-sample -> surviving node reclaims and answers.
-    st = self.bus.state()
-    active_node = st.procs[st.procs_of(sid)[0]].node
-    req = await self.bus.submit_command(sid, Op.SAMPLE, payload, cost=50)
-    self.bus.nodes[active_node].until = 0.0
+    snap = self.bus.snapshot_scheduling()["state"]
+    active_node = snap["procs"][self.bus.workers_of(sid)[0]]["node"]
+    req = self.bus.submit_command(sid, Op.SAMPLE, payload, cost=50)
+    self.bus.nodes[active_node].lease_until = 0.0
     self.assertTrue((await self.bus.wait_for_reply(req, 5)).ok)
-    self.assertEqual((await self.bus.get_run(sid))["tokens"], (total_cmds + 1) * 50)
+    self.assertEqual((self.bus.get_run(sid))["tokens"], (total_cmds + 1) * 50)
     self.assertGreater(self.bus.service["team-s"], svc_before)
 
   async def test_controller_enforces_gpu_exclusivity_oversized_rejection_and_single_writer(self):
@@ -1192,10 +1189,10 @@ class TestMultiNodeExecution(BusTest):
         while (await self.bus.wait_for_reply(req, 0)) is None:
           for node in (node_a, node_b):
             flat = [g for h in node.workers.values() for g in h.resident]
-            self.assertEqual(len(flat), len(set(flat)))  # GpuExclusive
-            self.assertTrue(all(h.spec.gpus <= node.gpus for h in node.workers.values()))  # oversized gang rejected
+            self.assertEqual(len(flat), len(set(flat)))
+            self.assertTrue(all(h.spec.gpus <= node.gpus for h in node.workers.values()))
           holders = [f"{n.id}:{p}" for n in (node_a, node_b) for p, h in n.workers.items() if r1 in h.loaded]
-          self.assertLessEqual(len(holders), 1)  # SingleWriter
+          self.assertLessEqual(len(holders), 1)
           await asyncio.sleep(0.005)
       self.assertTrue((await self.bus.wait_for_reply(req, 5)).ok)
 
@@ -1213,15 +1210,12 @@ class TestMultiNodeExecution(BusTest):
     before = time.monotonic()
     await self.create(a, account="alice")
     await self.run_cmd(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
-    pa = self.bus.state().home[a]
-    w_a = self.bus.nodes["node-a"].workers[pa]
-    # Push `a` past its minimum quantum (into OVERTIME) without touching `b` yet.
-    self.assertGreaterEqual(w_a.hold_until, before + QUANTUM_MS / 1000)
-    w_a.hold_until = expired = time.monotonic() - 1.0
-    # Running alone after the deadline keeps the original turn.
+    pa = self.bus.snapshot_scheduling()["state"]["home"][a]
+    cw_a = self.bus.nodes["node-a"].workers[pa]
+    self.assertGreaterEqual(cw_a.hold_until, before)
+    cw_a.hold_until = expired = time.monotonic() - 1.0
     await self.run_cmd(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
-    self.assertEqual(w_a.hold_until, expired)
-    # Late-joiner `b` arrives while `a` is busy in OVERTIME -> preempts without waiting a full 2s quantum.
+    self.assertEqual(cw_a.hold_until, expired)
     await self.create(b, account="bob")
     t0 = time.monotonic()
     fa = [await self.submit(a, Op.FORWARD_BACKWARD, proto_body(a, 6)) for _ in range(2)]
@@ -1230,9 +1224,8 @@ class TestMultiNodeExecution(BusTest):
     self.assertLess(time.monotonic() - t0, 1.5)
     for req in fa:
       self.assertTrue((await self.bus.wait_for_reply(req, 5)).ok)
-    svc = self.bus.service
-    self.assertGreater(svc["alice"], 0.0)
-    self.assertGreater(svc["bob"], 0.0)
+    self.assertGreater(self.bus.service["alice"], 0.0)
+    self.assertGreater(self.bus.service["bob"], 0.0)
 
 
 if __name__ == "__main__":

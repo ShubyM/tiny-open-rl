@@ -1,469 +1,504 @@
-"""The Tinker HTTP API.
-
-Every training call becomes a command on its run's stream, and retrieve_future waits for the trainer's reply.
-"""
+"""Tinker HTTP API and full-duplex `/internal/ws` node channel (zero Store, fsspec, or ML imports)."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses
 import datetime
 import json
+import sys
 import time
 import uuid
 from typing import Any
 
 import msgspec
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Body, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from tinyrl.api import wire
-from tinyrl.bus import COUNTERS, BackpressureError, Bus, PromiseGoneError
-from tinyrl.control import estimator, scheduler
+from tinyrl.control import estimator
+from tinyrl.control.controller import COUNTERS, TICK_MS, Controller
 from tinyrl.helpers import getenv
-from tinyrl.storage.store import Store
-from tinyrl.types import NodeReport, Op, Role, Run, parse_uri
+from tinyrl.types import (
+  Checkpoint,
+  FencedError,
+  NodeMsg,
+  Op,
+  QueueFullError,
+  RequestGoneError,
+  Role,
+  Run,
+  parse_uri,
+)
 
-WAIT = getenv("WAIT", 30.0)  # how long retrieve_future waits for a reply. The SDK gives up after 45s.
-CKPT_TTL = getenv("CKPT_TTL", 0)  # the TTL of a checkpoint saved without one, at least 3600. 0 keeps it until deleted
-
-
-# ***** requests *****
-
-
-class SessionRequest(BaseModel):
-  session_id: str
-
-
-class CreateSessionRequest(BaseModel):
-  tags: list[str] = []  # TINKER_TAGS: open-rl clients ask for full fine-tuning with openrl.fine_tuning_type=full
-  user_metadata: dict[str, Any] | None = None
-
-
-class CreateModelRequest(BaseModel):
-  base_model: str
-  session_id: str = ""
-  lora_config: dict[str, Any] | None = None
-  user_metadata: dict[str, Any] | None = None
-  model_seq_id: int | None = None
+WAIT = getenv("WAIT", 30.0)
+CKPT_TTL = getenv("CKPT_TTL", 0)
+MAX_TTL_SECONDS = 10 * 365 * 24 * 3600
+CHECKPOINT_KINDS = {"weights": "training", "sampler_weights": "sampler"}
+ERROR_CODES = {
+  ValueError: 400,
+  KeyError: 400,
+  FencedError: 409,
+  RequestGoneError: 410,
+  QueueFullError: 429,
+}
 
 
-class ModelRequest(BaseModel):
+class ModelReq(BaseModel):
   model_id: str
   seq_id: int | None = None
 
 
-class OptimStepRequest(ModelRequest):
-  adam_params: dict[str, Any] = {}
-
-
-class SaveRequest(ModelRequest):
+class SaveReq(ModelReq):
   path: str | None = None
   sampling_session_seq_id: int | None = None
   ttl_seconds: int | None = None
 
   def checkpoint(self, kind: str, *, owned: bool = False) -> dict:
     seq = self.sampling_session_seq_id if self.sampling_session_seq_id is not None else self.seq_id
-    name = self.path or f"step-{seq if seq is not None else time.time_ns()}"
-    seconds = self.ttl_seconds if self.ttl_seconds is not None or owned else CKPT_TTL or None
-    return {"uri": checkpoint_uri(self.model_id, kind, name), "ttl_seconds": ttl(seconds)}
+    suffix = seq if seq is not None else time.time_ns()
+    name = self.path or f"step-{suffix}"
+    ttl = self.ttl_seconds if (self.ttl_seconds is not None or owned) else (CKPT_TTL or None)
+    return {"uri": ckpt_uri(self.model_id, kind, name), "ttl_seconds": check_ttl(ttl)}
 
 
-class TTLRequest(BaseModel):
-  ttl_seconds: int | None = None
+class SamplingReq(BaseModel):
+  sampling_session_id: str | None = None
+  base_model: str | None = None
+  model_path: str | None = None
+  session_id: str | None = None
 
 
-class LoadRequest(ModelRequest):
-  path: str
-  optimizer: bool = False
-
-
-class FutureRequest(BaseModel):
-  request_id: str
-
-
-class WeightsInfoRequest(BaseModel):
-  tinker_path: str
-
-
-def ttl(seconds: int | None) -> int | None:
-  """A checkpoint's TTL, which the Tinker API bounds between an hour and ten years."""
-  if seconds is not None and not 3600 <= seconds <= 10 * 365 * 24 * 3600:
+def check_ttl(seconds: int | None) -> int | None:
+  if seconds is not None and not 3600 <= seconds <= MAX_TTL_SECONDS:
     raise HTTPException(400, "ttl_seconds must be between 3600 and 10 years")
   return seconds
 
 
-def iso(t: float | None) -> str | None:
-  return datetime.datetime.fromtimestamp(t, datetime.UTC).isoformat() if t else None
+def iso(timestamp: float | None) -> str | None:
+  if not timestamp:
+    return None
+  return datetime.datetime.fromtimestamp(timestamp, datetime.UTC).isoformat()
 
 
-def public(c: dict) -> dict:
-  """A registry entry as the Tinker API's Checkpoint."""
-  keep = {k: c[k] for k in ("checkpoint_id", "checkpoint_type", "tinker_path", "size_bytes")}
-  return keep | {"time": iso(c["time"]), "expires_at": iso(c["expires_at"])}
+def public(ckpt: Checkpoint) -> dict:
+  _, checkpoint_id = parse_uri(ckpt.uri)
+  prefix = checkpoint_id.split("/", 1)[0]
+  return {
+    "checkpoint_id": checkpoint_id,
+    "checkpoint_type": CHECKPOINT_KINDS.get(prefix, prefix),
+    "tinker_path": ckpt.uri,
+    "size_bytes": ckpt.size,
+    "time": iso(ckpt.time),
+    "expires_at": iso(ckpt.expires_at),
+  }
 
 
-def checkpoint_uri(run: str, kind: str, name: str) -> str:
-  """The logical tinker://<run>/<kind>/<name> URI for a checkpoint."""
-  if name.startswith("tinker://"):  # a checkpoint by URI, maybe another run's to resume from
-    run, cid = parse_uri(name)
-    kind, _, name = cid.partition("/")
-  if not name or name.startswith("/") or ".." in f"{run}/{kind}/{name}".split("/"):
+def ckpt_uri(run: str, kind: str, name: str) -> str:
+  raw = name if name.startswith("tinker://") else f"tinker://{run}/{kind}/{name}"
+  owner, checkpoint_id = parse_uri(raw)
+  if not checkpoint_id.partition("/")[2]:
     raise ValueError(f"bad checkpoint name {name}")
-  return f"tinker://{run}/{kind}/{name}"
+  return f"tinker://{owner}/{checkpoint_id}"
 
 
-def app(bus: Bus | None = None, store: Store | None = None, *, control: bool = False) -> FastAPI:
-  bus = bus if bus is not None else Bus()
-  store = store if store is not None else Store()
+def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
+  ctrl = ctrl if ctrl is not None else Controller()
 
   @contextlib.asynccontextmanager
   async def lifespan(_: FastAPI):
-    async def maintain_loop():
+    async def maintain_loop() -> None:
+      tick_s = TICK_MS / 1000
       while True:
-        await bus.maintain()
-        await asyncio.sleep(scheduler.TICK_MS / 1000)
+        try:
+          ctrl.maintain()
+        except Exception as exc:
+          print(f"controller maintain failed: {exc!r}", file=sys.stderr, flush=True)
+        due = ctrl.next_wake - time.monotonic() if ctrl.next_wake is not None else tick_s
+        await asyncio.sleep(min(tick_s, max(0.001, due)))
 
-    maint = asyncio.create_task(maintain_loop())
+    maint_task = asyncio.create_task(maintain_loop())
     try:
       yield
     finally:
-      maint.cancel()
+      maint_task.cancel()
       with contextlib.suppress(asyncio.CancelledError):
-        await maint
-      await bus.aclose()
+        await maint_task
+      await ctrl.aclose()
 
   api = FastAPI(title="tiny-open-rl", lifespan=lifespan if control else None)
+  for exc_type, status_code in ERROR_CODES.items():
+    api.add_exception_handler(
+      exc_type,
+      lambda _, err, code=status_code: JSONResponse({"error": f"{type(err).__name__}: {err}"}, code),
+    )
 
-  @api.post("/internal/exchange")
-  async def exchange(request: Request, wait_ms: int = 0) -> Response:
-    report = msgspec.msgpack.decode(await request.body(), type=NodeReport)
-    return Response(msgspec.msgpack.encode(await bus.exchange(report, wait_ms)), media_type="application/msgpack")
+  @api.websocket("/internal/ws")
+  async def node_ws(ws: WebSocket) -> None:
+    await ws.accept()
+    bound_node: tuple[str, str] | None = None
+    pusher: asyncio.Task | None = None
 
-  def bad_request(_: Request, e: Exception) -> JSONResponse:
-    return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400)
+    async def push_loop(node_id: str, boot_id: str) -> None:
+      while (node := ctrl.nodes.get(node_id)) is not None and node.boot_id == boot_id:
+        await node.push_ev.wait()
+        node = ctrl.nodes.get(node_id)
+        if node is None or node.boot_id != boot_id:
+          return
+        out = node.drain_push()
+        if any((out.tasks, out.cancel, out.stage, out.sweep, out.ack)):
+          await ws.send_bytes(msgspec.msgpack.encode(out))
 
-  api.add_exception_handler(ValueError, bad_request)
-  api.add_exception_handler(KeyError, bad_request)
-  api.add_exception_handler(PromiseGoneError, lambda _, e: JSONResponse({"error": str(e)}, status_code=410))
-  api.add_exception_handler(BackpressureError, lambda _, e: JSONResponse({"error": str(e)}, status_code=429))
+    try:
+      while True:
+        msg = msgspec.msgpack.decode(await ws.receive_bytes(), type=NodeMsg)
+        reply = ctrl.handle(msg)
+        await ws.send_bytes(msgspec.msgpack.encode(reply))
+        if reply.reset:
+          await ws.close()
+          return
+        if bound_node != (msg.node, msg.boot_id):
+          if pusher is not None:
+            pusher.cancel()
+          bound_node = (msg.node, msg.boot_id)
+          pusher = asyncio.create_task(push_loop(*bound_node))
+    except (WebSocketDisconnect, RuntimeError):
+      pass
+    finally:
+      if pusher is not None:
+        pusher.cancel()
+        with contextlib.suppress(BaseException):
+          await pusher
 
-  async def require_run(run_id: str, kind: str = "model") -> dict:
-    if (record := await bus.get_run(run_id)) is None:
-      raise HTTPException(404, f"no {kind} {run_id}")
+  def require_run(run_id: str | None) -> dict:
+    if not run_id:
+      raise HTTPException(404, f"no model {run_id}")
+    record = ctrl.get_run(run_id)
+    if record is None:
+      raise HTTPException(404, f"no model {run_id}")
     return record
 
-  async def submit(
+  def submit(
     run: str,
     op: Op,
     body: bytes | dict,
     seq_id: int | None = None,
     cost: int = 1,
-    stability_refs: set[str] | None = None,
+    uri: str | None = None,
+    refs: set[str] | None = None,
   ) -> dict[str, str]:
-    if isinstance(body, dict):
-      body = json.dumps(body).encode()
-    request_id = await bus.submit_command(run, op, body, seq_id, cost, stability_refs)
+    payload = json.dumps(body).encode() if isinstance(body, dict) else body
+    request_id = ctrl.submit_command(run, op, payload, seq_id, cost, uri, refs)
     if request_id is None:
       raise HTTPException(404, f"no model {run}")
     return {"request_id": request_id, "model_id": run}
 
-  async def open_sampler(base_model: str | None, model_path: str | None, session_id: str = "") -> str:
-    model_path = model_path or None
-    train_run = parse_uri(model_path)[0] if model_path else None
-    train = (await bus.get_run(train_run) or {}) if train_run else {}
-    base, lora = base_model, True
-    if train.get("base"):
-      base, lora = train["base"], train["rank"] > 0
-    elif model_path:
-      meta = await asyncio.to_thread(store.read_meta, await bus.checkpoint_version(model_path))
-      base, lora = meta.get("base") or base_model, bool(meta.get("lora"))
+  async def make_sampler(
+    base_model: str | None,
+    model_path: str | None,
+    session_id: str = "",
+    *,
+    create: bool = True,
+  ) -> Run:
+    path = model_path or None
+    train_run_id = parse_uri(path)[0] if path else None
+    train_run = (ctrl.get_run(train_run_id) or {}) if train_run_id else {}
+
+    ckpt_meta: dict = {}
+    if path and not train_run.get("base"):
+      ckpt = ctrl.get_checkpoint(path)
+      ckpt_meta = ckpt.meta if ckpt else {}
+
+    base = train_run.get("base") or ckpt_meta.get("base") or base_model
     if not base:
-      raise ValueError("could not resolve base_model" if model_path else "base_model required when model_path is None")
+      raise ValueError("could not resolve base_model" if path else "base_model required when model_path is None")
 
-    exclusive = bool(train.get("exclusive"))
-    sess_meta = ((await bus.get_session(session_id)) or {}).get("metadata", {}) if session_id else {}
-    account = str(train.get("account") or sess_meta.get("openrl.account") or "")
+    if train_run.get("base"):
+      lora = train_run["rank"] > 0
+    elif path:
+      lora = bool(ckpt_meta.get("lora"))
+    else:
+      lora = True
+
+    session_meta = (ctrl.get_session(session_id) or {}).get("metadata", {}) if session_id else {}
+    account = str(train_run.get("account") or session_meta.get("openrl.account") or "")
+    exclusive = bool(train_run.get("exclusive"))
     gpus = await asyncio.to_thread(estimator.gpus, base, "vllm")
-    sid = f"samp-{uuid.uuid4().hex[:12]}"
-    await bus.create_run(
-      Run(sid, base, int(lora), session_id, model_path, {}, exclusive, Role.SAMPLER, train_run, gpus, account)
+    run = Run(
+      id=f"samp-{uuid.uuid4().hex[:12]}",
+      base=base,
+      rank=int(lora),
+      session=session_id,
+      model_path=path,
+      exclusive=exclusive,
+      role=Role.SAMPLER,
+      train_run=train_run_id,
+      gpus=gpus,
+      account=account,
     )
-    return sid
+    if create:
+      ctrl.create_run(run)
+    return run
 
-  # ***** service *****
-
-  @api.get("/api/v1/scheduling")
-  async def scheduling():
-    """The cluster's plan, account lags, and each process's actual GPUs and PID from its node's last heartbeat."""
-    nodes = await bus.live_nodes(details=True)
-    state = dataclasses.asdict(bus.state())
-    for proc, placed in state["procs"].items():
-      heartbeat = nodes.get(placed["node"], {})
-      for src, field in (("pids", "pid"), ("on", "gpus")):
-        if proc in heartbeat.get(src, {}):
-          placed[field] = heartbeat[src][proc]
-    return {"nodes": {n: v["gpus"] for n, v in nodes.items()}, "state": state}
-
-  @api.get("/api/v1/healthz")
-  async def healthz():
-    return {"status": "ok"}
+  api.get("/api/v1/scheduling")(ctrl.snapshot_scheduling)
+  api.get("/api/v1/healthz")(lambda: {"status": "ok"})
+  api.post("/api/v1/telemetry")(lambda: {"status": "accepted"})
+  api.post("/api/v1/client/config")(lambda: {"parallel_fwdbwd_chunks": False})
+  api.post("/api/v1/client/dynamic_config")(lambda: {})
+  api.get("/api/v1/get_server_capabilities")(lambda: {"supported_models": []})
 
   @api.post("/api/v1/sessions/{session_id}/finish")
   async def finish_session(session_id: str):
-    await bus.finish_session(session_id)  # the SDK's close(), and the end of a `with ServiceClient()` block
+    ctrl.heartbeat_session(session_id, finish=True)
     return {"status": "ok"}
 
-  @api.post("/api/v1/telemetry")
-  async def telemetry():
-    return {"status": "accepted"}
-
-  @api.post("/api/v1/client/config")
-  async def client_config():
-    return {"parallel_fwdbwd_chunks": False}
-
-  @api.post("/api/v1/client/dynamic_config")
-  async def client_dynamic_config():
-    return {}  # the SDK's defaults
-
-  @api.get("/api/v1/get_server_capabilities")
-  async def get_server_capabilities():
-    return {"supported_models": []}
-
   @api.post("/api/v1/create_session")
-  async def create_session(req: CreateSessionRequest | None = None):
+  async def create_session(req: dict[str, Any] | None = Body(None)):
     session_id = f"sess-{uuid.uuid4().hex[:12]}"
-    req = req or CreateSessionRequest()
-    await bus.heartbeat_session(session_id, dict(t.partition("=")[::2] for t in req.tags) | (req.user_metadata or {}))
+    body = req or {}
+    tag_meta = dict(tag.partition("=")[::2] for tag in (body.get("tags") or ()))
+    user_meta = body.get("user_metadata") or {}
+    ctrl.heartbeat_session(session_id, tag_meta | user_meta)
     return {"type": "create_session", "session_id": session_id}
 
   @api.post("/api/v1/session_heartbeat")
-  async def session_heartbeat(req: SessionRequest):
-    await bus.heartbeat_session(req.session_id)
+  async def session_heartbeat(session_id: str = Body(embed=True)):
+    ctrl.heartbeat_session(session_id)
     return {"type": "session_heartbeat"}
 
   @api.post("/api/v1/create_model")
-  async def create_model(req: CreateModelRequest):
-    session = await bus.get_session(req.session_id) or {}
-    metadata, lora = session.get("metadata", {}) | (req.user_metadata or {}), req.lora_config or {}
-    rank = 0 if metadata.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
-    exclusive = str(metadata.get("openrl.exclusive")).lower() == "true"
+  async def create_model(
+    base_model: str = Body(),
+    session_id: str | None = Body(None),
+    lora_config: dict | None = Body(None),
+    user_metadata: dict | None = Body(None),
+    model_seq_id: int | None = Body(None),
+  ):
+    session = session_id or ""
+    lora = lora_config or {}
+    session_meta = (ctrl.get_session(session) or {}).get("metadata", {})
+    meta = session_meta | (user_metadata or {})
 
-    seq = req.model_seq_id
-    run = f"{req.session_id}-{seq}" if req.session_id and seq is not None else str(uuid.uuid4())
+    full_ft = meta.get("openrl.fine_tuning_type") == "full"
+    rank = 0 if full_ft else int(lora.get("rank", 16))
+    run_id = f"{session}-{model_seq_id}" if session and model_seq_id is not None else str(uuid.uuid4())
 
-    base, account = req.base_model, str(metadata.get("openrl.account") or "")
-    raw_gpus = metadata.get("openrl.gpus")
-    gpus = (1 if rank else await asyncio.to_thread(estimator.gpus, base, "full")) if raw_gpus is None else int(raw_gpus)
+    raw_gpus = meta.get("openrl.gpus")
+    if raw_gpus is not None:
+      gpus = int(raw_gpus)
+    elif rank:
+      gpus = 1
+    else:
+      gpus = await asyncio.to_thread(estimator.gpus, base_model, "full")
     if gpus < 1:
       raise ValueError(f"openrl.gpus must be at least 1, got {gpus}")
-    if not await bus.get_run(run):
-      await bus.create_run(Run(run, base, rank, req.session_id, None, lora, exclusive, gpus=gpus, account=account))
-    return await submit(run, Op.CREATE_MODEL, {"base_model": base, "rank": rank, "lora": lora}, seq)
+
+    if not ctrl.get_run(run_id):
+      exclusive = str(meta.get("openrl.exclusive")).lower() == "true"
+      account = str(meta.get("openrl.account") or "")
+      ctrl.create_run(Run(run_id, base_model, rank, session, None, lora, exclusive, gpus=gpus, account=account))
+    dedup_seq = -1 if (session and model_seq_id is not None) else None
+    return submit(run_id, Op.CREATE_MODEL, {"base_model": base_model, "rank": rank, "lora": lora}, dedup_seq)
 
   @api.post("/api/v1/get_info")
-  async def get_info(req: ModelRequest):
-    run = await require_run(req.model_id)
-
-    # the SDK reads LoRA shaped metadata, even for a full fine-tune
+  async def get_info(req: ModelReq):
+    record = require_run(req.model_id)
+    base = record["base"]
     return {
       "type": "get_info",
       "model_id": req.model_id,
-      "model_name": run["base"],
+      "model_name": base,
       "is_lora": True,
-      "lora_rank": run["rank"] or 16,
-      "model_data": {"model_name": run["base"], "tokenizer_id": run["base"]},
+      "lora_rank": record["rank"] or 16,
+      "model_data": {"model_name": base, "tokenizer_id": base},
     }
-
-  # ***** training *****
 
   @api.post("/api/v1/forward_backward")
   async def forward_backward(request: Request):
     body = await request.body()
     parsed = wire.parse(body)
     refs = wire.referenced_sequences(parsed) if parsed.loss_fn == "stable_reinforce" else None
-    return await submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed), refs)
+    return submit(parsed.model_id, Op.FORWARD_BACKWARD, body, parsed.seq_id or None, wire.cost(parsed), refs=refs)
 
   @api.post("/api/v1/optim_step")
-  async def optim_step(req: OptimStepRequest):
-    return await submit(req.model_id, Op.OPTIM_STEP, {"adam_params": req.adam_params}, req.seq_id)
+  async def optim_step(model_id: str = Body(), seq_id: int | None = Body(None), adam_params: dict[str, Any] = Body({})):
+    return submit(model_id, Op.OPTIM_STEP, {"adam_params": adam_params}, seq_id)
 
-  @api.post("/api/v1/save_weights")  # save_state, so the optimizer is saved too
-  async def save_weights(req: SaveRequest):
-    return await submit(req.model_id, Op.SAVE_WEIGHTS, req.checkpoint("weights"), req.seq_id)
+  @api.post("/api/v1/save_weights")
+  async def save_weights(req: SaveReq):
+    return submit(req.model_id, Op.SAVE_WEIGHTS, req.checkpoint("weights"), req.seq_id)
 
   @api.post("/api/v1/save_weights_for_sampler")
-  async def save_weights_for_sampler(req: SaveRequest):
-    if request_id := await bus.seen_request(req.model_id, req.seq_id):
-      return {"request_id": request_id, "model_id": req.model_id}
-
-    train = await require_run(req.model_id)
-    # a sampling session's weights, which its run owns
+  async def save_weights_for_sampler(req: SaveReq):
+    existing = ctrl.seen_request(req.model_id, req.seq_id)
+    if existing:
+      return {"request_id": existing, "model_id": req.model_id}
+    train_run = require_run(req.model_id)
     owned = req.path is None or req.sampling_session_seq_id is not None
     args = req.checkpoint("sampler_weights", owned=owned)
     if owned:
-      sid = await open_sampler(train["base"], args["uri"], train.get("session", ""))
-      args.update(sampling_session_id=sid, owned=True)
-    return await submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
+      sampler = await make_sampler(train_run["base"], args["uri"], train_run.get("session") or "", create=False)
+      existing = ctrl.seen_request(req.model_id, req.seq_id)
+      if existing:
+        return {"request_id": existing, "model_id": req.model_id}
+      ctrl.create_run(sampler)
+      args |= {"sampling_session_id": sampler.id, "owned": True}
+    return submit(req.model_id, Op.SAVE_WEIGHTS_FOR_SAMPLER, args, req.seq_id)
 
   @api.post("/api/v1/load_weights")
-  async def load_weights(req: LoadRequest):
-    uri = checkpoint_uri(req.model_id, "weights", req.path)
-    return await submit(req.model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": req.optimizer}, req.seq_id)
+  async def load_weights(
+    model_id: str = Body(),
+    path: str = Body(),
+    seq_id: int | None = Body(None),
+    optimizer: bool = Body(False),
+  ):
+    uri = ckpt_uri(model_id, "weights", path)
+    return submit(model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": optimizer}, seq_id, uri=uri)
 
   @api.post("/api/v1/weights_info")
-  async def weights_info(req: WeightsInfoRequest):
-    """What the SDK asks before it resumes from a checkpoint: how to create a run like the one that saved it. The checkpoint
-    says so itself, as its run is deleted soon after its client stops."""
-    try:
-      meta = await asyncio.to_thread(store.read_meta, await bus.checkpoint_version(req.tinker_path))
-    except (OSError, IndexError, ValueError):
-      meta = {}
+  async def weights_info(tinker_path: str = Body(embed=True)):
+    ckpt = ctrl.get_checkpoint(tinker_path)
+    meta = ckpt.meta if ckpt else {}
     if "base" not in meta:
-      raise HTTPException(404, f"no checkpoint {req.tinker_path} that names its base model")
-    made = meta["targets"]
-    trained = {"train_unembed": "lm_head" in made, "train_mlp": "gate_proj" in made, "train_attn": "q_proj" in made}
-    # the SDK reads LoRA shaped metadata, even for a full fine-tune
-    return {"base_model": meta["base"], "is_lora": True, "lora_rank": meta["rank"] or 16} | (
-      trained if meta["rank"] else {}
-    )
+      raise HTTPException(404, f"no checkpoint {tinker_path} that names its base model")
+    rank = int(meta.get("rank") or 0)
+    info = {"base_model": meta["base"], "is_lora": True, "lora_rank": rank or 16}
+    if rank:
+      info |= meta.get("flags", {})
+    return info
 
   @api.post("/api/v1/delete_model")
-  async def delete_model(req: ModelRequest):
-    await submit(req.model_id, Op.DELETE_MODEL, {}, req.seq_id)  # queued behind the run's work, which still finishes
+  async def delete_model(req: ModelReq):
+    submit(req.model_id, Op.DELETE_MODEL, {}, req.seq_id)
     return {"status": "ok"}
 
   @api.post("/api/v1/retrieve_future")
-  async def retrieve_future(req: FutureRequest):
-    reply = await bus.wait_for_reply(req.request_id, WAIT)
+  async def retrieve_future(request_id: str = Body(embed=True)):
+    reply = await ctrl.wait_for_reply(request_id, WAIT)
     if reply is None:
-      return {"type": "try_again", "request_id": req.request_id, "queue_state": "active"}
+      return {"type": "try_again", "request_id": request_id, "queue_state": "active"}
     return Response(reply.body, media_type=reply.content_type)
 
-  # ***** sampling *****
-
   @api.post("/api/v1/create_sampling_session")
-  async def create_sampling_session(req: Request):
-    data = await req.json()
-    sid = await open_sampler(data.get("base_model"), data.get("model_path"), data.get("session_id", ""))
-    return {"type": "create_sampling_session", "sampling_session_id": sid}
+  async def create_sampling_session(req: SamplingReq):
+    sampler_id = req.sampling_session_id
+    if not (sampler_id and ctrl.get_run(sampler_id)):
+      sampler = await make_sampler(req.base_model, req.model_path, req.session_id or "")
+      sampler_id = sampler.id
+    return {"type": "create_sampling_session", "sampling_session_id": sampler_id}
 
   @api.post("/api/v1/join_sampling_session")
-  async def join_sampling_session(req: Request):
-    data = await req.json()
-    sid = data.get("sampling_session_id")
-    await require_run(sid, "session")
-    return {"type": "join_sampling_session", "client_counter": await bus.join_sampling_session(sid)}
+  async def join_sampling_session(req: SamplingReq):
+    require_run(req.sampling_session_id)
+    return {"type": "join_sampling_session", "client_counter": ctrl.join_sampling_session(req.sampling_session_id)}
 
   @api.get("/api/v1/samplers/{sampler_id}")
   async def get_sampler(sampler_id: str):
-    run = await require_run(sampler_id, "sampler")
-    return {"sampler_id": sampler_id, "base_model": run["base"], "model_path": run.get("model_path")}
+    record = require_run(sampler_id)
+    return {"sampler_id": sampler_id, "base_model": record["base"], "model_path": record.get("model_path")}
 
   @api.post("/api/v1/asample")
-  async def asample(req: Request):
-    data = await req.json()
-    prompt = data.get("prompt", {})
-    chunks = prompt.get("chunks", [])
-    if not all(c.get("type") == "encoded_text" for c in chunks):
-      raise ValueError("only encoded_text chunks are supported")
-    tokens = [int(t) for c in chunks for t in c.get("tokens", [])]
+  async def asample(request: Request):
+    body = await request.json()
+    chunks = (body.get("prompt") or {}).get("chunks", [])
+    if any(chunk.get("type", "encoded_text") != "encoded_text" for chunk in chunks):
+      raise ValueError("only encoded_text prompt chunks are supported")
+    tokens = [int(tok) for chunk in chunks for tok in chunk.get("tokens", [])]
     if not tokens:
-      raise ValueError("prompt is empty")
-
-    if data.get("target_prompt_logprobs") is not None or data.get("prompt_alt_tokens_k", 0) > 0:
+      raise ValueError("empty prompt is not supported")
+    if body.get("target_prompt_logprobs") is not None or (body.get("prompt_alt_tokens_k") or 0) > 0:
       raise ValueError("target_prompt_logprobs and prompt_alt_tokens are not supported")
 
-    last_n = data.get("prompt_logprobs_last_n")
-    if last_n is not None:
-      if not data.get("prompt_logprobs"):
-        raise ValueError("prompt_logprobs must be true if prompt_logprobs_last_n is set")
-      if not (1 <= last_n <= len(tokens) - 1):
-        raise ValueError("prompt_logprobs_last_n must be between 1 and len(tokens) - 1")
+    last_n = body.get("prompt_logprobs_last_n")
+    if last_n is not None and (not body.get("prompt_logprobs") or not 1 <= last_n <= len(tokens) - 1):
+      raise ValueError("invalid prompt_logprobs_last_n")
 
-    sid = data.get("sampling_session_id") or await open_sampler(data.get("base_model"), data.get("model_path"))
+    sampler_id = body.get("sampling_session_id")
+    if not sampler_id:
+      sampler_id = (await make_sampler(body.get("base_model"), body.get("model_path"))).id
 
-    num_samples = int(data.get("num_samples", 1))
-    params = data.get("sampling_params", {})
+    num_samples = int(body.get("num_samples", 1))
+    params = body.get("sampling_params") or {}
+    max_tokens = params.get("max_tokens") or 128
     job = {
       "prompt": tokens,
       "num_samples": num_samples,
-      "max_tokens": params.get("max_tokens") or 128,
+      "max_tokens": max_tokens,
+      "seed": params.get("seed"),
+      "stop": params.get("stop"),
       "temperature": float(params.get("temperature", 1.0)),
       "top_k": int(params.get("top_k", -1)),
       "top_p": float(params.get("top_p", 1.0)),
-      "seed": params.get("seed"),
-      "stop": params.get("stop"),
-      "prompt_logprobs": bool(data.get("prompt_logprobs")),
+      "prompt_logprobs": bool(body.get("prompt_logprobs")),
       "prompt_logprobs_last_n": last_n,
-      "topk_prompt": int(data.get("topk_prompt_logprobs", 0)),
-      "topk_sample": int(data.get("topk_sample_logprobs", 0)),
-      "record_stability_info": bool(data.get("record_stability_info")),
+      "topk_prompt": int(body.get("topk_prompt_logprobs", 0)),
+      "topk_sample": int(body.get("topk_sample_logprobs", 0)),
+      "record_stability_info": bool(body.get("record_stability_info")),
     }
-
-    res = await submit(sid, Op.SAMPLE, job, data.get("seq_id"), len(tokens) + num_samples * job["max_tokens"])
-    return {
-      "request_id": res["request_id"],
-      "sample_sequence_ids": [f"{res['request_id']}:{i}" for i in range(num_samples)],
-    }
-
-  # ***** checkpoints *****
+    cost = len(tokens) + num_samples * max_tokens
+    request_id = submit(sampler_id, Op.SAMPLE, job, body.get("seq_id"), cost)["request_id"]
+    return {"request_id": request_id, "sample_sequence_ids": [f"{request_id}:{i}" for i in range(num_samples)]}
 
   @api.get("/api/v1/training_runs/{run}/checkpoints")
   async def list_checkpoints(run: str):
-    return {"checkpoints": [public(c) for c in await bus.checkpoints_of_run(run)]}
+    return {"checkpoints": [public(c) for c in ctrl.list_checkpoints(run)]}
 
   @api.get("/api/v1/checkpoints")
   async def list_user_checkpoints(limit: int = 100, offset: int = 0):
-    found, total = await bus.page_of_checkpoints(limit, offset)
+    visible = ctrl.list_checkpoints()
+    window = visible[offset : offset + limit] if limit > 0 else []
     return {
-      "checkpoints": [public(c) for c in found],
-      "cursor": {"offset": offset, "limit": limit, "total_count": total},
+      "checkpoints": [public(c) for c in window],
+      "cursor": {"offset": offset, "limit": limit, "total_count": len(visible)},
     }
 
-  @api.delete("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}")
-  async def delete_checkpoint(run: str, checkpoint_id: str):
-    if not await bus.unregister_checkpoints(f"tinker://{run}/{checkpoint_id}"):  # its files go with the next sweep
-      raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
+  @api.delete("/api/v1/training_runs/{run}/checkpoints/{cid:path}")
+  async def delete_checkpoint(run: str, cid: str):
+    if not ctrl.delete_checkpoint(f"tinker://{run}/{cid}"):
+      raise HTTPException(404, f"no checkpoint {cid} in {run}")
 
-  @api.put("/api/v1/training_runs/{run}/checkpoints/{checkpoint_id:path}/ttl")
-  async def set_checkpoint_ttl(run: str, checkpoint_id: str, req: TTLRequest):
-    if not await bus.set_checkpoint_ttl(f"tinker://{run}/{checkpoint_id}", ttl(req.ttl_seconds)):
-      raise HTTPException(404, f"no checkpoint {checkpoint_id} in {run}")
-
-  # ***** inspection *****
+  @api.put("/api/v1/training_runs/{run}/checkpoints/{cid:path}/ttl")
+  async def set_checkpoint_ttl(run: str, cid: str, ttl_seconds: int | None = Body(None, embed=True)):
+    if not ctrl.set_checkpoint_ttl(f"tinker://{run}/{cid}", check_ttl(ttl_seconds)):
+      raise HTTPException(404, f"no checkpoint {cid} in {run}")
 
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
-    run = await require_run(run_id)
-    procs = bus.state().procs_of(run_id)
-    extra = {"procs": procs, **({"worker": procs[0]} if procs else {})}
-    return {**run, **extra, **await bus.queued_and_in_flight(run_id)}
+    record = require_run(run_id)
+    workers = ctrl.workers_of(run_id)
+    info = {**record, "procs": workers, **ctrl.queued_and_in_flight(run_id)}
+    if workers:
+      info["worker"] = workers[0]
+    return info
 
   @api.get("/api/v1/sessions/{session_id}")
   async def session_info(session_id: str):
-    session = await bus.get_session(session_id)
+    session = ctrl.get_session(session_id)
     if session is None:
       raise HTTPException(404, f"no session {session_id}")
     return session
 
   @api.get("/metrics")
   async def metrics():
-    """Every run's counters, account service and node loop lag for Prometheus."""
-    nodes, state, lines = await bus.live_nodes(details=True), bus.state(), []
-    for run in state.jobs:
-      if ps := state.procs_of(run):
-        info = await bus.get_run(run)
-        for name in COUNTERS:
-          name, n = (f"{name[:-3]}_seconds", info[name] / 1000) if name.endswith("_ms") else (name, info[name])
-          lines.append(f'tinyrl_{name}_total{{worker="{ps[0]}",run="{run}"}} {n}')
-    for account, total in sorted(bus.service.items()):
+    ctrl.expire_nodes()
+    lines: list[str] = []
+    for run_id, state in sorted(ctrl.runs.items()):
+      if not state.live:
+        continue
+      workers = ctrl.workers_of(run_id)
+      if not workers:
+        continue
+      for key in COUNTERS:
+        label = f"{key[:-3]}_seconds" if key.endswith("_ms") else key
+        value = state.counters[key] / 1000 if key.endswith("_ms") else state.counters[key]
+        lines.append(f'tinyrl_{label}_total{{worker="{workers[0]}",run="{run_id}"}} {value}')
+    for account, total in sorted(ctrl.service.items()):
       lines.append(f'tinyrl_account_service_total{{account="{account}"}} {float(total)}')
-    for node, beat in nodes.items():
-      lines.append(f'tinyrl_node_loop_lag_seconds{{node="{node}"}} {beat.get("lag", 0.0)}')
+    for node_id, node in sorted(ctrl.nodes.items()):
+      if node.gpus:
+        lines.append(f'tinyrl_node_loop_lag_seconds{{node="{node_id}"}} {node.lag}')
     return PlainTextResponse("\n".join(lines) + "\n")
 
   return api

@@ -1,4 +1,4 @@
-"""Immutable safetensors checkpoints. The Bus binds each logical name to a version after the trainer commits.
+"""Immutable safetensors checkpoints. The Ledger binds each logical name to a version after the trainer commits.
 
 Local saves rename a completed directory into objects/<id>. Bucket saves stage the same files in the node cache,
 serve them to peers, and upload a per-version manifest last so readers see only complete versions.
@@ -81,8 +81,12 @@ def as_bytes(t: torch.Tensor) -> torch.Tensor:
 
 def header(path: str | Path) -> dict:
   with open(path, "rb") as f:
-    n = int.from_bytes(f.read(8), "little")
-    return json.loads(json.loads(f.read(n)).get("__metadata__", {}).get("meta", "{}"))
+    return read_header(f)
+
+
+def read_header(f) -> dict:
+  n = int.from_bytes(f.read(8), "little")
+  return json.loads(json.loads(f.read(n)).get("__metadata__", {}).get("meta", "{}"))
 
 
 def parallel(fn, *xs):
@@ -230,8 +234,7 @@ class Store:
       lambda i, name, shard: self.write_safetensors(i, f"{folder}/{name}", shard, meta), range(n), weights, shards
     )
 
-  @span("store.put")
-  def put(self, tensors: dict[str, torch.Tensor], meta: dict | None = None, *, version: str | None = None) -> str:
+  def publish(self, version: str | None, write) -> str:
     version = version or uuid.uuid4().hex
     if not object_id(version):
       raise ValueError(f"invalid checkpoint version {version!r}")
@@ -240,14 +243,27 @@ class Store:
     folder = parent / f"{version}.writing"
     folder.mkdir()
     try:
-      with self.lock:
-        self.write_checkpoint_files(str(folder), tensors, meta or {})
+      write(folder)
       if self.remote:
         (parent / f"{version}.upload").touch()  # present before rename so trim_cache never drops an unuploaded save
       folder.rename(parent / version)
     finally:
       shutil.rmtree(folder, ignore_errors=True)
     return f"{version}@{self.peer}" if self.remote and self.peer else version
+
+  @span("store.put")
+  def put(self, tensors: dict[str, torch.Tensor], meta: dict | None = None, *, version: str | None = None) -> str:
+    def write(folder: Path) -> None:
+      with self.lock:
+        self.write_checkpoint_files(str(folder), tensors, meta or {})
+
+    return self.publish(version, write)
+
+  def put_blob(self, data: bytes, *, version: str | None = None) -> str:
+    return self.publish(version, lambda folder: (folder / "blob.bin").write_bytes(data))
+
+  def get_blob(self, reference: str) -> bytes:
+    return Path(self.local_folder(reference)[0], "blob.bin").read_bytes()
 
   def upload_pending_saves(self) -> None:
     """An independent, retryable upload per immutable version. Publish its manifest after its files."""
@@ -306,15 +322,22 @@ class Store:
     folder, _ = self.local_folder(version)
     return sorted(Path(folder).glob("*.safetensors"))
 
+  def read_meta(self, reference: str) -> dict:
+    version = reference.partition("@")[0]
+    prefix = f"{self.base}/objects/{version}"
+    if self.remote and object_id(version) and self.fs.exists(f"{prefix}/manifest.json"):
+      names = json.loads(self.fs.cat_file(f"{prefix}/manifest.json"))
+      first = sorted(n for n in names if n.endswith(".safetensors"))[0]
+      with self.fs.open(f"{prefix}/{first}", "rb", block_size=8192) as f:
+        return read_header(f)
+    return header(self.weight_files(reference)[0])
+
   @span("store.get")
   def get(self, version: str) -> tuple[dict[str, torch.Tensor], dict]:
     from safetensors.torch import load_file
 
     paths = self.weight_files(version)
     return {k: v for shard in parallel(load_file, paths) for k, v in shard.items()}, header(paths[0])
-
-  def read_meta(self, version: str) -> dict:
-    return header(self.weight_files(version)[0])
 
   def versions(self) -> set[str]:
     found = {os.path.basename(p).removesuffix(".writing") for p in self.fs.glob(f"{self.base}/objects/*")}
@@ -332,8 +355,7 @@ class Store:
         with contextlib.suppress(FileNotFoundError):
           self.fs.rm(path, recursive=True)
         if self.remote:
-          for suffix in (".upload", ".uploaded"):
-            Path(self.cache, version + suffix).unlink(missing_ok=True)
+          Path(self.cache, f"{version}.upload").unlink(missing_ok=True)
           for suffix in ("", ".writing"):
             shutil.rmtree(Path(self.cache, version + suffix), ignore_errors=True)
         else:
@@ -341,7 +363,7 @@ class Store:
     self.trim_cache()
 
   def trim_cache(self) -> None:
-    """Delete the versions in CKPT_CACHE nobody read for longest, until it is under CKPT_CACHE_BYTES. Only ones the bucket has: a version still uploading stays."""
+    """Remove oldest uploaded checkpoints in CKPT_CACHE until under CKPT_CACHE_BYTES."""
     if not os.path.isdir(self.cache):
       return
     limit = CACHE_BYTES or shutil.disk_usage(self.cache).total // 2

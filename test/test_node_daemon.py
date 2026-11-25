@@ -15,10 +15,9 @@ from test.helpers import BusTest, new_id, tiny
 from test.test_api import proto_body
 from test.test_process import require_unix
 from test.test_sampler import JOB
-from tinyrl.bus import Op, Role, Run
 from tinyrl.control.node_daemon import NodeDaemon, WorkerHandle
 from tinyrl.storage.store import Store
-from tinyrl.types import Turn, WorkerSpec
+from tinyrl.types import Op, Role, Run, WorkerSpec
 
 LORA = {"rank": 4, "seed": 0, "lora_dropout": 0.0}
 
@@ -65,7 +64,7 @@ class TestNodeDaemon(BusTest):
     return reply
 
   async def create(self, run, base, node):
-    request = await self.bus.submit_command(
+    request = self.bus.submit_command(
       run, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 4, "lora": LORA}).encode()
     )
     await self.reply(request, node)
@@ -77,23 +76,25 @@ class TestNodeDaemon(BusTest):
       self.assertTrue(os.path.isdir(f"{folder}/cache") and os.path.isdir(f"{folder}/local"))
 
   async def test_a_backlogged_run_yields_to_a_ready_sibling(self):
-    node, a, b = self.node(), new_id(), new_id()
+    node, a, b = self.node(gpus=1), new_id(), new_id()
+    await node.tick()
     creates = {}
     for run in (a, b):
-      await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
-      creates[run] = await self.bus.submit_command(
+      self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
+      creates[run] = self.bus.submit_command(
         run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
       )
     for _ in range(12):
-      await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
+      self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
     await node.bind("worker", a, b)
     await self.reply(creates[b], node)
-    child = node.processes["worker"]
-    self.assertLessEqual((await self.bus.get_run(a))["steps"], 4)
-    self.assertGreater((await self.bus.queued_and_in_flight(a))["queued"], 0)
+    [wid] = self.bus.workers_of(a)
+    child = node.processes[wid]
+    self.assertLessEqual((self.bus.get_run(a))["steps"], 4)
+    self.assertGreater((self.bus.queued_and_in_flight(a))["queued"], 0)
     await node.drain(a)
-    self.assertEqual((await self.bus.get_run(a))["steps"], 12)
-    self.assertIs(node.processes["worker"], child)
+    self.assertEqual((self.bus.get_run(a))["steps"], 12)
+    self.assertIs(node.processes[wid], child)
 
   async def test_a_slow_checkpoint_read_does_not_block_ready_work_or_gpu_handoff(self):
     with tempfile.TemporaryDirectory() as folder:
@@ -109,49 +110,59 @@ class TestNodeDaemon(BusTest):
       node.store.local_folder = slow_read
       uri = "tinker://training/sampler_weights/slow"
       version = writer.put({}, {"base": "tiny", "lora": True, "config": {}})
-      await self.seed_checkpoint(uri, 0, version=version)
-      await self.bus.create_run(Run("slow", "tiny", 4, role=Role.SAMPLER, model_path=uri))
-      await self.bus.create_run(Run("ready", "tiny", 4, role=Role.SAMPLER))
-      slow = await self.bus.submit_command("slow", Op.SAMPLE, json.dumps(JOB).encode())
+      self.seed_checkpoint(uri, 0, version=version)
+      self.bus.create_run(Run("slow", "tiny", 4, role=Role.SAMPLER, model_path=uri))
+      self.bus.create_run(Run("ready", "tiny", 4, role=Role.SAMPLER))
+      slow = self.bus.submit_command("slow", Op.SAMPLE, json.dumps(JOB).encode())
       try:
-        ready = await self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
+        ready = self.bus.submit_command("ready", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(ready, node)
-        resident = self.bus.plan_state.procs_of("slow")[0]
+        resident = self.bus.workers_of("slow")[0]
         await self.until(started.is_set, node)
         # Another base-model sampler takes the GPU from `resident` while `slow` is still downloading off-GPU.
-        await self.bus.create_run(Run("other", "other-base", 4, role=Role.SAMPLER))
-        request = await self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
+        self.bus.create_run(Run("other", "other-base", 4, role=Role.SAMPLER))
+        request = self.bus.submit_command("other", Op.SAMPLE, json.dumps(JOB).encode())
         await self.reply(request, node)
-        contender = self.bus.plan_state.procs_of("other")[0]
+        contender = self.bus.workers_of("other")[0]
         self.assertEqual(node.workers[resident].resident, ())
         self.assertEqual(node.workers[contender].resident, (0,))
         self.assertIsNone(await self.bus.wait_for_reply(slow, 0))
-        self.assertEqual(await self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
+        self.assertEqual(self.bus.queued_and_in_flight("slow"), {"live": True, "queued": 1, "in_flight": []})
       finally:
         await asyncio.to_thread(writer.upload_pending_saves)
         release.set()
       await self.reply(slow, node)
 
-  async def test_a_checkpoint_whose_node_left_before_it_uploaded_fails_fast(self):
+  async def test_a_failed_stage_retries_when_the_checkpoint_arrives(self):
     with tempfile.TemporaryDirectory() as folder:
       writer = Store(f"file://{folder}/bucket", cache=f"{folder}/writer")
       writer.peer = "127.0.0.1:9"  # a node that no longer answers
       node = self.node(store=Store(writer.root, cache=f"{folder}/reader"))
       uri = "tinker://training/sampler_weights/lost"
-      version = writer.put({}, {"base": "tiny", "lora": True, "config": {}})  # never uploaded
-      await self.seed_checkpoint(uri, 0, version=version)
-      await self.bus.create_run(Run("lost", "tiny", 4, role=Role.SAMPLER, model_path=uri))
-      request = await self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
+      version = writer.put({}, {"base": "tiny", "lora": True, "config": {}})
+      self.seed_checkpoint(uri, 0, version=version)
+      self.bus.create_run(Run("lost", "tiny", 4, role=Role.SAMPLER, model_path=uri))
+      request = self.bus.submit_command("lost", Op.SAMPLE, json.dumps(JOB).encode())
+      failed, read = threading.Event(), node.store.local_folder
+
+      def stage(ver):
+        try:
+          return read(ver)
+        except ValueError:
+          failed.set()
+          raise
+
+      node.store.local_folder = stage
       await node.bind("sampler", "lost")
-      waiting = self.background(self.bus.wait_for_reply(request, 10))
-      await self.until(waiting.done, node)
-      self.assertFalse(waiting.result().ok)
-      self.assertIn("has not landed, and 127.0.0.1:9 failed to copy", waiting.result().body.decode())
+      await self.until(failed.is_set, node)
+      self.assertIsNone(await self.bus.wait_for_reply(request, 0))
+      await asyncio.to_thread(writer.upload_pending_saves)
+      await self.reply(request, node)
 
   async def test_trainer_leaves_next_command_unclaimed_during_execution(self):
     node, a, b = self.node(), new_id(), new_id()
     for r in (a, b):
-      await self.bus.create_run(Run(r, "tiny", 4, lora=LORA))
+      self.bus.create_run(Run(r, "tiny", 4, lora=LORA))
     await node.bind("worker", a, b)
     for r in (a, b):
       await self.create(r, "tiny", node)
@@ -166,13 +177,13 @@ class TestNodeDaemon(BusTest):
       return await call(method, *args)
 
     child.call = hold_step
-    first = await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    first = self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
     try:
       await self.until(entered.is_set, node)
-      second = await self.bus.submit_command(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
-      other = await self.bus.submit_command(b, Op.OPTIM_STEP, b'{"adam_params":{}}')
+      second = self.bus.submit_command(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
+      other = self.bus.submit_command(b, Op.OPTIM_STEP, b'{"adam_params":{}}')
       await node.tick()
-      state = await self.bus.queued_and_in_flight(a)
+      state = self.bus.queued_and_in_flight(a)
       self.assertEqual((state["queued"], len(state["in_flight"])), (1, 1))
     finally:
       release.set()
@@ -181,7 +192,7 @@ class TestNodeDaemon(BusTest):
 
   async def test_dead_trainer_cleanup_fails_only_the_command_it_claimed(self):
     node, run = self.node(), new_id()
-    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
+    self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
     await node.bind("worker", run)
     await self.create(run, "tiny", node)
     child = node.processes["worker"]
@@ -196,18 +207,18 @@ class TestNodeDaemon(BusTest):
       return await call(method, *args)
 
     child.call = die_during_execute
-    first = await self.bus.submit_command(run, Op.OPTIM_STEP, b"{}")
+    first = self.bus.submit_command(run, Op.OPTIM_STEP, b"{}")
     await self.until(entered.is_set, node)
-    next_request = await self.bus.submit_command(run, Op.CREATE_MODEL, b'{"base_model":"tiny","rank":4,"lora":{}}')
+    next_request = self.bus.submit_command(run, Op.CREATE_MODEL, b'{"base_model":"tiny","rank":4,"lora":{}}')
     stopped.set()
-    await self.until(lambda: not node.active, node)
+    await self.until(lambda: not node.busy(), node)
     self.assertFalse((await self.bus.wait_for_reply(first, 0)).ok)
     await self.reply(next_request, node)
 
   async def test_failed_park_keeps_gpu_until_child_closes(self):
     node, a, b = self.node(), new_id(), new_id()
     for run, base in ((a, "a"), (b, "b")):
-      await self.bus.create_run(Run(run, base, 4, lora=LORA))
+      self.bus.create_run(Run(run, base, 4, lora=LORA))
     await node.bind("holder", a)
     await self.create(a, "a", node)
     closing, release = asyncio.Event(), asyncio.Event()
@@ -224,7 +235,7 @@ class TestNodeDaemon(BusTest):
 
     child.park, child.close = fail_park, slow_close
     await node.bind("contender", b)
-    request = await self.bus.submit_command(
+    request = self.bus.submit_command(
       b, Op.CREATE_MODEL, json.dumps({"base_model": "b", "rank": 4, "lora": LORA}).encode()
     )
     try:
@@ -243,24 +254,23 @@ class TestNodeDaemon(BusTest):
     base = f"{node.store.root}/base"
     tiny().save_pretrained(base)
     a, b = new_id(), new_id()
-    await self.bus.create_run(Run(a, base, 0))
-    await self.bus.create_run(Run(b, base, 0))
-    req_a = await self.bus.submit_command(
+    self.bus.create_run(Run(a, base, 0))
+    self.bus.create_run(Run(b, base, 0))
+    req_a = self.bus.submit_command(
       a, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
     )
     await self.reply(req_a, node)
-    pa = self.bus.plan_state.home[a]
+    pa = self.bus.workers_of(a)[0]
     holder = node.workers[pa]
     pid = holder.model.proc.pid
     os.killpg(pid, signal.SIGSTOP)
     try:
-      request = await self.bus.submit_command(
+      request = self.bus.submit_command(
         b, Op.CREATE_MODEL, json.dumps({"base_model": base, "rank": 0, "lora": {}}).encode()
       )
-      await self.until(lambda: any(t.kind == "park" and t.worker == pa for t, _ in node.active.values()), node)
-      pb = self.bus.plan_state.home[b]
+      await self.until(lambda: any(t.worker == pa and t.kind == "park" for t, _ in node.active.values()), node)
       self.assertEqual(holder.resident, (0,))
-      self.assertNotIn(pb, node.workers)  # Rule R1: never enters GPU 0 until holder finishes parking
+      self.assertEqual(list(node.workers), [pa])  # Rule R1: never enters GPU 0 until holder finishes parking
       before = self.bus.nodes[node.id].until
       await node.step_once(wait_ms=0)
       self.assertGreater(self.bus.nodes[node.id].until, before)
@@ -276,28 +286,26 @@ class TestNodeDaemon(BusTest):
     base = f"{node.store.root}/base"
     tiny().save_pretrained(base)
     run = new_id()
-    await self.bus.create_run(Run(run, base, 4, lora=LORA))
+    self.bus.create_run(Run(run, base, 4, lora=LORA))
     await self.create(run, base, node)
-    proc = self.bus.plan_state.home[run]
+    proc = self.bus.workers_of(run)[0]
     first = node.workers[proc].model.proc.pid
     # When GPU 0 is occupied, the parked 1-GPU trainer hops to GPU 1 without restarting its subprocess.
     handle = node.workers[proc]
     await handle.park()
     other_spec = WorkerSpec(Role.TRAINER, base, False, True, None, 1)
     node.workers["other"] = WorkerHandle("other", other_spec, handle.model, resident=(0,))
-    self.bus.nodes[node.id].workers["other"] = self.bus.nodes[node.id].workers[proc]
     try:
-      await node.claim_gpus(handle, (1,))
       await handle.ensure_gpu((1,))
       self.assertEqual(handle.model.proc.pid, first)
       self.assertEqual(handle.resident, (1,))
     finally:
       node.workers.pop("other", None)
-      self.bus.nodes[node.id].workers.pop("other", None)
     os.killpg(first, signal.SIGKILL)
     await self.until(lambda: proc not in node.workers, node)
     await self.create(run, base, node)
-    self.assertNotEqual(node.workers[proc].model.proc.pid, first)
+    [new_proc] = self.bus.workers_of(run)
+    self.assertNotEqual(node.workers[new_proc].model.proc.pid, first)
 
   async def test_the_node_uploads_what_its_model_saved(self):
     with tempfile.TemporaryDirectory() as folder:
@@ -309,8 +317,8 @@ class TestNodeDaemon(BusTest):
   async def test_synchronous_clock_cycles_hold_quantum_across_step_gaps_without_parking(self):
     node = self.node(gpus=1)
     a, b = new_id(), new_id()
-    await self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
-    await self.bus.create_run(Run(b, "tiny-b", 4, account="acct-b", lora=LORA))
+    self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
+    self.bus.create_run(Run(b, "tiny-b", 4, account="acct-b", lora=LORA))
     await self.create(a, "tiny", node)
     await self.create(b, "tiny", node)
     parks = []
@@ -320,10 +328,10 @@ class TestNodeDaemon(BusTest):
     parks.clear()
 
     # Waiter `b` queues work while `a` runs 4 synchronous SDK-style steps with a 15ms HTTP round-trip gap between steps.
-    req_b = await self.bus.submit_command(b, Op.OPTIM_STEP, b'{"adam_params":{}}')
+    req_b = self.bus.submit_command(b, Op.OPTIM_STEP, b'{"adam_params":{}}')
     for _ in range(4):
-      fb = await self.bus.submit_command(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
-      opt = await self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
+      fb = self.bus.submit_command(a, Op.FORWARD_BACKWARD, proto_body(a, 6))
+      opt = self.bus.submit_command(a, Op.OPTIM_STEP, b'{"adam_params":{}}')
       await self.reply(fb, node)
       await self.reply(opt, node)
       await asyncio.sleep(0.015)
@@ -333,8 +341,8 @@ class TestNodeDaemon(BusTest):
   async def test_contending_sequential_clients_do_not_swap_the_gpu_on_every_command(self):
     node = self.node(gpus=1)
     a, b = new_id(), new_id()
-    await self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
-    await self.bus.create_run(Run(b, "tiny-b", 4, account="acct-b", lora=LORA))
+    self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
+    self.bus.create_run(Run(b, "tiny-b", 4, account="acct-b", lora=LORA))
     await self.create(a, "tiny", node)
     await self.create(b, "tiny", node)
     parks = []
@@ -345,7 +353,7 @@ class TestNodeDaemon(BusTest):
     async def client(run):
       for _ in range(4):
         for op, body in ((Op.FORWARD_BACKWARD, proto_body(run, 6)), (Op.OPTIM_STEP, b'{"adam_params":{}}')):
-          reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, body), 60)
+          reply = await self.bus.wait_for_reply(self.bus.submit_command(run, op, body), 60)
           self.assertTrue(reply is not None and reply.ok)
           await asyncio.sleep(0.015)
 
@@ -356,11 +364,11 @@ class TestNodeDaemon(BusTest):
     self.assertLessEqual(len(parks), 3)
 
   async def test_a_swap_waits_for_an_open_training_step_to_finish(self):
-    self.enterContext(patch("tinyrl.bus.QUANTUM_MS", 40))
+    self.enterContext(patch("tinyrl.control.policy.QUANTUM_MS", 40))
     node = self.node(gpus=1)
     a, b = new_id(), new_id()
-    await self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
-    await self.bus.create_run(Run(b, "tiny-b", 4, account="acct-b", lora=LORA))
+    self.bus.create_run(Run(a, "tiny-a", 4, account="acct-a", lora=LORA))
+    self.bus.create_run(Run(b, "tiny-b", 4, account="acct-b", lora=LORA))
     await self.create(a, "tiny", node)
     await self.create(b, "tiny", node)
     parks = []  # the last command each process ran before it parked
@@ -383,7 +391,7 @@ class TestNodeDaemon(BusTest):
     async def client(run):
       for _ in range(8):
         for op, body in ((Op.FORWARD_BACKWARD, proto_body(run, 6)), (Op.OPTIM_STEP, b'{"adam_params":{}}')):
-          reply = await self.bus.wait_for_reply(await self.bus.submit_command(run, op, body), 60)
+          reply = await self.bus.wait_for_reply(self.bus.submit_command(run, op, body), 60)
           self.assertTrue(reply is not None and reply.ok)
           await asyncio.sleep(0.015)
 
@@ -396,14 +404,14 @@ class TestNodeDaemon(BusTest):
 
   async def test_reset_reply_fences_and_closes_workers_with_fresh_boot_id(self):
     node, run = self.node(), new_id()
-    await self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
+    self.bus.create_run(Run(run, "tiny", 4, lora=LORA))
     await node.bind("worker", run)
     await self.create(run, "tiny", node)
     old_boot = node.boot_id
     child = node.workers["worker"].model
-    self.bus.reap_node(node.id, old_boot)
-    reply = await node.step_once(wait_ms=0)
-    self.assertTrue(reply.reset)
+    self.bus.expire_node(node.id, old_boot)
+    ok = await node.step_once(wait_ms=0)
+    self.assertFalse(ok)
     self.assertTrue(child.closed)
     self.assertEqual(node.workers, {})
     self.assertNotEqual(node.boot_id, old_boot)
@@ -411,7 +419,7 @@ class TestNodeDaemon(BusTest):
   async def test_snapshot_waits_for_concurrent_park_without_colliding(self):
     node, a, b = self.node(gpus=1), new_id(), new_id()
     for run, base in ((a, "a"), (b, "b")):
-      await self.bus.create_run(Run(run, base, 4, lora=LORA))
+      self.bus.create_run(Run(run, base, 4, lora=LORA))
     await node.bind("holder", a)
     await self.create(a, "a", node)
     holder = node.workers["holder"]
@@ -433,34 +441,61 @@ class TestNodeDaemon(BusTest):
 
     child.call = checked
     await node.bind("contender", b)
-    req = await self.bus.submit_command(
-      b, Op.CREATE_MODEL, json.dumps({"base_model": "b", "rank": 4, "lora": LORA}).encode()
-    )
+    req = self.bus.submit_command(b, Op.CREATE_MODEL, json.dumps({"base_model": "b", "rank": 4, "lora": LORA}).encode())
     try:
       await self.until(parking.is_set, node)
-      snap = self.background(
-        node.execute_turn(
-          Turn(
-            "t-snap",
-            "snapshot",
-            "holder",
-            holder.spec,
-            (),
-            args={"run": a, "version": new_id().replace("-", ""), "drop": True},
-          )
-        )
-      )
+      import uuid as _uuid
+
+      from tinyrl.types import Task, TaskKind
+
+      save_t = Task(_uuid.uuid4().hex[:12], TaskKind.SAVE, "holder", holder.spec, run_id=a, version=_uuid.uuid4().hex)
+      snap = self.background(node.execute_task(save_t))
       for _ in range(5):
         await asyncio.sleep(0)
       self.assertFalse(snap.done())
       self.assertEqual(overlap, [])
     finally:
       release.set()
-    res = await snap
-    self.assertTrue(res.ok)
-    self.assertIsNotNone(res.saved)
+    done = await snap
+    self.assertIsNotNone(done.saved)
     self.assertEqual(overlap, [])
     await self.reply(req, node)
+
+  async def test_single_gpu_full_finetune_on_nonzero_gpu_uses_local_default_device(self):
+    seen_env, seen_resume = {}, []
+
+    class RecordingNode(TestNode):
+      def open_trainer(self, worker_id, width, env):
+        seen_env[worker_id] = env.get("CUDA_VISIBLE_DEVICES")
+        proc = super().open_trainer(worker_id, width, env)
+        orig = proc.resume
+
+        async def record(gpus):
+          seen_resume.append((worker_id, gpus))
+          return await orig(gpus)
+
+        proc.resume = record
+        return proc
+
+    node = RecordingNode(self.bus, gpus=2, node="two-gpu")
+    self.addAsyncCleanup(node.aclose)
+    lora_run, full_run = new_id(), new_id()
+    self.bus.create_run(Run(lora_run, "tiny", 4, lora=LORA))
+    self.bus.create_run(Run(full_run, "tiny", 0))
+    await node.bind("lora", lora_run)
+    await node.bind("full", full_run)
+    r1 = self.bus.submit_command(
+      lora_run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 4, "lora": LORA}).encode()
+    )
+    await self.reply(r1, node)
+    r2 = self.bus.submit_command(
+      full_run, Op.CREATE_MODEL, json.dumps({"base_model": "tiny", "rank": 0, "lora": {}}).encode()
+    )
+    await self.reply(r2, node)
+    self.assertEqual(seen_env["lora"], "0,1")
+    self.assertEqual(seen_env["full"], "1")
+    self.assertEqual(seen_resume, [("lora", (0,)), ("full", ())])
+    self.assertEqual(node.workers["full"].bound, (1,))
 
 
 if __name__ == "__main__":

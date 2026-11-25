@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import ctypes
 import fcntl
+import functools
 import glob
 import hashlib
 import importlib.metadata
@@ -14,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 from tinyrl.control.process import launch, reap, target_pid
 
@@ -42,11 +46,12 @@ def run(*args: str, log: str = "") -> None:
     raise RuntimeError(f"{args[0]} {args[1]} failed: {''.join(tail).strip()}")
 
 
-def gpus() -> list[str]:
+@functools.cache
+def gpus() -> tuple[str, ...]:
   out = subprocess.run(
     ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"], check=True, capture_output=True, text=True
   )
-  return out.stdout.split()
+  return tuple(out.stdout.split())
 
 
 def gpu(visible: str) -> str:
@@ -80,13 +85,55 @@ def cuda_pids(pid: int) -> list[int]:
   ]
 
 
+class GpuPair(ctypes.Structure):
+  _fields_ = [("old", ctypes.c_ubyte * 16), ("new", ctypes.c_ubyte * 16)]
+
+
+class LockArgs(ctypes.Structure):
+  _fields_ = [("timeout_ms", ctypes.c_uint), ("pad", ctypes.c_ubyte * 60)]
+
+
+class RestoreArgs(ctypes.Structure):
+  _fields_ = [("pairs", ctypes.POINTER(GpuPair)), ("count", ctypes.c_uint), ("pad", ctypes.c_ubyte * 52)]
+
+
+def check_cuda(lib: ctypes.CDLL, name: str, code: int) -> None:
+  if code:
+    detail = ctypes.c_char_p()
+    lib.cuGetErrorString(code, ctypes.byref(detail))
+    raise RuntimeError(f"{name} failed ({code}): {(detail.value or b'').decode()}")
+
+
+def open_cuda() -> ctypes.CDLL:
+  """Initialize libcuda once per dump/restore instead of paying multi-second `cuInit` per subprocess."""
+  lib = ctypes.CDLL("libcuda.so.1")
+  lib.cuInit.argtypes, lib.cuInit.restype = [ctypes.c_uint], ctypes.c_int
+  lib.cuGetErrorString.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+  lib.cuGetErrorString.restype = ctypes.c_int
+  for fn in (
+    lib.cuCheckpointProcessLock,
+    lib.cuCheckpointProcessCheckpoint,
+    lib.cuCheckpointProcessRestore,
+    lib.cuCheckpointProcessUnlock,
+  ):
+    fn.argtypes, fn.restype = [ctypes.c_int, ctypes.c_void_p], ctypes.c_int
+  check_cuda(lib, "cuInit", lib.cuInit(0))
+  return lib
+
+
+def uuid_bytes(gpu_uuid: str) -> tuple[int, ...]:
+  return tuple(uuid.UUID(gpu_uuid.removeprefix("GPU-")).bytes)
+
+
 def save(pid: int, folder: str, name: str, visible: str) -> None:
   """Save the asleep server whose root process is `pid`, and whose socket and log are `name`.sock and `name`.log, to `folder`. This ends the server."""
   pids = cuda_pids(pid)
+  lib = open_cuda()
+  lock_args = LockArgs(timeout_ms=10_000)
   for p in pids:
-    run("cuda-checkpoint", "--action", "lock", "--pid", str(p), "--timeout", "10000")
+    check_cuda(lib, "cuCheckpointProcessLock", lib.cuCheckpointProcessLock(p, ctypes.byref(lock_args)))
   for p in pids:
-    run("cuda-checkpoint", "--action", "checkpoint", "--pid", str(p))
+    check_cuda(lib, "cuCheckpointProcessCheckpoint", lib.cuCheckpointProcessCheckpoint(p, None))
   tmp = f"{folder}.{pid}"
   try:
     os.makedirs(f"{tmp}/keep")
@@ -112,8 +159,10 @@ def save(pid: int, folder: str, name: str, visible: str) -> None:
 
 async def restore(folder: str, visible: str, env: dict[str, str]) -> tuple[subprocess.Popen, str]:
   """Restore onto the engine's GPU. The node owns the namespace process even while waiting for it to start."""
-  target = await asyncio.to_thread(gpu, visible)
-  ns = launch([*UNSHARE, sys.executable, "-m", __name__, folder, target], env=env, stdout=subprocess.PIPE, text=True)
+  all_gpus = await asyncio.to_thread(gpus)
+  target = visible if visible.startswith("GPU-") else all_gpus[int(visible)]
+  cmd = [*UNSHARE, sys.executable, "-m", __name__, folder, target, *all_gpus]
+  ns = launch(cmd, env=env, stdout=subprocess.PIPE, text=True)
   try:
     if (await asyncio.to_thread(ns.stdout.readline)).strip() != "restored":
       raise RuntimeError(f"could not restore the snapshot in {folder}")
@@ -130,37 +179,42 @@ async def restore(folder: str, visible: str, env: dict[str, str]) -> tuple[subpr
     ns.stdout.close()
 
 
-def restore_here(folder: str, target: str) -> None:
+def restore_here(folder: str, target: str, all_gpus: tuple[str, ...]) -> None:
   """Runs as the init of fresh namespaces: give the copy its own loopback and private /tmp, /dev/shm and RUN, restore, move it onto `target`, then reap."""
-  run("ip", "link", "set", "lo", "up")
-  # private /tmp and /dev/shm, so copies don't collide on the files the snapshot recreates there, with the node's folders bound back in: the snapshot, checkpoints and models live there
-  for d in ("/tmp", "/dev/shm"):
-    os.makedirs(f"/mnt/tinyrl{d}", exist_ok=True)
-    run("mount", "--bind", d, f"/mnt/tinyrl{d}")
-    run("mount", "-t", "tmpfs", "tmpfs", d)
-    for e in os.scandir(f"/mnt/tinyrl{d}"):
-      try:
-        if e.is_dir(follow_symlinks=False):
-          os.makedirs(f"{d}/{e.name}")
-          run("mount", "--bind", e.path, f"{d}/{e.name}")
-      except (FileNotFoundError, RuntimeError):
-        if os.path.exists(e.path):
-          raise
-        with contextlib.suppress(OSError):
-          os.rmdir(f"{d}/{e.name}")
-  os.makedirs(RUN, exist_ok=True)
-  run("mount", "-t", "tmpfs", "tmpfs", RUN)
-  for f in glob.glob(f"{folder}/keep/*"):
-    shutil.copy2(f, "/dev/shm" if os.path.basename(f).startswith("link_remap.") else RUN)
-  with open(f"{folder}/meta.json") as f:
-    meta = json.load(f)
-  log = "/tmp/criu-restore.log"
-  run("criu", "restore", "-D", folder, *CRIU, "--tcp-close", "-d", "--log-file", log, log=log)
+  # Overlap multi-second cuInit (UVM registration across all GPUs) with mounts and CRIU page restore.
+  with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+    cuda_fut = pool.submit(open_cuda)
+    run("ip", "link", "set", "lo", "up")
+    # private /tmp and /dev/shm, so copies don't collide on the files the snapshot recreates there, with the node's folders bound back in: the snapshot, checkpoints and models live there
+    for d in ("/tmp", "/dev/shm"):
+      os.makedirs(f"/mnt/tinyrl{d}", exist_ok=True)
+      run("mount", "--bind", d, f"/mnt/tinyrl{d}")
+      run("mount", "-t", "tmpfs", "tmpfs", d)
+      for e in os.scandir(f"/mnt/tinyrl{d}"):
+        try:
+          if e.is_dir(follow_symlinks=False):
+            os.makedirs(f"{d}/{e.name}")
+            run("mount", "--bind", e.path, f"{d}/{e.name}")
+        except (FileNotFoundError, RuntimeError):
+          if os.path.exists(e.path):
+            raise
+          with contextlib.suppress(OSError):
+            os.rmdir(f"{d}/{e.name}")
+    os.makedirs(RUN, exist_ok=True)
+    run("mount", "-t", "tmpfs", "tmpfs", RUN)
+    for f in glob.glob(f"{folder}/keep/*"):
+      shutil.copy2(f, "/dev/shm" if os.path.basename(f).startswith("link_remap.") else RUN)
+    with open(f"{folder}/meta.json") as f:
+      meta = json.load(f)
+    log = "/tmp/criu-restore.log"
+    run("criu", "restore", "-D", folder, *CRIU, "--tcp-close", "-d", "--log-file", log, log=log)
+    lib = cuda_fut.result()
   swap = {meta["gpu"]: target, target: meta["gpu"]}
-  device_map = ",".join(f"{u}={swap.get(u, u)}" for u in gpus())  # cuda-checkpoint wants every GPU listed
+  pairs = (GpuPair * len(all_gpus))(*(GpuPair(uuid_bytes(u), uuid_bytes(swap.get(u, u))) for u in all_gpus))
+  restore_args = RestoreArgs(pairs=ctypes.cast(pairs, ctypes.POINTER(GpuPair)), count=len(all_gpus))
   for p in meta["pids"]:
-    run("cuda-checkpoint", "--action", "restore", "--pid", str(p), "--device-map", device_map)
-    run("cuda-checkpoint", "--action", "unlock", "--pid", str(p))
+    check_cuda(lib, "cuCheckpointProcessRestore", lib.cuCheckpointProcessRestore(p, ctypes.byref(restore_args)))
+    check_cuda(lib, "cuCheckpointProcessUnlock", lib.cuCheckpointProcessUnlock(p, None))
   print("restored", flush=True)
   while True:
     try:
@@ -170,4 +224,4 @@ def restore_here(folder: str, target: str) -> None:
 
 
 if __name__ == "__main__":
-  restore_here(sys.argv[1], sys.argv[2])
+  restore_here(sys.argv[1], sys.argv[2], tuple(sys.argv[3:]) or gpus())

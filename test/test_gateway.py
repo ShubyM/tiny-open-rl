@@ -31,7 +31,7 @@ class TestGatewayDedupe(BusTest):
     self.assertEqual(r2.status_code, 200)
     self.assertEqual(r1.json()["model_id"], r2.json()["model_id"])
 
-    runs = self.bus.state().jobs
+    runs = {r for r, rs in self.bus.runs.items() if rs.live}
     self.assertEqual(len(runs), 1)
 
   async def test_b2_save_weights_for_sampler_dedupes(self):
@@ -47,7 +47,7 @@ class TestGatewayDedupe(BusTest):
     self.assertEqual(s2.status_code, 200)
     self.assertEqual(s1.json()["request_id"], s2.json()["request_id"])
 
-    runs = self.bus.state().jobs
+    runs = {r for r, rs in self.bus.runs.items() if rs.live}
     samplers = [r for r in runs if r.startswith("samp-")]
     self.assertEqual(len(samplers), 1)
 

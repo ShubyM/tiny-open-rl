@@ -11,34 +11,34 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEDULER = "tinyrl/control/scheduler.py"
-BUS = "tinyrl/bus.py"
-FAIRNESS = "tinyrl/control/fairness.py"
+CONTROLLER = "tinyrl/control/controller.py"
+LEDGER = "tinyrl/control/ledger.py"
+POLICY = "tinyrl/control/policy.py"
 ACCOUNTING = "tinyrl/control/accounting.py"
 ORDER = "test.test_scheduler.TestLocalQuantum"
 BILLING = "test.test_accounting.TestAccounting"
-CLAIM = "test.test_bus.TestBus.test_reaped_boot_id_is_fenced_and_gets_reset_without_overwriting_checkpoint"
-DEDUP = "test.test_bus.TestBus.test_competing_sampler_replicas_answer_and_charge_exactly_once"
+CLAIM = "test.test_ledger.TestLedger.test_reaped_boot_id_is_fenced_and_gets_reset_without_overwriting_checkpoint"
+DEDUP = "test.test_ledger.TestLedger.test_competing_sampler_replicas_answer_and_charge_exactly_once"
 RECOVERY = "test.test_trainer.TestTrainer.test_parked_gradients_and_the_recovery_warning_cannot_replay_after_a_failure"
 
 # (source, function, original expression, faulty replacement, tests that should detect it)
 CASES = [
-  (FAIRNESS, "rank_runs", "-ready_lag(cmd.run)", "ready_lag(cmd.run)", ORDER),
-  (FAIRNESS, "admit_samples", "max_seqs - sum(in_flight.values())", "1 - sum(in_flight.values())", BILLING),
-  (FAIRNESS, "rank_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
-  (SCHEDULER, "ready_lag", "self.service.get(account, 0.0)", "self.seen.get(account, 0.0)", ORDER),
+  (POLICY, "rank_runs", "-lag_of(cmd.run)", "lag_of(cmd.run)", ORDER),
+  (
+    POLICY,
+    "admit_samples",
+    "for _ in range(slots):",
+    "for _ in range(1):",
+    ORDER + ".test_sampler_wave_obeys_account_and_version_limits_and_rotates_within_them",
+  ),
+  (POLICY, "rank_runs", "entry_sort_key(cmd.entry_id)", "cmd.entry_id", ORDER),
+  (POLICY, "ready_lag", "service.get(acct, 0.0)", "seen.get(acct, 0.0)", ORDER),
   (ACCOUNTING, "_change_active", "1_000_000 * self.active", "1_000_000", BILLING),
   (ACCOUNTING, "_change_active", "* self.gpus", "* 1", BILLING),
-  (BUS, "commit", "if acct and charge and charge.gpu_ms", "if reply.ok and acct and charge and charge.gpu_ms", BILLING),
-  (BUS, "exchange_sync", "if report.boot_id in self.reaped_boots:", "if False:", CLAIM),
-  (
-    BUS,
-    "commit",
-    "if (p := queue.get(cmd.entry_id)) is None or p.turn != turn:",
-    "if cmd.request_id in self.box(cmd.run).replies:",
-    DEDUP,
-  ),
-  (BUS, "commit", "if mutated and not deleting:", "if reply.ok and mutated and not deleting:", RECOVERY),
+  (LEDGER, "apply_charge", "if charge.gpu_ms:", "if reply.ok and charge.gpu_ms:", BILLING),
+  (CONTROLLER, "handle", "if self.db.is_fenced(msg.boot_id):", "if False:", CLAIM),
+  (LEDGER, "finish_sample", "item.owner != owner or item.attempt != attempt", "item.attempt != attempt", DEDUP),
+  (LEDGER, "finish_train", "if mutated:", "if reply.ok and mutated:", RECOVERY),
 ]
 
 
@@ -58,6 +58,7 @@ def run_tests(folder, tests):
   env.pop("TINYRL_DB", None)
   env.pop("CONTROL_URL", None)
   env.pop("PYTHONPATH", None)
+  env["PYTHONPATH"] = str(folder)
   env["TMPDIR"] = str(folder)
   return subprocess.run(
     [sys.executable, "-B", "-m", "test.mutation", *tests],
@@ -80,7 +81,7 @@ def measure():
     if baseline.returncode:
       raise SystemExit(f"Clean baseline failed:\n{baseline.stderr}")
     for path, function, old, new, test in CASES:
-      source = (ROOT / path).read_text()
+      source = (folder / path).read_text()
       (folder / path).write_text(mutate(source, function, old, new))
       result = run_tests(folder, [test])
       (folder / path).write_text(source)

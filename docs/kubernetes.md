@@ -1,16 +1,12 @@
 # tinyrl on Kubernetes
 
-**Current implementation.** The cluster scheduler groups runs and places workers on nodes. Each node daemon owns
-worker leases, command preparation, GPU reservations and process lifetime. Each worker runs in one coroutine with its
-executor and ready queue local to that lifetime. GPU admission uses the node's actual reservations and waiting order;
-state changes wake waiting coroutines directly. Trainers are synchronous model processes; sampling controllers run
-in the node and drive isolated engines. Only cluster assignments use the event log. Portable checkpoints, multi-node
-placement, single-node FSDP, host parking, background uploads and node-loss recovery are built.
-See the [README](../README.md) and [node_daemon.py](../tinyrl/control/node_daemon.py) for the running system.
+**Current implementation.** One gateway hosts the SQLite ledger and the fleet scheduler. Each GPU node reports its capacity,
+worker residency, active requests, and staged checkpoints when it pulls work. The controller chooses the worker, physical
+GPU block, and requests to execute. The node daemon owns local process lifetime, stages weights, parks and resumes
+workers, and reports measured GPU time. Portable checkpoints, single-node FSDP, host parking, and node-loss recovery
+are implemented. [Controller](../tinyrl/control/ledger.py) · [Node daemon](../tinyrl/control/node_daemon.py)
 
-**Roadmap below.** Live run migration between healthy nodes, adaptive worker sharding, `/dev/shm` + peer Store tiers,
-Spot notification handling and autoscaling remain proposals. The topology, key layouts and implementation sketches
-below describe that broader design; they are not a specification of the current Redis schema or process ownership.
+**Historical design.** The Redis key layouts and implementation sketches below describe an earlier proposal. The current controller can move checkpointed runs between healthy nodes and the Store can fetch weights from a peer. Adaptive sharding, a `/dev/shm` storage tier, and Spot notification handling are proposed extensions.
 Figures marked measured come from an H100 and an L4 on GKE, driver 580; the rest are estimates.
 
 ## The idea

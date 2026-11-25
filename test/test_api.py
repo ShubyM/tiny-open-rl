@@ -14,10 +14,11 @@ import torch
 
 from test.execution import TestNode
 from test.helpers import BusTest, tiny
-from tinyrl import bus
 from tinyrl.api import gateway, wire
 from tinyrl.api.proto import tinker_public_pb2 as pb
+from tinyrl.control import controller as bus
 from tinyrl.storage.store import Store
+from tinyrl.types import NodeMsg
 
 PROTO = {"content-type": wire.PROTO}
 
@@ -40,9 +41,7 @@ class TestAPI(BusTest):
   async def asyncSetUp(self):
     await super().asyncSetUp()
     self.store = Store(root=tempfile.mkdtemp())
-    self.http = httpx.AsyncClient(
-      transport=httpx.ASGITransport(app=gateway.app(self.bus, self.store)), base_url="http://tinyrl"
-    )
+    self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app(self.bus)), base_url="http://tinyrl")
     self.node = TestNode(self.bus, store=self.store)
 
   async def asyncTearDown(self):
@@ -137,9 +136,7 @@ class TestAPI(BusTest):
     save = {"model_id": run_id, "sampling_session_seq_id": 0}
     sampler = (await self.result(await self.post("save_weights_for_sampler", json=save))).json()
     self.assertEqual(sampler["path"], f"tinker://{run_id}/sampler_weights/step-0")
-    with open(
-      f"{self.store.local_folder(await self.bus.checkpoint_version(sampler['path']))[0]}/adapter_config.json"
-    ) as f:
+    with open(f"{self.store.local_folder(self.bus.checkpoint_version(sampler['path']))[0]}/adapter_config.json") as f:
       self.assertEqual(json.load(f)["r"], 4)
 
     load = {"model_id": run_id, "path": "nope", "optimizer": False}
@@ -165,7 +162,8 @@ class TestAPI(BusTest):
     final = f"/api/v1/training_runs/{run_id}/checkpoints/weights/final"
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": 60})).status_code, 400)
     self.assertEqual((await self.http.put(f"{final}/ttl", json={"ttl_seconds": None})).status_code, 200)
-    self.assertEqual(await self.bus.expire_checkpoints(), 0)
+    self.bus.maintain()
+    self.assertEqual(len(self.bus.list_checkpoints()), 2)
     self.assertEqual((await self.http.delete(final)).status_code, 200)
     self.assertEqual((await self.http.delete(final)).status_code, 404)
 
@@ -174,14 +172,14 @@ class TestAPI(BusTest):
     self.assertEqual((await self.http.get(f"/api/v1/training_runs/{run_id}/checkpoints")).json()["checkpoints"], [])
 
   async def test_a_checkpoint_leaves_the_registry_when_its_ttl_runs_out(self):
-    await self.seed_checkpoint("tinker://r/weights/soon", 10, ttl=0.2)
-    await self.seed_checkpoint("tinker://r/weights/later", 10, ttl=3600)
+    self.seed_checkpoint("tinker://r/weights/soon", 10, ttl=0.2)
+    self.seed_checkpoint("tinker://r/weights/later", 10, ttl=3600)
     self.start_maintenance()
     for _ in range(100):
-      if await self.bus.get_checkpoint("tinker://r/weights/soon") is None:
+      if self.bus.get_checkpoint("tinker://r/weights/soon") is None:
         break
       await asyncio.sleep(0.05)
-    self.assertEqual([c["checkpoint_id"] for c in await self.bus.checkpoints_of_run("r")], ["weights/later"])
+    self.assertEqual([c.uri for c in self.bus.list_checkpoints()], ["tinker://r/weights/later"])
 
   async def test_errors(self):
     run_id = await self.create_model()
@@ -201,17 +199,17 @@ class TestAPI(BusTest):
     self.assertEqual(failed.status_code, 200)
     self.assertEqual(failed.json()["category"], "user")
     self.assertIn("dpo", failed.json()["error"])
-    self.assertEqual((await self.bus.get_run(run_id))["failed"], 1)
+    self.assertEqual((self.bus.get_run(run_id))["failed"], 1)
 
   async def test_workers(self):
     shared, also_shared = await self.create_model(), await self.create_model()
     full = await self.create_model(user_metadata={"openrl.fine_tuning_type": "full"})
     exclusive = await self.create_model(user_metadata={"openrl.exclusive": "true"})
 
-    workers = [await self.worker(run_id) for run_id in (shared, also_shared, full, exclusive)]
+    workers = [self.worker(run_id) for run_id in (shared, also_shared, full, exclusive)]
     self.assertEqual(workers[0], workers[1])
     self.assertEqual(len(set(workers)), 3)
-    self.assertEqual((await self.bus.get_run(full))["rank"], 0)
+    self.assertEqual((self.bus.get_run(full))["rank"], 0)
     self.assertEqual((await self.post("get_info", json={"model_id": full})).json()["lora_rank"], 16)
 
   async def test_session_tags_apply_to_its_models(self):
@@ -219,9 +217,9 @@ class TestAPI(BusTest):
     tags = ["openrl.fine_tuning_type=full", "openrl.recipe=rl"]
     session = await self.post("create_session", json={"tags": tags, "user_metadata": None, "sdk_version": "0.29.0"})
     full = await self.create_model(session_id=session.json()["session_id"])
-    self.assertEqual((await self.bus.get_run(full))["rank"], 0)
-    state = self.bus.state()
-    self.assertEqual(state.runs(await self.worker(full)), [full])
+    self.assertEqual((self.bus.get_run(full))["rank"], 0)
+    wid = self.worker(full)
+    self.assertEqual([r for r, rs in self.bus.runs.items() if rs.live and rs.owner and rs.owner[0] == wid], [full])
 
   async def test_delete(self):
     run_id = await self.create_model()
@@ -240,27 +238,27 @@ class TestAPI(BusTest):
       "create_sampling_session", json={"session_id": session_id, "base_model": "tiny", "model_path": ""}
     )
     samp_id = sampling.json()["sampling_session_id"]
-    self.assertIsNone((await self.bus.get_run(samp_id))["model_path"])
+    self.assertIsNone((self.bus.get_run(samp_id))["model_path"])
     self.start_maintenance()
     await self.scheduling_until(lambda d: samp_id in d["state"]["jobs"])
 
     stale = time.time() - bus.SESSION_GRACE - 1
     with self.bus.db:
-      self.bus.sessions[session_id]["seen"] = stale
-      self.bus.sessions.save(session_id)
+      self.bus.db.execute("UPDATE sessions SET seen=? WHERE id=?", (stale, session_id))
     await self.post("session_heartbeat", json={"session_id": session_id})  # a heartbeat in time keeps it
     await asyncio.sleep(0.3)
     self.assertTrue((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
 
     with self.bus.db:
-      self.bus.sessions[session_id]["seen"] = stale  # longer ago than the grace
-      self.bus.sessions.save(session_id)
+      self.bus.db.execute("UPDATE sessions SET seen=? WHERE id=?", (stale, session_id))  # longer ago than the grace
     await self.scheduling_until(lambda d: samp_id not in d["state"]["jobs"])
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     self.assertFalse((await self.http.get(f"/api/v1/runs/{samp_id}")).json()["live"])
     cutoff = time.time() - bus.SESSION_GRACE
-    self.assertEqual([s for s, v in self.bus.sessions.items() if v["active"] and v["seen"] <= cutoff], [])
+    self.assertEqual(
+      self.bus.db.execute("SELECT id FROM sessions WHERE active=1 AND seen<=?", (cutoff,)).fetchall(), []
+    )
 
   async def test_a_finished_session_loses_its_runs_without_waiting_for_its_heartbeats_to_stop(self):
     session_id = (await self.post("create_session")).json()["session_id"]
@@ -275,7 +273,9 @@ class TestAPI(BusTest):
     await self.drain(run_id)  # its training run goes once its queued work is done
     self.assertFalse((await self.http.get(f"/api/v1/runs/{run_id}")).json()["live"])
     cutoff = time.time() - bus.SESSION_GRACE
-    self.assertEqual([s for s, v in self.bus.sessions.items() if v["active"] and v["seen"] <= cutoff], [])
+    self.assertEqual(
+      self.bus.db.execute("SELECT id FROM sessions WHERE active=1 AND seen<=?", (cutoff,)).fetchall(), []
+    )
 
   async def test_a_checkpoint_saved_without_a_ttl_gets_the_deployment_default_unless_its_run_owns_it(self):
     run_id = await self.create_model()
@@ -307,7 +307,7 @@ class TestAPI(BusTest):
 
     saved = (await self.result(await self.post("save_weights", json={"model_id": run_id, "path": "final_pin"}))).json()
 
-    folder = self.store.local_folder(await self.bus.checkpoint_version(saved["path"]))[0]
+    folder = self.store.local_folder(self.bus.checkpoint_version(saved["path"]))[0]
     files = os.listdir(folder)
     self.assertTrue(all(f.endswith(".safetensors") for f in files), f"Found non-safetensors files: {files}")
 
@@ -326,7 +326,7 @@ class TestAPI(BusTest):
     saved = (
       await self.result(await self.post("save_weights_for_sampler", json={"model_id": run, "path": "sampler"}))
     ).json()
-    files = glob.glob(f"{self.store.local_folder(await self.bus.checkpoint_version(saved['path']))[0]}/*.safetensors")
+    files = glob.glob(f"{self.store.local_folder(self.bus.checkpoint_version(saved['path']))[0]}/*.safetensors")
     self.assertTrue(files)
     for path in files:
       self.assertTrue(all(t.dtype == torch.bfloat16 for t in safetensors.torch.load_file(path).values()))
@@ -415,14 +415,12 @@ class TestAPI(BusTest):
     )
     samp_id = saved.json()["sampling_session_id"]
 
-    from tinyrl.types import NodeReport
-
-    await self.bus.exchange(NodeReport("node-1", "b1", 8))
+    self.bus.handle(NodeMsg("hello", "node-1", "b1", gpus=8))
     self.start_maintenance()
-    worker = await self.worker(run_id)
+    worker = self.worker(run_id)
     data = await self.scheduling_until(lambda d: d["state"]["procs"].get(worker, {}).get("node"))
     self.assertIn(data["state"]["procs"][worker]["node"], ("test-node", "node-1"))
-    sampler = data["state"]["procs"][await self.worker(samp_id)]
+    sampler = data["state"]["procs"][self.worker(samp_id)]
     self.assertEqual(
       sampler["spec"],
       {"role": "sampler", "base": "tiny", "lora": True, "exclusive": True, "train_run": excl_id, "gpus": 1},
@@ -444,9 +442,7 @@ class TestAPI(BusTest):
     self.fail(f"never: {data}")
 
   async def sampler_runs(self) -> list[str]:
-    return [
-      e.body["run"] for e in await self.bus.read_events() if e.kind == "run_created" and e.body["role"] == "sampler"
-    ]
+    return [e.body["run"] for e in self.bus.read_events() if e.kind == "run_created" and e.body["role"] == "sampler"]
 
   async def test_only_sampling_sessions_get_a_sampler_and_it_ends_with_its_training_run(self):
     sft = await self.create_model()
@@ -463,11 +459,9 @@ class TestAPI(BusTest):
     saved = await self.post("save_weights_for_sampler", json={"model_id": excl, "sampling_session_seq_id": 0})
     sid = (await self.result(saved)).json()["sampling_session_id"]
     self.assertEqual(await self.sampler_runs(), [sid])
-    sampler = await self.worker(sid)
+    sampler = self.worker(sid)
 
-    from tinyrl.types import NodeReport
-
-    await self.bus.exchange(NodeReport("n8", "b8", 8))
+    self.bus.handle(NodeMsg("hello", "n8", "b8", gpus=8))
     self.start_maintenance()
     await self.scheduling_until(lambda d: d["state"]["procs"].get(sampler, {}).get("node"))
     await self.post("delete_model", json={"model_id": excl})
@@ -484,7 +478,7 @@ class TestAPI(BusTest):
 
     session = await self.post("create_sampling_session", json={"base_model": "tiny"})
     sid = session.json()["sampling_session_id"]
-    with patch("tinyrl.bus.SAMPLE_QUEUE_BYTES", 8):
+    with patch("tinyrl.control.ledger.SAMPLE_QUEUE_BYTES", 8):
       res = await self.post(
         "asample",
         json={
@@ -564,9 +558,9 @@ class TestAPI(BusTest):
   async def test_stable_reinforce_records_stability_info_and_trains_end_to_end(self):
     run_id, prompt = await self.create_model(), [1, 2, 3, 4]
     seq_ids, resp = await self._sample_for_stable_reinforce(run_id, prompt)
-    # Client did not ask for topk_sample_logprobs, so wire reply stays lean while Bus retains stability info.
+    # Client did not ask for topk_sample_logprobs, so only the training input carries the recorded top-k values.
     self.assertFalse(resp.sequences[0].HasField("topk_sampled_logprobs"))
-    self.assertIn(seq_ids[0], self.bus.stability)
+    self.assertIn(seq_ids[0], self.bus.db.read_stability({seq_ids[0]}, time.time()))
 
     # Valid provenance -> succeeds and runs optim_step.
     fb = await self.post(
@@ -606,32 +600,62 @@ class TestAPI(BusTest):
     )
     id0, id1 = fb0.json()["request_id"], fb1.json()["request_id"]
 
-    # Dispatch fb0 and drop the exchange reply; fb1 remains queued. Then wipe RAM by reopening SQLite.
-    first = self.bus.exchange_sync(self.node.build_report())
-    self.assertEqual(len(first.turns), 1)
-    self.assertEqual(first.turns[0].cmd.request_id, id0)
-    self.assertIn(seq_ids[0], first.turns[0].args["stability"])
+    # Leave the first command claimed and the second queued when the controller restarts.
+    hello = NodeMsg(
+      "hello",
+      self.node.id,
+      self.node.boot_id,
+      gpus=self.node.gpus,
+      workers=tuple(w.info() for w in self.node.workers.values()),
+    )
+    [first] = [t for t in self.bus.handle(hello).tasks if t.cmd and t.cmd.run == run_id]
+    self.assertEqual(first.cmd.request_id, id0)
 
     await self.bus.aclose()
-    self.bus = bus.Bus(self.db_path)
+    self.bus = bus.Controller(self.db_path)
     self.node.control = self.bus
-    self.assertEqual(self.bus.stability, {})
-    self.assertIsNotNone(self.bus.db.get("blobs", f"s:{id0}"))
-    self.assertIsNotNone(self.bus.db.get("blobs", f"s:{id1}"))
+    self.node.connected = False
+    with self.bus.db:
+      self.bus.db.execute("DELETE FROM stability WHERE expires<=?", (float("inf"),))
+    self.assertFalse(self.bus.db.read_stability(set(seq_ids), time.time()))
+    # Store sweep still preserves stability blobs pinned by queued/claimed commands!
+    self.store.sweep(self.store.versions() - set(self.bus.live_versions()), 0)
 
-    # Re-polling from the same node redelivers fb0 verbatim with its durable stability tensors.
-    redelivered = self.bus.exchange_sync(self.node.build_report())
-    self.assertEqual([t.id for t in redelivered.turns], [first.turns[0].id])
-    self.assertEqual(redelivered.turns[0].gpus, first.turns[0].gpus)
-    self.assertEqual(redelivered.turns[0].args["stability"], first.turns[0].args["stability"])
-
-    # Draining executes both the redelivered turn (fb0) and the queued turn (fb1) with empty RAM cache, then cleans up.
+    # The queued commands retain their own inputs across a restart, sample expiry, and store GC sweep.
+    [redelivered] = [t for t in self.bus.handle(hello).tasks if t.cmd and t.cmd.run == run_id]
+    self.assertEqual(redelivered, first)
     await self.node.drain(run_id)
     for req_id in (id0, id1):
       reply = await self.bus.wait_for_reply(req_id, 1)
       self.assertTrue(reply.ok, reply.body)
       self.assertIn("loss:sum", pb.ForwardBackwardOutput.FromString(reply.body).metrics)
-      self.assertIsNone(self.bus.db.get("blobs", f"s:{req_id}"))
+
+  async def test_join_sampler_info_weights_info_and_asample_validation(self):
+    created = await self.post(
+      "create_model", json={"base_model": "tiny", "session_id": None, "lora_config": {"rank": 4}}
+    )
+    run_id = (await self.result(created)).json()["model_id"]
+    save_res = await self.post("save_weights_for_sampler", json={"model_id": run_id, "sampling_session_seq_id": 0})
+    saved = (await self.result(save_res)).json()
+    sid, path = saved["sampling_session_id"], saved["path"]
+
+    info = (await self.http.get(f"/api/v1/samplers/{sid}")).json()
+    self.assertEqual(info, {"sampler_id": sid, "base_model": "tiny", "model_path": path})
+    self.assertEqual(
+      (await self.post("join_sampling_session", json={"sampling_session_id": sid})).json()["client_counter"], 1
+    )
+    self.assertEqual(
+      (await self.post("join_sampling_session", json={"sampling_session_id": sid})).json()["client_counter"], 2
+    )
+
+    winfo = await self.post("weights_info", json={"tinker_path": path})
+    self.assertEqual(winfo.status_code, 200)
+    self.assertEqual(winfo.json()["base_model"], "tiny")
+
+    bad = await self.post(
+      "asample", json={"base_model": "tiny", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "target_prompt_logprobs": True}
+    )
+    self.assertEqual(bad.status_code, 400)
 
 
 if __name__ == "__main__":
