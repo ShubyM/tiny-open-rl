@@ -53,7 +53,7 @@ class TestNodeDaemon(BusTest):
   async def until(self, done, node):
     async with asyncio.timeout(60):
       while not done():
-        await node.step_once(wait_ms=0)
+        await node.step_once()
         await asyncio.sleep(0.01)
 
   async def reply(self, request, node):
@@ -273,7 +273,7 @@ class TestNodeDaemon(BusTest):
       self.assertEqual(holder.resident, (0,))
       self.assertEqual(list(node.workers), [pa])  # Rule R1: never enters GPU 0 until holder finishes parking
       before = self.bus.nodes[node.id].until
-      await node.step_once(wait_ms=0)
+      await node.step_once()
       self.assertGreater(self.bus.nodes[node.id].until, before)
     finally:
       with contextlib.suppress(ProcessLookupError):
@@ -411,7 +411,7 @@ class TestNodeDaemon(BusTest):
     old_boot = node.boot_id
     child = node.workers["worker"].model
     self.bus.expire_node(node.id, old_boot)
-    ok = await node.step_once(wait_ms=0)
+    ok = await node.step_once()
     self.assertFalse(ok)
     self.assertTrue(child.closed)
     self.assertEqual(node.workers, {})

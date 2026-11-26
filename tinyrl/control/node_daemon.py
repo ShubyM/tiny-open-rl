@@ -405,7 +405,7 @@ class NodeDaemon:
       if task.id not in cancelled and task.id not in self.active and task.id not in self.done_buf:
         self.start_background(self.active, task.id, self.record_done(task), wrap=lambda bg, t=task: (t, bg))
 
-  async def step_once(self, wait_ms: int = 0) -> bool:
+  async def step_once(self) -> bool:
     if self.lease_expired():
       await self.reset()
     msg = await self.build_msg(hello=not self.connected)

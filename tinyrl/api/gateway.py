@@ -136,10 +136,16 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
     )
 
   live_ws: dict[str, tuple[WebSocket, asyncio.Task | None]] = {}
+  closing: set[asyncio.Task] = set()
 
-  async def close_socket(old: WebSocket) -> None:
-    with contextlib.suppress(BaseException):
-      await old.close()
+  def close_later(old: WebSocket) -> None:
+    async def _close() -> None:
+      with contextlib.suppress(BaseException):
+        await old.close()
+
+    t = asyncio.create_task(_close())
+    closing.add(t)
+    t.add_done_callback(closing.discard)
 
   @api.websocket("/internal/ws")
   async def node_ws(ws: WebSocket) -> None:
@@ -174,10 +180,10 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
             if old_ws is not None and old_ws is not ws:
               if old_pusher is not None:
                 old_pusher.cancel()
-              asyncio.create_task(close_socket(old_ws))
+              close_later(old_ws)
             live_ws[msg.node] = (ws, pusher if bound_node == (msg.node, msg.boot_id) else None)
           await ws.send_bytes(msgspec.msgpack.encode(reply))
-          if reply.reset:
+          if reply.reset or live_ws.get(msg.node, (None, None))[0] is not ws:
             await ws.close()
             return
           if bound_node != (msg.node, msg.boot_id):
@@ -509,17 +515,27 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
   @api.get("/metrics")
   async def metrics():
     ctrl.expire_nodes()
+    sampler_worker: dict[Any, str] = {}
+    for n in ctrl.nodes.values():
+      if n.gpus:
+        for w in n.workers.values():
+          if not w.stopping and (w.spec not in sampler_worker or w.id < sampler_worker[w.spec]):
+            sampler_worker[w.spec] = w.id
     lines: list[str] = []
     for run_id, state in sorted(ctrl.runs.items()):
       if not state.live:
         continue
-      workers = ctrl.workers_of(run_id)
-      if not workers:
+      wid = (
+        (state.owner[0] if state.owner else None)
+        if state.run.role == Role.TRAINER
+        else sampler_worker.get(state.run.spec)
+      )
+      if not wid:
         continue
       for key in COUNTERS:
         label = f"{key[:-3]}_seconds" if key.endswith("_ms") else key
         value = state.counters[key] / 1000 if key.endswith("_ms") else state.counters[key]
-        lines.append(f'tinyrl_{label}_total{{worker="{workers[0]}",run="{run_id}"}} {value}')
+        lines.append(f'tinyrl_{label}_total{{worker="{wid}",run="{run_id}"}} {value}')
     for account, total in sorted(ctrl.service.items()):
       lines.append(f'tinyrl_account_service_total{{account="{account}"}} {float(total)}')
     for node_id, node in sorted(ctrl.nodes.items()):

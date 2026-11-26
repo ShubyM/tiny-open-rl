@@ -5,11 +5,14 @@ from __future__ import annotations
 import itertools
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 from tinyrl import types
 from tinyrl.control import policy
-from tinyrl.control.fleet import LiveWorker, NodeState
-from tinyrl.types import Op, Role, Task, TaskKind, WorkerSpec
+from tinyrl.types import Done, Op, Role, Task, TaskKind, WorkerSpec
+
+if TYPE_CHECKING:
+  from tinyrl.control.controller import Controller, LiveWorker, NodeState
 
 
 @dataclass
@@ -34,9 +37,9 @@ def eligible_stage(worker: LiveWorker, active: list[Task], staged: set[str]) -> 
   return ({ver} & staged if ver is not None else set()), ver is None
 
 
-def build_view(ctrl, nodes: dict[str, NodeState]) -> FleetView:
-  capacity = {nid: node.gpus for nid, node in nodes.items()}
-  live_workers = [(nid, w) for nid, node in nodes.items() for w in node.workers.values() if not w.stopping]
+def build_view(ctrl: Controller, nodes: dict[str, NodeState]) -> FleetView:
+  capacity = {nid: n.gpus for nid, n in nodes.items()}
+  live_workers = [(nid, w) for nid, n in nodes.items() for w in n.workers.values() if not w.stopping]
   sampler_runs: dict[WorkerSpec, list[str]] = {}
   trainer_runs = {(nid, w.id): [] for nid, w in live_workers if w.spec.role == Role.TRAINER}
 
@@ -50,36 +53,34 @@ def build_view(ctrl, nodes: dict[str, NodeState]) -> FleetView:
 
   sampler_specs = sorted(sampler_runs, key=lambda s: (s.base, s.lora, s.exclusive, s.train_run or "", s.gpus))
   sampler_want = {
-    spec: policy.sampler_replicas(spec, [len(ctrl.runs[rid].queue) for rid in sampler_runs[spec]])
-    for spec in sampler_specs
+    s: policy.sampler_replicas(s, [len(ctrl.runs[r].queue) for r in sampler_runs[s]]) for s in sampler_specs
   }
   placed: dict[tuple[str, str], policy.Placed] = {}
-  for nid, worker in live_workers:
-    owned = sampler_runs.get(worker.spec, ()) if worker.spec.role == Role.SAMPLER else trainer_runs[nid, worker.id]
+  for nid, w in live_workers:
+    owned = sampler_runs.get(w.spec, ()) if w.spec.role == Role.SAMPLER else trainer_runs[nid, w.id]
     ready = [rid for rid in owned if ctrl.runs[rid].queue]
-    lag = max(map(ctrl.ready_lag, ready), default=0.0)
-    placed[nid, worker.id] = policy.Placed(nid, worker.id, worker.spec, busy=bool(ready), lag=lag, runs=len(owned))
+    placed[nid, w.id] = policy.Placed(
+      nid, w.id, w.spec, busy=bool(ready), lag=max(map(ctrl.ready_lag, ready), default=0.0), runs=len(owned)
+    )
   return FleetView(nodes, capacity, sampler_runs, sampler_specs, sampler_want, trainer_runs, placed)
 
 
-def evict_workers(ctrl, view: FleetView, now: float) -> None:
+def evict_workers(ctrl: Controller, view: FleetView, now: float) -> None:
   """Page out excess samplers and invalid, blocked, idle, or imbalanced trainers."""
 
-  def sampler_rank(loc: tuple[str, str]) -> tuple:
+  def rank(loc: tuple[str, str]) -> tuple:
     node = view.nodes[loc[0]]
     return (not node.workers[loc[1]].started, not node.worker_tasks(loc[1]), loc)
 
   keep_samplers = {
     loc
     for spec in view.sampler_specs
-    for loc in sorted((k for k, p in view.placed.items() if p.spec == spec), key=sampler_rank)[
-      : view.sampler_want[spec]
-    ]
+    for loc in sorted((k for k, p in view.placed.items() if p.spec == spec), key=rank)[: view.sampler_want[spec]]
   }
-  saving = sum(1 for node in view.nodes.values() for task in node.tasks.values() if task.kind == TaskKind.SAVE)
+  saving = sum(1 for n in view.nodes.values() for t in n.tasks.values() if t.kind == TaskKind.SAVE)
 
   for nid, node in view.nodes.items():
-    exclusive_gpus = {gpu for w in node.workers.values() if not w.stopping and w.spec.exclusive for gpu in w.gpus}
+    excl_gpus = {g for w in node.workers.values() if not w.stopping and w.spec.exclusive for g in w.gpus}
     for worker in sorted(list(node.workers.values()), key=lambda w: w.id):
       if node.worker_tasks(worker.id):
         continue
@@ -89,26 +90,26 @@ def evict_workers(ctrl, view: FleetView, now: float) -> None:
 
       loc, is_trainer = (nid, worker.id), worker.spec.role == Role.TRAINER
       owned = view.trainer_runs[loc] if is_trainer else view.sampler_runs.get(worker.spec, ())
-      ready, all_placed = [rid for rid in owned if ctrl.runs[rid].queue], list(view.placed.values())
+      ready, all_placed = [r for r in owned if ctrl.runs[r].queue], list(view.placed.values())
 
       can_move = worker.spec.gpus == 1 or any(
-        policy.can_host(other, view.capacity, all_placed, worker.spec) for other in view.capacity if other != nid
+        policy.can_host(o, view.capacity, all_placed, worker.spec) for o in view.capacity if o != nid
       )
       squeezed = not policy.can_host(nid, view.capacity, all_placed, worker.spec, skip=worker.id) and can_move
       can_rebind = not is_trainer or (
-        bool(ready) and any(exclusive_gpus.isdisjoint(b) for b in policy.blocks(node.gpus, worker.spec.gpus))
+        bool(ready) and any(excl_gpus.isdisjoint(b) for b in policy.blocks(node.gpus, worker.spec.gpus))
       )
-      blocked = not worker.gpus and bool(worker.bound) and not exclusive_gpus.isdisjoint(worker.bound) and can_rebind
+      blocked = not worker.gpus and bool(worker.bound) and not excl_gpus.isdisjoint(worker.bound) and can_rebind
       unneeded = (not owned and worker.started) if is_trainer else (loc not in keep_samplers)
       should_drop = worker.spec.gpus > node.gpus or squeezed or blocked or unneeded
 
       if not should_drop and is_trainer and worker.spec.shareable:
         stats = policy.node_stats(nid, node.gpus, all_placed)
-        has_peer = any(p.spec == worker.spec and other != loc for other, p in view.placed.items())
-        no_fleet_spare = stats.spare < 0 and not any(
+        has_peer = any(p.spec == worker.spec and o != loc for o, p in view.placed.items())
+        no_spare = stats.spare < 0 and not any(
           policy.node_stats(m, g, all_placed).spare >= worker.spec.gpus for m, g in view.capacity.items()
         )
-        should_drop = has_peer and ((not ready and stats.used > node.gpus) or no_fleet_spare)
+        should_drop = has_peer and ((not ready and stats.used > node.gpus) or no_spare)
         if not should_drop and len(ready) >= 2 and not saving:
           detachable = [r for r in ready if r not in worker.failed_saves]
           if detachable and policy.choose_node(worker.spec, view.capacity, all_placed, only_spare=True):
@@ -133,9 +134,9 @@ def evict_workers(ctrl, view: FleetView, now: float) -> None:
         ctrl.evict_worker(node, worker, now)
 
 
-def place_workers(ctrl, view: FleetView) -> None:
+def place_workers(ctrl: Controller, view: FleetView) -> None:
   """Page in workers for unowned ready runs, scale sampler pools, and set declarative checkpoint staging."""
-  sampled = {state.run.train_run for state in ctrl.runs.values() if state.live and state.run.train_run}
+  sampled = {s.run.train_run for s in ctrl.runs.values() if s.live and s.run.train_run}
   spare_unstarted = {
     loc
     for loc, runs in view.trainer_runs.items()
@@ -174,10 +175,11 @@ def place_workers(ctrl, view: FleetView) -> None:
     if compat and (idle_compat or not spare_node):
       chosen = min(idle_compat or compat, key=lambda loc: (len(view.trainer_runs[loc]), loc))
     elif target := (spare_node or pick_node(spec, prefer_cool=True)):
-      reused = next(
-        (loc for loc in sorted(spare_unstarted) if loc[0] == target and view.placed[loc].spec == spec), None
-      )
-      if reused is not None:
+      if (
+        reused := next(
+          (loc for loc in sorted(spare_unstarted) if loc[0] == target and view.placed[loc].spec == spec), None
+        )
+      ) is not None:
         spare_unstarted.remove(reused)
         chosen = reused
       else:
@@ -197,8 +199,8 @@ def place_workers(ctrl, view: FleetView) -> None:
 
   needed_stage: dict[str, set[str]] = {}
   for spec in view.sampler_specs:
-    parents = (ctrl.runs.get(ctrl.runs[rid].run.train_run or "") for rid in view.sampler_runs[spec])
-    near = {parent.owner[1] for parent in parents if parent and parent.owner and parent.owner[1] in view.capacity}
+    parents = (ctrl.runs.get(ctrl.runs[r].run.train_run or "") for r in view.sampler_runs[spec])
+    near = {p.owner[1] for p in parents if p and p.owner and p.owner[1] in view.capacity}
     pool = sorted(loc for loc, p in view.placed.items() if p.spec == spec)
     if not pool and (target := pick_node(spec, near=near)):
       pool.append((target, add_worker(target, spec, busy=any(ctrl.runs[r].queue for r in view.sampler_runs[spec]))))
@@ -215,18 +217,18 @@ def place_workers(ctrl, view: FleetView) -> None:
 
 
 def plan_node(
-  ctrl,
+  ctrl: Controller,
   nid: str,
   node: NodeState,
   trainer_runs: dict[tuple[str, str], list[str]],
   lag_of_run: Callable[[str], float],
   now: float,
-  deadlines: list[float],
-) -> tuple[dict[str, tuple[int, ...]], float | None, list[tuple]]:
+) -> tuple[dict[str, tuple[int, ...]], list[float], list[tuple]]:
   fixed: dict[str, tuple[int, ...]] = {}
   occupied: set[int] = set()
   plan_inputs: dict[str, policy.Worker] = {}
   ready_by_worker: dict[str, set[str]] = {}
+  node_deadlines: list[float] = []
 
   for wid, worker in node.workers.items():
     active = node.worker_tasks(wid)
@@ -245,10 +247,10 @@ def plan_node(
       heads = {r: h for r in trainer_runs.get((nid, wid), ()) if (h := ctrl.train_head(r)) is not None}
       in_grace = bool(worker.gpus and worker.idle_until > now)
       if in_grace:
-        deadlines.append(worker.idle_until)
+        node_deadlines.append(worker.idle_until)
       finishing = any(
-        open_grad and ((r in heads and heads[r].cmd.op == Op.OPTIM_STEP) or (not heads and in_grace))
-        for r, open_grad in worker.loaded.items()
+        og and ((r in heads and heads[r].cmd.op == Op.OPTIM_STEP) or (not heads and in_grace))
+        for r, og in worker.loaded.items()
       )
       demand = (
         policy.Demand.FINISH_STEP if finishing else (policy.Demand.READY if (heads or in_grace) else policy.Demand.IDLE)
@@ -273,6 +275,8 @@ def plan_node(
     )
 
   chosen, wake_at = policy.plan_gpus(plan_inputs, node.gpus, now, occupied, {g for b in fixed.values() for g in b})
+  if wake_at is not None:
+    node_deadlines.append(wake_at)
   keep = fixed | chosen
   contended = any(pw.demand != policy.Demand.IDLE and wid not in keep for wid, pw in plan_inputs.items())
 
@@ -281,7 +285,7 @@ def plan_node(
     worker, ready_runs = node.workers[wid], ready_by_worker.get(wid)
     if not block or not ready_runs or (wid in fixed and contended) or (worker.gpus and worker.gpus != block):
       continue
-    if any(not set(other.gpus).isdisjoint(block) for oid, other in node.workers.items() if oid != wid):
+    if any(not set(o.gpus).isdisjoint(block) for oid, o in node.workers.items() if oid != wid):
       continue
     prio = (
       worker.spec.exclusive,
@@ -292,11 +296,16 @@ def plan_node(
       wid,
     )
     candidates.append((prio, node, worker, block))
-  return keep, wake_at, candidates
+  return keep, node_deadlines, candidates
+
+
+def _arm_quantum(worker: LiveWorker, block: tuple[int, ...], now: float) -> None:
+  if block and worker.gpus != block:
+    worker.resumed_at, worker.hold_until = now, now + policy.QUANTUM_MS / 1000
 
 
 def grant_worker(
-  ctrl,
+  ctrl: Controller,
   view: FleetView,
   node: NodeState,
   worker: LiveWorker,
@@ -309,16 +318,14 @@ def grant_worker(
     heads = [h.cmd for r in view.trainer_runs.get((node.id, worker.id), ()) if (h := ctrl.train_head(r)) is not None]
     if not heads:
       return False
+    _arm_quantum(worker, block, now)
     return ctrl.dispatch_train(node, worker, block, policy.rank_runs(heads, lag_of_run, fair)[0], now)
 
-  active = [task for task in node.worker_tasks(worker.id) if task.kind == TaskKind.SAMPLE]
-  lora_cap = types.MAX_LORAS if worker.spec.lora else 1
-  active_vers = {task.version for task in active if task.version is not None}
+  active = [t for t in node.worker_tasks(worker.id) if t.kind == TaskKind.SAMPLE]
   eligible, allow_base = eligible_stage(worker, active, node.staged)
-
   first_by_run = ctrl.sample_heads(worker.spec, eligible, allow_base)
-  heads = [item.cmd for item in first_by_run.values()]
-  ver_by_run = {run_id: item.version for run_id, item in first_by_run.items()}
+  heads = [it.cmd for it in first_by_run.values()]
+  ver_by_run = {rid: it.version for rid, it in first_by_run.items()}
 
   def queued(run_id: str, limit: int):
     target_ver = ver_by_run[run_id]
@@ -328,9 +335,9 @@ def grant_worker(
 
   in_flight: dict[str, int] = {}
   for live_node in view.nodes.values():
-    for task in live_node.tasks.values():
-      if task.kind == TaskKind.SAMPLE and task.spec == worker.spec and task.cmd:
-        acct = ctrl.account(task.cmd.run)
+    for t in live_node.tasks.values():
+      if t.kind == TaskKind.SAMPLE and t.spec == worker.spec and t.cmd:
+        acct = ctrl.account(t.cmd.run)
         in_flight[acct] = in_flight.get(acct, 0) + 1
   batch = policy.admit_samples(
     heads,
@@ -340,61 +347,59 @@ def grant_worker(
     fair,
     ver_by_run.get,
     types.MAX_SEQS - len(active),
-    lora_cap,
+    types.MAX_LORAS if worker.spec.lora else 1,
     in_flight,
-    active_vers,
+    {t.version for t in active if t.version is not None},
   )
+  if batch:
+    _arm_quantum(worker, block, now)
   return ctrl.dispatch_samples(node, worker, block, batch, now)
 
 
-def worker_holds(ctrl, node: NodeState, wid: str) -> list[tuple[str, float]]:
+def worker_holds(ctrl: Controller, node: NodeState, wid: str) -> list[tuple[str, float]]:
   """Proportional GPU hold per account for one active worker."""
   tasks = [t for t in node.worker_tasks(wid) if t.kind in (TaskKind.TRAIN, TaskKind.SAMPLE) and t.cmd]
   if not tasks:
     return []
   width, counts = len(tasks[0].gpus) or tasks[0].spec.gpus, {}
-  for task in tasks:
-    acct = ctrl.account(task.cmd.run)
+  for t in tasks:
+    acct = ctrl.account(t.cmd.run)
     counts[acct] = counts.get(acct, 0) + 1
   return [(acct, width * count / len(tasks)) for acct, count in counts.items()]
 
 
-def dispatch_and_park(ctrl, view: FleetView, now: float, deadlines: list[float]) -> None:
-  fair = {rid: state.fair_ms or 0.0 for rid, state in ctrl.runs.items() if state.live and state.queue}
+def dispatch_and_park(ctrl: Controller, view: FleetView, now: float, deadlines: list[float]) -> None:
+  fair = {rid: s.fair_ms or 0.0 for rid, s in ctrl.runs.items() if s.live and s.queue}
   demand_runs = ctrl.demand_runs()
-  holds = {
-    (nid, wid): sh for nid, node in view.nodes.items() for wid in node.workers if (sh := worker_holds(ctrl, node, wid))
-  }
+  holds = {(nid, wid): sh for nid, n in view.nodes.items() for wid in n.workers if (sh := worker_holds(ctrl, n, wid))}
 
   keeps: dict[str, dict[str, tuple[int, ...]]] = {}
-  wakes: dict[str, float | None] = {}
+  final_deadlines: list[float] = []
   while True:
     flat_holds = [share for shares in holds.values() for share in shares]
     lag_of_acct = policy.projected_lag(
       ctrl.lag, ctrl.seen, ctrl.service, ctrl.weights, demand_runs, view.capacity, flat_holds
     )
 
-    def lag_of_run(run_id: str, fn=lag_of_acct) -> float:
-      return fn(ctrl.account(run_id))
+    def lag_of_run(rid: str, fn=lag_of_acct) -> float:
+      return fn(ctrl.account(rid))
 
-    candidates, keeps, wakes = [], {}, {}
+    candidates, keeps, final_deadlines = [], {}, []
     for nid, node in view.nodes.items():
-      keeps[nid], wakes[nid], node_cands = plan_node(ctrl, nid, node, view.trainer_runs, lag_of_run, now, deadlines)
+      keeps[nid], node_dl, node_cands = plan_node(ctrl, nid, node, view.trainer_runs, lag_of_run, now)
+      final_deadlines.extend(node_dl)
       candidates.extend(node_cands)
 
     candidates.sort(key=lambda entry: entry[0], reverse=True)
-    granted = False
-    for _, node, worker, block in candidates:
-      if grant_worker(ctrl, view, node, worker, block, fair, lag_of_run, now):
-        holds[node.id, worker.id] = worker_holds(ctrl, node, worker.id)
-        granted = True
-        break
-    if not granted:
+    if not any(
+      grant_worker(ctrl, view, node, worker, block, fair, lag_of_run, now)
+      and (holds.__setitem__((node.id, worker.id), worker_holds(ctrl, node, worker.id)) or True)
+      for _, node, worker, block in candidates
+    ):
       break
 
+  deadlines.extend(final_deadlines)
   for nid, node in view.nodes.items():
-    if wakes.get(nid) is not None:
-      deadlines.append(wakes[nid])
     for worker in list(node.workers.values()):
       if (
         worker.gpus
@@ -405,11 +410,25 @@ def dispatch_and_park(ctrl, view: FleetView, now: float, deadlines: list[float])
         ctrl.park_worker(node, worker, now)
 
 
-def schedule(ctrl, now: float) -> list[float]:
-  """Single policy pass over healthy nodes: evict, place + stage, grant GPU turns, and park idle."""
+def on_done(worker: LiveWorker, task: Task, done: Done, now: float) -> None:
+  """Update pager-owned switch-amortization quantum and train cycle grace after a completed task."""
+  if done.duration_s > 0 and worker.park_s > 0:
+    worker.hold_until = max(worker.hold_until, worker.resumed_at + policy.quantum_s(worker.park_s + done.duration_s))
+  if task.kind == TaskKind.TRAIN:
+    worker.idle_until = now + policy.CYCLE_GRACE_S
+
+
+def schedule(ctrl: Controller, now: float) -> list[float]:
+  """Single policy pass over healthy nodes: advance EEVDF lag, evict, place + stage, grant GPU turns, and park idle."""
+  if now >= ctrl.lag_due:
+    ctrl.lag_due = now + ctrl.tick_s
+    ctrl.advance_lag()
   deadlines: list[float] = []
-  view = build_view(ctrl, ctrl.fleet.healthy_nodes())
+  view = build_view(ctrl, ctrl.healthy_nodes())
   evict_workers(ctrl, view, now)
   place_workers(ctrl, view)
   dispatch_and_park(ctrl, view, now, deadlines)
   return deadlines
+
+
+schedule.on_done = on_done

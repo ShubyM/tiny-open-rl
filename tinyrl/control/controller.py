@@ -1,16 +1,17 @@
-"""Controller kernel: connects the durable `Ledger`, live `Fleet`, and a swappable `scheduler` over `NodeMsg`."""
+"""Controller kernel: connects the durable `Ledger`, live cluster nodes/workers, and a swappable `scheduler`."""
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import json
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, field, replace
 
-from tinyrl.control import pager, policy
+from tinyrl.control import pager
 from tinyrl.control.db import DB
-from tinyrl.control.fleet import Fleet, LiveWorker, NodeState, new_task_id
 from tinyrl.control.ledger import COUNTERS, SESSION_TTL, Ledger, QueueItem
 from tinyrl.helpers import LEASE_MS, SWEEP_S, getenv
 from tinyrl.types import (
@@ -21,6 +22,7 @@ from tinyrl.types import (
   Ev,
   NodeMsg,
   Op,
+  Owner,
   Reply,
   Role,
   Run,
@@ -35,23 +37,111 @@ SESSION_GRACE = getenv("SESSION_GRACE", 60)
 TICK_MS = getenv("TICK_MS", 100)
 
 
+def new_task_id() -> str:
+  return uuid.uuid4().hex[:12]
+
+
+@dataclass
+class LiveWorker:
+  id: str
+  spec: WorkerSpec
+  gpus: tuple[int, ...] = ()
+  bound: tuple[int, ...] = ()
+  loaded: dict[str, bool] = field(default_factory=dict)
+  pid: int | None = None
+  started: bool = False
+  resumed_at: float = 0.0
+  hold_until: float = 0.0
+  idle_until: float = 0.0
+  park_s: float = 0.0
+  gpu_ms: float = 0.0
+  stopping: bool = False
+  failed_saves: set[str] = field(default_factory=set)
+  retry_save_at: float = 0.0
+
+
+@dataclass
+class NodeState:
+  id: str
+  boot_id: str
+  gpus: int
+  gpu_mib: int = 0
+  draining: bool = False
+  until: float = 0.0
+  lag: float = 0.0
+  staged: set[str] = field(default_factory=set)
+  stage: tuple[str, ...] = ()
+  sent_stage: tuple[str, ...] = ()
+  workers: dict[str, LiveWorker] = field(default_factory=dict)
+  tasks: dict[str, Task] = field(default_factory=dict)
+  new_tasks: list[Task] = field(default_factory=list)
+  cancelled: list[str] = field(default_factory=list)
+  push_ev: asyncio.Event = field(default_factory=asyncio.Event)
+
+  def worker_tasks(self, worker_id: str) -> list[Task]:
+    return [t for t in self.tasks.values() if t.worker == worker_id]
+
+  def record_task(self, task: Task) -> None:
+    worker = self.workers.get(task.worker)
+    if task.gpus and worker is not None:
+      worker.gpus = task.gpus
+      if not worker.bound and not worker.spec.movable:
+        worker.bound = task.gpus
+    self.tasks[task.id] = task
+    self.new_tasks.append(task)
+
+  def cancel_task(self, task_id: str) -> None:
+    self.tasks.pop(task_id, None)
+    self.new_tasks = [t for t in self.new_tasks if t.id != task_id]
+    self.cancelled.append(task_id)
+
+  def wake(self) -> None:
+    if self.new_tasks or self.cancelled or self.stage != self.sent_stage:
+      self.push_ev.set()
+
+  def drain_push(
+    self,
+    ack: tuple[str, ...] = (),
+    sweep: tuple[str, ...] | None = None,
+    *,
+    hello: bool = False,
+    active_ids: set[str] = frozenset(),
+  ) -> ControlMsg:
+    stage_update = self.stage if self.stage != self.sent_stage else ()
+    self.sent_stage = self.stage
+    msg = ControlMsg(
+      ack=ack, tasks=tuple(self.new_tasks), cancel=tuple(self.cancelled), stage=stage_update, sweep=sweep
+    )
+    self.new_tasks.clear()
+    self.cancelled.clear()
+    self.push_ev.clear()
+    if hello:
+      stale_active = tuple(sorted(tid for tid in active_ids if tid not in self.tasks and tid not in ack))
+      cancel = tuple(dict.fromkeys((*msg.cancel, *stale_active)))
+      tasks = tuple(t for t in self.tasks.values() if t.id not in active_ids)
+      return replace(msg, tasks=tasks, cancel=cancel)
+    return msg
+
+
 class Controller(Ledger):
-  """Safety & execution kernel realizing `Ledger` state onto `Fleet` with a pluggable `scheduler(ctrl, now)`."""
+  """Safety & execution kernel realizing `Ledger` state onto live nodes with a pluggable `scheduler(ctrl, now)`."""
 
   def __init__(self, path: str | None = None, *, scheduler: Callable | None = None):
     super().__init__(DB(getenv("TINYRL_DB", "/tmp/tinyrl.db") if path is None else path))
-    self.fleet = Fleet()
-    self.nodes = self.fleet.nodes
+    self.nodes: dict[str, NodeState] = {}
+    self.made = 0
     self.scheduler = pager.schedule if scheduler is None else scheduler
     self.gc_due = self.sweep_due = self.lag_due = 0.0
     self.next_wake: float | None = None
 
     grace_until = time.monotonic() + LEASE_MS / 1000
     for node_id, boot_id, task in self.load():
-      if task is None:
-        self.fleet.restore_node(node_id, boot_id, grace_until)
-      else:
-        self.fleet.restore_task(node_id, boot_id, task, grace_until)
+      node = self.nodes.setdefault(node_id, NodeState(node_id, boot_id, gpus=0, until=grace_until))
+      if task is not None:
+        node.tasks[task.id] = task
+        worker = node.workers.setdefault(task.worker, LiveWorker(task.worker, task.spec, task.gpus, started=True))
+        if not worker.bound and not task.spec.movable:
+          worker.bound = task.gpus
 
   @property
   def tick_s(self) -> float:
@@ -64,8 +154,20 @@ class Controller(Ledger):
       self.db.close()
       self.db = None
 
+  def live_node(self, owner: Owner | None) -> NodeState | None:
+    if owner is None:
+      return None
+    node = self.nodes.get(owner[1])
+    return node if (node is not None and node.boot_id == owner[2]) else None
+
+  def healthy_nodes(self) -> dict[str, NodeState]:
+    return {nid: n for nid, n in sorted(self.nodes.items()) if n.gpus and not n.draining}
+
+  def healthy_capacity(self) -> dict[str, int]:
+    return {nid: n.gpus for nid, n in self.nodes.items() if n.gpus and not n.draining}
+
   def advance_lag(self, capacity: dict[str, int] | None = None) -> None:
-    super().advance_lag(self.fleet.healthy_capacity() if capacity is None else capacity)
+    super().advance_lag(self.healthy_capacity() if capacity is None else capacity)
 
   def settle_trivial_heads(self) -> None:
     """Complete head commands that can be answered immediately without touching a GPU worker."""
@@ -95,27 +197,24 @@ class Controller(Ledger):
           worker.failed_saves.clear()
         elif worker.failed_saves:
           deadlines.append(worker.retry_save_at)
-      if node.draining:
-        for worker in list(node.workers.values()):
-          if not node.worker_tasks(worker.id):
-            self.evict_worker(node, worker, now)
+        if node.draining and not node.worker_tasks(worker.id):
+          self.evict_worker(node, worker, now)
 
   def schedule(self) -> float | None:
     """Run kernel housekeeping, invoke the swappable `scheduler`, wake nodes, and record next wakeup."""
     now, deadlines = time.monotonic(), []
     self.settle_trivial_heads()
-    if now >= self.lag_due:
-      self.lag_due = now + self.tick_s
-      self.advance_lag()
     self.prepare_nodes(now, deadlines)
-    if self.fleet.healthy_nodes():
+    if self.healthy_nodes():
       deadlines.extend(self.scheduler(self, now))
-    self.fleet.wake_all()
+    for node in self.nodes.values():
+      node.wake()
     self.next_wake = min((d for d in deadlines if d > now), default=None)
     return self.next_wake
 
   def live_versions(self) -> list[str]:
-    return self.retained_versions(self.fleet.task_versions())
+    extra = {v for n in self.nodes.values() for t in n.tasks.values() for v in (t.version, t.snapshot) if v}
+    return self.retained_versions(extra)
 
   # --- schedule-triggering client mutations ---
 
@@ -134,11 +233,11 @@ class Controller(Ledger):
   def delete_run(self, run_id: str) -> None:
     cancelled_samples, aborted_trains = self.remove_run(run_id)
     for owner, task_id in cancelled_samples:
-      if (node := self.fleet.live_node(owner)) is not None:
+      if (node := self.live_node(owner)) is not None:
         node.cancel_task(task_id)
         node.wake()
     for owner, task_id in aborted_trains:
-      if (node := self.fleet.live_node(owner)) is not None and any(t.id == task_id for t in node.new_tasks):
+      if (node := self.live_node(owner)) is not None and any(t.id == task_id for t in node.new_tasks):
         node.tasks.pop(task_id, None)
         node.new_tasks = [t for t in node.new_tasks if t.id != task_id]
     self.schedule()
@@ -149,17 +248,21 @@ class Controller(Ledger):
     for rid in live:
       if self.is_sampler(rid):
         self.delete_run(rid)
-    self.db.close_session(session_id, wait_for_deletes=any(queued), now=time.time())
+    with self.db:
+      self.db.close_session(session_id, wait_for_deletes=any(queued), now=time.time())
 
   def reclaim_samples(self, predicate: Callable[[QueueItem], bool]) -> None:
     for owner, task_id in self.take_samples(predicate):
-      if (node := self.fleet.live_node(owner)) is not None:
+      if (node := self.live_node(owner)) is not None:
         node.cancel_task(task_id)
 
-  # --- safe execution mechanisms (the surface called by any swappable scheduler) ---
+  # --- safe execution mechanisms (surface called by any swappable scheduler) ---
 
   def spawn_worker(self, node_id: str, spec: WorkerSpec) -> str:
-    wid = self.fleet.spawn_worker(node_id, spec)
+    used = {wid for n in self.nodes.values() for wid in n.workers}
+    self.made = next(i for i in itertools.count(self.made + 1) if f"w{i}" not in used)
+    wid = f"w{self.made}"
+    self.nodes[node_id].workers[wid] = LiveWorker(wid, spec)
     self.record_event(Ev.PLACED, {"proc": wid, "node": node_id})
     return wid
 
@@ -177,8 +280,7 @@ class Controller(Ledger):
   def dispatch_train(
     self, node: NodeState, worker: LiveWorker, block: tuple[int, ...], run_id: str, now: float
   ) -> bool:
-    item = self.train_head(run_id)
-    if item is None:
+    if (item := self.train_head(run_id)) is None:
       return False
     state, op = self.runs[run_id], item.cmd.op
     version = (
@@ -227,12 +329,13 @@ class Controller(Ledger):
       state = self.runs[task.cmd.run]
       item, claimed_at = state.queue[task.cmd.request_id], time.time()
       slim = replace(task, cmd=replace(task.cmd, body=b"", stability=None))
-      self.db.claim_command(task.cmd.request_id, node.id, node.boot_id, claimed_at, slim, replace(state, owner=owner))
+      with self.db:
+        self.db.claim_command(task.cmd.request_id, node.id, node.boot_id, claimed_at, slim, replace(state, owner=owner))
       state.owner, item.task_id, item.owner, item.since = owner, task.id, owner, claimed_at
     elif task.kind == TaskKind.SAMPLE:
       item = self.runs[task.cmd.run].queue[task.cmd.request_id]
       item.task_id, item.owner, item.since = task.id, owner, now
-    node.record_task(task, now)
+    node.record_task(task)
 
   def detach_run(self, node: NodeState, worker: LiveWorker, run_id: str, now: float) -> None:
     if self.runs[run_id].status == RunStatus.LIVE and run_id in worker.loaded:
@@ -270,26 +373,26 @@ class Controller(Ledger):
 
   def live_nodes(self) -> dict[str, int]:
     self.expire_nodes()
-    return {nid: node.gpus for nid, node in self.nodes.items() if node.gpus}
+    return {nid: n.gpus for nid, n in self.nodes.items() if n.gpus}
 
   def expire_node(self, node_id: str, boot_id: str) -> None:
-    if self.fleet.live_node(("", node_id, boot_id)) is not None:
+    if self.live_node(("", node_id, boot_id)) is not None:
       del self.nodes[node_id]
     self.record_event(Ev.NODE_LOST, {"node": node_id})
     for state in list(self.runs.values()):
-      if state.run.role != Role.TRAINER:
-        continue
-      for cmd_id, item in list(state.queue.items()):
-        if item.owner and item.owner[1:] == (node_id, boot_id):
-          err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {item.cmd.op}"))
-          self.finish_train(cmd_id, item.owner, err, dead=True)
+      if state.run.role == Role.TRAINER:
+        for cmd_id, item in list(state.queue.items()):
+          if item.owner and item.owner[1:] == (node_id, boot_id):
+            err = Reply.error(RuntimeError(f"its trainer died, or lost ownership, during {item.cmd.op}"))
+            self.finish_train(cmd_id, item.owner, err, dead=True)
     with self.db:
       self.db.add_fenced(boot_id)
     self.reclaim_samples(lambda it: it.owner[1:] == (node_id, boot_id))
     self.clear_owners(lambda s: s.owner[1:] == (node_id, boot_id))
 
   def expire_nodes(self) -> bool:
-    stale = self.fleet.stale_nodes(time.monotonic())
+    now = time.monotonic()
+    stale = [(nid, n.boot_id) for nid, n in list(self.nodes.items()) if n.until <= now]
     for node_id, boot_id in stale:
       self.expire_node(node_id, boot_id)
     return bool(stale)
@@ -303,33 +406,30 @@ class Controller(Ledger):
       self.record_event(Ev.UNPLACED, {"proc": worker_id, "node": node.id})
 
   def apply_done(self, node: NodeState, done: Done, now: float) -> None:
-    task = node.tasks.get(done.id)
-    if task is None:
+    if (task := node.tasks.get(done.id)) is None:
       return
-    worker = node.workers.get(task.worker)
-    owner = (task.worker, node.id, node.boot_id)
-    failed = done.dead or not done.ok
+    worker, owner, failed = (
+      node.workers.get(task.worker),
+      (task.worker, node.id, node.boot_id),
+      done.dead or not done.ok,
+    )
     if worker and done.pid is not None:
       worker.pid, worker.started = done.pid, True
 
-    if task.kind == TaskKind.SAVE and not failed:
-      self.finish_save(task.run_id, owner, done.saved)
-      node.tasks.pop(done.id, None)
-      if worker:
-        worker.failed_saves.discard(task.run_id)
-        if not worker.stopping and worker.started and task.run_id in worker.loaded:
-          self.issue(node, Task(new_task_id(), TaskKind.DROP, worker.id, worker.spec, run_id=task.run_id), now)
-      return
-
     if task.kind == TaskKind.SAVE:
-      if done.dead:
+      if not failed:
+        self.finish_save(task.run_id, owner, done.saved)
+        if worker:
+          worker.failed_saves.discard(task.run_id)
+          if not worker.stopping and worker.started and task.run_id in worker.loaded:
+            self.issue(node, Task(new_task_id(), TaskKind.DROP, worker.id, worker.spec, run_id=task.run_id), now)
+      elif done.dead:
         self.drop_worker(node, task.worker)
       elif worker:
         worker.failed_saves.add(task.run_id)
         worker.retry_save_at = now + 0.05
     elif task.kind in (TaskKind.TRAIN, TaskKind.SAMPLE):
-      effect = done.effect or Effect()
-      reply = done.reply or Reply.error(RuntimeError(f"{task.kind} failed"))
+      effect, reply = done.effect or Effect(), done.reply or Reply.error(RuntimeError(f"{task.kind} failed"))
       if task.kind == TaskKind.TRAIN:
         self.finish_train(
           task.cmd.request_id,
@@ -350,12 +450,9 @@ class Controller(Ledger):
       elif worker:
         worker.started = True
         worker.gpu_ms += done.charge.gpu_ms if done.charge else 0.0
-        if done.duration_s > 0 and worker.park_s > 0:
-          worker.hold_until = max(
-            worker.hold_until, worker.resumed_at + policy.quantum_s(worker.park_s + done.duration_s)
-          )
+        if cb := getattr(self.scheduler, "on_done", None):
+          cb(worker, task, done, now)
         if task.kind == TaskKind.TRAIN:
-          worker.idle_until = now + policy.CYCLE_GRACE_S
           worker.loaded.pop(task.cmd.run, None)
           if effect.loaded:
             worker.loaded[task.cmd.run] = effect.open_grad
@@ -381,14 +478,33 @@ class Controller(Ledger):
       self.drop_worker(node, task.worker)
     node.tasks.pop(done.id, None)
 
+  def _sync_hello(self, node: NodeState, msg: NodeMsg) -> None:
+    node.gpu_mib, node.staged, node.sent_stage = msg.gpu_mib, set(msg.staged or ()), ()
+    node.new_tasks.clear()
+    node.cancelled.clear()
+    for info in msg.workers:
+      if (worker := node.workers.get(info.worker)) is not None:
+        worker.pid, worker.started, worker.bound = info.pid, True, info.bound or worker.bound
+        if not node.worker_tasks(info.worker):
+          worker.gpus, worker.loaded = info.gpus, dict(info.loaded)
+        elif info.loaded:
+          worker.loaded = {**info.loaded, **worker.loaded}
+      else:
+        node.workers[info.worker] = LiveWorker(
+          info.worker, info.spec, info.gpus, info.bound, dict(info.loaded), info.pid, started=True
+        )
+    alive = {i.worker for i in msg.workers} | {t.worker for t in node.tasks.values() if t.worker}
+    for wid in [wid for wid, w in list(node.workers.items()) if wid not in alive and w.started]:
+      self.drop_worker(node, wid)
+    self.clear_owners(lambda s: s.owner[1:] == (node.id, node.boot_id) and s.owner[0] not in node.workers)
+
   def handle(self, msg: NodeMsg) -> ControlMsg:
     self.expire_nodes()
     now = time.monotonic()
     if self.db.is_fenced(msg.boot_id):
       return ControlMsg(reset=True)
     node = self.nodes.get(msg.node)
-    is_hello = msg.kind == "hello" or node is None
-    lost_stage = False
+    is_hello, lost_stage = msg.kind == "hello" or node is None, False
 
     if is_hello:
       if node is not None and node.boot_id != msg.boot_id:
@@ -401,14 +517,14 @@ class Controller(Ledger):
         for tid, task in list(node.tasks.items()):
           if task.cmd and not task.cmd.body:
             node.tasks[tid] = replace(task, cmd=self.hydrate_cmd(task.cmd.request_id))
-      for wid in self.fleet.sync_hello(node, msg):
-        self.drop_worker(node, wid)
-      self.clear_owners(lambda s: s.owner[1:] == (node.id, node.boot_id) and s.owner[0] not in node.workers)
+      self._sync_hello(node, msg)
     elif node.boot_id != msg.boot_id:
       return ControlMsg(reset=True)
     else:
-      lost_stage, exited = self.fleet.sync_events(node, msg)
-      for wid in exited:
+      if msg.staged is not None:
+        reported = set(msg.staged)
+        lost_stage, node.staged, node.sent_stage = bool(node.staged - reported), reported, ()
+      for wid in [wid for wid in msg.exited if wid in node.workers and not node.worker_tasks(wid)]:
         self.drop_worker(node, wid)
 
     node.gpus, node.until, node.lag, node.draining = msg.gpus or node.gpus, now + LEASE_MS / 1000, msg.lag, msg.draining
@@ -494,4 +610,4 @@ class Controller(Ledger):
     }
 
 
-__all__ = ["COUNTERS", "Controller", "TICK_MS"]
+__all__ = ["COUNTERS", "Controller", "LiveWorker", "NodeState", "TICK_MS", "new_task_id"]

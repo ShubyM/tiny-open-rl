@@ -1,4 +1,4 @@
-"""Durable SQLite WAL store: the only module in tinyrl that speaks SQL."""
+"""Durable SQLite WAL store: the only module in tinyrl that speaks SQL. Callers own `with db:` transactions."""
 
 from __future__ import annotations
 
@@ -75,19 +75,17 @@ class DB:
       return
     created, seen = (row[0] if row else now), (0.0 if finish else now)
     stored = metadata if (not finish and metadata) else (decode(row[2]) if row else {})
-    with self:
-      self.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?)", (session_id, created, seen, 1, encode(stored)))
+    self.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?)", (session_id, created, seen, 1, encode(stored)))
 
   def load_session(self, session_id: str) -> tuple[float, float, dict] | None:
     row = self.one("SELECT created, seen, meta FROM sessions WHERE id=?", (session_id,))
     return (row[0], row[1], decode(row[2])) if row else None
 
   def close_session(self, session_id: str, *, wait_for_deletes: bool, now: float) -> None:
-    with self:
-      if wait_for_deletes:
-        self.execute("UPDATE sessions SET seen=? WHERE id=?", (now, session_id))
-      else:
-        self.execute("UPDATE sessions SET active=0 WHERE id=?", (session_id,))
+    if wait_for_deletes:
+      self.execute("UPDATE sessions SET seen=? WHERE id=?", (now, session_id))
+    else:
+      self.execute("UPDATE sessions SET active=0 WHERE id=?", (session_id,))
 
   def expired_sessions(self, seen_before: float) -> list[str]:
     return [sid for (sid,) in self.execute("SELECT id FROM sessions WHERE active=1 AND seen<=?", (seen_before,))]
@@ -155,21 +153,19 @@ class DB:
     stab_refs: set[str] | None,
     now: float,
   ) -> tuple[str, ...]:
-    with self:
-      stab = self.read_stability(stab_refs, now) if stab_refs else None
-      vals = (cmd.request_id, cmd.run, seq, str(cmd.op), cmd.cost, uri, cmd.body, encode(stab) if stab else None)
-      self.execute("INSERT INTO commands VALUES (?,?,?,?,?,?,?,?,NULL)", vals)
-      if seq_id is not None:
-        self.execute("INSERT OR REPLACE INTO dedup VALUES (?,?,?,?)", (cmd.run, seq_id, cmd.request_id, dedup_exp))
-      self.execute("INSERT OR REPLACE INTO meta VALUES ('seq', ?)", (seq,))
+    stab = self.read_stability(stab_refs, now) if stab_refs else None
+    vals = (cmd.request_id, cmd.run, seq, str(cmd.op), cmd.cost, uri, cmd.body, encode(stab) if stab else None)
+    self.execute("INSERT INTO commands VALUES (?,?,?,?,?,?,?,?,NULL)", vals)
+    if seq_id is not None:
+      self.execute("INSERT OR REPLACE INTO dedup VALUES (?,?,?,?)", (cmd.run, seq_id, cmd.request_id, dedup_exp))
+    self.execute("INSERT OR REPLACE INTO meta VALUES ('seq', ?)", (seq,))
     return tuple(sorted({ref for ref, _, _ in stab.values()})) if stab else ()
 
   def claim_command(self, req_id: str, node_id: str, boot_id: str, claimed_at: float, slim_task: Task, state) -> None:
-    with self:
-      self.execute(
-        "UPDATE commands SET claim=? WHERE id=?", (encode((node_id, boot_id, claimed_at, encode(slim_task))), req_id)
-      )
-      self.save_run(state)
+    self.execute(
+      "UPDATE commands SET claim=? WHERE id=?", (encode((node_id, boot_id, claimed_at, encode(slim_task))), req_id)
+    )
+    self.save_run(state)
 
   def load_command_payload(self, req_id: str) -> tuple[bytes, dict[str, StabSlice] | None]:
     row = self.one("SELECT body, stab FROM commands WHERE id=?", (req_id,))
@@ -197,13 +193,14 @@ class DB:
     row = self.one("SELECT ok, content_type, expires, body FROM replies WHERE id=?", (req_id,))
     if row is None or row[2] <= now:
       return None
-    with self:
-      self.execute("UPDATE replies SET expires=? WHERE id=?", (min(row[2], now + read_ttl), req_id))
+    self.execute("UPDATE replies SET expires=? WHERE id=?", (min(row[2], now + read_ttl), req_id))
     return Reply(bool(row[0]), row[1], bytes(row[3]))
 
   def save_checkpoint(self, c: Checkpoint) -> None:
-    vals = (c.uri, c.version, c.size, c.time, c.expires_at, int(c.owned), encode(c.meta))
-    self.execute("INSERT OR REPLACE INTO checkpoints VALUES (?,?,?,?,?,?,?)", vals)
+    self.execute(
+      "INSERT OR REPLACE INTO checkpoints VALUES (?,?,?,?,?,?,?)",
+      (c.uri, c.version, c.size, c.time, c.expires_at, int(c.owned), encode(c.meta)),
+    )
 
   def get_checkpoint(self, uri: str, now: float) -> Checkpoint | None:
     parse_uri(uri)

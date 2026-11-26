@@ -6,7 +6,7 @@ These specifications model and exhaustively verify the `tinyrl` control plane ac
 
 | Module | Truth / Hint | Code mapping |
 | --- | --- | --- |
-| `PagedFleet.tla` | Ground truth: `on` (node GPU table), `run` (`owner`, `status`, `snap`), `nodes[node].until` + `fenced`. Pure hints: `procs`, `home`. | `db.py`, `ledger.py`, `fleet.py`, `controller.py`, `node_daemon.py` |
+| `PagedFleet.tla` | Ground truth: `on` (node GPU table), `run` (`owner`, `status`, `snap`), `nodes[node].until` + `fenced`. Pure hints: `procs`, `home`. | `db.py`, `ledger.py`, `controller.py`, `node_daemon.py` |
 | `ConvPaged.tla` | Finite termination rank proving deadlock-free convergence to any well-formed `(procs, home)` once crashes/plan edits stop. | `pager.py`, `NodeDaemon.serve_socket`, `WorkerHandle` |
 | `Lag.tla` | EEVDF `lag` updated from monotone `service - seen` deltas (`gpu_ms`) with minimum-quantum switch amortization `c / eps`. | `policy.py` (`waterfill`, `update_lag`, `plan_gpus`, `rebalance_target`), `node_daemon.py` (`WorkerHandle.ensure_gpu`) |
 

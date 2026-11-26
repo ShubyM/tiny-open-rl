@@ -31,14 +31,13 @@ from tinyrl.types import (
   entry_sort_key,
 )
 
-LIVE_SECONDS = 30
-READ_REPLY_TTL = 60
-REPLY_TTL = getenv("REPLY_TTL", 3600)
-SESSION_TTL = getenv("SESSION_TTL", 7 * 24 * 3600)
-SAMPLE_QUEUE_BYTES = getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20)
-SAMPLE_REPLY_BYTES = getenv("SAMPLE_REPLY_BYTES", 256 * 2**20)
-STABILITY_TTL = getenv("STABILITY_TTL", 24 * 3600)
-STABILITY_BYTES = getenv("STABILITY_BYTES", 512 * 2**20)
+LIVE_SECONDS, READ_REPLY_TTL = 30, 60
+REPLY_TTL, SESSION_TTL = getenv("REPLY_TTL", 3600), getenv("SESSION_TTL", 7 * 24 * 3600)
+SAMPLE_QUEUE_BYTES, SAMPLE_REPLY_BYTES = (
+  getenv("SAMPLE_QUEUE_BYTES", 256 * 2**20),
+  getenv("SAMPLE_REPLY_BYTES", 256 * 2**20),
+)
+STABILITY_TTL, STABILITY_BYTES = getenv("STABILITY_TTL", 24 * 3600), getenv("STABILITY_BYTES", 512 * 2**20)
 COUNTERS = ("steps", "failed", "cmds", "tokens", "busy_ms", "wait_ms")
 
 
@@ -76,8 +75,7 @@ class SampleCache:
   """Bounded volatile memory for queued sample bodies (`429`), reply LRU (`410`), and seq dedup."""
 
   def __init__(self) -> None:
-    self.queue_bytes = 0
-    self.reply_bytes = 0
+    self.queue_bytes = self.reply_bytes = 0
     self.replies: OrderedDict[str, tuple[Reply, float, bool]] = OrderedDict()
     self.seen: dict[tuple[str, int], tuple[str, float]] = {}
 
@@ -97,19 +95,18 @@ class SampleCache:
     return hit[0] if hit and hit[1] > now else None
 
   def drop_run(self, run_id: str) -> None:
-    self.seen = {key: val for key, val in self.seen.items() if key[0] != run_id}
+    self.seen = {k: v for k, v in self.seen.items() if k[0] != run_id}
 
   def put_reply(self, req_id: str, reply: Reply, expires: float, limit: int) -> None:
     self.replies[req_id] = (reply, expires, False)
     self.reply_bytes += len(reply.body)
     while self.reply_bytes > limit and len(self.replies) > 1:
-      victim = next((k for k, (r, _, was_read) in self.replies.items() if was_read and r.body), None)
-      if victim is None:
-        victim = next((k for k, (r, _, _) in self.replies.items() if k != req_id and r.body), None)
+      victim = next((k for k, (r, _, was_read) in self.replies.items() if was_read and r.body), None) or next(
+        (k for k, (r, _, _) in self.replies.items() if k != req_id and r.body), None
+      )
       if victim is None:
         return
-      evicted, _, _ = self.replies.pop(victim)
-      self.reply_bytes -= len(evicted.body)
+      self.reply_bytes -= len(self.replies.pop(victim)[0].body)
 
   def read_reply(self, req_id: str, now: float, read_ttl: float) -> Reply | None:
     hit = self.replies.get(req_id)
@@ -123,13 +120,12 @@ class SampleCache:
   def gc(self, now: float) -> None:
     for req_id, (_, expires, _) in list(self.replies.items()):
       if expires <= now:
-        evicted, _, _ = self.replies.pop(req_id)
-        self.reply_bytes -= len(evicted.body)
-    self.seen = {key: val for key, val in self.seen.items() if val[1] > now}
+        self.reply_bytes -= len(self.replies.pop(req_id)[0].body)
+    self.seen = {k: v for k, v in self.seen.items() if v[1] > now}
 
 
 class Ledger:
-  """Owns all logical run, session, checkpoint, command, reply, and EEVDF account state (no Fleet)."""
+  """Owns all logical run, session, checkpoint, command, reply, and EEVDF account state."""
 
   def __init__(self, db: DB):
     self.db = db
@@ -140,6 +136,19 @@ class Ledger:
     self.accounts_dirty = False
     self.events: deque[Event] = deque(maxlen=100_000)
     self.waiters: weakref.WeakValueDictionary[str, asyncio.Event] = weakref.WeakValueDictionary()
+
+  def _apply_runs(self, updates: list[RunState]) -> None:
+    for u in updates:
+      s = self.runs[u.run.id]
+      s.status, s.owner, s.snapshot, s.clients, s.deleted_at, s.fair_ms, s.counters = (
+        u.status,
+        u.owner,
+        u.snapshot,
+        u.clients,
+        u.deleted_at,
+        u.fair_ms,
+        u.counters,
+      )
 
   def load(self) -> list[tuple[str, str, object]]:
     """Populate `runs` and durable queues from SQLite; return claimed `(node_id, boot_id, task|None)`."""
@@ -217,11 +226,11 @@ class Ledger:
   # --- sessions, runs & checkpoints ---
 
   def heartbeat_session(self, session_id: str, metadata: dict | None = None, *, finish: bool = False) -> None:
-    self.db.save_session(session_id, time.time(), metadata, finish=finish)
+    with self.db:
+      self.db.save_session(session_id, time.time(), metadata, finish=finish)
 
   def get_session(self, session_id: str) -> dict | None:
-    loaded = self.db.load_session(session_id)
-    if loaded is None:
+    if (loaded := self.db.load_session(session_id)) is None:
       return None
     created, seen, metadata = loaded
     runs = sorted(rid for rid, s in self.runs.items() if s.run.session == session_id)
@@ -243,17 +252,16 @@ class Ledger:
     self.record_event(Ev.RUN_CREATED, {"run": run.id, **info})
 
   def join_sampling_session(self, run_id: str) -> int:
-    state = self.runs.get(run_id)
-    if state is None:
+    if (state := self.runs.get(run_id)) is None:
       return 1
+    updated = replace(state, clients=state.clients + 1)
     with self.db:
-      self.db.save_run(replace(state, clients=state.clients + 1))
-    state.clients += 1
+      self.db.save_run(updated)
+    self._apply_runs([updated])
     return state.clients
 
   def get_run(self, run_id: str) -> dict | None:
-    state = self.runs.get(run_id)
-    if state is None:
+    if (state := self.runs.get(run_id)) is None:
       return None
     info = {**asdict(state.run), "created": state.created, "status": str(state.status), **state.counters}
     if state.owner:
@@ -266,10 +274,8 @@ class Ledger:
     """Mark `run_id` deleted; return `(cancelled_samples, aborted_trains)` as `(owner, task_id)` pairs."""
     cancelled_samples: list[tuple[Owner, str]] = []
     aborted_trains: list[tuple[Owner, str]] = []
-    state = self.runs.get(run_id)
-    if state is not None:
-      deleted_reply = Reply.error(RuntimeError(f"run {run_id} was deleted"))
-      queued_trains: list[str] = []
+    if (state := self.runs.get(run_id)) is not None:
+      deleted_reply, queued_trains = Reply.error(RuntimeError(f"run {run_id} was deleted")), []
       for cmd_id, item in list(state.queue.items()):
         if state.run.role == Role.SAMPLER:
           self.samples.release(len(item.cmd.body))
@@ -283,12 +289,13 @@ class Ledger:
           queued_trains.append(cmd_id)
       self.samples.drop_run(run_id)
       now, dropped = time.time(), list(state.queue)
+      updated = replace(state, status=RunStatus.DELETED, owner=None, snapshot=None, deleted_at=now)
       with self.db:
         for cmd_id in queued_trains:
           self.db.save_reply(cmd_id, deleted_reply, now + REPLY_TTL)
-        self.db.save_run(replace(state, status=RunStatus.DELETED, owner=None, snapshot=None, deleted_at=now))
+        self.db.save_run(updated)
         self.db.remove_command(None, run_id, deleting=True)
-      state.status, state.owner, state.snapshot, state.deleted_at = RunStatus.DELETED, None, None, now
+      self._apply_runs([updated])
       state.queue.clear()
       for cmd_id in dropped:
         self.notify(cmd_id)
@@ -324,8 +331,7 @@ class Ledger:
     return True
 
   def retained_versions(self, extra: set[str] = frozenset()) -> list[str]:
-    versions = {ckpt.version for ckpt in self.list_checkpoints() if ckpt.version}
-    versions |= self.db.stability_refs(time.time()) | extra
+    versions = {c.version for c in self.list_checkpoints() if c.version} | self.db.stability_refs(time.time()) | extra
     for state in self.runs.values():
       if state.live and state.snapshot:
         versions.add(state.snapshot)
@@ -341,9 +347,11 @@ class Ledger:
     if seq_id is None:
       return None
     now = time.time()
-    if self.is_sampler(run_id):
-      return self.samples.lookup_seq(run_id, seq_id, now)
-    return self.db.seen_dedup(run_id, seq_id, now)
+    return (
+      self.samples.lookup_seq(run_id, seq_id, now)
+      if self.is_sampler(run_id)
+      else self.db.seen_dedup(run_id, seq_id, now)
+    )
 
   def enqueue(
     self, run_id: str, op: Op, body: bytes, seq_id=None, cost=1, uri=None, stability_refs=None
@@ -376,7 +384,8 @@ class Ledger:
       if state.run.model_path and ckpt is None:
         self.finish_sample(req_id, None, Reply.error(ValueError(f"no checkpoint at {state.run.model_path}")), None, 0)
     else:
-      stab_vers = self.db.insert_command(cmd, self.seq, uri, seq_id, now + SESSION_TTL, stability_refs, now)
+      with self.db:
+        stab_vers = self.db.insert_command(cmd, self.seq, uri, seq_id, now + SESSION_TTL, stability_refs, now)
       state.queue[req_id] = QueueItem(replace(cmd, body=b""), uri=uri, stab_vers=stab_vers)
     return req_id, True
 
@@ -389,7 +398,8 @@ class Ledger:
       if state is None or req_id not in state.queue:
         raise RequestGoneError(f"sampling request gone: {req_id}")
       return None
-    return self.db.read_reply(req_id, now, read_ttl)
+    with self.db:
+      return self.db.read_reply(req_id, now, read_ttl)
 
   async def wait_for_reply(self, req_id: str, timeout: float) -> Reply | None:
     deadline = time.monotonic() + max(0.0, timeout)
@@ -495,6 +505,7 @@ class Ledger:
       ):
         next_state.owner = None
 
+    updates = [*peer_updates, next_state]
     with self.db:
       self.db.remove_command(req_id, cmd.run, deleting=deleting)
       self.db.save_reply(req_id, reply, now + REPLY_TTL)
@@ -506,19 +517,11 @@ class Ledger:
       self.flush_sql(service)
       if checkpoint and reply.ok:
         self.db.save_checkpoint(checkpoint)
-      for updated in (*peer_updates, next_state):
+      for updated in updates:
         self.db.save_run(updated)
 
     self.service = service
-    for updated in peer_updates:
-      self.runs[updated.run.id].owner, self.runs[updated.run.id].status = updated.owner, updated.status
-    state.status, state.owner, state.snapshot, state.deleted_at = (
-      next_state.status,
-      next_state.owner,
-      next_state.snapshot,
-      next_state.deleted_at,
-    )
-    state.counters, state.fair_ms = counters, next_state.fair_ms
+    self._apply_runs(updates)
     for cid in list(state.queue) if deleting else [req_id]:
       state.queue.pop(cid, None)
       self.notify(cid)
@@ -552,7 +555,7 @@ class Ledger:
     updated = replace(state, owner=None, snapshot=saved or state.snapshot, status=status)
     with self.db:
       self.db.save_run(updated)
-    state.owner, state.snapshot, state.status = updated.owner, updated.snapshot, updated.status
+    self._apply_runs([updated])
 
   def take_samples(self, predicate: Callable[[QueueItem], bool]) -> list[tuple[Owner, str]]:
     """Release matching claimed sample items back to queued; return cancelled `(owner, task_id)` pairs."""
@@ -577,8 +580,7 @@ class Ledger:
       with self.db:
         for updated in updates:
           self.db.save_run(updated)
-      for updated in updates:
-        self.runs[updated.run.id].owner, self.runs[updated.run.id].status = updated.owner, updated.status
+      self._apply_runs(updates)
 
   def gc(self, now: float) -> None:
     self.samples.gc(now)

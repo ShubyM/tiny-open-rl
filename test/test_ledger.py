@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import msgspec
@@ -12,9 +13,10 @@ from test.helpers import BusTest, new_id, serve_control
 from tinyrl.control.accounting import Charge
 from tinyrl.control.controller import Controller
 from tinyrl.control.db import DB, SCHEMA_VERSION
-from tinyrl.control.node_daemon import ControlClient, NodeDaemon
+from tinyrl.control.node_daemon import ControlClient, NodeDaemon, WorkerHandle
 from tinyrl.storage.store import Store
 from tinyrl.types import (
+  MAX_SEQS,
   Checkpoint,
   ControlMsg,
   Done,
@@ -475,7 +477,7 @@ class TestLedger(BusTest):
 
   async def test_custom_swappable_scheduler_drives_train_and_sample(self):
     def fifo_scheduler(ctrl: Controller, now: float) -> list[float]:
-      [node] = ctrl.fleet.healthy_nodes().values()
+      [node] = ctrl.healthy_nodes().values()
       if node.tasks:
         return []
       for run_id, state in ctrl.runs.items():
@@ -673,6 +675,231 @@ class TestControlRestart(unittest.IsolatedAsyncioTestCase):
       self.assertEqual(sorted(saved_runs), ["a", "b"])
       self.assertEqual([t.kind for t in cmsg.tasks], [TaskKind.STOP])
       self.assertEqual(ctrl.get_run("b")["snapshot"], "snap-b")
+
+
+class TestClaimStorage(BusTest):
+  async def test_sample_keeps_its_version_on_retry_and_reassignment(self):
+    uri = "tinker://trainer/sampler_weights/latest"
+    self.seed_checkpoint(uri, 1, version="first")
+    self.bus.create_run(Run("s", "base", 8, role=Role.SAMPLER, model_path=uri))
+    first = self.bus.submit_command("s", Op.SAMPLE, b"{}")
+    staged = ("first", "second")
+
+    [initial] = [
+      t
+      for t in self.bus.handle(NodeMsg("hello", "east", "boot1", gpus=1, staged=staged)).tasks
+      if t.kind == TaskKind.SAMPLE
+    ]
+    self.seed_checkpoint(uri, 1, version="second")
+    second = self.bus.submit_command("s", Op.SAMPLE, b"{}")
+    [replay] = [
+      t
+      for t in self.bus.handle(NodeMsg("hello", "east", "boot1", gpus=1, staged=staged)).tasks
+      if t.cmd.request_id == first
+    ]
+    self.assertEqual(replay, initial)
+    self.assertIn("first", self.bus.live_versions())
+
+    self.bus.nodes["east"].until = 0
+    [retry] = [
+      t
+      for t in self.bus.handle(NodeMsg("hello", "west", "boot2", gpus=1, staged=staged)).tasks
+      if t.cmd.request_id == first
+    ]
+    self.assertEqual((retry.cmd.request_id, retry.version), (first, "first"))
+    self.bus.handle(NodeMsg("events", "west", "boot2", done=(Done(retry.id, True, ok()),)))
+    self.assertNotIn("first", self.bus.live_versions())
+    done_second = [t for t in self.bus.nodes["west"].tasks.values() if t.cmd and t.cmd.request_id == second]
+    self.assertEqual([(t.cmd.request_id, t.version) for t in done_second], [(second, "second")])
+
+  async def test_redelivered_wave_preserves_interleaved_run_order(self):
+    for run in ("a", "b"):
+      self.bus.create_run(Run(run, "base", 8, role=Role.SAMPLER, account="owner"))
+      for _ in range(2):
+        self.bus.submit_command(run, Op.SAMPLE, b"{}")
+    initial = [t for t in self.bus.handle(NodeMsg("hello", "n", "boot", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
+    self.assertEqual([t.cmd.run for t in initial], ["a", "b", "a", "b"])
+    replay = [t for t in self.bus.handle(NodeMsg("hello", "n", "boot", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
+    self.assertEqual(replay, initial)
+
+  async def test_failed_finish_preserves_trainer_claim_and_bills_once_on_retry(self):
+    self.bus.create_run(Run("r", "base", 8, account="a"))
+    req = self.bus.submit_command("r", Op.OPTIM_STEP, b"{}")
+    [task] = [t for t in self.bus.handle(NodeMsg("hello", "n", "b", gpus=1)).tasks if t.kind == TaskKind.TRAIN]
+    self.bus.db.execute(
+      """CREATE TEMP TRIGGER fail_run_write BEFORE INSERT ON runs
+         BEGIN SELECT RAISE(ABORT, 'injected write failure'); END"""
+    )
+    done = Done(task.id, True, ok(), Charge(gpu_ms=5), Effect(loaded=True, mutated=True))
+    try:
+      with self.assertRaisesRegex(sqlite3.IntegrityError, "injected write failure"):
+        self.bus.handle(NodeMsg("events", "n", "b", done=(done,)))
+    finally:
+      self.bus.db.execute("DROP TRIGGER fail_run_write")
+
+    self.assertIsNone(await self.bus.wait_for_reply(req, 0))
+    self.assertEqual([x["request_id"] for x in self.bus.queued_and_in_flight("r")["in_flight"]], [req])
+    [replay] = [t for t in self.bus.handle(NodeMsg("hello", "n", "b", gpus=1)).tasks if t.kind == TaskKind.TRAIN]
+    self.assertEqual(replay, task)
+    ack = self.bus.handle(NodeMsg("events", "n", "b", done=(done,))).ack
+    self.assertEqual(ack, (task.id,))
+    self.assertEqual(await self.bus.wait_for_reply(req, 0), ok())
+    self.assertEqual(self.bus.service["a"], 5)
+    self.assertEqual(self.bus.get_run("r")["steps"], 1)
+
+
+class TestDetachRetry(unittest.IsolatedAsyncioTestCase):
+  async def asyncSetUp(self):
+    self.ctrl = Controller(":memory:")
+    self.addAsyncCleanup(self.ctrl.aclose)
+    store = mock.Mock()
+    store.env.return_value = {}
+    store.versions.return_value = set()
+    self.node = NodeDaemon(self.ctrl, gpus=1, node="n", gpu_mib=0, store=store)
+    self.model = SimpleNamespace(call=mock.AsyncMock(), close=mock.AsyncMock(), proc=None)
+    spec = WorkerSpec(lora=True, base="base")
+    self.worker = self.node.workers["w"] = WorkerHandle("w", spec, self.model, resident=(0,))
+    self.worker.loaded = {"a": False, "b": False}
+    for r in ("a", "b"):
+      self.ctrl.create_run(Run(r, "base", 8))
+      rs = self.ctrl.runs[r]
+      rs.status, rs.owner = RunStatus.LIVE, ("w", "n", self.node.boot_id)
+    await self.node.step_once()
+
+  async def test_stop_saves_other_runs_and_retries_only_the_failed_snapshot(self):
+    self.model.call.side_effect = [OSError("storage unavailable"), "snap-b", "snap-a"]
+    self.node.begin_drain()
+    await self.node.step_once()
+    await asyncio.sleep(0.01)
+    await self.node.step_once()
+    await asyncio.sleep(0.01)
+    await self.node.step_once()
+    self.assertEqual(self.ctrl.get_run("b")["snapshot"], "snap-b")
+    self.assertIsNone(self.ctrl.get_run("a").get("snapshot"))
+    self.model.close.assert_not_awaited()
+
+    await asyncio.sleep(0.06)
+    await self.node.step_once()
+    await asyncio.sleep(0.01)
+    await self.node.step_once()
+    await asyncio.sleep(0.01)
+    await self.node.step_once()
+    self.assertEqual([c.args[:2] for c in self.model.call.await_args_list], [("save_run", r) for r in "aba"])
+    self.assertEqual(self.ctrl.get_run("a")["snapshot"], "snap-a")
+    self.assertEqual(self.node.workers, {})
+    self.model.close.assert_awaited_once()
+
+  async def test_detach_keeps_source_until_controller_acknowledges_snapshot(self):
+    self.model.call.return_value = "snap-b"
+    self.ctrl.detach_run(self.ctrl.nodes["n"], self.ctrl.nodes["n"].workers["w"], "b", 0.0)
+    cmsg = self.ctrl.nodes["n"].drain_push()
+    self.assertEqual([t.kind for t in cmsg.tasks], [TaskKind.SAVE])
+    self.node.apply(cmsg)
+    await asyncio.sleep(0.01)
+    self.assertIn("b", self.worker.loaded)
+    self.assertEqual([c.args[0] for c in self.model.call.await_args_list], ["save_run"])
+
+    await self.node.step_once()
+    self.assertEqual(self.ctrl.get_run("b")["snapshot"], "snap-b")
+    await asyncio.sleep(0.01)
+    await self.node.step_once()
+    self.model.call.assert_awaited_with("drop_run", "b")
+    self.assertEqual(set(self.worker.loaded), {"a"})
+    self.model.close.assert_not_awaited()
+
+  async def test_permanent_save_error_never_publishes_a_snapshot_during_forced_drain(self):
+    self.model.call.side_effect = OSError("storage unavailable")
+    self.node.begin_drain()
+    with mock.patch("tinyrl.control.node_daemon.TICK", 0.01), mock.patch("tinyrl.control.node_daemon.DRAIN_S", 0.15):
+      await asyncio.wait_for(self.node.serve(), 2)
+    self.assertGreater(self.model.call.await_count, 2)
+    self.assertIsNone(self.ctrl.get_run("a").get("snapshot"))
+    self.assertIsNone(self.ctrl.get_run("b").get("snapshot"))
+    self.model.close.assert_awaited_once()
+
+  async def test_scale_out_detach_respects_failed_saves_backoff(self):
+    self.ctrl.submit_command("a", Op.OPTIM_STEP, b"{}")
+    [t] = self.ctrl.nodes["n"].drain_push().tasks
+    self.ctrl.submit_command("a", Op.OPTIM_STEP, b"{}")
+    self.ctrl.submit_command("b", Op.OPTIM_STEP, b"{}")
+    self.ctrl.handle(NodeMsg("hello", "n2", "b2", gpus=1))
+    self.ctrl.handle(
+      NodeMsg("events", "n", self.node.boot_id, done=(Done(t.id, True, ok(), effect=Effect(True, True)),))
+    )
+    save_tasks = [x for x in self.ctrl.nodes["n"].tasks.values() if x.kind == TaskKind.SAVE]
+    self.assertEqual([x.run_id for x in save_tasks], ["b"])
+    cmsg = self.ctrl.handle(NodeMsg("events", "n", self.node.boot_id, done=(Done(save_tasks[0].id, ok=False),)))
+    self.assertEqual([x for x in cmsg.tasks if x.kind == TaskKind.SAVE and x.run_id == "b"], [])
+
+
+class TestSampleFailover(unittest.IsolatedAsyncioTestCase):
+  async def test_unstarted_claim_can_move_on_cache_loss_and_fences_all_earlier_attempts(self):
+    ctrl = Controller(":memory:")
+    self.addAsyncCleanup(ctrl.aclose)
+    uri, version = "tinker://train/sampler_weights/latest", "v1"
+    ctrl.put_checkpoint(Checkpoint(uri, version, 1))
+    for node in ("east", "west"):
+      ctrl.handle(NodeMsg("hello", node, node, gpus=1))
+    ctrl.create_run(Run("sample", "base", 8, role=Role.SAMPLER, model_path=uri))
+    ids = [ctrl.submit_command("sample", Op.SAMPLE, b"{}") for _ in range(MAX_SEQS + 1)]
+    first = [
+      t
+      for t in ctrl.handle(NodeMsg("hello", "east", "east", gpus=1, staged=(version,))).tasks
+      if t.kind == TaskKind.SAMPLE
+    ]
+    running, unseen = first[:2]
+    self.assertEqual(running.cmd.request_id, ids[0])
+
+    wi = WorkerInfo(running.worker, running.spec, running.gpus, running.gpus)
+    evicted = ctrl.handle(NodeMsg("hello", "east", "east", gpus=1, workers=(wi,), active=(running.id,)))
+    self.assertIn(unseen.id, evicted.cancel)
+    west = [
+      t
+      for t in ctrl.handle(NodeMsg("hello", "west", "west", gpus=1, staged=(version,))).tasks
+      if t.kind == TaskKind.SAMPLE
+    ]
+    west_claim = next(t for t in west if t.cmd.request_id == unseen.cmd.request_id)
+    self.assertNotIn(running.cmd.request_id, [t.cmd.request_id for t in west])
+    ctrl.handle(NodeMsg("events", "east", "east", done=(Done(running.id, True, ok()),)))
+    self.assertEqual(await ctrl.wait_for_reply(running.cmd.request_id, 0), ok())
+    self.assertFalse(
+      ctrl.finish_sample(unseen.cmd.request_id, (unseen.worker, "east", "east"), ok(), None, unseen.attempt)
+    )
+
+    ctrl.handle(NodeMsg("hello", "west", "west", gpus=1))
+    east = [
+      t
+      for t in ctrl.handle(NodeMsg("hello", "east", "east", gpus=1, workers=(wi,), staged=(version,))).tasks
+      if t.kind == TaskKind.SAMPLE
+    ]
+    current = next(t for t in east if t.cmd.request_id == unseen.cmd.request_id)
+    self.assertEqual((current.worker, current.version), (running.worker, version))
+    self.assertLess(unseen.attempt, west_claim.attempt)
+    self.assertLess(west_claim.attempt, current.attempt)
+    self.assertFalse(ctrl.finish_sample(unseen.cmd.request_id, (current.worker, "east", "east"), ok(), None, 0))
+    self.assertFalse(
+      ctrl.finish_sample(unseen.cmd.request_id, (west_claim.worker, "west", "west"), ok(), None, west_claim.attempt)
+    )
+    self.assertTrue(
+      ctrl.finish_sample(unseen.cmd.request_id, (current.worker, "east", "east"), ok(), None, current.attempt)
+    )
+    self.assertEqual(await ctrl.wait_for_reply(unseen.cmd.request_id, 0), ok())
+
+  async def test_unstaged_old_revision_does_not_block_later_samples_in_same_run(self):
+    ctrl = Controller(":memory:")
+    self.addAsyncCleanup(ctrl.aclose)
+    uri = "tinker://train/sampler_weights/latest"
+    ctrl.create_run(Run("sample", "base", 8, role=Role.SAMPLER, model_path=uri))
+    ids = []
+    for version in ("v1", "v2", "v1", "v2"):
+      ctrl.put_checkpoint(Checkpoint(uri, version, 1))
+      ids.append(ctrl.submit_command("sample", Op.SAMPLE, b"{}"))
+    r1 = ctrl.handle(NodeMsg("hello", "n", "boot", gpus=1))
+    self.assertEqual(set(r1.stage), {"v1", "v2"})
+    r2 = ctrl.handle(NodeMsg("hello", "n", "boot", gpus=1, staged=("v2",)))
+    samples = [t for t in r2.tasks if t.kind == TaskKind.SAMPLE]
+    self.assertEqual([t.cmd.request_id for t in samples], [ids[1], ids[3]])
+    self.assertEqual(set(r2.stage), {"v1"})
 
 
 if __name__ == "__main__":

@@ -95,6 +95,39 @@ class TestGatewayDedupe(BusTest):
     finally:
       await runner.cleanup()
 
+  async def test_superseded_ws_cannot_reclaim_live_ws_during_send(self):
+    from fastapi import WebSocket
+
+    paused, release = asyncio.Event(), asyncio.Event()
+    orig_send = WebSocket.send_bytes
+    calls = 0
+
+    async def slow_first_send(ws, data):
+      nonlocal calls
+      calls += 1
+      if calls == 1:
+        paused.set()
+        await release.wait()
+      return await orig_send(ws, data)
+
+    runner, url = await serve_control(self.bus, host="127.0.0.1", port=0)
+    client = ControlClient(url)
+    try:
+      with patch.object(WebSocket, "send_bytes", slow_first_send):
+        async with client.connect() as ws1, client.connect() as ws2:
+          await ws1.send_bytes(msgspec.msgpack.encode(NodeMsg("hello", "n1", "b1", gpus=1)))
+          await asyncio.wait_for(paused.wait(), 2.0)
+          await ws2.send_bytes(msgspec.msgpack.encode(NodeMsg("hello", "n1", "b1", gpus=1)))
+          msgspec.msgpack.decode(await asyncio.wait_for(ws2.receive_bytes(), 2.0), type=ControlMsg)
+          release.set()
+          await asyncio.sleep(0.05)
+          self.bus.create_run(Run("r1", "base", 4))
+          self.bus.submit_command("r1", Op.CREATE_MODEL, b"{}")
+          pushed = msgspec.msgpack.decode(await asyncio.wait_for(ws2.receive_bytes(), 2.0), type=ControlMsg)
+          self.assertEqual([t.cmd.run for t in pushed.tasks], ["r1"])
+    finally:
+      await runner.cleanup()
+
 
 class TestEstimator(unittest.TestCase):
   def test_estimates_full_and_vllm_without_importing_ml_frameworks(self):
