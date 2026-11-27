@@ -6,7 +6,7 @@ These specifications model and exhaustively verify the `tinyrl` control plane ac
 
 | Module | Truth / Hint | Code mapping |
 | --- | --- | --- |
-| `PagedFleet.tla` | Ground truth: `on` (node GPU table), `run` (`owner`, `status`, `snap`), `nodes[node].until` + `fenced`. Pure hints: `procs`, `home`. | `db.py`, `ledger.py`, `controller.py`, `node_daemon.py` |
+| `PagedFleet.tla` | Ground truth: `on` (node GPU table), `run` (`owner`, `status`, `snap`), `nodes[node].until` + `fenced`. Pure hints: `procs`, `home`. | `db.py`, `controller.py`, `node_daemon.py` |
 | `ConvPaged.tla` | Finite termination rank proving deadlock-free convergence to any well-formed `(procs, home)` once crashes/plan edits stop. | `pager.py`, `NodeDaemon.serve_socket`, `WorkerHandle` |
 | `Lag.tla` | EEVDF `lag` updated from monotone `service - seen` deltas (`gpu_ms`) with minimum-quantum switch amortization `c / eps`. | `policy.py` (`waterfill`, `update_lag`, `plan_gpus`, `rebalance_target`), `node_daemon.py` (`WorkerHandle.ensure_gpu`) |
 
@@ -20,8 +20,8 @@ Every safety and accounting rule has a boolean flag in the model; flipping any s
 | `OwnerFencesWrite` | `finish_train` and `finish_save` require exact `owner == (worker, node, boot_id)` | `MemoryMatchesPos` |
 | `ExactSnapOnly` | `finish_save` records `snapshot` iff clean snapshot saved; mutation clears superseded `snapshot` | `MemoryMatchesPos` |
 | `ReapChecksLease` | `expire_node` clears `owner` only after lease expiry and records durable `fenced` boot IDs | `LiveOwnerKept` |
-| `SerializeRunOps` | Ownership checks and state mutations run atomically in `Ledger` inside one SQLite `IMMEDIATE` transaction | `MemoryMatchesPos` |
-| `SampleSetNX` | Stateless sampler replicas complete and bill a sample once (`Ledger.finish_sample` checks `item.owner == owner` and `item.attempt == attempt`) | `SampleChargedOnce` |
+| `SerializeRunOps` | Ownership checks and state mutations run atomically in `Controller` inside one SQLite `IMMEDIATE` transaction | `MemoryMatchesPos` |
+| `SampleSetNX` | Stateless sampler replicas complete and bill a sample once (`Controller.finish_sample` checks `item.owner == owner` and `item.attempt == attempt`) | `SampleChargedOnce` |
 | `UseDelta` | Planner advances `lag` from `service[a] - seen[a]` (never overwriting `service`) | `ExactAccounting` |
 | `KeepNegLag` | Sleeping preserves negative debt (decaying only as active peers receive work) and zeros positive idle credit | `NoFlickerGain` |
 | `AmortizeCost` | Preemption requires `ran >= holder.cost` and `lag[waiter] - lag[holder] >= switch_cost` | `GoodputBounded` |

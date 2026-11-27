@@ -272,7 +272,7 @@ class TestLedger(BusTest):
     self.assertEqual((run["cmds"], run["tokens"]), (1, 100))
     self.assertEqual(self.bus.service["bob"], 40.5 + winner)
 
-    self.bus.samples.replies.pop(req, None)
+    self.bus.sample_replies.pop(req, None)
     self.assertFalse(
       self.bus.finish_sample(req, (t.worker, "n1", "b1"), ok(late=True), Charge(busy_ms=100, gpu_ms=100), t.attempt)
     )
@@ -282,7 +282,7 @@ class TestLedger(BusTest):
 
   async def test_sampling_backpressure_and_unknown_promise_raise_typed_errors(self):
     sid = self.new_run(role=Role.SAMPLER)
-    with mock.patch("tinyrl.control.ledger.SAMPLE_QUEUE_BYTES", 16):
+    with mock.patch("tinyrl.control.controller.SAMPLE_QUEUE_BYTES", 16):
       self.bus.submit_command(sid, Op.SAMPLE, b"0123456789")
       with self.assertRaises(QueueFullError):
         self.bus.submit_command(sid, Op.SAMPLE, b"0123456789")
@@ -396,7 +396,7 @@ class TestLedger(BusTest):
     tasks = [t for t in self.bus.handle(NodeMsg("hello", "n1", "b1", gpus=1)).tasks if t.kind == TaskKind.SAMPLE]
     self.assertEqual([t.cmd.request_id for t in tasks], reqs)
     big = Reply(True, "application/json", b"x" * 60)
-    with mock.patch("tinyrl.control.ledger.SAMPLE_REPLY_BYTES", 120):
+    with mock.patch("tinyrl.control.controller.SAMPLE_REPLY_BYTES", 120):
       self.done("n1", "b1", tasks[0].id, big)
       self.done("n1", "b1", tasks[1].id, big)
       self.assertEqual(await self.bus.wait_for_reply(reqs[1], 0), big)

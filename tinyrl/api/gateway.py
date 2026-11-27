@@ -21,29 +21,11 @@ from tinyrl.api import wire
 from tinyrl.control import estimator
 from tinyrl.control.controller import COUNTERS, TICK_MS, Controller
 from tinyrl.helpers import getenv
-from tinyrl.types import (
-  Checkpoint,
-  FencedError,
-  NodeMsg,
-  Op,
-  QueueFullError,
-  RequestGoneError,
-  Role,
-  Run,
-  parse_uri,
-)
+from tinyrl.types import Checkpoint, FencedError, NodeMsg, Op, QueueFullError, RequestGoneError, Role, Run, parse_uri
 
-WAIT = getenv("WAIT", 30.0)
-CKPT_TTL = getenv("CKPT_TTL", 0)
-MAX_TTL_SECONDS = 10 * 365 * 24 * 3600
+WAIT, CKPT_TTL, MAX_TTL_SECONDS = getenv("WAIT", 30.0), getenv("CKPT_TTL", 0), 10 * 365 * 24 * 3600
 CHECKPOINT_KINDS = {"weights": "training", "sampler_weights": "sampler"}
-ERROR_CODES = {
-  ValueError: 400,
-  KeyError: 400,
-  FencedError: 409,
-  RequestGoneError: 410,
-  QueueFullError: 429,
-}
+ERROR_CODES = {ValueError: 400, KeyError: 400, FencedError: 409, RequestGoneError: 410, QueueFullError: 429}
 
 
 class ModelReq(BaseModel):
@@ -58,8 +40,7 @@ class SaveReq(ModelReq):
 
   def checkpoint(self, kind: str, *, owned: bool = False) -> dict:
     seq = self.sampling_session_seq_id if self.sampling_session_seq_id is not None else self.seq_id
-    suffix = seq if seq is not None else time.time_ns()
-    name = self.path or f"step-{suffix}"
+    name = self.path or f"step-{seq if seq is not None else time.time_ns()}"
     ttl = self.ttl_seconds if (self.ttl_seconds is not None or owned) else (CKPT_TTL or None)
     return {"uri": ckpt_uri(self.model_id, kind, name), "ttl_seconds": check_ttl(ttl)}
 
@@ -78,16 +59,14 @@ def check_ttl(seconds: int | None) -> int | None:
 
 
 def iso(timestamp: float | None) -> str | None:
-  if not timestamp:
-    return None
-  return datetime.datetime.fromtimestamp(timestamp, datetime.UTC).isoformat()
+  return datetime.datetime.fromtimestamp(timestamp, datetime.UTC).isoformat() if timestamp else None
 
 
 def public(ckpt: Checkpoint) -> dict:
-  _, checkpoint_id = parse_uri(ckpt.uri)
-  prefix = checkpoint_id.split("/", 1)[0]
+  _, cid = parse_uri(ckpt.uri)
+  prefix = cid.split("/", 1)[0]
   return {
-    "checkpoint_id": checkpoint_id,
+    "checkpoint_id": cid,
     "checkpoint_type": CHECKPOINT_KINDS.get(prefix, prefix),
     "tinker_path": ckpt.uri,
     "size_bytes": ckpt.size,
@@ -97,15 +76,14 @@ def public(ckpt: Checkpoint) -> dict:
 
 
 def ckpt_uri(run: str, kind: str, name: str) -> str:
-  raw = name if name.startswith("tinker://") else f"tinker://{run}/{kind}/{name}"
-  owner, checkpoint_id = parse_uri(raw)
-  if not checkpoint_id.partition("/")[2]:
+  owner, cid = parse_uri(name if name.startswith("tinker://") else f"tinker://{run}/{kind}/{name}")
+  if not cid.partition("/")[2]:
     raise ValueError(f"bad checkpoint name {name}")
-  return f"tinker://{owner}/{checkpoint_id}"
+  return f"tinker://{owner}/{cid}"
 
 
 def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
-  ctrl = ctrl if ctrl is not None else Controller()
+  ctrl = Controller() if ctrl is None else ctrl
 
   @contextlib.asynccontextmanager
   async def lifespan(_: FastAPI):
@@ -131,8 +109,7 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
   api = FastAPI(title="tiny-open-rl", lifespan=lifespan if control else None)
   for exc_type, status_code in ERROR_CODES.items():
     api.add_exception_handler(
-      exc_type,
-      lambda _, err, code=status_code: JSONResponse({"error": f"{type(err).__name__}: {err}"}, code),
+      exc_type, lambda _, err, code=status_code: JSONResponse({"error": f"{type(err).__name__}: {err}"}, code)
     )
 
   live_ws: dict[str, tuple[WebSocket, asyncio.Task | None]] = {}
@@ -158,10 +135,8 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
       while (node := ctrl.nodes.get(node_id)) is not None and node.boot_id == boot_id:
         await node.push_ev.wait()
         async with send_lock:
-          if live_ws.get(node_id, (None, None))[0] is not ws:
-            return
           node = ctrl.nodes.get(node_id)
-          if node is None or node.boot_id != boot_id:
+          if live_ws.get(node_id, (None, None))[0] is not ws or node is None or node.boot_id != boot_id:
             return
           out = node.drain_push()
           if out.tasks or out.cancel or out.stage or out.sweep is not None or out.ack:
@@ -217,49 +192,32 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
     refs: set[str] | None = None,
   ) -> dict[str, str]:
     payload = json.dumps(body).encode() if isinstance(body, dict) else body
-    request_id = ctrl.submit_command(run, op, payload, seq_id, cost, uri, refs)
-    if request_id is None:
+    if (req_id := ctrl.submit_command(run, op, payload, seq_id, cost, uri, refs)) is None:
       raise HTTPException(404, f"no model {run}")
-    return {"request_id": request_id, "model_id": run}
+    return {"request_id": req_id, "model_id": run}
 
   async def make_sampler(
-    base_model: str | None,
-    model_path: str | None,
-    session_id: str = "",
-    *,
-    create: bool = True,
+    base_model: str | None, model_path: str | None, session_id: str = "", *, create: bool = True
   ) -> Run:
     path = model_path or None
     train_run_id = parse_uri(path)[0] if path else None
     train_run = (ctrl.get_run(train_run_id) or {}) if train_run_id else {}
-
-    ckpt_meta: dict = {}
-    if path and not train_run.get("base"):
-      ckpt = ctrl.get_checkpoint(path)
-      ckpt_meta = ckpt.meta if ckpt else {}
+    ckpt_meta = (ckpt.meta if (ckpt := ctrl.get_checkpoint(path)) else {}) if path and not train_run.get("base") else {}
 
     base = train_run.get("base") or ckpt_meta.get("base") or base_model
     if not base:
       raise ValueError("could not resolve base_model" if path else "base_model required when model_path is None")
-
-    if train_run.get("base"):
-      lora = train_run["rank"] > 0
-    elif path:
-      lora = bool(ckpt_meta.get("lora"))
-    else:
-      lora = True
-
+    lora = (train_run["rank"] > 0) if train_run.get("base") else (bool(ckpt_meta.get("lora")) if path else True)
     session_meta = (ctrl.get_session(session_id) or {}).get("metadata", {}) if session_id else {}
     account = str(train_run.get("account") or session_meta.get("openrl.account") or "")
-    exclusive = bool(train_run.get("exclusive"))
     gpus = await asyncio.to_thread(estimator.gpus, base, "vllm")
     run = Run(
-      id=f"samp-{uuid.uuid4().hex[:12]}",
-      base=base,
-      rank=int(lora),
-      session=session_id,
-      model_path=path,
-      exclusive=exclusive,
+      f"samp-{uuid.uuid4().hex[:12]}",
+      base,
+      int(lora),
+      session_id,
+      path,
+      exclusive=bool(train_run.get("exclusive")),
       role=Role.SAMPLER,
       train_run=train_run_id,
       gpus=gpus,
@@ -283,11 +241,9 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
 
   @api.post("/api/v1/create_session")
   async def create_session(req: dict[str, Any] | None = Body(None)):
-    session_id = f"sess-{uuid.uuid4().hex[:12]}"
-    body = req or {}
+    session_id, body = f"sess-{uuid.uuid4().hex[:12]}", req or {}
     tag_meta = dict(tag.partition("=")[::2] for tag in (body.get("tags") or ()))
-    user_meta = body.get("user_metadata") or {}
-    ctrl.heartbeat_session(session_id, tag_meta | user_meta)
+    ctrl.heartbeat_session(session_id, tag_meta | (body.get("user_metadata") or {}))
     return {"type": "create_session", "session_id": session_id}
 
   @api.post("/api/v1/session_heartbeat")
@@ -307,40 +263,34 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
     if "/" in session:
       raise ValueError("session_id must not contain '/'")
     lora = lora_config or {}
-    session_meta = (ctrl.get_session(session) or {}).get("metadata", {})
-    meta = session_meta | (user_metadata or {})
-
-    full_ft = meta.get("openrl.fine_tuning_type") == "full"
-    rank = 0 if full_ft else int(lora.get("rank", 16))
+    meta = (ctrl.get_session(session) or {}).get("metadata", {}) | (user_metadata or {})
+    rank = 0 if meta.get("openrl.fine_tuning_type") == "full" else int(lora.get("rank", 16))
     run_id = f"{session}-{model_seq_id}" if session and model_seq_id is not None else str(uuid.uuid4())
 
     raw_gpus = meta.get("openrl.gpus")
-    if raw_gpus is not None:
-      gpus = int(raw_gpus)
-    elif rank:
-      gpus = 1
-    else:
-      gpus = await asyncio.to_thread(estimator.gpus, base_model, "full")
+    gpus = (
+      int(raw_gpus)
+      if raw_gpus is not None
+      else (1 if rank else await asyncio.to_thread(estimator.gpus, base_model, "full"))
+    )
     if gpus < 1:
       raise ValueError(f"openrl.gpus must be at least 1, got {gpus}")
-
     if not ctrl.get_run(run_id):
-      exclusive = str(meta.get("openrl.exclusive")).lower() == "true"
-      account = str(meta.get("openrl.account") or "")
+      exclusive, account = str(meta.get("openrl.exclusive")).lower() == "true", str(meta.get("openrl.account") or "")
       ctrl.create_run(Run(run_id, base_model, rank, session, None, lora, exclusive, gpus=gpus, account=account))
     dedup_seq = -1 if (session and model_seq_id is not None) else None
     return submit(run_id, Op.CREATE_MODEL, {"base_model": base_model, "rank": rank, "lora": lora}, dedup_seq)
 
   @api.post("/api/v1/get_info")
   async def get_info(req: ModelReq):
-    record = require_run(req.model_id)
-    base = record["base"]
+    rec = require_run(req.model_id)
+    base = rec["base"]
     return {
       "type": "get_info",
       "model_id": req.model_id,
       "model_name": base,
       "is_lora": True,
-      "lora_rank": record["rank"] or 16,
+      "lora_rank": rec["rank"] or 16,
       "model_data": {"model_name": base, "tokenizer_id": base},
     }
 
@@ -361,19 +311,16 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
 
   @api.post("/api/v1/save_weights_for_sampler")
   async def save_weights_for_sampler(req: SaveReq):
-    existing = ctrl.seen_request(req.model_id, req.seq_id)
-    if existing:
+    if existing := ctrl.seen_request(req.model_id, req.seq_id):
       return {"request_id": existing, "model_id": req.model_id}
     train_run = require_run(req.model_id)
     owned = req.path is None or req.sampling_session_seq_id is not None
     args = req.checkpoint("sampler_weights", owned=owned)
     if owned:
       sampler = await make_sampler(train_run["base"], args["uri"], train_run.get("session") or "", create=False)
-      existing = ctrl.seen_request(req.model_id, req.seq_id)
-      if existing:
+      if existing := ctrl.seen_request(req.model_id, req.seq_id):
         return {"request_id": existing, "model_id": req.model_id}
-      state = ctrl.runs.get(req.model_id)
-      if state is None or not state.live:
+      if (state := ctrl.runs.get(req.model_id)) is None or not state.live:
         raise HTTPException(404, f"no model {req.model_id}")
       ctrl.create_run(sampler)
       args |= {"sampling_session_id": sampler.id, "owned": True}
@@ -381,25 +328,20 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
 
   @api.post("/api/v1/load_weights")
   async def load_weights(
-    model_id: str = Body(),
-    path: str = Body(),
-    seq_id: int | None = Body(None),
-    optimizer: bool = Body(False),
+    model_id: str = Body(), path: str = Body(), seq_id: int | None = Body(None), optimizer: bool = Body(False)
   ):
     uri = ckpt_uri(model_id, "weights", path)
     return submit(model_id, Op.LOAD_WEIGHTS, {"uri": uri, "optimizer": optimizer}, seq_id, uri=uri)
 
   @api.post("/api/v1/weights_info")
   async def weights_info(tinker_path: str = Body(embed=True)):
-    ckpt = ctrl.get_checkpoint(tinker_path)
-    meta = ckpt.meta if ckpt else {}
+    meta = ckpt.meta if (ckpt := ctrl.get_checkpoint(tinker_path)) else {}
     if "base" not in meta:
       raise HTTPException(404, f"no checkpoint {tinker_path} that names its base model")
     rank = int(meta.get("rank") or 0)
-    info = {"base_model": meta["base"], "is_lora": True, "lora_rank": rank or 16}
-    if rank:
-      info |= meta.get("flags", {})
-    return info
+    return {"base_model": meta["base"], "is_lora": True, "lora_rank": rank or 16} | (
+      meta.get("flags", {}) if rank else {}
+    )
 
   @api.post("/api/v1/delete_model")
   async def delete_model(req: ModelReq):
@@ -408,8 +350,7 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
 
   @api.post("/api/v1/retrieve_future")
   async def retrieve_future(request_id: str = Body(embed=True)):
-    reply = await ctrl.wait_for_reply(request_id, WAIT)
-    if reply is None:
+    if (reply := await ctrl.wait_for_reply(request_id, WAIT)) is None:
       return {"type": "try_again", "request_id": request_id, "queue_state": "active"}
     return Response(reply.body, media_type=reply.content_type)
 
@@ -417,8 +358,7 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
   async def create_sampling_session(req: SamplingReq):
     sampler_id = req.sampling_session_id
     if not (sampler_id and ctrl.get_run(sampler_id)):
-      sampler = await make_sampler(req.base_model, req.model_path, req.session_id or "")
-      sampler_id = sampler.id
+      sampler_id = (await make_sampler(req.base_model, req.model_path, req.session_id or "")).id
     return {"type": "create_sampling_session", "sampling_session_id": sampler_id}
 
   @api.post("/api/v1/join_sampling_session")
@@ -428,31 +368,28 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
 
   @api.get("/api/v1/samplers/{sampler_id}")
   async def get_sampler(sampler_id: str):
-    record = require_run(sampler_id)
-    return {"sampler_id": sampler_id, "base_model": record["base"], "model_path": record.get("model_path")}
+    rec = require_run(sampler_id)
+    return {"sampler_id": sampler_id, "base_model": rec["base"], "model_path": rec.get("model_path")}
 
   @api.post("/api/v1/asample")
   async def asample(request: Request):
     body = await request.json()
     chunks = (body.get("prompt") or {}).get("chunks", [])
-    if any(chunk.get("type", "encoded_text") != "encoded_text" for chunk in chunks):
+    if any(c.get("type", "encoded_text") != "encoded_text" for c in chunks):
       raise ValueError("only encoded_text prompt chunks are supported")
-    tokens = [int(tok) for chunk in chunks for tok in chunk.get("tokens", [])]
+    tokens = [int(tok) for c in chunks for tok in c.get("tokens", [])]
     if not tokens:
       raise ValueError("empty prompt is not supported")
     if body.get("target_prompt_logprobs") is not None or (body.get("prompt_alt_tokens_k") or 0) > 0:
       raise ValueError("target_prompt_logprobs and prompt_alt_tokens are not supported")
-
     last_n = body.get("prompt_logprobs_last_n")
     if last_n is not None and (not body.get("prompt_logprobs") or not 1 <= last_n <= len(tokens) - 1):
       raise ValueError("invalid prompt_logprobs_last_n")
 
-    sampler_id = body.get("sampling_session_id")
-    if not sampler_id:
-      sampler_id = (await make_sampler(body.get("base_model"), body.get("model_path"))).id
-
-    num_samples = int(body.get("num_samples", 1))
-    params = body.get("sampling_params") or {}
+    sampler_id = (
+      body.get("sampling_session_id") or (await make_sampler(body.get("base_model"), body.get("model_path"))).id
+    )
+    num_samples, params = int(body.get("num_samples", 1)), body.get("sampling_params") or {}
     max_tokens = params.get("max_tokens") or 128
     job = {
       "prompt": tokens,
@@ -469,9 +406,10 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
       "topk_sample": int(body.get("topk_sample_logprobs", 0)),
       "record_stability_info": bool(body.get("record_stability_info")),
     }
-    cost = len(tokens) + num_samples * max_tokens
-    request_id = submit(sampler_id, Op.SAMPLE, job, body.get("seq_id"), cost)["request_id"]
-    return {"request_id": request_id, "sample_sequence_ids": [f"{request_id}:{i}" for i in range(num_samples)]}
+    req_id = submit(sampler_id, Op.SAMPLE, job, body.get("seq_id"), len(tokens) + num_samples * max_tokens)[
+      "request_id"
+    ]
+    return {"request_id": req_id, "sample_sequence_ids": [f"{req_id}:{i}" for i in range(num_samples)]}
 
   @api.get("/api/v1/training_runs/{run}/checkpoints")
   async def list_checkpoints(run: str):
@@ -498,17 +436,12 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
 
   @api.get("/api/v1/runs/{run_id}")
   async def run_info(run_id: str):
-    record = require_run(run_id)
-    workers = ctrl.workers_of(run_id)
-    info = {**record, "procs": workers, **ctrl.queued_and_in_flight(run_id)}
-    if workers:
-      info["worker"] = workers[0]
-    return info
+    rec, workers = require_run(run_id), ctrl.workers_of(run_id)
+    return {**rec, "procs": workers, **ctrl.queued_and_in_flight(run_id), **({"worker": workers[0]} if workers else {})}
 
   @api.get("/api/v1/sessions/{session_id}")
   async def session_info(session_id: str):
-    session = ctrl.get_session(session_id)
-    if session is None:
+    if (session := ctrl.get_session(session_id)) is None:
       raise HTTPException(404, f"no session {session_id}")
     return session
 
@@ -530,17 +463,15 @@ def app(ctrl: Controller | None = None, *, control: bool = False) -> FastAPI:
         if state.run.role == Role.TRAINER
         else sampler_worker.get(state.run.spec)
       )
-      if not wid:
-        continue
-      for key in COUNTERS:
-        label = f"{key[:-3]}_seconds" if key.endswith("_ms") else key
-        value = state.counters[key] / 1000 if key.endswith("_ms") else state.counters[key]
-        lines.append(f'tinyrl_{label}_total{{worker="{wid}",run="{run_id}"}} {value}')
-    for account, total in sorted(ctrl.service.items()):
-      lines.append(f'tinyrl_account_service_total{{account="{account}"}} {float(total)}')
-    for node_id, node in sorted(ctrl.nodes.items()):
-      if node.gpus:
-        lines.append(f'tinyrl_node_loop_lag_seconds{{node="{node_id}"}} {node.lag}')
+      if wid:
+        for key in COUNTERS:
+          label = f"{key[:-3]}_seconds" if key.endswith("_ms") else key
+          val = state.counters[key] / 1000 if key.endswith("_ms") else state.counters[key]
+          lines.append(f'tinyrl_{label}_total{{worker="{wid}",run="{run_id}"}} {val}')
+    lines += [f'tinyrl_account_service_total{{account="{a}"}} {float(t)}' for a, t in sorted(ctrl.service.items())]
+    lines += [
+      f'tinyrl_node_loop_lag_seconds{{node="{nid}"}} {n.lag}' for nid, n in sorted(ctrl.nodes.items()) if n.gpus
+    ]
     return PlainTextResponse("\n".join(lines) + "\n")
 
   return api

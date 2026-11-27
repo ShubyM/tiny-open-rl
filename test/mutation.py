@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER = "tinyrl/control/controller.py"
-LEDGER = "tinyrl/control/ledger.py"
+LEDGER = CONTROLLER
 POLICY = "tinyrl/control/policy.py"
 ACCOUNTING = "tinyrl/control/accounting.py"
 ORDER = "test.test_scheduler.TestLocalQuantum"

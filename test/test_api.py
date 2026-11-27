@@ -478,7 +478,7 @@ class TestAPI(BusTest):
 
     session = await self.post("create_sampling_session", json={"base_model": "tiny"})
     sid = session.json()["sampling_session_id"]
-    with patch("tinyrl.control.ledger.SAMPLE_QUEUE_BYTES", 8):
+    with patch("tinyrl.control.controller.SAMPLE_QUEUE_BYTES", 8):
       res = await self.post(
         "asample",
         json={

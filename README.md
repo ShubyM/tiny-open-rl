@@ -43,8 +43,8 @@ flowchart TD
 
 Each GPU node holds one full-duplex msgpack WebSocket (`/internal/ws`) to the controller. Treating GPU VRAM across the fleet as a directly paged cache of training runs and sampler engines, the controller pushes explicit tasks (`train`, `sample`, `park`, `save`, `drop`, `stop`) plus off-GPU prefetch/sweep directives directly against live reported workers—with no persisted cluster plan or virtual process layer. Outstanding GPU grants reserve one quantum in EEVDF projected lag before the next grant is chosen, and two-phase `save` commits a detached snapshot before releasing a source worker.
 
-- **Durable training, RAM sampling:** Training runs follow an explicit `fresh -> live <-> saved -> lost -> deleted` lifecycle in [ledger.py](tinyrl/control/ledger.py) backed by [db.py](tinyrl/control/db.py) (the sole module speaking SQL). Sampling queues and bounded LRU replies live in RAM with `429` backpressure, `410` on evicted promises, submission-time version pinning, and attempt-fenced failover.
-- **Layered EEVDF fleet paging:** [policy.py](tinyrl/control/policy.py) holds pure waterfilling, EEVDF + projected lag, sample admission, and GPU/node math; [pager.py](tinyrl/control/pager.py) evicts, places, stages, grants, and parks; and [controller.py](tinyrl/control/controller.py) wires `Ledger`, live nodes/workers, and the swappable `scheduler` over `NodeMsg`.
+- **Durable training, RAM sampling:** Training runs follow an explicit `fresh -> live <-> saved -> lost -> deleted` lifecycle in [controller.py](tinyrl/control/controller.py) backed by [db.py](tinyrl/control/db.py) (the sole module speaking SQL). Sampling queues and bounded LRU replies live in RAM with `429` backpressure, `410` on evicted promises, submission-time version pinning, and attempt-fenced failover.
+- **Layered EEVDF fleet paging:** [policy.py](tinyrl/control/policy.py) holds pure waterfilling, EEVDF + projected lag, sample admission, and GPU/node math; [pager.py](tinyrl/control/pager.py) evicts, places, stages, grants, and parks; and [controller.py](tinyrl/control/controller.py) owns durable runs/queues, live nodes/workers, and drives the swappable `scheduler` over `NodeMsg`.
 - **Trainers, samplers, and store:** Trainers run as isolated synchronous PyTorch/PEFT processes (FSDP via `torchrun` across multiple GPUs) with bf16 forward, fp32 master weights + AdamW state, `cispo`/`dro`/`gspo`/`stable_reinforce` losses, and pinned host-memory parking. Samplers drive isolated vLLM processes (with optional CRIU snapshots). [store.py](tinyrl/storage/store.py) stores immutable `safetensors` checkpoints and `stable_reinforce` top-k blobs across local cache, peer HTTP, and async bucket uploads, with SQLite recording only byte-range metadata.
 
 ## Code layout
@@ -55,9 +55,8 @@ Each GPU node holds one full-duplex msgpack WebSocket (`/internal/ws`) to the co
 |---|---|
 | [tinyrl/control/db.py](tinyrl/control/db.py) | All SQLite WAL schema and queries (sessions, runs, checkpoints, commands, replies, stability, GC) |
 | [tinyrl/control/policy.py](tinyrl/control/policy.py) | Pure waterfilling, EEVDF + projected lag, sample admission, GPU block selection, and placement |
-| [tinyrl/control/ledger.py](tinyrl/control/ledger.py) | Client runs, durable/RAM queues, sample LRU cache, completions, and billing |
 | [tinyrl/control/pager.py](tinyrl/control/pager.py) | Worker eviction, placement, checkpoint staging, projected-lag GPU dispatch, and parking |
-| [tinyrl/control/controller.py](tinyrl/control/controller.py) | Execution kernel connecting `Ledger`, live nodes/workers, and a swappable `scheduler` over `NodeMsg` |
+| [tinyrl/control/controller.py](tinyrl/control/controller.py) | Durable runs/queues/checkpoints, live nodes/workers, and execution kernel driving a swappable `scheduler` |
 | [tinyrl/control/node_daemon.py](tinyrl/control/node_daemon.py) | Stateless task executor, `/internal/ws` WebSocket client, staging, sweep, and drain |
 | [tinyrl/control/accounting.py](tinyrl/control/accounting.py) | Monotonic GPU-time accounting across overlapping calls |
 | [tinyrl/control/process.py](tinyrl/control/process.py) | Private Unix IPC and owned process-group supervision |
