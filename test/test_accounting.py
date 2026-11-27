@@ -148,7 +148,7 @@ class TestAccounting(BusTest):
     ):
       for run in accounts:
         for _ in range(6):
-          self.bus.enqueue(run, Op.SAMPLE, b"{}")
+          self.bus.submit_command(run, Op.SAMPLE, b"{}", schedule=False)
       self.bus.schedule()
       await node.tick()
       for _ in range(6):

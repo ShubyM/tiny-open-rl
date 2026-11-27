@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 NS = os.getenv("NAMESPACE", "tinyrl")
 MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-0.5B")
 PORT = 18000
-PROJECT, ZONE = os.getenv("PROJECT", "open-rl-2-sandbox-102433"), os.getenv("ZONE", "us-central1-a")
+PROJECT, ZONE = os.getenv("PROJECT", ""), os.getenv("ZONE", "us-central1-a")
 
 
 def kubectl(*args: str, check: bool = True) -> str:
@@ -248,6 +248,8 @@ def main() -> None:
       kubectl("taint", "node", node, "tinyrl-e2e-drain-", check=False)
 
   def node_died():
+    if not PROJECT:
+      raise RuntimeError("set PROJECT to your GCP project to run node_died")
     pod = serving(run.worker)
     node = daemons()[pod]
     token = subprocess.run(
@@ -271,8 +273,8 @@ def main() -> None:
     placed = placements()
     workers = live_workers()
     procs = {pod: processes(pod) for pod in daemons()}
-    jobs = gateway_get("/api/v1/scheduling").get("state", {}).get("jobs", {})
-    owners = [j["owner"][0] for j in jobs.values() if j.get("owner")]
+    home = gateway_get("/api/v1/scheduling").get("state", {}).get("home", {})
+    owners = list(home.values())
     check_processes(placed, workers, procs, owners)
     engines = sum(s["pid"] is not None for s in workers.values())
     return f"{len(placed)} workers, {engines} owned process groups, and no stray processes or leases"

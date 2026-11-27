@@ -342,7 +342,7 @@ def load(name: str) -> PreTrainedModel:
   # this raises and the model keeps PyTorch's attention. It takes a sliding layer's window, as Gemma has, where PyTorch's
   # gets an [n, n] mask and computes every pair of a long row
   with contextlib.suppress(ImportError, ValueError):
-    text = getattr(lm, "language_model", None) or getattr(getattr(lm, "model", None), "language_model", lm)
+    text = getattr(lm, "language_model", None) or getattr(getattr(lm, "model", None), "language_model", None) or lm
     text.set_attn_implementation("flash_attention_4")
     # its kernels are for a head dimension up to 128, and for 256. A layer with another, as Gemma 4's full layers, stays
     for layer in [m for m in text.modules() if getattr(m, "head_dim", 0) > 128 and m.head_dim != 256]:

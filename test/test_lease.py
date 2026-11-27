@@ -7,9 +7,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from test.helpers import BusTest, new_id, serve_control, tiny
 from test.test_process import require_unix
+from tinyrl.control.node_daemon import NodeDaemon
 from tinyrl.storage.store import Store
 from tinyrl.types import Op, Reply, Run
 
@@ -148,6 +151,36 @@ class TestLease(BusTest):
     self.assertTrue(tensors)
     self.assertTrue(meta["optimizer"])
     self.assertIn(version.partition("@")[0], self.bus.live_versions())
+
+  async def test_silent_open_ws_self_fences_on_lease_expiry(self):
+    from aiohttp import WSMsgType
+
+    class SilentWS:
+      closed = False
+
+      def __init__(self):
+        self.blocker = asyncio.Event()
+
+      async def send_bytes(self, data: bytes) -> None:
+        pass
+
+      async def close(self) -> None:
+        self.closed = True
+        self.blocker.set()
+
+      def __aiter__(self):
+        return self
+
+      async def __anext__(self):
+        await self.blocker.wait()
+        return SimpleNamespace(type=WSMsgType.CLOSE, data=b"")
+
+    ws = SilentWS()
+    daemon = NodeDaemon(SimpleNamespace(), gpus=1, node="n1", gpu_mib=0, store=self.store)
+    self.addAsyncCleanup(daemon.close)
+    with mock.patch("tinyrl.control.node_daemon.LEASE_MS", 120):
+      with self.assertRaisesRegex(RuntimeError, "lease expired"):
+        await asyncio.wait_for(daemon.serve_socket(ws, 0.03, None), 2.0)
 
 
 if __name__ == "__main__":

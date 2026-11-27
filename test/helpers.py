@@ -30,7 +30,7 @@ def new_id() -> str:
 
 
 async def serve_control(ledger: Controller, host: str = "127.0.0.1", port: int = 0):
-  """Run the FastAPI gateway (including `/internal/{method}`) on a TCP port for tests."""
+  """Run the FastAPI gateway (including `/internal/ws`) on a TCP port for tests."""
   import socket
 
   import uvicorn

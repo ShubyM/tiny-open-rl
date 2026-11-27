@@ -10,7 +10,7 @@ from tinyrl.control.accounting import Charge
 
 MAX_LORAS, MAX_SEQS = 16, 256  # vLLM engine limits: --max-loras and max captured CUDA-graph batch size
 Role = StrEnum("Role", "TRAINER SAMPLER")
-Ev = StrEnum("Ev", "RUN_CREATED ASSIGNED RUN_DELETED NODE_UP NODE_LOST PLACED UNPLACED")
+Ev = StrEnum("Ev", "RUN_CREATED RUN_DELETED NODE_UP NODE_LOST PLACED UNPLACED")
 RunStatus = StrEnum("RunStatus", "FRESH LIVE SAVED LOST DELETED")
 Op = StrEnum(
   "Op",
@@ -205,7 +205,7 @@ class ControlMsg:
   tasks: tuple[Task, ...] = ()
   cancel: tuple[str, ...] = ()
   stage: tuple[str, ...] = ()
-  sweep: tuple[str, ...] = ()
+  sweep: tuple[str, ...] | None = None
   reset: bool = False
 
 

@@ -9,9 +9,9 @@ configMapGenerator:
 - name: tinyrl
   literals:
   - CONTROL_URL=http://gateway:8000
-  - CKPT=gs://open-rl-2-sandbox-102433-tinyrl/ckpt
+  - CKPT=gs://YOUR_BUCKET/ckpt
   - CKPT_CACHE=/dev/shm/tinyrl-cache
 images:
 - name: tinyrl
-  newName: us-central1-docker.pkg.dev/open-rl-2-sandbox-102433/open-rl/tinyrl
+  newName: YOUR_REGISTRY/tinyrl
   newTag: latest

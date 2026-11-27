@@ -125,15 +125,24 @@ def uuid_bytes(gpu_uuid: str) -> tuple[int, ...]:
   return tuple(uuid.UUID(gpu_uuid.removeprefix("GPU-")).bytes)
 
 
-def save(pid: int, folder: str, name: str, visible: str) -> None:
-  """Save the asleep server whose root process is `pid`, and whose socket and log are `name`.sock and `name`.log, to `folder`. This ends the server."""
-  pids = cuda_pids(pid)
+def lock_and_checkpoint(pids: list[int]) -> None:
   lib = open_cuda()
   lock_args = LockArgs(timeout_ms=10_000)
   for p in pids:
     check_cuda(lib, "cuCheckpointProcessLock", lib.cuCheckpointProcessLock(p, ctypes.byref(lock_args)))
   for p in pids:
     check_cuda(lib, "cuCheckpointProcessCheckpoint", lib.cuCheckpointProcessCheckpoint(p, None))
+
+
+def save(pid: int, folder: str, name: str, visible: str) -> None:
+  """Save the asleep server whose root process is `pid`, and whose socket and log are `name`.sock and `name`.log, to `folder`. This ends the server."""
+  pids = cuda_pids(pid)
+  if pids:
+    res = subprocess.run(
+      [sys.executable, "-m", __name__, "--lock-checkpoint", *map(str, pids)], capture_output=True, text=True
+    )
+    if res.returncode:
+      raise RuntimeError(f"cuda checkpoint failed: {(res.stderr or res.stdout).strip()}")
   tmp = f"{folder}.{pid}"
   try:
     os.makedirs(f"{tmp}/keep")
@@ -181,34 +190,37 @@ async def restore(folder: str, visible: str, env: dict[str, str]) -> tuple[subpr
 
 def restore_here(folder: str, target: str, all_gpus: tuple[str, ...]) -> None:
   """Runs as the init of fresh namespaces: give the copy its own loopback and private /tmp, /dev/shm and RUN, restore, move it onto `target`, then reap."""
-  # Overlap multi-second cuInit (UVM registration across all GPUs) with mounts and CRIU page restore.
-  with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+  run("ip", "link", "set", "lo", "up")
+  # private /tmp and /dev/shm, so copies don't collide on the files the snapshot recreates there, with the node's folders bound back in: the snapshot, checkpoints and models live there
+  for d in ("/tmp", "/dev/shm"):
+    os.makedirs(f"/mnt/tinyrl{d}", exist_ok=True)
+    run("mount", "--bind", d, f"/mnt/tinyrl{d}")
+    run("mount", "-t", "tmpfs", "tmpfs", d)
+    for e in os.scandir(f"/mnt/tinyrl{d}"):
+      try:
+        if e.is_dir(follow_symlinks=False):
+          os.makedirs(f"{d}/{e.name}")
+          run("mount", "--bind", e.path, f"{d}/{e.name}")
+      except (FileNotFoundError, RuntimeError):
+        if os.path.exists(e.path):
+          raise
+        with contextlib.suppress(OSError):
+          os.rmdir(f"{d}/{e.name}")
+  os.makedirs(RUN, exist_ok=True)
+  run("mount", "-t", "tmpfs", "tmpfs", RUN)
+  for f in glob.glob(f"{folder}/keep/*"):
+    shutil.copy2(f, "/dev/shm" if os.path.basename(f).startswith("link_remap.") else RUN)
+  with open(f"{folder}/meta.json") as f:
+    meta = json.load(f)
+  # Overlap multi-second cuInit (UVM registration across all GPUs) with CRIU page restore, after /tmp and /dev/shm mounts are settled.
+  pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+  try:
     cuda_fut = pool.submit(open_cuda)
-    run("ip", "link", "set", "lo", "up")
-    # private /tmp and /dev/shm, so copies don't collide on the files the snapshot recreates there, with the node's folders bound back in: the snapshot, checkpoints and models live there
-    for d in ("/tmp", "/dev/shm"):
-      os.makedirs(f"/mnt/tinyrl{d}", exist_ok=True)
-      run("mount", "--bind", d, f"/mnt/tinyrl{d}")
-      run("mount", "-t", "tmpfs", "tmpfs", d)
-      for e in os.scandir(f"/mnt/tinyrl{d}"):
-        try:
-          if e.is_dir(follow_symlinks=False):
-            os.makedirs(f"{d}/{e.name}")
-            run("mount", "--bind", e.path, f"{d}/{e.name}")
-        except (FileNotFoundError, RuntimeError):
-          if os.path.exists(e.path):
-            raise
-          with contextlib.suppress(OSError):
-            os.rmdir(f"{d}/{e.name}")
-    os.makedirs(RUN, exist_ok=True)
-    run("mount", "-t", "tmpfs", "tmpfs", RUN)
-    for f in glob.glob(f"{folder}/keep/*"):
-      shutil.copy2(f, "/dev/shm" if os.path.basename(f).startswith("link_remap.") else RUN)
-    with open(f"{folder}/meta.json") as f:
-      meta = json.load(f)
     log = "/tmp/criu-restore.log"
     run("criu", "restore", "-D", folder, *CRIU, "--tcp-close", "-d", "--log-file", log, log=log)
     lib = cuda_fut.result()
+  finally:
+    pool.shutdown(wait=False)
   swap = {meta["gpu"]: target, target: meta["gpu"]}
   pairs = (GpuPair * len(all_gpus))(*(GpuPair(uuid_bytes(u), uuid_bytes(swap.get(u, u))) for u in all_gpus))
   restore_args = RestoreArgs(pairs=ctypes.cast(pairs, ctypes.POINTER(GpuPair)), count=len(all_gpus))
@@ -224,4 +236,7 @@ def restore_here(folder: str, target: str, all_gpus: tuple[str, ...]) -> None:
 
 
 if __name__ == "__main__":
-  restore_here(sys.argv[1], sys.argv[2], tuple(sys.argv[3:]) or gpus())
+  if sys.argv[1:2] == ["--lock-checkpoint"]:
+    lock_and_checkpoint([int(p) for p in sys.argv[2:]])
+  else:
+    restore_here(sys.argv[1], sys.argv[2], tuple(sys.argv[3:]) or gpus())
